@@ -1,4 +1,4 @@
-<!-- Modified for Noite (ryuzcorp/noite, docker/celld/patches): node:crypto scrypt. -->
+<!-- Modified for Noite (ryuzcorp/noite, docker/celld/patches): node:crypto scrypt; cloned streaming bodies. -->
 # Cloudflare compatibility
 
 This page lists only the differences from the linked Cloudflare APIs. An entry
@@ -67,6 +67,10 @@ An unsupported feature that does not cause an error is a defect.
   cannot prove the geolocation, colo, or TLS metadata.
 - celld removes `Content-Length` from a Worker response, except for a `HEAD`
   response.
+- A cloned body that the platform streams (a `fetch()`, RPC, Durable Object
+  or R2 body) applies backpressure at the slower copy: reading only one copy
+  stalls it after 16 chunks until the other copy is read, cancelled, or
+  expires. Workerd buffers for the slower copy instead.
 - A remote Durable Object call cannot retry after request-body transmission
   starts because celld keeps no replay copy.
 - A remote Durable Object call waits for a rejected owner generation to change

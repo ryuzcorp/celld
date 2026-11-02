@@ -1,4 +1,4 @@
-// Modified for Noite (ryuzcorp/noite, docker/celld/patches): ctx.container.images.
+// Modified for Noite (ryuzcorp/noite, docker/celld/patches): ctx.container.images; clone() of streaming and disturbed bodies.
 // The DO object model and the Cloudflare-compatible runtime surface, run
 // once per isolate by `js.rs::install_harness` after the Web-API prelude.
 // Lived as a 4,000-line raw string inside js.rs until 2026-07-29; it is a
@@ -247,6 +247,11 @@ for (const bodyStream of [CelldBodyStream, CelldHttpBodyStream]) {
     value: ReadableStream, writable: true, configurable: true,
   });
 }
+// Fetch's clone() refuses a disturbed or locked body (Workerd too): a body
+// read through its own reader, even partly, cannot be cloned.
+const __bodyDisturbed = (message) => message.bodyUsed ||
+  (message.body != null &&
+    (message.body.locked || message.body._disturbed === true));
 globalThis.Response = class Response {
   constructor(body, init = {}) {
     // Streaming/iterable detection runs only for object bodies, so
@@ -360,11 +365,18 @@ globalThis.Response = class Response {
       { type: this.headers.get("content-type") || "" });
   }
   clone() {
-    if (this.bodyUsed) throw new TypeError("Body has already been consumed");
-    if (this._bodyBytes === null)
-      throw new TypeError("Cannot clone a streaming response before consumption");
+    if (__bodyDisturbed(this))
+      throw new TypeError("Body has already been consumed");
+    // Streaming body: tee, keep one branch, clone the other (as
+    // Request.clone does, and as Workerd does for both).
+    let body = this.body === null ? null : this._bodyBytes;
+    if (this._bodyBytes === null) {
+      const [left, right] = this.body.tee();
+      this.body = left;
+      body = right;
+    }
     const response = new Response(
-      this.body === null ? null : this._bodyBytes,
+      body,
       {
         status: this.status, statusText: this.statusText, headers: this.headers,
         webSocket: this.webSocket, __wsTarget: this._wsTarget, cf: this.cf,
@@ -526,7 +538,8 @@ globalThis.Request = class Request {
       { type: this.headers.get("content-type") || "" });
   }
   clone() {
-    if (this.bodyUsed) throw new TypeError("Body has already been consumed");
+    if (__bodyDisturbed(this))
+      throw new TypeError("Body has already been consumed");
     if (this._bodyBytes === null) {
       // Streaming body: tee, keep one branch, clone the other.
       const [left, right] = this.body.tee();
