@@ -1,3 +1,4 @@
+// Modified for Noite (ryuzcorp/noite, docker/celld/patches): exec() waits for start().
 //! Host ops behind `ctx.container`.
 //!
 //! JavaScript owns the surface and every validation message, copied from
@@ -7,7 +8,7 @@
 //! `__container_exec` returned.
 
 use super::*;
-use crate::container::{self, CellContainer, ContainerEngine, ExecParams, StartParams};
+use crate::container::{self, CellContainer, ContainerEngine, ExecParams, StartGuard, StartParams};
 use std::time::Duration;
 
 async fn cell_for(scope: &str) -> Result<(Arc<ContainerEngine>, Arc<CellContainer>), String> {
@@ -87,12 +88,29 @@ pub(super) fn op_container_start(
     };
     // The run opens here, on the calling thread, so the monitor() that
     // follows this call in the same turn waits for this start's exit.
-    let run = container::engine_if_ready()
+    let opened = container::engine_if_ready()
         .and_then(|engine| engine.cell(&cell))
-        .map(|cell| cell.begin_run());
+        // Guarded from the moment it opens: whatever ends the task below
+        // (done, failed, or cancelled and dropped, even before it first
+        // runs), the run counts as finished, or an exec() waiting on it
+        // would wait forever.
+        .map(|cell| StartGuard::new(cell.clone(), cell.begin_run()));
     let async_id = asyncrt::enqueue_io_context(async move {
         let (engine, cell) = cell_for(&cell).await?;
-        let run = run.unwrap_or_else(|| cell.begin_run());
+        // The run belongs to the cell it was opened on. If that cell was
+        // evicted and the scope came back as a new one, release the old
+        // run and open one here, or the new cell's exec() would see a
+        // foreign run number as started.
+        let guard = match opened {
+            Some(opened) if Arc::ptr_eq(opened.cell(), &cell) => opened,
+            // Dropping `released` releases the run opened on a cell that
+            // was evicted since; this cell gets a run of its own.
+            released => {
+                drop(released);
+                StartGuard::new(cell.clone(), cell.begin_run())
+            }
+        };
+        let run = guard.run();
         engine
             .start(
                 &cell,
@@ -106,6 +124,7 @@ pub(super) fn op_container_start(
             )
             .await
             .map_err(|error| format!("{error:#}"))?;
+        drop(guard);
         Ok::<String, String>(String::new())
     });
     rv.set(promise_for(scope, async_id));
