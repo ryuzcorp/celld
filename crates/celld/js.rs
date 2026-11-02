@@ -1,3 +1,4 @@
+// Modified for Noite (ryuzcorp/noite, docker/celld/patches): node:crypto scrypt.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 // The raw V8 adapter and its child modules remain outside the Actor execution
@@ -6866,6 +6867,7 @@ ops! { OP_NAMES, install_op_functions,
         "$$aesDecrypt" => crypto::op_webcrypto_aes_decrypt,
         "$$pbkdf2" => crypto::op_node_pbkdf2,
         "$$hkdf" => crypto::op_node_hkdf,
+        "$$scrypt" => crypto::op_node_scrypt,
         "$$timingSafeEqual" => crypto::op_timing_safe_equal,
         "__event_begin" => op_event_begin,
         "__event_end" => op_event_end,

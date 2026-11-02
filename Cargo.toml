@@ -1,3 +1,4 @@
+# Modified for Noite (ryuzcorp/noite, docker/celld/patches): node:crypto scrypt.
 # Clean-sheet celld workspace. `crates/logic` owns all behavioral state and
 # decisions; `crates/celld` is only an effect executor and adapter host.
 [workspace]
@@ -62,12 +63,15 @@ futures-util = "0.3"
 getrandom = "0.3"
 glob = "0.3"
 hex = "0.4"
-# The two node:crypto KDFs. Both crates already reach this build without a
-# line here -- `pbkdf2` through `pkcs5`, `hkdf` through `elliptic-curve` --
-# so declaring them costs no compile time and adds no supply-chain surface.
+# The three node:crypto KDFs. All three crates already reach this build
+# without a line here -- `pbkdf2` and `scrypt` through `pkcs5`, `hkdf`
+# through `elliptic-curve` -- so declaring them costs no compile time and
+# adds no supply-chain surface. `scrypt` keeps `pkcs5`'s feature set (no
+# `simple` PHC strings), so the lock gains only the dependency edge.
 hkdf = "0.12"
 hmac = "0.12"
 pbkdf2 = "0.12"
+scrypt = { version = "0.11", default-features = false }
 http-body-util = "0.1"
 # hyper also accepts h2 releases before 0.4.18, which retain the remotely
 # triggerable resource-exhaustion advisory. Keep a direct floor here because a

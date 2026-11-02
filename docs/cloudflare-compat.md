@@ -1,3 +1,4 @@
+<!-- Modified for Noite (ryuzcorp/noite, docker/celld/patches): node:crypto scrypt. -->
 # Cloudflare compatibility
 
 This page lists only the differences from the linked Cloudflare APIs. An entry
@@ -149,6 +150,9 @@ execution.
 - `node:diagnostics_channel` does not export messages to a tail Worker.
 - `node:crypto` does not implement Diffie-Hellman, streaming signatures,
   ciphers, RSA-PSS, or DSA signatures and key generation.
+- `node:crypto` implements `scrypt`/`scryptSync` with Node's parameters
+  and defaults (`N`/`cost` 16384, `r`/`blockSize` 8, `p`/`parallelization`
+  1, `maxmem` 32 MiB).
 - `KeyObject.toCryptoKey()` applies the requested algorithm, extractability,
   and usages to an asymmetric key.
 - `node:zlib` implements only the synchronous gzip and deflate functions.

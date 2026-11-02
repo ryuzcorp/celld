@@ -1,3 +1,4 @@
+// Modified for Noite (ryuzcorp/noite, docker/celld/patches): node:crypto scrypt.
 // node:crypto for celld -- a port of Workerd's implementation at commit
 // 191a27f941300dd8956f2afeb66c10a651108c0b. Copyright (c) 2017-2022
 // Cloudflare, Inc. (Apache-2.0), itself adapted from Node.js (Joyent and
@@ -13,7 +14,7 @@
 //   src/node/internal/validators.ts, internal_errors.ts (subsets)
 //
 // Types are stripped; the C++ `node-internal:crypto` builtin maps onto the
-// $$digest / $$hmacSign / $$pbkdf2 / $$hkdf / $$randomValues /
+// $$digest / $$hmacSign / $$pbkdf2 / $$hkdf / $$scrypt / $$randomValues /
 // $$timingSafeEqual host ops, with hash state buffered on the JS side (digest
 // runs once, at finalization).
 // checkPrime/generatePrime are pure-JS BigInt Miller-Rabin, mirroring
@@ -156,6 +157,9 @@
   const ERR_CRYPTO_TIMING_SAFE_EQUAL_LENGTH = () =>
     nodeErr(RangeError, "ERR_CRYPTO_TIMING_SAFE_EQUAL_LENGTH",
       "Input buffers must have the same byte length");
+  const ERR_CRYPTO_INVALID_SCRYPT_PARAMS = () =>
+    nodeErr(RangeError, "ERR_CRYPTO_INVALID_SCRYPT_PARAMS",
+      "Invalid scrypt params");
 
   function validateString(value, name) {
     if (typeof value !== "string")
@@ -1186,6 +1190,80 @@
     return getHkdf(hash, key, salt, info, length);
   }
 
+  // ---- scrypt --------------------------------------------------------------
+  // Node's option names and defaults: N/cost, r/blockSize,
+  // p/parallelization, maxmem. A present-but-zero N, r, p, or maxmem means
+  // "use the default", and each alias pair is exclusive. Also doubles as
+  // the `scrypt`/`scryptSync` default-parameter sentinel, like Node's own
+  // `defaults`.
+  const scryptDefaults = { N: 16384, r: 8, p: 1, maxmem: 33554432 };
+  function scryptCheckArgs(password, salt, keylen) {
+    password = getArrayBufferOrView(password, "password");
+    salt = getArrayBufferOrView(salt, "salt");
+    validateInt32(keylen, "keylen", 0);
+    return { password, salt, keylen };
+  }
+  function scryptCheckOptions(options) {
+    let N, cost, r, blockSize, p, parallelization, maxmem;
+    if (options != null) {
+      ({ N, cost, r, blockSize, p, parallelization, maxmem } = options);
+    }
+    if (N !== undefined) validateUint32(N, "N");
+    if (cost !== undefined) validateUint32(cost, "cost");
+    if (r !== undefined) validateUint32(r, "r");
+    if (blockSize !== undefined) validateUint32(blockSize, "blockSize");
+    if (p !== undefined) validateUint32(p, "p");
+    if (parallelization !== undefined)
+      validateUint32(parallelization, "parallelization");
+    if (maxmem !== undefined)
+      validateInteger(maxmem, "maxmem", 0, Number.MAX_SAFE_INTEGER);
+    if (N !== undefined && cost !== undefined)
+      throw ERR_INCOMPATIBLE_OPTION_PAIR("N", "cost");
+    if (r !== undefined && blockSize !== undefined)
+      throw ERR_INCOMPATIBLE_OPTION_PAIR("r", "blockSize");
+    if (p !== undefined && parallelization !== undefined)
+      throw ERR_INCOMPATIBLE_OPTION_PAIR("p", "parallelization");
+    N = N ?? cost ?? 16384;
+    r = r ?? blockSize ?? 8;
+    p = p ?? parallelization ?? 1;
+    maxmem = maxmem ?? 33554432;
+    if (N === 0) N = 16384;
+    if (r === 0) r = 8;
+    if (p === 0) p = 1;
+    if (maxmem === 0) maxmem = 33554432;
+    if (N <= 1 || (N & (N - 1)) !== 0)
+      throw ERR_CRYPTO_INVALID_SCRYPT_PARAMS();
+    if (128 * N * r > maxmem)
+      throw ERR_CRYPTO_INVALID_SCRYPT_PARAMS();
+    return { N, r, p };
+  }
+  function getScrypt(password, salt, keylen, N, r, p) {
+    const out = $$scrypt(asU8(password), asU8(salt), N, r, p, keylen);
+    if (out === undefined) throw ERR_CRYPTO_INVALID_SCRYPT_PARAMS();
+    return out;
+  }
+  function scryptSync(password, salt, keylen, options = scryptDefaults) {
+    ({ password, salt, keylen } = scryptCheckArgs(password, salt, keylen));
+    const { N, r, p } = scryptCheckOptions(options);
+    return Buffer.from(getScrypt(password, salt, keylen, N, r, p));
+  }
+  function scrypt(password, salt, keylen, options, callback = scryptDefaults) {
+    if (callback === scryptDefaults) {
+      callback = options;
+      options = scryptDefaults;
+    }
+    ({ password, salt, keylen } = scryptCheckArgs(password, salt, keylen));
+    validateFunction(callback, "callback");
+    const { N, r, p } = scryptCheckOptions(options);
+    new Promise((resolve, reject) => {
+      try { resolve(getScrypt(password, salt, keylen, N, r, p)); }
+      catch (err) { reject(err); }
+    }).then(
+      (val) => callback(null, Buffer.from(val)),
+      (err) => callback(err),
+    );
+  }
+
   // ---- random (crypto_random.ts) ------------------------------------------
   // $$randomValues fills any view (no WebCrypto 65,536-byte quota).
   const fillRandom = (view) => { $$randomValues(view); return view; };
@@ -1614,7 +1692,7 @@
     // Hash and Hmac
     Hash, Hmac, createHash, createHmac, getHashes, hash,
     // KDF
-    hkdf, hkdfSync, pbkdf2, pbkdf2Sync,
+    hkdf, hkdfSync, pbkdf2, pbkdf2Sync, scrypt, scryptSync,
     // Keys
     KeyObject, SecretKeyObject, PublicKeyObject, PrivateKeyObject,
     createSecretKey, createPrivateKey, createPublicKey,
@@ -1629,8 +1707,6 @@
     publicDecrypt: notImplemented("publicDecrypt"),
     privateEncrypt: notImplemented("privateEncrypt"),
     privateDecrypt: notImplemented("privateDecrypt"),
-    scrypt: notImplemented("scrypt"),
-    scryptSync: notImplemented("scryptSync"),
     createDiffieHellman: notImplemented("createDiffieHellman"),
     createDiffieHellmanGroup: notImplemented("createDiffieHellmanGroup"),
     getDiffieHellman: notImplemented("getDiffieHellman"),

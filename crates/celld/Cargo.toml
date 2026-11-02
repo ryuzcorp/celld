@@ -1,3 +1,4 @@
+# Modified for Noite (ryuzcorp/noite, docker/celld/patches): node:crypto scrypt.
 [package]
 name = "celld"
 version = "0.6.3"
@@ -69,6 +70,7 @@ sqlite-vec.workspace = true
 rustls.workspace = true
 rustls-webpki.workspace = true
 rsa.workspace = true
+scrypt.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha1.workspace = true

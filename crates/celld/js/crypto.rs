@@ -1,3 +1,4 @@
+// Modified for Noite (ryuzcorp/noite, docker/celld/patches): node:crypto scrypt.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! Web Crypto and node:crypto: the key formats and the primitives.
@@ -1739,6 +1740,132 @@ pub(super) fn op_node_hkdf(
     let out = dispatch_digest!(algorithm.as_str(), hkdf_kdf, (&ikm, &salt, &info, length));
     if let Some(Some(out)) = out {
         webcrypto_return_bytes(scope, rv, &out);
+    }
+}
+
+/// scrypt (RFC 7914) for node:crypto, over the `scrypt` crate.
+///
+/// Like `pbkdf2`, the crate already reaches this build through `pkcs5`,
+/// which this file uses for encrypted PKCS#8, so only the `Cargo.toml`
+/// line is new. `None` is an invalid parameter set: `N` is not a power of
+/// two above one, `r` or `p` is zero, or the parameters overflow the
+/// crate's internal sizes. The JS layer validates all of these first and
+/// reports `ERR_CRYPTO_INVALID_SCRYPT_PARAMS`, so `None` here is the same
+/// belt-and-braces as `hkdf_kdf`'s: the ops are reachable from the user's
+/// `globalThis` whatever the JS layer does.
+fn scrypt_kdf(
+    password: &[u8],
+    salt: &[u8],
+    n: u32,
+    r: u32,
+    p: u32,
+    keylen: usize,
+) -> Option<Vec<u8>> {
+    if n <= 1 || !n.is_power_of_two() || r == 0 || p == 0 {
+        return None;
+    }
+    if keylen == 0 {
+        // Node derives an empty key; the crate refuses an empty output.
+        return Some(Vec::new());
+    }
+    // `Params` also carries a PHC hash length the raw `scrypt()` never
+    // reads, and the constructor only accepts 10..=64 for it, so the key
+    // length stays out of here: any placeholder in range behaves the same.
+    let params = scrypt::Params::new(n.trailing_zeros() as u8, r, p, 32).ok()?;
+    let mut out = vec![0u8; keylen];
+    scrypt::scrypt(password, salt, &params, &mut out).ok()?;
+    Some(out)
+}
+
+/// `$$scrypt(password, salt, n, r, p, keylen)` -> Uint8Array
+pub(super) fn op_node_scrypt(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    rv: v8::ReturnValue<v8::Value>,
+) {
+    let Some(password) = view_bytes(args.get(0)) else {
+        return;
+    };
+    let Some(salt) = view_bytes(args.get(1)) else {
+        return;
+    };
+    let n = args.get(2).uint32_value(scope).unwrap_or(0);
+    let r = args.get(3).uint32_value(scope).unwrap_or(0);
+    let p = args.get(4).uint32_value(scope).unwrap_or(0);
+    let keylen = args.get(5).uint32_value(scope).unwrap_or(0) as usize;
+    if let Some(out) = scrypt_kdf(&password, &salt, n, r, p, keylen) {
+        webcrypto_return_bytes(scope, rv, &out);
+    }
+}
+
+#[cfg(test)]
+mod scrypt_tests {
+    use super::*;
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    /// RFC 7914 section 12, vector 1. Node and Python's `hashlib` agree.
+    #[test]
+    fn empty_password_and_salt() {
+        let out = scrypt_kdf(b"", b"", 16, 1, 1, 64).unwrap();
+        assert_eq!(
+            hex(&out),
+            "77d6576238657b203b19ca42c18a0497f16b4844e3074ae8dfdffa3fede21442\
+             fcd0069ded0948f8326a753a0fc81f17e8d3e0fb2e0d3628cf35e20c38d18906"
+        );
+    }
+
+    /// RFC 7914 section 12, vector 2.
+    #[test]
+    fn password_and_nacl() {
+        let out = scrypt_kdf(b"password", b"NaCl", 1024, 8, 16, 64).unwrap();
+        assert_eq!(
+            hex(&out),
+            "fdbabe1c9d3472007856e7190d01e9fe7c6ad7cbc8237830e77376634b373162\
+             2eaf30d92e22a3886ff109279d9830dac727afb94a83ee6d8360cbdfa2cc0640"
+        );
+    }
+
+    /// Node's defaults (N=16384, r=8, p=1), the shape password hashing
+    /// asks for. Ground truth from Node itself.
+    #[test]
+    fn node_defaults() {
+        let out = scrypt_kdf(b"password", b"salt", 16384, 8, 1, 32).unwrap();
+        assert_eq!(
+            hex(&out),
+            "745731af4484f323968969eda289aeee005b5903ac561e64a5aca121797bf773"
+        );
+    }
+
+    /// The smallest valid `N`.
+    #[test]
+    fn smallest_cost() {
+        let out = scrypt_kdf(b"p", b"s", 2, 1, 1, 32).unwrap();
+        assert_eq!(
+            hex(&out),
+            "48b0d2a8a3272611984c50ebd630af52e187db3433930c3b74d0889935944cf3"
+        );
+    }
+
+    /// Node derives an empty key for keylen 0.
+    #[test]
+    fn empty_key() {
+        let out = scrypt_kdf(b"password", b"salt", 16384, 8, 1, 0).unwrap();
+        assert!(out.is_empty());
+    }
+
+    /// Shapes the JS layer refuses with `ERR_CRYPTO_INVALID_SCRYPT_PARAMS`
+    /// never reach the crate: the op refuses them too.
+    #[test]
+    fn invalid_parameters() {
+        for (n, r, p) in [(0, 8, 1), (1, 8, 1), (100, 8, 1), (16, 0, 1), (16, 8, 0)] {
+            assert!(
+                scrypt_kdf(b"password", b"salt", n, r, p, 32).is_none(),
+                "n={n} r={r} p={p} derived a key"
+            );
+        }
     }
 }
 
