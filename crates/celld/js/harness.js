@@ -1,3 +1,4 @@
+// Modified for Noite (ryuzcorp/noite, docker/celld/patches): ctx.container.images.
 // The DO object model and the Cloudflare-compatible runtime surface, run
 // once per isolate by `js.rs::install_harness` after the Web-API prelude.
 // Lived as a 4,000-line raw string inside js.rs until 2026-07-29; it is a
@@ -2429,6 +2430,8 @@ class ContainerPort {
       __container_address(this._scope, this._port), options);
   }
 }
+const CONTAINER_IMAGES = Object.freeze({ default: "default" });
+
 class Container {
   constructor(scope) {
     this._scope = scope;
@@ -2437,10 +2440,16 @@ class Container {
   // The host's answer, not a JavaScript flag: a monitor() promise can be
   // dropped with its event, so the flag it would maintain could go stale.
   get running() { return __container_running(this._scope); }
+  // The class's images by name, as on Cloudflare (`ctx.container.images`).
+  // celld deploys one image per class, so `default` is the only entry, and
+  // it is what `start({ image })` takes.
+  get images() { return CONTAINER_IMAGES; }
   start(options) {
     if (this.running)
       throw new Error("start() cannot be called on a container that is already running.");
     const o = options ?? {};
+    if (o.image !== undefined && o.image !== CONTAINER_IMAGES.default)
+      throw new TypeError(`start(): unknown image ${JSON.stringify(String(o.image))}; this class has only ctx.container.images.default`);
     const params = { enableInternet: !!o.enableInternet, labels: [] };
     if (o.entrypoint !== undefined) params.entrypoint = Array.from(o.entrypoint, String);
     params.env = __containerEnvList(o.env);

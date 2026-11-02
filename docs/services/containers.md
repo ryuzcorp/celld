@@ -1,3 +1,4 @@
+<!-- Modified for Noite (ryuzcorp/noite, docker/celld/patches): ctx.container.images. -->
 # Containers
 
 A container runs a program that is not JavaScript beside the Worker that needs
@@ -25,7 +26,10 @@ most one container.
 celld implements this part of `ctx.container`:
 
 - `start()` starts the container. It accepts `entrypoint`, `env`,
-  `enableInternet`, and `labels`.
+  `enableInternet`, `labels`, and `image`.
+- `images` lists the images of the class by name. celld deploys one image per
+  class, so `images.default` is the only entry, and `start({ image })` takes
+  only that value.
 - `running` reports the state of the engine, so an object that lost its
   `monitor()` sees the exit at its next event.
 - `monitor()` returns a promise that settles when the container exits.
