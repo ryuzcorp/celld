@@ -1,4 +1,4 @@
-<!-- Modified by ryuzcorp (ryuzcorp/celld): ctx.container.images. -->
+<!-- Modified by ryuzcorp (ryuzcorp/celld): ctx.container.images; fence node-netns exception. -->
 # Containers
 
 A container runs a program that is not JavaScript beside the Worker that needs
@@ -88,6 +88,24 @@ the node, another node, the private ranges `10/8`, `172.16/12`, `192.168/16`,
 and `100.64/10`, or the link-local range. A node that cannot install the rules
 starts no container, and a deployment from a celld without the fence image
 starts no container on a node that has the fence.
+
+A node that itself runs in a container on a private bridge, with its engine
+socket reaching a daemon on the same host, needs one more rule: without it
+the forward rejects above drop the replies to the node's own connections,
+so the node cannot reach its containers. `CELLD_FENCE_NODE_NETNS=auto` cuts
+that exception at fence-install time: ahead of each private-range reject,
+the fence admits `established,related` packets toward the node's own
+addresses, discovered from its interfaces on Linux or pinned with
+`CELLD_FENCE_NODE_ADDRS`, a comma-separated list of exact IPs (set but
+empty refuses the fence). `related` admits only the ICMP errors of a live
+flow, which keep path-MTU discovery working. The exception
+admits replies only — a container still cannot open a connection to the
+node — and the default `off` installs the unchanged ruleset. Nodes sharing
+one engine install one shared table, so pin the same union of node
+addresses on every node; a restart re-applies the fence and re-discovers
+the addresses. The exception says nothing about which containers a node may
+dial: a hoster running mutually untrusting tenants on one engine still
+enforces that above celld.
 
 `enableInternet: false` attaches the container to an internal bridge with no
 route out. On macOS, an internal network publishes no port, so `celld dev` on

@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): exec() waits for start(); exec pty/resize.
+// Modified by ryuzcorp (ryuzcorp/celld): exec() waits for start(); exec pty/resize; fence node-netns exception.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! Containers attached to Durable Objects: the engine side of
@@ -30,6 +30,7 @@ use anyhow::{anyhow, Context};
 use bytes::Bytes;
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
@@ -164,6 +165,302 @@ table inet celld {
 /// the same bridge. The node still reaches every container, because it
 /// speaks from the host side of the bridge.
 const ICC_OPTION: &str = "com.docker.network.bridge.enable_icc";
+
+/// The forward chain's private-range reject lines, as anchors for the
+/// node-netns exception. They must match `FENCE_RULES` verbatim, exactly
+/// once each; the fence tests pin that.
+const FENCE_FORWARD_REJECT_V4: &str = r#"    iifname { "celld0", "celld1" } ip daddr { 169.254.0.0/16, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10 } reject"#;
+const FENCE_FORWARD_REJECT_V6: &str =
+    r#"    iifname { "celld0", "celld1" } ip6 daddr { fe80::/10, fc00::/7 } reject"#;
+
+/// The private ranges the forward chain rejects, as data mirroring
+/// `FENCE_RULES` (the fence tests keep the two in sync). A node-netns
+/// exception is only ever cut for an address inside these ranges: traffic
+/// to anything outside them is never fenced, so an exception for it would
+/// be a no-op.
+const FENCE_REJECT_V4: &[(Ipv4Addr, u32)] = &[
+    (Ipv4Addr::new(169, 254, 0, 0), 16),
+    (Ipv4Addr::new(10, 0, 0, 0), 8),
+    (Ipv4Addr::new(172, 16, 0, 0), 12),
+    (Ipv4Addr::new(192, 168, 0, 0), 16),
+    (Ipv4Addr::new(100, 64, 0, 0), 10),
+];
+const FENCE_REJECT_V6: &[(Ipv6Addr, u32)] = &[
+    (Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 0), 10),
+    (Ipv6Addr::new(0xfc00, 0, 0, 0, 0, 0, 0, 0), 7),
+];
+
+/// `CELLD_FENCE_NODE_NETNS`: `auto` cuts the node-netns exception into the
+/// fence (see `fence_ruleset`); unset or `off` installs `FENCE_RULES`
+/// unchanged. Anything else fails the fence install, so no container
+/// starts on a node whose fence mode is misspelled.
+const FENCE_NODE_NETNS_ENV: &str = "CELLD_FENCE_NODE_NETNS";
+/// `CELLD_FENCE_NODE_ADDRS`: comma-separated IPs the exception covers
+/// instead of the discovered addresses. Nodes sharing one engine install
+/// one shared table, so each must pin the same union of node addresses;
+/// the last install wins, and a union keeps every node's replies passing.
+const FENCE_NODE_ADDRS_ENV: &str = "CELLD_FENCE_NODE_ADDRS";
+
+/// The node-netns fence mode of this node.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FenceNodeNetns {
+    Off,
+    Auto,
+}
+
+impl FenceNodeNetns {
+    fn parse(value: &str) -> anyhow::Result<Self> {
+        match value.trim() {
+            "" | "off" => Ok(Self::Off),
+            "auto" => Ok(Self::Auto),
+            other => Err(anyhow!(
+                "{FENCE_NODE_NETNS_ENV} is {other:?}: want \"off\" or \"auto\""
+            )),
+        }
+    }
+
+    fn from_env() -> anyhow::Result<Self> {
+        match std::env::var(FENCE_NODE_NETNS_ENV) {
+            Ok(value) => Self::parse(&value),
+            Err(std::env::VarError::NotPresent) => Ok(Self::Off),
+            Err(error) => Err(anyhow!(
+                "{FENCE_NODE_NETNS_ENV} is not valid unicode: {error}"
+            )),
+        }
+    }
+}
+
+fn v4_contains(net: Ipv4Addr, prefix: u32, addr: Ipv4Addr) -> bool {
+    if !(1..=32).contains(&prefix) {
+        return false;
+    }
+    let mask = !0u32 << (32 - prefix);
+    u32::from(addr) & mask == u32::from(net) & mask
+}
+
+fn v6_contains(net: Ipv6Addr, prefix: u32, addr: Ipv6Addr) -> bool {
+    if !(1..=128).contains(&prefix) {
+        return false;
+    }
+    let (addr, net) = (addr.octets(), net.octets());
+    let full = (prefix / 8) as usize;
+    if addr[..full] != net[..full] {
+        return false;
+    }
+    let rest = prefix % 8;
+    if rest == 0 {
+        return true;
+    }
+    let mask = !0u8 << (8 - rest);
+    addr[full] & mask == net[full] & mask
+}
+
+/// Whether the forward chain rejects traffic to `addr`.
+fn fenced_range(addr: &IpAddr) -> bool {
+    match addr {
+        IpAddr::V4(addr) => FENCE_REJECT_V4
+            .iter()
+            .any(|(net, prefix)| v4_contains(*net, *prefix, *addr)),
+        IpAddr::V6(addr) => FENCE_REJECT_V6
+            .iter()
+            .any(|(net, prefix)| v6_contains(*net, *prefix, *addr)),
+    }
+}
+
+/// The exception-worthy subset of `candidates`: assigned addresses (never
+/// loopback or unspecified) inside the fenced ranges, sorted and
+/// deduplicated so the rendered ruleset is deterministic.
+fn select_fence_node_addrs(candidates: impl IntoIterator<Item = IpAddr>) -> Vec<IpAddr> {
+    let mut out: Vec<IpAddr> = candidates
+        .into_iter()
+        .filter(|addr| match addr {
+            IpAddr::V4(addr) => !addr.is_loopback() && !addr.is_unspecified(),
+            IpAddr::V6(addr) => !addr.is_loopback() && !addr.is_unspecified(),
+        })
+        .filter(fenced_range)
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Parse `CELLD_FENCE_NODE_ADDRS`: comma-separated exact IPs. Anything that
+/// is not an IP — a hostname, a CIDR, a typo — fails the fence install
+/// outright, so a misspelled exception list never silently fences the wrong
+/// addresses. The survivors go through the same selection as discovered
+/// addresses, so out-of-range entries (whose traffic the fence never
+/// touches) are dropped as documented no-ops.
+fn parse_fence_node_addrs(value: &str) -> anyhow::Result<Vec<IpAddr>> {
+    let mut out = Vec::new();
+    for part in value.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let addr: IpAddr = part.parse().map_err(|_| {
+            anyhow!("{FENCE_NODE_ADDRS_ENV} has an entry that is not an IP address: {part:?}")
+        })?;
+        out.push(addr);
+    }
+    Ok(select_fence_node_addrs(out))
+}
+
+/// The node's own addresses from this netns, for the fence exception. The
+/// fence installs on the engine host while the node dials from here, so
+/// these are the source addresses whose replies cross the forward chain.
+#[cfg(target_os = "linux")]
+fn discover_node_addrs() -> Vec<IpAddr> {
+    let mut found = Vec::new();
+    // SAFETY: getifaddrs/freeifaddrs pairing; the list is only read, and
+    // each sockaddr is read only as the family it claims.
+    unsafe {
+        let mut list: *mut libc::ifaddrs = std::ptr::null_mut();
+        if libc::getifaddrs(&mut list) != 0 || list.is_null() {
+            return Vec::new();
+        }
+        let mut item = list;
+        while !item.is_null() {
+            let ifa = &*item;
+            if !ifa.ifa_addr.is_null() {
+                let family = (*ifa.ifa_addr).sa_family as libc::c_int;
+                if family == libc::AF_INET {
+                    let addr = std::ptr::read_unaligned(ifa.ifa_addr as *const libc::sockaddr_in);
+                    found.push(IpAddr::V4(Ipv4Addr::from(u32::from_be(
+                        addr.sin_addr.s_addr,
+                    ))));
+                } else if family == libc::AF_INET6 {
+                    let addr = std::ptr::read_unaligned(ifa.ifa_addr as *const libc::sockaddr_in6);
+                    found.push(IpAddr::V6(Ipv6Addr::from(addr.sin6_addr.s6_addr)));
+                }
+            }
+            item = ifa.ifa_next;
+        }
+        libc::freeifaddrs(list);
+    }
+    select_fence_node_addrs(found)
+}
+
+/// Discovery needs the node's netns to be the engine host's own, which only
+/// a Linux node has: off Linux, `auto` without a pinned list installs the
+/// unchanged fence, and an operator with a remote engine pins
+/// `CELLD_FENCE_NODE_ADDRS` explicitly.
+#[cfg(not(target_os = "linux"))]
+fn discover_node_addrs() -> Vec<IpAddr> {
+    tracing::warn!(
+        event = "container_fence_no_discovery",
+        "node address discovery needs Linux; set {FENCE_NODE_ADDRS_ENV} to cut the exception, or the fence installs unchanged"
+    );
+    Vec::new()
+}
+
+/// The fence with a node-netns exception for `node_addrs`: a node that
+/// itself lives in a container netns dials its containers from a private
+/// address, and the forward rejects drop the replies, so the node cannot
+/// reach its own containers.
+///
+/// An empty list installs `FENCE_RULES` byte for byte, so `auto` with no
+/// addresses and every `off` node run exactly today's ruleset. Otherwise one
+/// accept line per family goes directly ahead of that family's private-range
+/// reject, admitting only `established,related` packets toward the node's
+/// own addresses: replies to connections the node opened. A container can
+/// never open a connection through the exception — a new connection's first
+/// packet is never established — so the node's listeners stay closed to its
+/// containers exactly as the input chain keeps them on a host-netns node.
+/// `related` rides along deliberately, as in the input chain: it admits the
+/// ICMP errors (unreachable, packet-too-big) that belong to a live flow, so
+/// path-MTU discovery keeps working; it opens nothing without that flow.
+/// The exception says nothing about which containers the node may dial; a
+/// hoster running mutually untrusting tenants on one engine still enforces
+/// that above celld.
+fn fence_ruleset(node_addrs: &[IpAddr]) -> String {
+    let mut v4: Vec<Ipv4Addr> = Vec::new();
+    let mut v6: Vec<Ipv6Addr> = Vec::new();
+    for addr in node_addrs {
+        match addr {
+            IpAddr::V4(addr) => v4.push(*addr),
+            IpAddr::V6(addr) => v6.push(*addr),
+        }
+    }
+    if v4.is_empty() && v6.is_empty() {
+        return FENCE_RULES.to_string();
+    }
+    v4.sort();
+    v4.dedup();
+    v6.sort();
+    v6.dedup();
+    let mut rules = FENCE_RULES.to_string();
+    // The anchors are pinned to `FENCE_RULES` by the fence tests; if one
+    // ever misses, `replacen` leaves that family without an exception,
+    // which fails closed (broken replies, never a hole).
+    if !v4.is_empty() {
+        let line = format!(
+            "    iifname {{ \"celld0\", \"celld1\" }} ip daddr {{ {} }} ct state established,related accept\n{FENCE_FORWARD_REJECT_V4}",
+            v4.iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        rules = rules.replacen(FENCE_FORWARD_REJECT_V4, &line, 1);
+    }
+    if !v6.is_empty() {
+        let line = format!(
+            "    iifname {{ \"celld0\", \"celld1\" }} ip6 daddr {{ {} }} ct state established,related accept\n{FENCE_FORWARD_REJECT_V6}",
+            v6.iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        rules = rules.replacen(FENCE_FORWARD_REJECT_V6, &line, 1);
+    }
+    rules
+}
+
+/// The ruleset `ensure_fence` installs: `FENCE_RULES` unless
+/// `CELLD_FENCE_NODE_NETNS=auto` cuts the node-netns exception. Every
+/// misconfiguration fails here, before any container starts: an unknown
+/// mode, an unreadable address list, or an unparseable entry all refuse the
+/// fence rather than install a surprising one.
+fn fence_rules_for_install() -> anyhow::Result<String> {
+    if FenceNodeNetns::from_env()? == FenceNodeNetns::Off {
+        return Ok(FENCE_RULES.to_string());
+    }
+    let addrs = fence_node_addrs(std::env::var(FENCE_NODE_ADDRS_ENV))?;
+    if addrs.is_empty() {
+        tracing::warn!(
+            event = "container_fence_no_node_addrs",
+            "auto found no node address in the fenced ranges; the fence installs unchanged"
+        );
+    } else {
+        tracing::info!(
+            event = "container_fence_node_addrs",
+            addrs = %addrs
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(","),
+            "the fence admits replies to the node's own addresses"
+        );
+    }
+    Ok(fence_ruleset(&addrs))
+}
+
+/// The node addresses `auto` admits replies to, from the read of
+/// `CELLD_FENCE_NODE_ADDRS`: unset discovers them, a list pins them.
+fn fence_node_addrs(value: Result<String, std::env::VarError>) -> anyhow::Result<Vec<IpAddr>> {
+    match value {
+        // Set but listing nothing is ambiguous — "discover" or "no
+        // exception" — so it refuses rather than guess.
+        Ok(value) if value.split(',').all(|part| part.trim().is_empty()) => Err(anyhow!(
+            "{FENCE_NODE_ADDRS_ENV} is set but empty; unset it to discover the node's \
+             addresses or list them"
+        )),
+        Ok(value) => parse_fence_node_addrs(&value),
+        Err(std::env::VarError::NotPresent) => Ok(discover_node_addrs()),
+        Err(error) => Err(anyhow!(
+            "{FENCE_NODE_ADDRS_ENV} is not valid unicode: {error}"
+        )),
+    }
+}
 
 /// How a cell stop treats its container.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -736,9 +1033,10 @@ impl ContainerEngine {
         })?;
         self.ensure_image(&image).await?;
         self.networks().await?;
+        let rules = fence_rules_for_install()?;
         let body = json!({
             "Image": image,
-            "Env": [format!("CELLD_NFT={FENCE_RULES}")],
+            "Env": [format!("CELLD_NFT={rules}")],
             "Cmd": ["sh", "-c", "printf '%s' \"$CELLD_NFT\" | nft -f -"],
             "Labels": { "celld.node": self.node, "celld.fence": "1" },
             "HostConfig": { "NetworkMode": "host", "CapAdd": ["NET_ADMIN"] },
@@ -1990,6 +2288,286 @@ mod pty_tests {
         assert!(
             err.to_string().contains("connect to the container engine"),
             "{err:#}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod fence_node_netns_tests {
+    use super::*;
+
+    fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
+
+    /// `off` — and `auto` with no addresses — install exactly today's
+    /// ruleset: default behavior is byte-identical.
+    #[test]
+    fn empty_exception_installs_the_legacy_ruleset_byte_for_byte() {
+        assert_eq!(fence_ruleset(&[]), FENCE_RULES);
+    }
+
+    /// A pin set but empty refuses the fence instead of guessing between
+    /// discovery and no exception; a listed pin is used as given.
+    #[test]
+    fn empty_node_addrs_pin_refuses() {
+        for value in ["", " ", " , ", ","] {
+            let error = fence_node_addrs(Ok(value.to_string()))
+                .expect_err("a pin that lists no address refuses");
+            assert!(
+                error.to_string().contains(FENCE_NODE_ADDRS_ENV),
+                "{value:?}: {error}"
+            );
+        }
+        assert_eq!(
+            fence_node_addrs(Ok("172.18.0.4".to_string())).unwrap(),
+            vec!["172.18.0.4".parse::<IpAddr>().unwrap()]
+        );
+    }
+
+    /// The anchors the exception is inserted at match the legacy ruleset
+    /// verbatim, exactly once each, so the exception lands in the forward
+    /// chain and nowhere else.
+    #[test]
+    fn forward_reject_anchors_match_the_legacy_ruleset() {
+        for anchor in [FENCE_FORWARD_REJECT_V4, FENCE_FORWARD_REJECT_V6] {
+            assert!(
+                FENCE_RULES.contains(anchor),
+                "anchor drifted from FENCE_RULES: {anchor}"
+            );
+            assert_eq!(
+                FENCE_RULES.matches(anchor).count(),
+                1,
+                "anchor matches more than the forward chain: {anchor}"
+            );
+        }
+    }
+
+    /// The range data the selection filters against mirrors the legacy
+    /// ruleset's reject sets.
+    #[test]
+    fn reject_range_data_mirrors_the_legacy_ruleset() {
+        for (net, prefix) in FENCE_REJECT_V4 {
+            assert!(
+                FENCE_RULES.contains(&format!("{net}/{prefix}")),
+                "v4 range missing from FENCE_RULES: {net}/{prefix}"
+            );
+        }
+        for (net, prefix) in FENCE_REJECT_V6 {
+            assert!(
+                FENCE_RULES.contains(&format!("{net}/{prefix}")),
+                "v6 range missing from FENCE_RULES: {net}/{prefix}"
+            );
+        }
+    }
+
+    /// Host-netns topology: a node dialing from loopback or a public
+    /// address selects no exception, so `auto` degrades to the legacy
+    /// ruleset there.
+    #[test]
+    fn host_netns_topology_needs_no_exception() {
+        let addrs = select_fence_node_addrs([
+            ip("127.0.0.1"),
+            ip("::1"),
+            ip("203.0.113.7"),
+            ip("2001:db8::1"),
+        ]);
+        assert!(addrs.is_empty(), "unexpected exception: {addrs:?}");
+        assert_eq!(fence_ruleset(&addrs), FENCE_RULES);
+    }
+
+    /// Container-netns topology (node on a private bridge, same engine):
+    /// the v4 exception admits replies to the node's address, sits ahead
+    /// of the reject so nft takes it first, and leaves every reject
+    /// standing for all other private hosts.
+    #[test]
+    fn container_netns_v4_topology_admits_only_replies_to_the_node() {
+        let rules = fence_ruleset(&[ip("172.18.0.4")]);
+        let accept = "iifname { \"celld0\", \"celld1\" } ip daddr { 172.18.0.4 } ct state established,related accept";
+        assert!(rules.contains(accept), "{rules}");
+        assert!(
+            rules.find(accept).unwrap() < rules.find(FENCE_FORWARD_REJECT_V4).unwrap(),
+            "exception must precede the reject: {rules}"
+        );
+        assert!(rules.contains(FENCE_FORWARD_REJECT_V4), "{rules}");
+        assert!(rules.contains(FENCE_FORWARD_REJECT_V6), "{rules}");
+        // No v6 exception for a v4-only node.
+        assert_eq!(rules.matches("ip6 daddr").count(), 1, "{rules}");
+    }
+
+    /// The v6 exception mirrors the v4 one: link-local and unique-local
+    /// node addresses each get an `ip6` line ahead of the v6 reject, and
+    /// no v4 line appears for a v6-only node.
+    #[test]
+    fn v6_node_addresses_get_an_ip6_exception_only() {
+        for addr in ["fe80::1", "fd00::4"] {
+            let rules = fence_ruleset(&[ip(addr)]);
+            let accept = format!(
+                "iifname {{ \"celld0\", \"celld1\" }} ip6 daddr {{ {addr} }} ct state established,related accept"
+            );
+            assert!(rules.contains(&accept), "{rules}");
+            assert!(
+                rules.find(&accept).unwrap() < rules.find(FENCE_FORWARD_REJECT_V6).unwrap(),
+                "exception must precede the reject: {rules}"
+            );
+            assert_eq!(rules.matches(" ip daddr").count(), 1, "{rules}");
+        }
+    }
+
+    /// Mixed node (v4 + v6): both families get an exception line, each
+    /// ahead of its own reject.
+    #[test]
+    fn mixed_node_gets_both_exceptions() {
+        let rules = fence_ruleset(&[ip("10.9.0.2"), ip("fd00::9")]);
+        assert!(
+            rules.contains("ip daddr { 10.9.0.2 } ct state established,related accept"),
+            "{rules}"
+        );
+        assert!(
+            rules.contains("ip6 daddr { fd00::9 } ct state established,related accept"),
+            "{rules}"
+        );
+    }
+
+    /// Shared-engine topology: the pinned union of node addresses renders
+    /// every node into one set, sorted and deduplicated for a stable
+    /// ruleset no matter the install order.
+    #[test]
+    fn shared_engine_union_renders_every_node() {
+        let rules = fence_ruleset(&[ip("172.18.0.9"), ip("172.18.0.4"), ip("172.18.0.9")]);
+        assert!(
+            rules.contains(
+                "ip daddr { 172.18.0.4, 172.18.0.9 } ct state established,related accept"
+            ),
+            "{rules}"
+        );
+    }
+
+    /// The security property: nothing in the auto ruleset accepts a new
+    /// connection from a bridge. Every accept line carries
+    /// `established,related`, so a container can answer the node but never
+    /// open a connection to it — the node's listeners stay closed to
+    /// tenant code.
+    #[test]
+    fn new_connections_from_a_bridge_stay_rejected() {
+        let rules = fence_ruleset(&[ip("172.18.0.4"), ip("fd00::4")]);
+        for line in rules
+            .lines()
+            .filter(|line| line.contains("accept") && !line.contains("policy accept"))
+        {
+            assert!(
+                line.contains("ct state established,related"),
+                "accepts new flows: {line}"
+            );
+        }
+    }
+
+    /// Denied tuples: the metadata address, the neighbouring private
+    /// ranges, and the v6 fenced ranges stay covered by the rejects, with
+    /// no exception naming them.
+    #[test]
+    fn metadata_and_neighbour_ranges_stay_rejected() {
+        let rules = fence_ruleset(&[ip("172.18.0.4")]);
+        for range in [
+            "169.254.0.0/16",
+            "10.0.0.0/8",
+            "172.16.0.0/12",
+            "192.168.0.0/16",
+            "100.64.0.0/10",
+            "fe80::/10",
+            "fc00::/7",
+        ] {
+            assert!(rules.contains(range), "{range} missing: {rules}");
+        }
+        assert!(!rules.contains("169.254.169.254"), "{rules}");
+    }
+
+    /// Selection covers every fenced range including the edges, and drops
+    /// loopback, unspecified, and public addresses.
+    #[test]
+    fn selection_covers_every_fenced_range() {
+        for addr in [
+            "169.254.0.1",
+            "169.254.255.254",
+            "10.0.0.1",
+            "10.255.255.254",
+            "172.16.0.1",
+            "172.31.255.254",
+            "192.168.0.1",
+            "192.168.255.254",
+            "100.64.0.1",
+            "100.127.255.254",
+            "fe80::1",
+            "febf:ffff::1",
+            "fc00::1",
+            "fdff:ffff::1",
+        ] {
+            assert!(fenced_range(&ip(addr)), "{addr} should be fenced");
+        }
+        for addr in [
+            "169.253.255.255",
+            "169.255.0.1",
+            "9.255.255.255",
+            "11.0.0.1",
+            "172.15.255.255",
+            "172.32.0.1",
+            "192.167.255.255",
+            "192.169.0.1",
+            "100.63.255.255",
+            "100.128.0.1",
+            "203.0.113.7",
+            "2001:db8::1",
+            "ff02::1",
+        ] {
+            assert!(!fenced_range(&ip(addr)), "{addr} should not be fenced");
+        }
+        let addrs = select_fence_node_addrs([
+            ip("127.0.0.1"),
+            ip("::1"),
+            ip("0.0.0.0"),
+            ip("::"),
+            ip("203.0.113.7"),
+            ip("192.168.1.5"),
+            ip("10.1.2.3"),
+            ip("10.1.2.3"),
+        ]);
+        assert_eq!(addrs, vec![ip("10.1.2.3"), ip("192.168.1.5")]);
+    }
+
+    /// Mode parsing defaults to off and refuses anything but `off`/`auto`,
+    /// so a misspelled mode fails the fence install instead of silently
+    /// installing one ruleset or the other.
+    #[test]
+    fn mode_parsing_defaults_off_and_refuses_garbage() {
+        assert_eq!(FenceNodeNetns::parse("").unwrap(), FenceNodeNetns::Off);
+        assert_eq!(FenceNodeNetns::parse("off").unwrap(), FenceNodeNetns::Off);
+        assert_eq!(
+            FenceNodeNetns::parse("  off ").unwrap(),
+            FenceNodeNetns::Off
+        );
+        assert_eq!(FenceNodeNetns::parse("auto").unwrap(), FenceNodeNetns::Auto);
+        assert!(FenceNodeNetns::parse("on").is_err());
+        assert!(FenceNodeNetns::parse("AUTO").is_err());
+        assert!(FenceNodeNetns::parse("yes").is_err());
+    }
+
+    /// Pinned lists parse, dedupe, and fail closed: a hostname, a CIDR, or
+    /// a typo fails the install rather than fencing the wrong addresses.
+    /// Out-of-range entries drop as documented no-ops.
+    #[test]
+    fn pinned_addrs_parse_dedupe_and_fail_closed() {
+        assert_eq!(
+            parse_fence_node_addrs("172.18.0.4, 172.18.0.5,172.18.0.4").unwrap(),
+            vec![ip("172.18.0.4"), ip("172.18.0.5")]
+        );
+        assert_eq!(parse_fence_node_addrs("  ").unwrap(), Vec::<IpAddr>::new());
+        assert!(parse_fence_node_addrs("172.18.0.4, bogus").is_err());
+        assert!(parse_fence_node_addrs("172.18.0.300").is_err());
+        assert!(parse_fence_node_addrs("172.18.0.0/16").is_err());
+        assert!(parse_fence_node_addrs("node1.local").is_err());
+        assert_eq!(
+            parse_fence_node_addrs("203.0.113.7").unwrap(),
+            Vec::<IpAddr>::new()
         );
     }
 }
