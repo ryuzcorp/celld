@@ -43,7 +43,7 @@ jobs:
       - name: Test and build
         run: |
           set -euo pipefail
-          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' crates/celld/Cargo.toml | head -1)
+          version=$(awk '/^\[package\]/{p=1;next} /^\[/{p=0} p&&/^version = "/{gsub(/"/,"");print $3;exit}' crates/celld/Cargo.toml)
           docker buildx build \
             --platform "${{ matrix.platform }}" \
             --build-arg "CELLD_COMMIT=$GITHUB_SHA" \
