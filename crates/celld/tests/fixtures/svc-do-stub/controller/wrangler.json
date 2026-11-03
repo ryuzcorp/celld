@@ -1,0 +1,10 @@
+{
+  "name": "svc-do-controller",
+  "main": "worker.js",
+  "compatibility_date": "2026-02-12",
+  "no_bundle": true,
+  "durable_objects": {
+    "bindings": [{ "name": "SANDBOX", "class_name": "ControllerDO" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["ControllerDO"] }]
+}

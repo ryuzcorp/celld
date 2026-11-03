@@ -1,4 +1,4 @@
-// Modified for Noite (ryuzcorp/noite, docker/celld/patches): ctx.container.images; clone() of streaming and disturbed bodies.
+// Modified for Noite (ryuzcorp/noite, docker/celld/patches): ctx.container.images; clone() of streaming and disturbed bodies; __celld$do on the service-binding RPC path.
 // The DO object model and the Cloudflare-compatible runtime surface, run
 // once per isolate by `js.rs::install_harness` after the Web-API prelude.
 // Lived as a 4,000-line raw string inside js.rs until 2026-07-29; it is a
@@ -3939,7 +3939,9 @@ const __stubEntries = new Map();
 const __stubMeta = new WeakMap();
 // Keep the Durable Object brand outside the user-visible object. Reading a
 // string property here would invoke an inherited getter before validation can
-// reject its unsupported prototype.
+// reject its unsupported prototype. The entry snapshots the id and the
+// dispatch name at mint, so a later `stub.name =` cannot pollute the
+// receiver's idNames through the lift marker.
 const __doStubMeta = new WeakMap();
 let __nextStubId = 1;
 const __stubIsolate = Math.random().toString(36).slice(2);
@@ -4228,6 +4230,11 @@ const __stubLift = (value, allowCapabilities = true, originals) => {
   let caps = false;
   const seen = new Map();
   const ctx = __ctxNow();
+  // "do" is the cross-isolate service-binding mode: only Durable Object
+  // stubs cross (by value, no caps), every other capability stays a
+  // DataCloneError as with false.
+  const doOnly = allowCapabilities === "do";
+  const allowAll = allowCapabilities === true;
   // A buffered body crosses as its bytes; a live-stream body
   // crosses as a stream handle (a capability, so the reply
   // roots its callee context and the pulls keep working).
@@ -4243,7 +4250,7 @@ const __stubLift = (value, allowCapabilities = true, originals) => {
     if (cached !== undefined) return cached;
     const meta = __stubMeta.get(v);
     if (meta) {
-      if (!allowCapabilities) return v;
+      if (!allowAll) return v;
       lifted = true;
       caps = true;
       if (meta.disposed) throw __stubDisposedError();
@@ -4259,7 +4266,7 @@ const __stubLift = (value, allowCapabilities = true, originals) => {
     }
     const svc = __svcMeta.get(v);
     if (svc !== undefined) {
-      if (!allowCapabilities) return v;
+      if (!allowAll) return v;
       // A loopback service stub (ctx.exports): name + props cross
       // as plain data and revive as a fresh loopback stub. Props
       // are lifted too -- they may nest further stubs (Workerd's
@@ -4279,7 +4286,7 @@ const __stubLift = (value, allowCapabilities = true, originals) => {
         '". This type does not support serialization.',
         "DataCloneError");
     if (typeof v === "function" || v instanceof __cf.RpcTarget) {
-      if (!allowCapabilities) return v;
+      if (!allowAll) return v;
       lifted = true;
       caps = true;
       const marker = { "__celld$stub": __newEntry(v).id,
@@ -4288,13 +4295,13 @@ const __stubLift = (value, allowCapabilities = true, originals) => {
       seen.set(v, marker);
       return marker;
     }
-    const doId = __doStubMeta.get(v);
-    if (doId !== undefined) {
-      if (!allowCapabilities) return v;
+    const doMeta = __doStubMeta.get(v);
+    if (doMeta !== undefined) {
+      if (!allowAll && !doOnly) return v;
       lifted = true;
-      caps = true;
-      const marker = { "__celld$do": doId._className,
-                       v: doId._value, n: v.name ?? null };
+      if (allowAll) caps = true;
+      const marker = { "__celld$do": doMeta.id._className,
+                       v: doMeta.id._value, n: doMeta.name ?? null };
       seen.set(v, marker);
       return marker;
     }
@@ -4305,22 +4312,22 @@ const __stubLift = (value, allowCapabilities = true, originals) => {
     // a fresh one. A live stream body cannot cross yet.
     let marker;
     if (v instanceof Headers) {
-      if (!allowCapabilities) return v;
+      if (!allowAll) return v;
       marker = { "__celld$hdr": [...v] };
     } else if (v instanceof Blob) {
-      if (!allowCapabilities) return v;
+      if (!allowAll) return v;
       marker = { "__celld$blob": v._bytes, y: v.type };
       if (v instanceof File) {
         marker.n = v.name;
         marker.m = v.lastModified;
       }
     } else if (v instanceof Request) {
-      if (!allowCapabilities) return v;
+      if (!allowAll) return v;
       marker = { "__celld$req": v.url, m: v.method,
                  h: [...v.headers], r: v.redirect, c: v.cf,
                  b: liftBody(v) };
     } else if (v instanceof Response) {
-      if (!allowCapabilities) return v;
+      if (!allowAll) return v;
       marker = { "__celld$res": v.status,
                  t: v.statusText ||
                     __STATUS_TEXT[v.status] || "",
@@ -4329,7 +4336,7 @@ const __stubLift = (value, allowCapabilities = true, originals) => {
                  b: v.body === null ? null : liftBody(v) };
     } else if (v instanceof ReadableStream ||
                v instanceof WritableStream) {
-      if (!allowCapabilities) return v;
+      if (!allowAll) return v;
       caps = true;
       marker = __liftStream(v);
     } else if (v instanceof AbortSignal) {
@@ -4355,10 +4362,20 @@ const __stubLift = (value, allowCapabilities = true, originals) => {
     }
     const out = Array.isArray(v) ? [] : {};
     seen.set(v, out);
-    for (const key of Object.keys(v)) out[key] = lift(v[key]);
+    for (const key of Object.keys(v)) {
+      // A user value shaped like a wire marker would revive as a live
+      // handle. Refuse it on every lift path, including lift=false and
+      // storage, so only harness-minted markers (from stubs the sender
+      // actually holds) ever reach the revive path.
+      if (key.startsWith("__celld$"))
+        throw new DOMException(
+          'Could not serialize object with reserved key "' + key + '".',
+          "DataCloneError");
+      out[key] = lift(v[key]);
+    }
     const disposerSource = originals?.get(v) ?? v;
     const disposer = disposerSource[Symbol.dispose];
-    if (allowCapabilities && !Array.isArray(v) &&
+    if (allowAll && !Array.isArray(v) &&
         typeof disposer === "function") {
       lifted = true;
       caps = true;
@@ -4500,7 +4517,16 @@ const __stubRevive = (value) => {
         : __foreignStub();
     const doClass = v["__celld$do"];
     if (doClass !== undefined) {
-      const namespace = __cell.makeNamespace(doClass);
+      // A cross-script marker names a class this isolate never declared.
+      // The lift-time reserved-key check ensures only harness-minted
+      // markers reach here, so revive foreign classes with a placeholder
+      // key: get() routes by the id value alone and never reads the key.
+      let namespace;
+      try {
+        namespace = __cell.makeNamespace(doClass);
+      } catch {
+        namespace = new DurableObjectNamespace(doClass, "foreign");
+      }
       return namespace.get(
         new DurableObjectId(doClass, v.v, v.n ?? undefined));
     }
@@ -4748,7 +4774,7 @@ const __entrypointSession = (name, local, script, makeInst, propsSc) => ({
         await __svc_rpc(
           script, name, JSON.stringify(path), null, propsSc)))(),
   call: (path, args) => (async () => {
-    const argsSc = __rpcOut(args, local);
+    const argsSc = __rpcOut(args, local ? true : "do");
     if (local)
       return __rpcDes(await __entrypointOp(
         name, path, argsSc, true, makeInst));
@@ -4924,17 +4950,25 @@ const __storedLift = (value) => {
         '". This type does not support serialization.',
         "DataCloneError");
     if (typeof v === "function") return v; // leave to the clone
-    const doId = __doStubMeta.get(v);
-    if (doId !== undefined) {
+    const doMeta = __doStubMeta.get(v);
+    if (doMeta !== undefined) {
       lifted = true;
-      const marker = { "__celld$do": doId._className,
-                       v: doId._value, n: v.name ?? null };
+      const marker = { "__celld$do": doMeta.id._className,
+                       v: doMeta.id._value, n: doMeta.name ?? null };
       seen.set(v, marker);
       return marker;
     }
     if (Array.isArray(v)) {
       const out = [];
       seen.set(v, out);
+      // Indices copy below; extras are dropped, but a forged marker in an
+      // extra must still be refused, not silently kept as inert data.
+      for (const key of Object.keys(v)) {
+        if (key.startsWith("__celld$"))
+          throw new DOMException(
+            'Could not serialize object with reserved key "' + key + '".',
+            "DataCloneError");
+      }
       for (let i = 0; i < v.length; i++) out[i] = lift(v[i]);
       return out;
     }
@@ -4943,7 +4977,15 @@ const __storedLift = (value) => {
       return v; // host/other: leave to the clone
     const out = {};
     seen.set(v, out);
-    for (const key of Object.keys(v)) out[key] = lift(v[key]);
+    for (const key of Object.keys(v)) {
+      // As in __stubLift: a user value shaped like a wire marker would
+      // revive as a live stub on read. Refuse it while lifting.
+      if (key.startsWith("__celld$"))
+        throw new DOMException(
+          'Could not serialize object with reserved key "' + key + '".',
+          "DataCloneError");
+      out[key] = lift(v[key]);
+    }
     return out;
   };
   const tree = lift(value);
@@ -5018,14 +5060,16 @@ const __ctxExports = () => __ctxExportsCache ??= (() => {
 // ---- RPC envelope ----------------------------------------------
 // Serialize one payload. `lift` marks a same-isolate transport,
 // where stub-able values may cross as markers; elsewhere they stay
-// a DataCloneError, exactly as before stubs existed.
+// a DataCloneError, exactly as before stubs existed. "do" is the
+// cross-isolate service-binding mode: DO stubs plus signals only.
 const __rpcOut = (value, lift) => {
   const projected = __rpcProject(value);
   try {
     return __sc_encode(projected.tree);
   } catch (error) {
-    // A cross-isolate call lifts only a live signal. A same-isolate call can
-    // also transfer the existing host values and JS capability handles.
+    // A cross-isolate call lifts only a live signal (plus DO stubs in "do"
+    // mode). A same-isolate call can also transfer the existing host values
+    // and JS capability handles.
     const lifted = __stubLift(projected.tree, lift, projected.originals);
     if (lifted === null) throw __dataCloneError(error);
     try {
@@ -5300,7 +5344,7 @@ class DurableObjectNamespace {
         )),
       );
     }});
-    __doStubMeta.set(stub, id);
+    __doStubMeta.set(stub, { id, name: dispatchName });
     return stub;
   }
 }
@@ -5753,7 +5797,7 @@ const __entrypointOp = (name, path, argsSc, local, makeInst, props) => {
         drain = __endEvent();
       }
       return await result;
-    }, local);
+    }, local ? true : "do");
     // Registered work drains before a plain reply. A
     // capability-bearing reply (tag 1) must not wait: a returned
     // stream's chunks may be produced by that very work, which
