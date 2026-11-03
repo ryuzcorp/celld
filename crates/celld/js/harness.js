@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): ctx.container.images; clone() of streaming and disturbed bodies; __celld$do on the service-binding RPC path; container exec pty/resize; cross-isolate RPC stubs and streams.
+// Modified by ryuzcorp (ryuzcorp/celld): ctx.container.images; clone() of streaming and disturbed bodies; __celld$do on the service-binding RPC path; container exec pty/resize; cross-isolate RPC stubs and streams; container exec AbortSignal.
 // The DO object model and the Cloudflare-compatible runtime surface, run
 // once per isolate by `js.rs::install_harness` after the Web-API prelude.
 // Lived as a 4,000-line raw string inside js.rs until 2026-07-29; it is a
@@ -2354,12 +2354,30 @@ class ContainerExecProcess {
   // wait/drop/kill/resize at another cell's exec. Streams already pin the
   // construction-time id via closure.
   #id;
-  constructor(id, pid, stdinMode, stdoutMode, stderrMode, isPty = false) {
+  constructor(id, pid, stdinMode, stdoutMode, stderrMode, isPty = false, signal = undefined) {
     this.#id = id;
     this.pid = pid;
     this.isPty = !!isPty;
     this._outputCalled = false;
     this._exitCode = null;
+    // workerd sends SIGKILL when the exec signal aborts
+    // (api/container.c++ `ExecProcess`, `kSigKill = 9`; the Durable
+    // Object Container API documents "Aborting the signal sends SIGKILL
+    // to the process"). An abort that lands while the exec op is in
+    // flight kills the fresh process at once; otherwise the listener
+    // below does it, and is removed when the process exits, so a later
+    // abort cannot signal a dead process and the signal cannot retain
+    // this process.
+    if (signal !== undefined && signal !== null) {
+      if (signal.aborted) {
+        this.kill(9);
+      } else {
+        const onAbort = () => this.kill(9);
+        signal.addEventListener("abort", onAbort, { once: true });
+        const unwire = () => signal.removeEventListener("abort", onAbort);
+        this.exitCode.then(unwire, unwire);
+      }
+    }
     this.stdout = stdoutMode === "pipe" ? __execStream(id, 1) : null;
     // A PTY merges stderr into stdout; there is no separate stream.
     this.stderr = this.isPty || stderrMode !== "pipe"
@@ -2592,6 +2610,14 @@ class Container {
     }
     if (pty && combined)
       throw new TypeError('stderr: "combined" requires a non-PTY exec.');
+    const signal = o.signal ?? undefined;
+    if (signal !== undefined && !(signal instanceof AbortSignal))
+      throw new TypeError("signal must be an AbortSignal.");
+    // workerd refuses an already-aborted signal before spawning
+    // anything, with the signal's reason (`throwIfAborted`; an
+    // AbortError for abort()). The signal stays in JavaScript: only the
+    // params below cross into the native op.
+    if (signal !== undefined && signal.aborted) throw signal.reason;
     const params = {
       cmd: Array.from(cmd, String),
       env: __containerEnvList(o.env),
@@ -2623,7 +2649,7 @@ class Container {
       __container_exec_close(id).catch(() => {});
     }
     return new ContainerExecProcess(
-      id, pid, stdinMode, stdoutMode, stderrMode, isPty);
+      id, pid, stdinMode, stdoutMode, stderrMode, isPty, signal);
   }
   inspect() {
     return Promise.reject(new Error("inspect() is not implemented in celld"));
@@ -6440,6 +6466,28 @@ if (__test_wait_enabled())
       return { promise: __retainedWait(() => __testwait_await(id)), id };
     },
     fire(id, value) { __testwait_fire(id, value); },
+  };
+// Test-only fake container exec driver: the test environment has no
+// container engine, so suites attach a scope and drive the real
+// `Container.prototype.exec` (validation, the already-aborted refusal,
+// param building, and the process abort wiring) against the fake exec
+// table beneath the ops. Defined only on nodes booted with
+// CELLD_TEST_WAIT=1 (the exec-signal conformance suite).
+if (__test_wait_enabled())
+  globalThis.__celldTestExecForTestOnly = {
+    attach(scope) { __testexec_attach(scope); },
+    exec(scope, cmd, options) {
+      // The real exec on a scope-only Container: the receiver inherits
+      // the prototype (so `this.running` resolves) and carries only
+      // `_scope`, which is all `running` and the ops read.
+      const self = Object.create(Container.prototype);
+      self._scope = scope;
+      return self.exec(cmd, options);
+    },
+    ids(scope) { return JSON.parse(__testexec_ids(scope)); },
+    exit(id, code) { __testexec_exit(id, code); },
+    kills(id) { return JSON.parse(__testexec_kills(id)); },
+    params(id) { return JSON.parse(__testexec_params(id)); },
   };
 const __entrypointClass = (name) => {
   const cls = __cell.entrypoints[name];
