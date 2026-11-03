@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): ported from meln1k/celld: scripted core-bug reproductions (ea471ee, e46a685, 6d61462, 18d3bf9, 9d4c163).
+// Modified by ryuzcorp (ryuzcorp/celld): ported from meln1k/celld: scripted core-bug reproductions (ea471ee, e46a685, 6d61462, 18d3bf9, 9d4c163, 468b456).
 //! Scripted reproductions of core bugs the deterministic simulator
 //! (`crates/sim`) found. Each drives the core through a minimal shell that
 //! answers every effect at once, except the ones a test holds back to
@@ -12,7 +12,7 @@ use celld_logic::wake::{AlarmSnapshot, AlarmSource, PublicationId};
 use celld_logic::{
     on_event, pressure, CasOutcome, Channel, Config, Effect, Event, Failure, LeaseCasOutcome,
     LocalCell, NodeLeaseSpec, OwnerRecord, OwnershipOnEvict, ProofSource, RestoreOutcome, State,
-    Timer, WakeHintScope,
+    Timer, WakeHintScope, WebSocketKind,
 };
 use std::collections::{BTreeMap, VecDeque};
 
@@ -529,6 +529,101 @@ fn a_fence_clears_a_balancing_handoff() {
 /// flight. It used to retire the owner read but leave the cell in the
 /// confirmation set: `validate` failed. The preserve now settles the
 /// confirmation too.
+/// A request's durability proof fails on a cell holding a regular socket.
+/// The reset discards the runtime, and it used to drop the sockets only
+/// once the stop landed: until then a stopping cell held a live
+/// transport and `validate` failed. The sockets now go with the runtime.
+#[test]
+fn a_reset_drops_a_stopping_cell_s_sockets() {
+    let mut shell = Shell::new(4, |effect| matches!(effect, Effect::AwaitDurable { .. }));
+    shell.start();
+    shell.serve(1, "a");
+    shell.send(Event::WebSocketOpened {
+        cell: "a".into(),
+        websocket: 7,
+        kind: WebSocketKind::Regular,
+    });
+    let effects = shell.send(Event::RequestAt {
+        request: 2,
+        cell: "a".into(),
+        now_mono_ms: MONO_MS,
+    });
+    assert!(effects
+        .iter()
+        .any(|effect| matches!(effect, Effect::Complete { request: 2, .. })));
+    shell.send(Event::OutputAt {
+        request: 2,
+        channel: Channel::Response,
+        position: Some(1),
+        observed: None,
+        epoch: None,
+        now_mono_ms: MONO_MS,
+    });
+    let proof = shell
+        .held
+        .iter()
+        .find_map(|effect| match effect {
+            Effect::AwaitDurable { op, .. } => Some(*op),
+            _ => None,
+        })
+        .expect("the write waits for its proof");
+
+    shell.hold = |_| false;
+    shell.send(Event::DurableReached {
+        op: proof,
+        result: Err(Failure::Ambiguous),
+        source: ProofSource::Bucket,
+    });
+    shell.state.validate().expect("state invariant");
+}
+
+/// A hibernatable socket's event reaches a quiescing cell. It used to run
+/// locally, keeping a swapping cell busy past its single forced cancel
+/// until a gate it raised waited for the swap that waited for it: the
+/// cell never swapped and stopped serving. The event now waits for the
+/// restarted runtime like any request.
+#[test]
+fn a_hibernatable_socket_event_waits_on_a_quiescing_cell() {
+    let mut shell = Shell::new(1, |_| false);
+    shell.start();
+    shell.serve(1, "a");
+    shell.send(Event::WebSocketOpened {
+        cell: "a".into(),
+        websocket: 7,
+        kind: WebSocketKind::Hibernatable,
+    });
+    // An unfinished request keeps the cell active, so the drain quiesces
+    // it without starting its eviction.
+    let effects = shell.send(Event::RequestAt {
+        request: 2,
+        cell: "a".into(),
+        now_mono_ms: MONO_MS,
+    });
+    assert!(effects
+        .iter()
+        .any(|effect| matches!(effect, Effect::Complete { request: 2, .. })));
+    shell.send(Event::ReleaseAll);
+
+    let effects = shell.send(Event::WebSocketRequestAt {
+        request: 3,
+        cell: "a".into(),
+        websocket: 7,
+        now_ms: NOW_MS,
+        now_mono_ms: MONO_MS,
+    });
+    assert!(
+        !effects.iter().any(|effect| matches!(
+            effect,
+            Effect::Complete {
+                request: 3,
+                result: Ok(celld_logic::Route::Local)
+            }
+        )),
+        "the hibernatable event waits for the restarted runtime: {effects:?}"
+    );
+    shell.state.validate().expect("state invariant");
+}
+
 #[test]
 fn a_preserve_settles_a_confirming_read() {
     let mut shell = Shell::new(4, |effect| matches!(effect, Effect::ReadOwner { .. }));
