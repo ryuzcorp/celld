@@ -500,6 +500,35 @@ fn rpc_signals() -> &'static std::sync::Mutex<HashMap<RequestId, RpcSignalState>
     RPC_SIGNALS.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
 }
 
+/// Whether the test-only retained-wait ops exist. True only with
+/// `CELLD_TEST_WAIT=1` (the cross-event wait conformance suite); the ops
+/// throw otherwise, so production tenants cannot mint or fire waits.
+fn test_wait_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("CELLD_TEST_WAIT").as_deref() == Ok("1"))
+}
+
+/// One test-only retained wait: an unrefed native wait the harness holds
+/// across native-event retirements, standing in for a container exec wait
+/// (which needs a container engine the test environment has not got).
+/// The fired value is stored like an engine exit code, so a subscriber
+/// arriving after the fire resolves at once.
+struct TestWait {
+    fired: Option<String>,
+    waiters: Vec<tokio::sync::oneshot::Sender<String>>,
+}
+
+static TEST_WAITS: OnceLock<std::sync::Mutex<HashMap<String, TestWait>>> = OnceLock::new();
+
+fn test_waits() -> &'static std::sync::Mutex<HashMap<String, TestWait>> {
+    TEST_WAITS.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+/// Cap on stored test waits. Fired values persist for late subscribers
+/// (that is the point), so a runaway sender cannot grow the map without
+/// bound; eviction drops an already-fired entry only, never live waiters.
+const TEST_WAIT_CAP: usize = 1024;
+
 struct RpcSignalSubscriptionGuard {
     signal: RequestId,
     subscription: RequestId,
@@ -6920,6 +6949,9 @@ ops! { OP_NAMES, install_op_functions,
         "__stub_acquire" => op_stub_acquire,
         "__stub_handoff" => op_stub_handoff,
         "__test_stub_stats_enabled" => op_test_stub_stats_enabled,
+        "__test_wait_enabled" => op_test_wait_enabled,
+        "__testwait_await" => op_testwait_await,
+        "__testwait_fire" => op_testwait_fire,
         "__upload_new" => op_upload_new,
         "__upload_push" => op_upload_push,
         "__upload_pull" => op_upload_pull,
@@ -9054,6 +9086,161 @@ fn op_rpc_signal_wait(
         object.set(scope, key.into(), value.into());
     }
     rv.set(promise);
+}
+
+/// `__test_wait_enabled()` -> bool; whether this node defines the
+/// test-only retained-wait global. True only with `CELLD_TEST_WAIT=1`
+/// (the cross-event wait conformance suite); production isolates never
+/// define it, so tenant code cannot mint waits there.
+fn op_test_wait_enabled(
+    scope: &mut v8::PinScope,
+    _args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    rv.set(v8::Boolean::new(scope, test_wait_enabled()).into());
+}
+
+/// `__testwait_await(id)` -> Promise<string>; subscribe to one test-only
+/// retained wait, resolving with its fired value. Unrefed like the
+/// container exec wait it stands in for: the subscription belongs to
+/// the subscribing event and dies with it, so a promise held across
+/// events needs a fresh subscription in each later event. Throws
+/// unless `CELLD_TEST_WAIT=1`.
+fn op_testwait_await(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    if !test_wait_enabled() {
+        return loader_throw(scope, "test waits are disabled on this node");
+    }
+    let id = args.get(0).to_rust_string_lossy(scope);
+    if id.is_empty() || id.len() > 256 {
+        return loader_throw(scope, "test wait id must be 1..=256 bytes");
+    }
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let immediate = {
+        let mut waits = test_waits().lock().unwrap();
+        match waits.get_mut(&id) {
+            Some(wait) if wait.fired.is_some() => Some(wait.fired.clone().unwrap_or_default()),
+            Some(wait) => {
+                wait.waiters.push(tx);
+                None
+            }
+            None => {
+                if waits.len() >= TEST_WAIT_CAP && !evict_fired_test_wait(&mut waits, &id) {
+                    return loader_throw(scope, "too many live test waits");
+                }
+                waits.insert(
+                    id.clone(),
+                    TestWait {
+                        fired: None,
+                        waiters: vec![tx],
+                    },
+                );
+                None
+            }
+        }
+    };
+    if let Some(value) = immediate {
+        let value = v8::String::new(scope, &value)
+            .map(v8::Local::<v8::Value>::from)
+            .unwrap_or_else(|| v8::undefined(scope).into());
+        match resolved_promise(scope, value) {
+            Ok(promise) => rv.set(promise.into()),
+            Err(_) => loader_throw(scope, "could not create wait promise"),
+        }
+        return;
+    }
+    let id_for_guard = id.clone();
+    let op_id = asyncrt::enqueue_unrefed(async move {
+        let _guard = TestWaitGuard { id: id_for_guard };
+        Ok(rx.await.unwrap_or_default())
+    });
+    rv.set(promise_for(scope, op_id));
+}
+
+/// Drop a fired test-only wait when the map is full, making room for a
+/// new id. Live (unfired) waits are never evicted: their waiters would
+/// hang. Never evicts the id being awaited.
+fn evict_fired_test_wait(waits: &mut HashMap<String, TestWait>, keep: &str) -> bool {
+    let victim = waits
+        .iter()
+        .find(|(id, wait)| id.as_str() != keep && wait.fired.is_some())
+        .map(|(id, _)| id.clone());
+    match victim {
+        Some(id) => waits.remove(&id).is_some(),
+        None => false,
+    }
+}
+
+/// Remove one test-only wait subscription when its op is dropped (event
+/// retirement cancels the future), so a fired value is not sent into a
+/// dead channel and the waiter list cannot grow without bound.
+struct TestWaitGuard {
+    id: String,
+}
+
+impl Drop for TestWaitGuard {
+    fn drop(&mut self) {
+        let mut waits = test_waits().lock().unwrap();
+        let remove = match waits.get_mut(&self.id) {
+            Some(wait) => {
+                wait.waiters.retain(|waiter| !waiter.is_closed());
+                wait.fired.is_none() && wait.waiters.is_empty()
+            }
+            None => false,
+        };
+        if remove {
+            waits.remove(&self.id);
+        }
+    }
+}
+
+/// `__testwait_fire(id, value)`; fire one test-only retained wait,
+/// resolving its current subscribers and storing the value for late
+/// ones (first fire wins, like a cached exit code). Throws unless
+/// `CELLD_TEST_WAIT=1`.
+fn op_testwait_fire(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue<v8::Value>,
+) {
+    if !test_wait_enabled() {
+        return loader_throw(scope, "test waits are disabled on this node");
+    }
+    let id = args.get(0).to_rust_string_lossy(scope);
+    if id.is_empty() || id.len() > 256 {
+        return loader_throw(scope, "test wait id must be 1..=256 bytes");
+    }
+    let value = args.get(1).to_rust_string_lossy(scope);
+    if value.len() > 4096 {
+        return loader_throw(scope, "test wait value must be 0..=4096 bytes");
+    }
+    let mut waits = test_waits().lock().unwrap();
+    let wait = match waits.get_mut(&id) {
+        Some(wait) => wait,
+        None => {
+            if waits.len() >= TEST_WAIT_CAP && !evict_fired_test_wait(&mut waits, &id) {
+                return loader_throw(scope, "too many live test waits");
+            }
+            waits.insert(
+                id.clone(),
+                TestWait {
+                    fired: None,
+                    waiters: vec![],
+                },
+            );
+            waits.get_mut(&id).expect("just inserted")
+        }
+    };
+    if wait.fired.is_some() {
+        return;
+    }
+    wait.fired = Some(value.clone());
+    for waiter in wait.waiters.drain(..) {
+        let _ = waiter.send(value.clone());
+    }
 }
 
 /// `__rpc_call(scope, name, method, argsSc)` -> Promise<Uint8Array>;

@@ -1,0 +1,10 @@
+{
+  "name": "svc-stub-wait-controller",
+  "main": "worker.js",
+  "compatibility_date": "2026-02-12",
+  "no_bundle": true,
+  "durable_objects": {
+    "bindings": [{ "name": "WAITS", "class_name": "WaitDO" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["WaitDO"] }]
+}
