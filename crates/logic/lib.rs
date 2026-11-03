@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): ported from meln1k/celld: coordination-core fixes (ea471ee, e46a685, 6d61462, 18d3bf9, 9d4c163, 468b456).
+// Modified by ryuzcorp (ryuzcorp/celld): ported from meln1k/celld: coordination-core fixes (ea471ee, e46a685, 6d61462, 18d3bf9, 9d4c163, 468b456, 01522b3).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! Clean-sheet celld decision core.
@@ -4490,14 +4490,13 @@ impl State {
                 // core just read (lease-fold): a dead owner whose folded
                 // log state is not sealed may hold acked writes only on
                 // its followers, and claiming before recovery fixes a
-                // bucket state that excludes them. Absence of a lease —
-                // or a lease that never opened a log — keeps its meaning
-                // as a proof: nothing was acked past the bucket.
+                // bucket state that excludes them. Absence of a lease keeps
+                // its meaning as a proof: nothing was acked past the bucket.
+                // A lease that never opened a log is no proof until it is
+                // sealed: its session may still hold it by its own clock,
+                // and open a log through a renewal its etag still matches.
                 let unrecovered = lease.as_ref().is_some_and(|lease| {
-                    !matches!(
-                        lease.record.log_state,
-                        None | Some(crate::log_tier::LogState::Sealed)
-                    )
+                    lease.record.log_state != Some(crate::log_tier::LogState::Sealed)
                 });
                 if unrecovered {
                     let owner = record.node.clone().unwrap_or_default();
