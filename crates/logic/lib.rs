@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): ported from meln1k/celld: coordination-core fixes (ea471ee, e46a685).
+// Modified by ryuzcorp (ryuzcorp/celld): ported from meln1k/celld: coordination-core fixes (ea471ee, e46a685, 6d61462).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! Clean-sheet celld decision core.
@@ -6418,6 +6418,26 @@ impl State {
                     result: Err(RequestError::DurabilityUnproven),
                 });
             }
+        }
+        // A handler still running against this runtime has opened no barrier
+        // yet, so the loop above cannot reach it. Its runtime is being
+        // discarded, so it settles as the gated case does, as a failed
+        // handler: re-armed, its op retired so the late `AlarmFinished` finds
+        // nothing, and the wake entry left for the next activation to find.
+        let firing = self.cells.get(id).and_then(|cell| match &cell.alarm {
+            Some(AlarmState::Firing { op, .. }) => Some(*op),
+            _ => None,
+        });
+        if let Some(op) = firing {
+            let (now_ms, now_mono_ms) = (self.now_ms, self.now_mono_ms);
+            self.alarm_finished(
+                op,
+                (id.to_string(), epoch),
+                now_ms,
+                now_mono_ms,
+                Err(Failure::Ambiguous),
+                effects,
+            );
         }
         // Requests already running against this runtime lose it here, exactly
         // as a fence does. Leaving them in `active_requests` would leave the
