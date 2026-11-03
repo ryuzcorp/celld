@@ -1,5 +1,5 @@
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
-// Modified by ryuzcorp (ryuzcorp/celld): d1 export.
+// Modified by ryuzcorp (ryuzcorp/celld): d1 export; d1 execute --batch.
 
 // The D1 CLI reads operator input and migration files outside node storage.
 #![allow(clippy::disallowed_methods)]
@@ -75,6 +75,127 @@ fn cell(value: &Value) -> String {
         Value::String(text) => text.clone(),
         other => other.to_string(),
     }
+}
+
+/// A duration as an operator reads it.
+fn took(milliseconds: f64) -> String {
+    // "0.00 sec" reads as a missing measurement rather than a fast
+    // statement, the same way "0.0s" did on a listing summary.
+    if milliseconds < 1000.0 {
+        format!("{}ms", milliseconds.round() as u64)
+    } else {
+        format!("{:.2} sec", milliseconds / 1000.0)
+    }
+}
+
+/// One batch statement: exactly one prepared statement with its binds, as
+/// D1's `batch()` takes them.
+#[derive(Debug)]
+struct BatchStatement {
+    sql: String,
+    params: Vec<Value>,
+}
+
+/// Bytes one batch may carry on stdin. The batch crosses to the owner as
+/// one request, and the request body the route accepts reaches far past
+/// this; the stdin cap exists so a redirected garbage file fails fast
+/// instead of swelling the command.
+const BATCH_STDIN_MAX_BYTES: usize = 32 * 1024 * 1024;
+
+fn read_batch_stdin() -> anyhow::Result<String> {
+    use std::io::Read as _;
+    let mut input = String::new();
+    std::io::stdin()
+        .lock()
+        .take((BATCH_STDIN_MAX_BYTES + 1) as u64)
+        .read_to_string(&mut input)
+        .context("read the batch from stdin")?;
+    if input.len() > BATCH_STDIN_MAX_BYTES {
+        bail!("the batch on stdin exceeds {BATCH_STDIN_MAX_BYTES} bytes");
+    }
+    Ok(input)
+}
+
+/// The stdin document as statements: a JSON array of `{"sql", "params"}`.
+/// Structural only -- unknown keys are ignored and bind values are the
+/// engine's to validate -- but every refusal names its statement, because
+/// a bare "invalid batch" against fifty statements helps nobody.
+fn parse_batch_input(input: &str) -> anyhow::Result<Vec<BatchStatement>> {
+    let value: Value = serde_json::from_str(input).context("parse the batch on stdin as JSON")?;
+    let items = value.as_array().ok_or_else(|| {
+        anyhow!("the batch on stdin must be a JSON array of {{\"sql\", \"params\"}}")
+    })?;
+    let mut statements = Vec::with_capacity(items.len());
+    for (index, item) in items.iter().enumerate() {
+        let object = item.as_object().ok_or_else(|| {
+            anyhow!(
+                "batch statement {index} must be an object with \"sql\" and optional \"params\""
+            )
+        })?;
+        let sql = object
+            .get("sql")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("batch statement {index} needs a \"sql\" string"))?;
+        let params = match object.get("params") {
+            None => Vec::new(),
+            Some(params) => params
+                .as_array()
+                .ok_or_else(|| anyhow!("batch statement {index} needs \"params\" to be an array"))?
+                .to_vec(),
+        };
+        statements.push(BatchStatement {
+            sql: sql.to_string(),
+            params,
+        });
+    }
+    Ok(statements)
+}
+
+/// One result per statement, shaped as the Worker's `batch()` shapes them,
+/// so a consumer parses one document one way. Returns the shaped results
+/// and the summed per-statement durations for the summary line.
+fn shape_batch_results(answers: &[Value]) -> (Vec<Value>, f64) {
+    let mut shaped = Vec::with_capacity(answers.len());
+    let mut milliseconds = 0.0;
+    for answer in answers {
+        let columns: Vec<&str> = answer
+            .get("columns")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect();
+        let rows = answer
+            .get("rows")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let results: Vec<Value> = rows
+            .into_iter()
+            .map(|row| {
+                let cells = row.as_array().cloned().unwrap_or_default();
+                Value::Object(
+                    columns
+                        .iter()
+                        .cloned()
+                        .zip(cells)
+                        .map(|(name, value)| (name.to_string(), value))
+                        .collect(),
+                )
+            })
+            .collect();
+        milliseconds += answer
+            .get("meta")
+            .and_then(|meta| meta.get("duration"))
+            .and_then(Value::as_f64)
+            .unwrap_or_default();
+        shaped.push(serde_json::json!({
+            "success": true,
+            "meta": answer.get("meta").cloned().unwrap_or(Value::Null),
+            "results": results,
+        }));
+    }
+    (shaped, milliseconds)
 }
 
 pub async fn run(arguments: Vec<String>) -> anyhow::Result<()> {
@@ -193,14 +314,21 @@ pub async fn run(arguments: Vec<String>) -> anyhow::Result<()> {
                 .get("duration")
                 .and_then(Value::as_f64)
                 .unwrap_or_default();
-            // "0.00 sec" reads as a missing measurement rather than a fast
-            // statement, the same way "0.0s" did on a listing summary.
-            let took = if milliseconds < 1000.0 {
-                format!("{}ms", milliseconds.round() as u64)
-            } else {
-                format!("{:.2} sec", milliseconds / 1000.0)
-            };
-            note!("Executed {count} statement(s) in {took}");
+            note!("Executed {count} statement(s) in {}", took(milliseconds));
+        }
+        Action::Batch => {
+            let statements = parse_batch_input(&read_batch_stdin()?)?;
+            let answers = database.batch(&statements).await?;
+            let answers = answers
+                .as_array()
+                .ok_or_else(|| anyhow!("the database reply carried no batch results"))?;
+            let (shaped, milliseconds) = shape_batch_results(answers);
+            note!(
+                "Ran {} statement(s) in {}",
+                shaped.len(),
+                took(milliseconds)
+            );
+            return out.line(format_args!("{}", Value::Array(shaped)));
         }
         Action::Export {
             output,
@@ -291,6 +419,21 @@ impl Reachable {
     ) -> anyhow::Result<Value> {
         self.call(serde_json::json!({
             "export": { "tables": tables, "no_schema": no_schema, "no_data": no_data },
+        }))
+        .await
+    }
+
+    /// One transactional batch: the engine runs every prepared statement
+    /// inside one transaction and answers one result per statement, as D1's
+    /// `batch()` does. A consumer issuing many reads pays one round trip
+    /// instead of one subprocess per query.
+    async fn batch(&self, statements: &[BatchStatement]) -> anyhow::Result<Value> {
+        self.call(serde_json::json!({
+            "batch": {
+                "statements": statements.iter().map(|statement| {
+                    serde_json::json!({ "sql": statement.sql, "params": statement.params })
+                }).collect::<Vec<_>>(),
+            },
         }))
         .await
     }
@@ -455,7 +598,7 @@ fn read_migrations(directory: &std::path::Path) -> anyhow::Result<Vec<Migration>
 /// outlives the node that wrote it and a draining node keeps its lease while
 /// it refuses work.
 enum Action {
-    /// Exactly one of the two, enforced at parse.
+    /// Exactly one of command, file, or batch, enforced at parse.
     Execute {
         command: Option<String>,
         file: Option<PathBuf>,
@@ -468,6 +611,10 @@ enum Action {
         no_schema: bool,
         no_data: bool,
     },
+    /// A JSON array of statements from stdin, run as one transactional
+    /// batch, answered as one JSON array. Always JSON; there is no table
+    /// rendering for per-statement results.
+    Batch,
     MigrationsList,
     MigrationsApply,
 }
@@ -520,6 +667,7 @@ impl Command {
         let mut tables = Vec::new();
         let mut no_schema = false;
         let mut no_data = false;
+        let mut batch = false;
         let mut project = None;
         let mut fleet = FleetFlags::default();
         let mut json = false;
@@ -537,6 +685,7 @@ impl Command {
                 "--table" => tables.push(value("--table")?),
                 "--no-schema" => no_schema = true,
                 "--no-data" => no_data = true,
+                "--batch" => batch = true,
                 "--json" => json = true,
                 "--unsafe-public-advertise" => unsafe_public_advertise = true,
                 "--help" | "-h" => return Ok(None),
@@ -559,9 +708,9 @@ impl Command {
             Some(action) => {
                 // Accepting the flag and ignoring it would tell an operator
                 // their SQL ran when nothing read it.
-                if sql.is_some() || file.is_some() || export_options {
+                if sql.is_some() || file.is_some() || batch || export_options {
                     bail!(
-                        "`celld d1 migrations` takes no --command, --file, or export options; \
+                        "`celld d1 migrations` takes no --command, --file, --batch, or export options; \
                          migrations come from the migrations directory"
                     );
                 }
@@ -570,6 +719,9 @@ impl Command {
             None if is_export => {
                 if sql.is_some() || file.is_some() {
                     bail!("`celld d1 export` takes no --command or --file; it dumps the live database");
+                }
+                if batch {
+                    bail!("`celld d1 export` takes no --batch; it dumps the live database");
                 }
                 if json {
                     bail!("`celld d1 export` writes SQL text, so --json does not apply");
@@ -590,10 +742,28 @@ impl Command {
                         "--output, --table, --no-schema, and --no-data belong to `celld d1 export`"
                     );
                 }
-                if sql.is_some() == file.is_some() {
-                    bail!("celld d1 execute requires exactly one of --command or --file");
+                if batch {
+                    if sql.is_some() || file.is_some() {
+                        bail!(
+                            "`celld d1 execute --batch` reads its statements from stdin, so it \
+                             takes no --command or --file"
+                        );
+                    }
+                    if !json {
+                        bail!(
+                            "`celld d1 execute --batch` requires --json: per-statement results \
+                             are structured"
+                        );
+                    }
+                    Action::Batch
+                } else {
+                    if sql.is_some() == file.is_some() {
+                        bail!(
+                            "celld d1 execute requires exactly one of --command, --file, or --batch"
+                        );
+                    }
+                    Action::Execute { command: sql, file }
                 }
-                Action::Execute { command: sql, file }
             }
         };
         Ok(Some(Self {
@@ -614,7 +784,7 @@ pub fn print_help() {
         r#"celld d1 — run SQL, migrations, and exports against a deployed D1 database
 
 USAGE:
-  celld d1 execute DATABASE (--command SQL | --file PATH) [PROJECT] --bucket NAME
+  celld d1 execute DATABASE (--command SQL | --file PATH | --batch) [PROJECT] --bucket NAME
   celld d1 export DATABASE [--output PATH] [--table NAME]... [PROJECT] --bucket NAME
   celld d1 migrations apply DATABASE [PROJECT] --bucket NAME
   celld d1 migrations list  DATABASE [PROJECT] --bucket NAME
@@ -641,6 +811,11 @@ bookkeeping table. celld records applied migrations in that table
 `execute` prints a table, and every message goes to stderr, so its stdout
 carries only result rows. Pass --json for one JSON object per row.
 
+`execute --batch` reads a JSON array of {{"sql", "params"}} from stdin and
+runs it as one transactional batch -- D1's `batch()` semantics, one result
+per statement -- printing one JSON array; it requires --json. A caller
+issuing many reads pays one round trip instead of one subprocess per query.
+
 `export` writes the database as SQL — schema beside data in creation order —
 read under one transaction on the owning node, so the dump is a single
 snapshot even while the database takes writes. It prints to stdout, or to
@@ -650,6 +825,8 @@ which replays it in one transaction, as `wrangler d1 execute --file` does.
 OPTIONS:
   --command SQL       SQL to run; several statements are permitted
   --file PATH         Read the SQL from a file instead
+  --batch             Read a JSON array of statements from stdin and run it
+                      as one transactional batch (requires --json)
   --json              Print one JSON object per row instead of a table
   --output PATH       Write the export to a file instead of stdout
   --table NAME        Export only this table, its indexes, and its triggers;
@@ -737,6 +914,7 @@ mod d1_export_cli_tests {
                 ["export", "db", "--file", "q.sql"].as_slice(),
                 "takes no --command or --file",
             ),
+            (["export", "db", "--batch"].as_slice(), "takes no --batch"),
             (
                 ["export", "db", "--json"].as_slice(),
                 "--json does not apply",
@@ -763,6 +941,142 @@ mod d1_export_cli_tests {
                 Ok(_) => panic!("accepted {arguments:?}"),
             };
             assert!(error.contains(fragment), "arguments {arguments:?}: {error}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod d1_batch_cli_tests {
+    use super::*;
+
+    fn parse(arguments: &[&str]) -> anyhow::Result<Option<Command>> {
+        Command::parse(arguments.iter().map(ToString::to_string).collect())
+    }
+
+    fn refused(arguments: &[&str]) -> String {
+        match parse(arguments) {
+            Err(error) => error.to_string(),
+            Ok(_) => panic!("accepted {arguments:?}"),
+        }
+    }
+
+    #[test]
+    fn batch_parses_with_json() {
+        let command = parse(&["execute", "mydb", "--batch", "--json"])
+            .expect("parse")
+            .expect("command");
+        assert_eq!(command.database, "mydb");
+        assert!(command.json);
+        assert!(matches!(command.action, Action::Batch));
+    }
+
+    #[test]
+    fn batch_needs_json_and_no_other_source() {
+        for (arguments, fragment) in [
+            (["execute", "db", "--batch"].as_slice(), "requires --json"),
+            (
+                [
+                    "execute",
+                    "db",
+                    "--batch",
+                    "--json",
+                    "--command",
+                    "SELECT 1",
+                ]
+                .as_slice(),
+                "takes no --command or --file",
+            ),
+            (
+                ["execute", "db", "--batch", "--json", "--file", "q.sql"].as_slice(),
+                "takes no --command or --file",
+            ),
+            (
+                ["migrations", "apply", "db", "--batch", "--json"].as_slice(),
+                "--batch",
+            ),
+            (
+                ["execute", "db"].as_slice(),
+                "exactly one of --command, --file, or --batch",
+            ),
+            (
+                ["execute", "db", "--command", "a", "--file", "b"].as_slice(),
+                "exactly one of --command, --file, or --batch",
+            ),
+        ] {
+            let error = refused(arguments);
+            assert!(error.contains(fragment), "arguments {arguments:?}: {error}");
+        }
+    }
+
+    #[test]
+    fn batch_input_parses_statements_with_and_without_params() {
+        let statements = parse_batch_input(
+            r#"[
+              {"sql": "SELECT * FROM t WHERE id = ?", "params": [1]},
+              {"sql": "SELECT COUNT(*) FROM t"}
+            ]"#,
+        )
+        .expect("parse");
+        assert_eq!(statements.len(), 2);
+        assert_eq!(statements[0].sql, "SELECT * FROM t WHERE id = ?");
+        assert_eq!(statements[0].params, vec![serde_json::json!(1)]);
+        assert_eq!(statements[1].sql, "SELECT COUNT(*) FROM t");
+        assert!(statements[1].params.is_empty());
+        assert!(parse_batch_input("[]").expect("empty").is_empty());
+    }
+
+    #[test]
+    fn batch_shaping_maps_rows_to_objects_and_sums_durations() {
+        // One statement returning rows, one returning none: every shaped
+        // result reports success and carries its statement's meta through,
+        // positional rows become column-keyed objects, and the summary
+        // duration is the per-statement sum.
+        let answers = [
+            serde_json::json!({
+                "columns": ["id", "name"],
+                "rows": [[1, "ada"], [2, "bob"]],
+                "meta": {"duration": 12.5, "changes": 0, "rows_read": 2},
+            }),
+            serde_json::json!({
+                "columns": [],
+                "rows": [],
+                "meta": {"duration": 7.5, "changes": 1, "rows_read": 0},
+            }),
+        ];
+        let (shaped, milliseconds) = shape_batch_results(&answers);
+        assert_eq!(shaped.len(), 2);
+        assert_eq!(shaped[0]["success"], true);
+        assert_eq!(shaped[0]["meta"], answers[0]["meta"]);
+        assert_eq!(
+            shaped[0]["results"],
+            serde_json::json!([{"id": 1, "name": "ada"}, {"id": 2, "name": "bob"}])
+        );
+        assert_eq!(shaped[1]["success"], true);
+        assert_eq!(shaped[1]["meta"], answers[1]["meta"]);
+        assert_eq!(shaped[1]["results"], serde_json::json!([]));
+        assert_eq!(milliseconds, 20.0);
+    }
+
+    #[test]
+    fn batch_input_refusals_name_the_statement() {
+        for (input, fragment) in [
+            ("no json", "parse the batch on stdin as JSON"),
+            ("{\"sql\": \"SELECT 1\"}", "must be a JSON array"),
+            (
+                "[{\"sql\": \"SELECT 1\"}, 7]",
+                "batch statement 1 must be an object",
+            ),
+            (
+                "[{\"params\": []}]",
+                "batch statement 0 needs a \"sql\" string",
+            ),
+            (
+                "[{\"sql\": \"SELECT ?\", \"params\": 1}]",
+                "batch statement 0 needs \"params\" to be an array",
+            ),
+        ] {
+            let error = parse_batch_input(input).expect_err("accepted").to_string();
+            assert!(error.contains(fragment), "input {input}: {error}");
         }
     }
 }

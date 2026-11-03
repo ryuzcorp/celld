@@ -1,5 +1,5 @@
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
-// Modified by ryuzcorp (ryuzcorp/celld): D1 export; D1 export hardening.
+// Modified by ryuzcorp (ryuzcorp/celld): D1 export; D1 export hardening; D1 batch tests.
 
 // This is V8-thread SQLite plumbing outside the Actor execution domain.
 #![allow(clippy::disallowed_methods)]
@@ -6202,5 +6202,145 @@ mod d1_export_tests {
         })
         .expect("db present");
         assert_eq!(count, 100);
+    }
+}
+
+#[cfg(test)]
+mod d1_batch_tests {
+    use super::d1_test_db::TestDb;
+    use super::*;
+
+    /// The semantics `celld d1 execute --batch` relies on: the engine runs
+    /// every statement inside one transaction and answers one result per
+    /// statement. These pin that contract where the CLI reaches it.
+    fn prepared(sql: &str, params: Vec<serde_json::Value>) -> D1PreparedRequest {
+        D1PreparedRequest {
+            sql: sql.to_string(),
+            params,
+        }
+    }
+
+    fn count(db: &TestDb, table: &str) -> i64 {
+        match d1_run(
+            &db.scope,
+            &D1Request::Exec {
+                sql: format!("SELECT COUNT(*) AS n FROM {table}"),
+                rows: true,
+            },
+        ) {
+            Ok(D1Response::Exec { results, .. }) => results[0].rows[0][0].as_i64().expect("count"),
+            Ok(_) => panic!("count answered the wrong shape"),
+            Err(failure) => panic!("count failed: {}", failure.message),
+        }
+    }
+
+    #[test]
+    fn batch_returns_one_result_per_statement() {
+        let db = TestDb::open("batch-results");
+        db.exec(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT NOT NULL); \
+             INSERT INTO t VALUES (1, 'a'), (2, 'b');",
+        );
+        match d1_run(
+            &db.scope,
+            &D1Request::Batch {
+                statements: vec![
+                    prepared("SELECT * FROM t WHERE id = ?", vec![serde_json::json!(2)]),
+                    prepared("SELECT COUNT(*) AS n FROM t", vec![]),
+                    prepared(
+                        "INSERT INTO t (name) VALUES (?)",
+                        vec![serde_json::json!("c")],
+                    ),
+                ],
+            },
+        ) {
+            Ok(D1Response::Batch(results)) => {
+                assert_eq!(results.len(), 3);
+                assert_eq!(results[0].columns, ["id", "name"].map(str::to_string));
+                assert_eq!(
+                    results[0].rows,
+                    vec![vec![serde_json::json!(2), serde_json::json!("b")]]
+                );
+                assert_eq!(results[1].rows, vec![vec![serde_json::json!(2)]]);
+                assert_eq!(results[2].meta.changes, 1);
+                assert!(results[2].meta.changed_db);
+            }
+            Ok(_) => panic!("batch answered the wrong shape"),
+            Err(failure) => panic!("batch failed: {}", failure.message),
+        }
+        // The batch committed: the insert persisted.
+        assert_eq!(count(&db, "t"), 3);
+    }
+
+    #[test]
+    fn batch_rolls_back_on_error() {
+        let db = TestDb::open("batch-rollback");
+        db.exec(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT UNIQUE NOT NULL); \
+             INSERT INTO t VALUES (1, 'a');",
+        );
+        match d1_run(
+            &db.scope,
+            &D1Request::Batch {
+                statements: vec![
+                    prepared(
+                        "INSERT INTO t VALUES (?, ?)",
+                        vec![serde_json::json!(2), serde_json::json!("b")],
+                    ),
+                    prepared(
+                        "INSERT INTO t VALUES (?, ?)",
+                        vec![serde_json::json!(3), serde_json::json!("a")],
+                    ),
+                ],
+            },
+        ) {
+            Err(_) => {}
+            Ok(_) => panic!("a batch with a failing statement succeeded"),
+        }
+        // Nothing persisted: the first insert rolled back with the second.
+        assert_eq!(count(&db, "t"), 1);
+        // And the failed batch left no open transaction: a later write works.
+        db.exec("INSERT INTO t VALUES (2, 'b')");
+        assert_eq!(count(&db, "t"), 2);
+    }
+
+    #[test]
+    fn batch_accepts_no_statements() {
+        let db = TestDb::open("batch-empty");
+        db.exec("CREATE TABLE t (id INTEGER PRIMARY KEY);");
+        match d1_run(&db.scope, &D1Request::Batch { statements: vec![] }) {
+            Ok(D1Response::Batch(results)) => assert!(results.is_empty()),
+            Ok(_) => panic!("batch answered the wrong shape"),
+            Err(failure) => panic!("empty batch failed: {}", failure.message),
+        }
+    }
+
+    #[test]
+    fn batch_refuses_an_open_transaction() {
+        let db = TestDb::open("batch-open-txn");
+        db.exec("CREATE TABLE t (id INTEGER PRIMARY KEY);");
+        with(&db.scope, |connection| {
+            without_sql_authorizer(connection, || {
+                connection.execute_batch("BEGIN IMMEDIATE").expect("begin");
+            })
+        });
+        let error = match d1_run(
+            &db.scope,
+            &D1Request::Batch {
+                statements: vec![prepared("SELECT * FROM t", vec![])],
+            },
+        ) {
+            Ok(_) => panic!("batch ran inside an open transaction"),
+            Err(failure) => failure.message,
+        };
+        assert!(
+            error.contains("open transaction"),
+            "unexpected error: {error}"
+        );
+        with(&db.scope, |connection| {
+            without_sql_authorizer(connection, || {
+                connection.execute_batch("ROLLBACK").expect("rollback");
+            })
+        });
     }
 }

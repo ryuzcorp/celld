@@ -9,7 +9,7 @@ README below is kept intact; this file documents the fork.
 
 - `main` mirrors upstream `main` and carries no patches.
 - `ryuzcorp/v<version>` is a line branch: the upstream tag `v<version>`
-  plus our patches as commits, one commit per patch, in `0001`-`0022`
+  plus our patches as commits, one commit per patch, in `0001`-`0023`
   order. Each patch commit is self-contained and carries its own tests.
 
 Upstream's `.github/workflows/release.yml` targets `ghcr.io/denoland` and
@@ -271,7 +271,7 @@ push to `ghcr.io/denoland`, but still. Pushing a branch named
   address; tenant clients ignore proxies, celld's own traffic and
   published container endpoints are exempt, and refused fetches reject
   with `TypeError`.
-- `0022` (sha TBD at merge) `celld d1 export` writes a consistent SQL
+- `0022` (`72456c2`) `celld d1 export` writes a consistent SQL
   dump: the owner node reads schema beside data under one transaction, so the
   dump is a single snapshot even under concurrent writes; `--table`
   (repeatable), `--no-schema`, and `--no-data` narrow it, and one dump
@@ -283,6 +283,11 @@ push to `ghcr.io/denoland`, but still. Pushing a branch named
   generated columns, carries NUL and invalid-UTF-8 TEXT byte-exact,
   rebuilds fts5/fts5vocab/vec0 virtual tables without their shadows, and
   parses the virtual-table module instead of matching a DDL prefix.
+- `0023` (sha TBD at merge) `celld d1 execute --batch --json` reads a JSON
+  array of statements from stdin and runs it as one transactional batch:
+  the cell runs the engine's own `batch()` behind a new fetch branch, so
+  the CLI and the Worker binding share one implementation, and the CLI
+  prints one JSON array shaped as the Worker's `batch()` shapes it.
 
 ## Releases
 
