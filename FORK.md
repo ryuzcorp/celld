@@ -9,7 +9,7 @@ README below is kept intact; this file documents the fork.
 
 - `main` mirrors upstream `main` and carries no patches.
 - `ryuzcorp/v<version>` is a line branch: the upstream tag `v<version>`
-  plus our patches as commits, one commit per patch, in `0001`-`0006`
+  plus our patches as commits, one commit per patch, in `0001`-`0008`
   order. Each patch commit is self-contained and carries its own tests.
 
 Upstream's `.github/workflows/release.yml` targets `ghcr.io/denoland` and
@@ -158,6 +158,23 @@ push to `ghcr.io/denoland`, but still. Pushing a branch named
 - `0006` (`81ebacb`) container exec `pty` (`true` or `{ cols, rows }`,
   default 80x24), `isPty`, and `resize(cols, rows)`; a failed first
   resize kills the exec instead of orphaning it.
+- `0007` (`5bea20d`) Durable Object RPC exports cross isolates on the
+  same node: stubs mint under host-routable ids validated on every op,
+  and `ReadableStream` args (with the abort-signal carrier) cross by
+  caller-side push into a bounded, backpressured host channel. Same
+  node only; caller-owned `WritableStream` args keep their
+  same-isolate marker; mint caps 4096/scope and 65536/process fail
+  the call with a clear error.
+- `0008` (`750e18a`) container exec `exitCode` survives the exec event:
+  a retained wait re-subscribes in each later event instead of hanging
+  on the first event's dropped op; awaiting in its own event still
+  resolves through its own subscription.
+
+## Releases
+
+- `v0.6.3-ryuzcorp.4` (`65419c6`): patches `0001`–`0006`; first
+  release published by this fork.
+- `v0.6.3-ryuzcorp.5` (`750e18a`): adds `0007`–`0008` (PR #2).
 
 ## License
 
