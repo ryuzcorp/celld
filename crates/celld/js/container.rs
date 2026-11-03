@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): exec() waits for start(); exec pty/resize; test-only fake exec engine.
+// Modified by ryuzcorp (ryuzcorp/celld): exec() waits for start(); exec pty/resize; test-only fake exec engine; fake kill completion.
 //! Host ops behind `ctx.container`.
 //!
 //! JavaScript owns the surface and every validation message, copied from
@@ -263,6 +263,7 @@ pub(super) fn op_container_exec(
                     scope: cell.clone(),
                     params: raw.clone(),
                     kills: Vec::new(),
+                    kills_completed: Vec::new(),
                     exit: None,
                     waiters: Vec::new(),
                 },
@@ -440,7 +441,13 @@ pub(super) fn op_container_exec_kill(
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
     let id = number_arg(scope, &args, 0);
-    let signal = number_arg(scope, &args, 1) as u32;
+    // The harness checks the range too; the op checks it again because
+    // the number is interpolated into the kill scan.
+    let signal = number_arg(scope, &args, 1);
+    if !(1..=64).contains(&signal) {
+        return loader_throw(scope, "kill(): signal must be 1..=64");
+    }
+    let signal = signal as u32;
     if test_exec_hit(id) {
         // Recorded synchronously: the abort dispatch and the op run on
         // the same thread, so the suite observes the kill without
@@ -448,15 +455,35 @@ pub(super) fn op_container_exec_kill(
         if let Some(process) = test_execs().lock().unwrap().processes.get_mut(&id) {
             process.kills.push(signal);
         }
-        test_exec_ok(scope, rv);
+        // The completion records asynchronously, through an op of the same
+        // lifetime as the real kill's: the delivery suite fires kill()
+        // without awaiting it and then observes whether the op ran at
+        // all. The yield mirrors the real op's suspension on daemon I/O:
+        // a dropped op never reaches the record.
+        let async_id = asyncrt::enqueue_io_context(async move {
+            tokio::task::yield_now().await;
+            if let Some(process) = test_execs().lock().unwrap().processes.get_mut(&id) {
+                process.kills_completed.push(signal);
+            }
+            Ok::<String, String>(String::new())
+        });
+        rv.set(promise_for(scope, async_id));
         return;
     }
     let process = process_arg(scope, &args);
-    let async_id = asyncrt::enqueue_unrefed(async move {
-        process?
-            .kill(signal)
-            .await
-            .map_err(|error| format!("{error:#}"))?;
+    // IoContext, like `start()`: `kill()` returns void and nobody
+    // awaits it, so the op is still pending when the handler answers;
+    // any shorter lifetime dies with the event before the daemon call
+    // runs, and the process is never signaled. The event waits out the
+    // two daemon calls (milliseconds), not the process.
+    let async_id = asyncrt::enqueue_io_context(async move {
+        // `kill()` returns nothing to the caller, so a failed delivery
+        // (an image without `sh`, a daemon error) is logged here or not
+        // at all.
+        process?.kill(signal).await.map_err(|error| {
+            tracing::warn!(event = "container_exec_kill_failed", signal, error = %format!("{error:#}"), "exec kill was not delivered");
+            format!("{error:#}")
+        })?;
         Ok::<String, String>(String::new())
     });
     rv.set(promise_for(scope, async_id));
@@ -523,6 +550,9 @@ struct TestExecProcess {
     /// AbortSignal never crosses into it.
     params: String,
     kills: Vec<u32>,
+    /// Kills whose op ran to completion (past the yield). A dropped op
+    /// records in `kills` but never here.
+    kills_completed: Vec<u32>,
     exit: Option<String>,
     waiters: Vec<tokio::sync::oneshot::Sender<String>>,
 }
@@ -669,6 +699,26 @@ pub(super) fn op_testexec_kills(
         return loader_throw(scope, "unknown test exec");
     };
     let kills = serde_json::json!(process.kills).to_string();
+    rv.set(v8::String::new(scope, &kills).unwrap().into());
+}
+
+/// `__testexec_kills_completed(id)` -> JSON array of the signals whose
+/// kill op ran to completion, in order. Throws unless
+/// `CELLD_TEST_WAIT=1`.
+pub(super) fn op_testexec_kills_completed(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    if !test_wait_enabled() {
+        return loader_throw(scope, "test execs are disabled on this node");
+    }
+    let id = number_arg(scope, &args, 0);
+    let execs = test_execs().lock().unwrap();
+    let Some(process) = execs.processes.get(&id) else {
+        return loader_throw(scope, "unknown test exec");
+    };
+    let kills = serde_json::json!(process.kills_completed).to_string();
     rv.set(v8::String::new(scope, &kills).unwrap().into());
 }
 

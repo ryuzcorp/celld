@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): exec() waits for start(); exec pty/resize; fence node-netns exception.
+// Modified by ryuzcorp (ryuzcorp/celld): exec() waits for start(); exec pty/resize; fence node-netns exception; process-granularity exec kill; kill conformance tests.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! Containers attached to Durable Objects: the engine side of
@@ -1355,10 +1355,13 @@ impl ContainerEngine {
             .await;
         let mut env: Vec<String> = DEFAULT_ENV.iter().map(|entry| entry.to_string()).collect();
         env.push(format!("CLOUDFLARE_DURABLE_OBJECT_ID={}", cell.scope));
+        // A container's own env must not carry an exec's kill marker, or a
+        // kill scan would signal the container's main process.
         env.extend(
             params
                 .env
                 .iter()
+                .filter(|(name, _)| name != EXEC_ID_ENV)
                 .map(|(name, value)| format!("{name}={value}")),
         );
         let mut labels = serde_json::Map::new();
@@ -1606,7 +1609,7 @@ impl ContainerEngine {
     pub async fn exec(
         &self,
         cell: &Arc<CellContainer>,
-        params: ExecParams,
+        mut params: ExecParams,
     ) -> anyhow::Result<Arc<ExecProcess>> {
         // An exec right after `start()` runs in the container that start
         // creates, as on Cloudflare: wait for it instead of answering the
@@ -1626,6 +1629,13 @@ impl ContainerEngine {
             (false, _, _) => return Err(anyhow!("exec(): pty size without pty")),
             _ => return Err(anyhow!("exec(): pty size must be positive cols and rows")),
         }
+        // The id doubles as the process's in-container marker (see
+        // `kill_via_exec`), so it is minted before the daemon creates
+        // anything. A forged marker in the caller's env would let one
+        // exec's kill signal another, so it goes first.
+        let id = next_exec_id();
+        params.env.retain(|(name, _)| name != EXEC_ID_ENV);
+        params.env.push((EXEC_ID_ENV.to_string(), format!("{id};")));
         let created = self
             .docker
             .expect(
@@ -1686,7 +1696,8 @@ impl ContainerEngine {
                     // The daemon-side process is already running; kill it so
                     // a failed resize doesn't orphan a process with no handle.
                     // Best-effort: the resize error is what the caller sees.
-                    let _ = kill_via_exec(&self.docker, &cell.name, pid, 9).await;
+                    let _ = kill_via_exec(&self.docker, &cell.name, id, 9, params.user.as_deref())
+                        .await;
                     return Err(resize_err);
                 }
             }
@@ -1716,10 +1727,11 @@ impl ContainerEngine {
             .detach();
         }
         let process = Arc::new(ExecProcess {
-            id: next_exec_id(),
+            id,
             exec_id,
             container: cell.name.clone(),
             pid,
+            user: params.user.clone(),
             is_pty,
             docker: self.docker.clone(),
             stdin: tokio::sync::Mutex::new(Some(write)),
@@ -1781,42 +1793,72 @@ fn exec_resize_path(exec_id: &str, cols: u16, rows: u16) -> String {
     format!("/exec/{exec_id}/resize?h={rows}&w={cols}")
 }
 
-/// The `POST /containers/{id}/exec` body that runs `kill -<signal> <pid>`,
-/// pure so tests pin the shape without an engine.
-fn kill_exec_body(pid: i64, signal: u32) -> Value {
-    json!({
-        "AttachStdin": false, "AttachStdout": false, "AttachStderr": false,
-        "Cmd": ["kill", format!("-{signal}"), pid.to_string()],
-    })
+/// The env var that marks one exec's process for its kill: `exec()`
+/// sets it to `<id>;`, and the kill scan matches that exact entry. The
+/// trailing `;` keeps id 12 from matching id 123.
+const EXEC_ID_ENV: &str = "CELLD_EXEC_ID";
+
+/// The shell scan that signals one exec's process: every `/proc` entry
+/// whose environment carries the exec's marker gets the signal. `kill`
+/// is the shell builtin, so the image needs no `kill` binary; it does
+/// need `sh`, `grep`, and `/proc`. Both interpolations are numeric, so
+/// the command cannot inject.
+fn kill_scan_script(id: u64, signal: u32) -> String {
+    format!(
+        "for d in /proc/[0-9]*;do grep -qa \"{EXEC_ID_ENV}={id};\" \"$d/environ\" 2>/dev/null&&kill -{signal} \"${{d#/proc/}}\";done"
+    )
 }
 
-/// Deliver a signal by a second exec of `kill`: the Engine API has no exec
-/// kill. Used by `ExecProcess::kill` and, best-effort with SIGKILL, to clean
-/// up a daemon-side process whose post-start resize failed before its handle
-/// was registered.
+/// The `POST /containers/{id}/exec` body that runs the kill scan, pure
+/// so tests pin the shape without an engine. Runs as the exec's user,
+/// so it can read the target's environment.
+fn kill_exec_body(id: u64, signal: u32, user: Option<&str>) -> Value {
+    let mut body = json!({
+        "AttachStdin": false, "AttachStdout": false, "AttachStderr": false,
+        "Cmd": ["sh", "-c", kill_scan_script(id, signal)],
+    });
+    if let Some(user) = user {
+        body["User"] = json!(user);
+    }
+    body
+}
+
+/// Deliver a signal by a second exec that scans for the process's
+/// marker: the Engine API has no exec kill, and the pid the daemon
+/// reports is a host pid, meaningless inside the container's pid
+/// namespace. Used by `ExecProcess::kill` and, best-effort with
+/// SIGKILL, to clean up a daemon-side process whose post-start resize
+/// failed before its handle was registered.
+///
+/// A scan that matches nothing signals nothing: a dead exec's marker
+/// died with it, so unlike a pid the marker cannot be reused onto an
+/// innocent process. An exec that forked children signals them too,
+/// since they inherit the marker. An image without `sh`, `grep`, or
+/// `/proc` degrades to a no-op kill, as before, but never misdelivers.
 async fn kill_via_exec(
     docker: &Docker,
     container: &str,
-    pid: i64,
+    id: u64,
     signal: u32,
+    user: Option<&str>,
 ) -> anyhow::Result<()> {
     let created = docker
         .expect(
             "POST",
             &format!("/containers/{container}/exec"),
-            Some(kill_exec_body(pid, signal)),
+            Some(kill_exec_body(id, signal, user)),
             "create exec",
         )
         .await?
         .json()?;
-    let id = created
+    let exec = created
         .get("Id")
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow!("exec create answered without an id"))?;
     docker
         .expect(
             "POST",
-            &format!("/exec/{id}/start"),
+            &format!("/exec/{exec}/start"),
             Some(json!({ "Detach": true })),
             "start exec",
         )
@@ -1831,6 +1873,7 @@ pub struct ExecProcess {
     exec_id: String,
     container: String,
     pub pid: i64,
+    user: Option<String>,
     pub is_pty: bool,
     docker: Docker,
     stdin: tokio::sync::Mutex<Option<WriteHalf>>,
@@ -1931,10 +1974,19 @@ impl ExecProcess {
         Ok(code)
     }
 
-    /// The Engine API has no exec kill, so the signal is delivered by a
-    /// second exec of `kill`, as workerd does.
+    /// The Engine API has no exec kill, so the signal is delivered by
+    /// a second exec that scans for this process's marker (see
+    /// `kill_via_exec`): `self.pid` is a host pid and meaningless
+    /// inside the container.
     pub async fn kill(&self, signal: u32) -> anyhow::Result<()> {
-        kill_via_exec(&self.docker, &self.container, self.pid, signal).await
+        kill_via_exec(
+            &self.docker,
+            &self.container,
+            self.id,
+            signal,
+            self.user.as_deref(),
+        )
+        .await
     }
 
     /// Resize a PTY exec's terminal. Refused on a non-TTY process, where the
@@ -2165,12 +2217,19 @@ mod pty_tests {
     }
 
     #[test]
-    fn kill_body_runs_kill_minus_signal_pid() {
-        let body = kill_exec_body(1234, 9);
-        assert_eq!(body["Cmd"], serde_json::json!(["kill", "-9", "1234"]));
+    fn kill_body_scans_for_the_exec_marker() {
+        let body = kill_exec_body(12, 9, None);
+        assert_eq!(body["Cmd"][0], serde_json::json!("sh"));
+        assert_eq!(body["Cmd"][1], serde_json::json!("-c"));
+        let script = body["Cmd"][2].as_str().expect("scan script");
+        assert!(script.contains("CELLD_EXEC_ID=12;"), "{script}");
+        assert!(script.contains("kill -9 "), "{script}");
+        assert!(body.get("User").is_none());
         assert_eq!(body["AttachStdin"], serde_json::json!(false));
         assert_eq!(body["AttachStdout"], serde_json::json!(false));
         assert_eq!(body["AttachStderr"], serde_json::json!(false));
+        let user = kill_exec_body(12, 15, Some("nobody"));
+        assert_eq!(user["User"], serde_json::json!("nobody"));
     }
 
     fn test_cell() -> CellContainer {
@@ -2260,6 +2319,7 @@ mod pty_tests {
             exec_id: "test-exec".to_string(),
             container: "test-container".to_string(),
             pid: 1234,
+            user: None,
             is_pty,
             docker: Docker::new("/nonexistent-celld-test.sock"),
             stdin: tokio::sync::Mutex::new(None),
@@ -2569,5 +2629,428 @@ mod fence_node_netns_tests {
             parse_fence_node_addrs("203.0.113.7").unwrap(),
             Vec::<IpAddr>::new()
         );
+    }
+}
+
+#[cfg(test)]
+mod kill_tests {
+    use super::*;
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::os::unix::net::{UnixListener, UnixStream};
+
+    /// A scripted Engine API over a unix socket: the daemon side of the
+    /// kill conformance test. Synchronous std threads only (no second
+    /// runtime): the engine under test is the only async party. Serves
+    /// the sleep exec's hijacked stream, answers exec inspect, and
+    /// simulates the kill only when the kill exec carries the sleep's
+    /// in-container marker: a host-pid `kill` or a missing `kill`
+    /// binary would leave the process running, and so does this mock.
+    struct MockDaemon {
+        _dir: tempfile::TempDir,
+        socket: PathBuf,
+        state: Arc<Mutex<MockState>>,
+    }
+
+    struct MockState {
+        exec_creates: Vec<Value>,
+        /// Container-scope calls (kill, DELETE): the kill must never
+        /// touch the container itself.
+        destructive: Vec<String>,
+        sleep_running: bool,
+        sleep_closer: Option<std::sync::mpsc::Sender<()>>,
+    }
+
+    impl MockDaemon {
+        fn start() -> Self {
+            let dir = tempfile::Builder::new()
+                .prefix("celld-kill-")
+                .tempdir()
+                .expect("mock daemon tempdir");
+            let socket = dir.path().join("d.sock");
+            let listener = UnixListener::bind(&socket).expect("mock daemon bind");
+            let state = Arc::new(Mutex::new(MockState {
+                exec_creates: Vec::new(),
+                destructive: Vec::new(),
+                sleep_running: true,
+                sleep_closer: None,
+            }));
+            let serving = state.clone();
+            std::thread::spawn(move || {
+                for stream in listener.incoming() {
+                    let Ok(stream) = stream else { break };
+                    let state = serving.clone();
+                    std::thread::spawn(move || serve(stream, state));
+                }
+            });
+            Self {
+                _dir: dir,
+                socket,
+                state,
+            }
+        }
+    }
+
+    fn read_request(stream: &UnixStream) -> (String, String, Vec<(String, String)>, Vec<u8>) {
+        let mut reader = BufReader::new(stream);
+        let mut line = String::new();
+        reader.read_line(&mut line).expect("request line");
+        let mut head = line.split_whitespace();
+        let method = head.next().unwrap_or_default().to_string();
+        let path = head.next().unwrap_or_default().to_string();
+        let mut headers = Vec::new();
+        loop {
+            line.clear();
+            reader.read_line(&mut line).expect("request header");
+            let trimmed = line.trim_end();
+            if trimmed.is_empty() {
+                break;
+            }
+            if let Some((name, value)) = trimmed.split_once(':') {
+                headers.push((name.trim().to_ascii_lowercase(), value.trim().to_string()));
+            }
+        }
+        let length = headers
+            .iter()
+            .find(|(name, _)| name == "content-length")
+            .and_then(|(_, value)| value.parse::<usize>().ok())
+            .unwrap_or(0);
+        let mut body = vec![0u8; length];
+        reader.read_exact(&mut body).expect("request body");
+        assert!(
+            reader.buffer().is_empty(),
+            "mock daemon over-read the request"
+        );
+        (method, path, headers, body)
+    }
+
+    fn respond(stream: &mut UnixStream, status: &str, body: &[u8]) {
+        write!(
+            stream,
+            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .expect("mock response head");
+        stream.write_all(body).expect("mock response body");
+        stream.flush().expect("mock response flush");
+    }
+
+    /// Whether the recorded kill exec could actually signal the sleep:
+    /// a shell scan for the sleep's marker, not a host-pid `kill`.
+    fn kill_shape_matches(creates: &[Value]) -> bool {
+        let [sleep, kill] = creates else {
+            return false;
+        };
+        let Some(marker) = sleep.get("Env").and_then(Value::as_array).and_then(|env| {
+            env.iter().find_map(|entry| {
+                entry
+                    .as_str()?
+                    .strip_prefix("CELLD_EXEC_ID=")
+                    .map(str::to_string)
+            })
+        }) else {
+            return false;
+        };
+        let Some(script) =
+            kill.get("Cmd")
+                .and_then(Value::as_array)
+                .and_then(|cmd| match cmd.as_slice() {
+                    [sh, flag, script] => (sh.as_str()? == "sh" && flag.as_str()? == "-c")
+                        .then(|| script.as_str())
+                        .flatten(),
+                    _ => None,
+                })
+        else {
+            return false;
+        };
+        script.contains(&format!("CELLD_EXEC_ID={marker}")) && script.contains("-9")
+    }
+
+    fn serve(stream: UnixStream, state: Arc<Mutex<MockState>>) {
+        let (method, path, headers, body) = read_request(&stream);
+        let upgraded = headers
+            .iter()
+            .any(|(name, value)| name == "upgrade" && value.eq_ignore_ascii_case("tcp"));
+        let mut stream = stream;
+        if method == "POST" && path == "/containers/n/exec" {
+            let body: Value = serde_json::from_slice(&body).expect("exec create JSON");
+            let id = {
+                let mut state = state.lock().unwrap();
+                let id = if state.exec_creates.is_empty() {
+                    "sleep-exec".to_string()
+                } else {
+                    format!("kill-exec-{}", state.exec_creates.len())
+                };
+                state.exec_creates.push(body);
+                id
+            };
+            respond(
+                &mut stream,
+                "201 Created",
+                json!({ "Id": id }).to_string().as_bytes(),
+            );
+            return;
+        }
+        if method == "POST" && path == "/exec/sleep-exec/start" && upgraded {
+            write!(
+                stream,
+                "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: tcp\r\n\r\n"
+            )
+            .expect("mock 101");
+            stream.flush().expect("mock 101 flush");
+            let (tx, rx) = std::sync::mpsc::channel();
+            state.lock().unwrap().sleep_closer = Some(tx);
+            // Park the stream until the kill lands; dropping it is the
+            // EOF the engine reads as the process exiting.
+            let _ = rx.recv();
+            return;
+        }
+        if method == "POST" && path.starts_with("/exec/") && path.ends_with("/start") && !upgraded {
+            let mut state = state.lock().unwrap();
+            if kill_shape_matches(&state.exec_creates) {
+                state.sleep_running = false;
+                if let Some(closer) = state.sleep_closer.take() {
+                    let _ = closer.send(());
+                }
+            }
+            drop(state);
+            respond(&mut stream, "204 No Content", b"");
+            return;
+        }
+        if method == "GET" && path == "/exec/sleep-exec/json" {
+            let running = state.lock().unwrap().sleep_running;
+            let code = (!running).then_some(137);
+            respond(
+                &mut stream,
+                "200 OK",
+                json!({ "Pid": 424242, "Running": running, "ExitCode": code })
+                    .to_string()
+                    .as_bytes(),
+            );
+            return;
+        }
+        if (method == "DELETE" && path.starts_with("/containers/"))
+            || (method == "POST" && path.starts_with("/containers/") && path.ends_with("/kill"))
+        {
+            state
+                .lock()
+                .unwrap()
+                .destructive
+                .push(format!("{method} {path}"));
+            respond(&mut stream, "204 No Content", b"");
+            return;
+        }
+        respond(
+            &mut stream,
+            "404 Not Found",
+            json!({ "message": format!("mock daemon: no such call {method} {path}") })
+                .to_string()
+                .as_bytes(),
+        );
+    }
+
+    fn kill_cell() -> CellContainer {
+        CellContainer {
+            scope: "s".into(),
+            name: "n".into(),
+            spec: Arc::new(ContainerSpec {
+                class_name: "C".into(),
+                image: "celld-image:x".into(),
+                instance_type: None,
+                max_instances: None,
+                runtime: None,
+            }),
+            state: Mutex::new(CellState::default()),
+            processes: Mutex::new(Vec::new()),
+            exit: watch::channel(None).0,
+            started: watch::channel(0).0,
+        }
+    }
+
+    /// The engine futures these tests run spawn their demux pumps
+    /// through the execution domain, installed here once for the test
+    /// binary.
+    fn ensure_domain() {
+        static DOMAIN: std::sync::Once = std::sync::Once::new();
+        DOMAIN.call_once(|| {
+            asyncrt::set_host_handle(tokio::runtime::Handle::current());
+        });
+    }
+
+    /// exec sleep -> kill(9) -> exitCode settles 137, container alive:
+    /// the kill runs by an in-container marker (the daemon reports host
+    /// PIDs, meaningless inside the container), needs no `kill` binary
+    /// (the shell builtin sends the signal), and never touches the
+    /// container itself.
+    #[tokio::test]
+    async fn kill_settles_the_exec_exit_and_spares_the_container() {
+        ensure_domain();
+        let mock = MockDaemon::start();
+        let engine = ContainerEngine {
+            runtime: None,
+            dns: Vec::new(),
+            resolv_conf: None,
+            docker: Docker::new(&mock.socket),
+            node: "test".to_string(),
+            bucket: None,
+            images: Mutex::new(HashMap::new()),
+            cells: Mutex::new(HashMap::new()),
+            networks: tokio::sync::Mutex::new(None),
+            fenced: tokio::sync::Mutex::new(false),
+        };
+        let cell = Arc::new(kill_cell());
+        let run = cell.begin_run();
+        cell.finish_start(run);
+        let proc = engine
+            .exec(
+                &cell,
+                ExecParams {
+                    cmd: vec!["sleep".to_string(), "60".to_string()],
+                    env: vec![
+                        ("A".to_string(), "b".to_string()),
+                        ("CELLD_EXEC_ID".to_string(), "forged".to_string()),
+                    ],
+                    cwd: None,
+                    user: None,
+                    combined: false,
+                    pty: false,
+                    cols: None,
+                    rows: None,
+                },
+            )
+            .await
+            .expect("exec sleep");
+        // The exec create carries the marker (ours, not the forged one).
+        let marker = format!("CELLD_EXEC_ID={};", proc.id);
+        {
+            let state = mock.state.lock().unwrap();
+            assert_eq!(state.exec_creates.len(), 1);
+            let env = state.exec_creates[0]["Env"].clone();
+            assert!(
+                env.as_array()
+                    .is_some_and(|env| env.iter().any(|entry| entry.as_str() == Some("A=b"))),
+                "{env}"
+            );
+            assert!(
+                env.as_array().is_some_and(|env| env
+                    .iter()
+                    .any(|entry| entry.as_str() == Some(marker.as_str()))),
+                "{env}"
+            );
+            assert!(!env.to_string().contains("forged"), "{env}");
+        }
+        proc.kill(9).await.expect("kill the sleep");
+        // The kill is a shell scan for the marker, not `kill -9 <host pid>`.
+        {
+            let state = mock.state.lock().unwrap();
+            assert_eq!(state.exec_creates.len(), 2);
+            let cmd = state.exec_creates[1]["Cmd"].clone();
+            let script = match cmd.as_array().map(Vec::as_slice) {
+                Some([sh, flag, script]) => {
+                    assert_eq!(sh.as_str(), Some("sh"));
+                    assert_eq!(flag.as_str(), Some("-c"));
+                    script.as_str().expect("scan script").to_string()
+                }
+                other => panic!("kill runs a shell scan, got {other:?}"),
+            };
+            assert!(script.contains(&marker), "{script}");
+            assert!(script.contains("-9"), "{script}");
+            assert!(!script.contains("424242"), "{script}");
+        }
+        assert_eq!(proc.wait().await.expect("exit code"), 137);
+        assert!(
+            mock.state.lock().unwrap().destructive.is_empty(),
+            "the kill must not touch the container"
+        );
+    }
+
+    /// The same kill against a real daemon: ignored by default (CI has
+    /// no daemon), run explicitly with one behind `DOCKER_HOST` and the
+    /// image below present in it. The mock above is the gate; this is
+    /// the independent oracle for the scan script itself.
+    #[tokio::test]
+    #[ignore]
+    async fn kill_settles_a_real_sleep_and_spares_its_container() {
+        ensure_domain();
+        const IMAGE: &str = "node:26-trixie-slim";
+        let docker =
+            Docker::discover().expect("a real daemon behind DOCKER_HOST (celld-test-dind)");
+        let name = "celld-kill-test".to_string();
+        docker
+            .call("DELETE", &format!("/containers/{name}?force=true"), None)
+            .await
+            .expect("remove stale test container");
+        let created = docker
+            .expect(
+                "POST",
+                &format!("/containers/create?name={name}"),
+                Some(json!({
+                    "Image": IMAGE,
+                    "Cmd": ["sleep", "300"],
+                    "HostConfig": { "Init": true },
+                })),
+                "create test container",
+            )
+            .await
+            .expect("create test container");
+        assert!(
+            created.status.is_success(),
+            "pull {IMAGE} into the test daemon first: {}",
+            created.message()
+        );
+        docker
+            .expect(
+                "POST",
+                &format!("/containers/{name}/start"),
+                None,
+                "start test container",
+            )
+            .await
+            .expect("start test container");
+        let engine = ContainerEngine {
+            runtime: None,
+            dns: Vec::new(),
+            resolv_conf: None,
+            docker: docker.clone(),
+            node: "test".to_string(),
+            bucket: None,
+            images: Mutex::new(HashMap::new()),
+            cells: Mutex::new(HashMap::new()),
+            networks: tokio::sync::Mutex::new(None),
+            fenced: tokio::sync::Mutex::new(false),
+        };
+        let mut cell = kill_cell();
+        cell.name = name.clone();
+        let cell = Arc::new(cell);
+        let run = cell.begin_run();
+        cell.finish_start(run);
+        let proc = engine
+            .exec(
+                &cell,
+                ExecParams {
+                    cmd: vec!["sleep".to_string(), "60".to_string()],
+                    env: Vec::new(),
+                    cwd: None,
+                    user: None,
+                    combined: false,
+                    pty: false,
+                    cols: None,
+                    rows: None,
+                },
+            )
+            .await
+            .expect("exec sleep");
+        proc.kill(9).await.expect("kill the sleep");
+        assert_eq!(proc.wait().await.expect("exit code"), 137);
+        let info = docker
+            .expect("GET", &format!("/containers/{name}/json"), None, "inspect")
+            .await
+            .expect("inspect test container")
+            .json()
+            .expect("inspect JSON");
+        assert_eq!(info["State"]["Running"], json!(true));
+        docker
+            .call("DELETE", &format!("/containers/{name}?force=true"), None)
+            .await
+            .expect("remove test container");
     }
 }

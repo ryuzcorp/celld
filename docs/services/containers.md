@@ -1,4 +1,4 @@
-<!-- Modified by ryuzcorp (ryuzcorp/celld): ctx.container.images; fence node-netns exception. -->
+<!-- Modified by ryuzcorp (ryuzcorp/celld): ctx.container.images; fence node-netns exception; exec kill delivery. -->
 # Containers
 
 A container runs a program that is not JavaScript beside the Worker that needs
@@ -36,7 +36,13 @@ celld implements this part of `ctx.container`:
 - `destroy()` stops the container, and `signal()` sends it a signal.
 - `getTcpPort(port).fetch()` sends an HTTP request to a port, and
   `getTcpPort(port).connect()` opens a raw socket.
-- `exec()` runs a process in the container.
+- `exec()` runs a process in the container. Its `kill(signal)` and an
+  aborted `signal` run a second exec that finds the process by an env
+  marker (`CELLD_EXEC_ID`) in `/proc` and signals it, and its children,
+  with the shell's `kill`. The image needs `sh`, `grep`, and `/proc`;
+  without them the kill is not delivered and is logged as
+  `container_exec_kill_failed`. A process that clears its environment
+  or changes user is not found, and its `exitCode` waits for it to exit.
 - `setInactivityTimeout()` sets the idle window.
 
 On Linux, `getTcpPort(port)` reaches every port through the bridge address of

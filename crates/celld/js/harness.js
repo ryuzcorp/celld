@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): ctx.container.images; clone() of streaming and disturbed bodies; __celld$do on the service-binding RPC path; container exec pty/resize; cross-isolate RPC stubs and streams; container exec AbortSignal.
+// Modified by ryuzcorp (ryuzcorp/celld): ctx.container.images; clone() of streaming and disturbed bodies; __celld$do on the service-binding RPC path; container exec pty/resize; cross-isolate RPC stubs and streams; container exec AbortSignal; test-only fake kill completion.
 // The DO object model and the Cloudflare-compatible runtime surface, run
 // once per isolate by `js.rs::install_harness` after the Web-API prelude.
 // Lived as a 4,000-line raw string inside js.rs until 2026-07-29; it is a
@@ -6487,6 +6487,7 @@ if (__test_wait_enabled())
     ids(scope) { return JSON.parse(__testexec_ids(scope)); },
     exit(id, code) { __testexec_exit(id, code); },
     kills(id) { return JSON.parse(__testexec_kills(id)); },
+    killsCompleted(id) { return JSON.parse(__testexec_kills_completed(id)); },
     params(id) { return JSON.parse(__testexec_params(id)); },
   };
 const __entrypointClass = (name) => {
