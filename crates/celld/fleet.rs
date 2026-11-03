@@ -1,4 +1,5 @@
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
+// Modified by ryuzcorp (ryuzcorp/celld): deploy --sourcemap writes the bundle's external map.
 
 // Fleet CLI and peer-diagnostic work executes outside the Actor execution
 // domain.
@@ -585,6 +586,9 @@ pub async fn run_deploy(arguments: Vec<String>) -> anyhow::Result<()> {
     }
     let built = deploy::build(&options)?;
     built.report();
+    // A local file, before anything reaches the bucket: a bad path fails the
+    // deploy without publishing, and dry runs emit the map too.
+    deploy::write_sourcemap(&options, &built)?;
     let mut out = Output::new(if options.json {
         Format::Json
     } else {

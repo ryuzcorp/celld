@@ -1,4 +1,5 @@
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
+// Modified by ryuzcorp (ryuzcorp/celld): deploy --sourcemap writes the bundle's external map.
 
 //! The build path for a Worker whose `main` is a `.py` file.
 //!
@@ -331,7 +332,15 @@ pub fn build(
         ),
         ("sentinel.wasm".to_string(), sentinel),
     ];
-    Ok((BundleOutput { bundle, wasm }, descriptor))
+    // Python bundles are generated bridges, not esbuild output: no map.
+    Ok((
+        BundleOutput {
+            bundle,
+            wasm,
+            sourcemap: None,
+        },
+        descriptor,
+    ))
 }
 
 fn is_identifier(name: &str) -> bool {

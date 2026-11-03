@@ -1,4 +1,4 @@
-<!-- Modified by ryuzcorp (ryuzcorp/celld): CELLD_MEMORY_SCOPE. -->
+<!-- Modified by ryuzcorp (ryuzcorp/celld): CELLD_MEMORY_SCOPE; deploy --sourcemap writes the bundle's external map. -->
 # celld
 
 celld is a stateful distributed system. It runs server-side JavaScript on
@@ -242,7 +242,10 @@ R2 buckets, Workflows, WebAssembly modules, and static assets. An unknown
 Wrangler configuration key stops the deploy. See
 [Cloudflare compatibility](cloudflare-compat.md) for the complete boundary.
 A node verifies the SHA-256 digest of each module before it builds a
-deployment.
+deployment. Pass `--sourcemap PATH` to also write the bundled Worker's
+external source map to a local file for stack-trace symbolication; the
+deployed bytes are identical with or without it, and asset-only,
+`no_bundle`, and Python projects warn and write nothing.
 
 A running node does not restart for a new deployment. Each node reads
 `deploy/current.json` every `CELLD_DEPLOY_POLL_S` seconds (default 30) and
