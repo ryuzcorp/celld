@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): ctx.container.images; clone() of streaming and disturbed bodies; __celld$do on the service-binding RPC path; container exec pty/resize; cross-isolate RPC stubs and streams; container exec AbortSignal; test-only fake kill completion.
+// Modified by ryuzcorp (ryuzcorp/celld): ctx.container.images; clone() of streaming and disturbed bodies; __celld$do on the service-binding RPC path; container exec pty/resize; cross-isolate RPC stubs and streams; container exec AbortSignal; test-only fake kill completion; exec reads survive their subscribing event.
 // The DO object model and the Cloudflare-compatible runtime surface, run
 // once per isolate by `js.rs::install_harness` after the Web-API prelude.
 // Lived as a 4,000-line raw string inside js.rs until 2026-07-29; it is a
@@ -2336,7 +2336,10 @@ const __validSignal = (signo) => Number.isInteger(signo) && signo > 0 && signo <
 const __execStream = (id, which) => new ReadableStream({
   type: "bytes",
   async pull(controller) {
-    const chunk = await __container_exec_read(id, which);
+    // Retained across native-event retirements: a read issued in one
+    // event and consumed in another (a read-ahead, a terminal frame)
+    // re-subscribes instead of hanging on the dropped op.
+    const chunk = await __retainedExecRead(id, which);
     if (chunk.byteLength === 0) controller.close();
     else controller.enqueue(new Uint8Array(chunk));
   },
@@ -4715,6 +4718,32 @@ const __refreshRetainedWaits = () => {
     __subscribeRetainedWait(record);
   }
 };
+// One exec output chunk that survives its subscribing event: the
+// backing read is unrefed (it dies with its subscribing event), so
+// the stable promise re-subscribes in each later event -- the same
+// rule retained waits follow above. Subscriptions chain: each names
+// the previous one, so a re-subscription after a dropped op takes
+// the consumed bytes from the pipe stash instead of reading ahead,
+// and a late pile-up comes back superseded (swallowed below: another
+// subscription owns the read) instead of settling.
+const __EXEC_READ_SUPERSEDED = "exec read superseded by a newer subscription";
+const __execReadNever = new Promise(() => {});
+const __retainedExecRead = (id, which) => {
+  const lease = __exec_read_seq();
+  let prev = 0;
+  return __retainedWait(() => {
+    const my = __exec_read_seq();
+    const take = prev;
+    prev = my;
+    return __container_exec_read(id, which, lease, take, my).then(
+      (bytes) => bytes,
+      (error) => {
+        if (String((error && error.message) || error) === __EXEC_READ_SUPERSEDED)
+          return __execReadNever;
+        throw error;
+      });
+  });
+};
 // Replace stub-able values with wire markers. Runs only after a
 // plain clone failed, so plain-data serialization never pays for
 // it. Passing an existing stub transfers its reference: the
@@ -6489,6 +6518,19 @@ if (__test_wait_enabled())
     kills(id) { return JSON.parse(__testexec_kills(id)); },
     killsCompleted(id) { return JSON.parse(__testexec_kills_completed(id)); },
     params(id) { return JSON.parse(__testexec_params(id)); },
+  };
+// Test-only in-memory exec processes: `spawn` mints a real process-table
+// entry, `emit`/`eof` feed its pipes, and `stream` is the production
+// exec output stream, so a test drives the real cross-event read path
+// where no container engine exists. Defined only on nodes booted with
+// CELLD_TEST_WAIT=1 (the cross-event conformance suites).
+if (__test_wait_enabled())
+  globalThis.__celldTestProcForTestOnly = {
+    spawn() { return __testproc_spawn(); },
+    emit(id, which, bytes) { __testproc_emit(id, which, bytes); },
+    eof(id, which) { __testproc_eof(id, which); },
+    stream(id, which) { return __execStream(id, which); },
+    drop(id) { __container_exec_drop(id); },
   };
 const __entrypointClass = (name) => {
   const cls = __cell.entrypoints[name];

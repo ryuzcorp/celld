@@ -9,7 +9,7 @@ README below is kept intact; this file documents the fork.
 
 - `main` mirrors upstream `main` and carries no patches.
 - `ryuzcorp/v<version>` is a line branch: the upstream tag `v<version>`
-  plus our patches as commits, one commit per patch, in `0001`-`0015`
+  plus our patches as commits, one commit per patch, in `0001`-`0016`
   order. Each patch commit is self-contained and carries its own tests.
 
 Upstream's `.github/workflows/release.yml` targets `ghcr.io/denoland` and
@@ -213,7 +213,7 @@ push to `ghcr.io/denoland`, but still. Pushing a branch named
   only — a container still cannot open a connection to the node — and no
   per-container ownership: a hoster with untrusting tenants on one engine
   still enforces which containers a node may dial above celld.
-- `0015` (sha TBD at merge) container exec kill reaches the process:
+- `0015` (`180ce26`) container exec kill reaches the process:
   the kill op runs under the start's lifetime (a fire-and-forget kill
   no longer dies with its event), and the signal is delivered by an
   in-container scan for the exec's marker env instead of a host-pid
@@ -222,6 +222,14 @@ push to `ghcr.io/denoland`, but still. Pushing a branch named
   and the container is untouched. The image needs `sh`, `grep` and
   `/proc`; an undelivered kill logs `container_exec_kill_failed`. This
   also makes `0010`'s abort signal reach the process.
+- `0016` (sha TBD at merge) container exec reads survive their
+  subscribing event: a read issued in one event and consumed in
+  another (a read-ahead, a terminal frame) re-subscribes per event
+  like a retained wait instead of hanging on the dropped op, while
+  the pipe stash hands a consumed-but-discarded chunk to the chained
+  re-subscription and the lease slot turns a late pile-up aside, so
+  bytes arrive exactly once. Test-only in-memory exec processes
+  stand in for the daemon where no engine exists.
 
 ## Releases
 

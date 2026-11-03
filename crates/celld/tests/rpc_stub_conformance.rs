@@ -1,7 +1,7 @@
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 //
 // Modified by ryuzcorp (ryuzcorp/celld): cross-isolate RPC
-// stubs and streams. Apache-2.0.
+// stubs and streams; response bodies across events. Apache-2.0.
 
 // A black-box runner, not node code: it boots the binary, copies fixtures,
 // and polls TCP with wall-clock deadlines, so the execution boundary's
@@ -826,6 +826,41 @@ fn rpc_stub_facet_export_validates_under_its_root() {
     let node = TestNode::boot(fixture.path(), "facet");
     let flow = get_json(&node, "/facet-stub");
     assert_eq!(flow["sum"], 42, "{flow}");
+}
+
+#[test]
+fn rpc_stub_response_body_across_events() {
+    // A stub method returning a Response with a streamed body settles
+    // when the body's reads span native events: the read-ahead went
+    // out in the call's event and the bytes arrive after it (the file
+    // read shape). The buffered shape is the control: it crosses by
+    // value and never touches the read path. Both shapes also run
+    // through a nested stub op.
+    let fixture = copy_fixture("resp");
+    let node = TestNode::boot_with_env(fixture.path(), "resp", &[("CELLD_TEST_WAIT", "1")]);
+    let buffered = get_json(&node, "/response-buffered");
+    assert_eq!(
+        buffered["data"],
+        serde_json::json!({"ok": true, "n": 3}),
+        "{buffered}"
+    );
+    let streamed = get_json(&node, "/response-read-ahead");
+    assert_eq!(
+        streamed["data"],
+        serde_json::json!({"ok": true, "n": 3}),
+        "{streamed}"
+    );
+    let nested = get_json(&node, "/response-nested");
+    assert_eq!(
+        nested["data"],
+        serde_json::json!({"ok": true, "n": 3}),
+        "{nested}"
+    );
+    assert_eq!(
+        nested["bufData"],
+        serde_json::json!({"ok": true, "n": 3}),
+        "{nested}"
+    );
 }
 
 #[test]
