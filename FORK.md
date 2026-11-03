@@ -9,7 +9,7 @@ README below is kept intact; this file documents the fork.
 
 - `main` mirrors upstream `main` and carries no patches.
 - `ryuzcorp/v<version>` is a line branch: the upstream tag `v<version>`
-  plus our patches as commits, one commit per patch, in `0001`-`0035`
+  plus our patches as commits, one commit per patch, in `0001`-`0036`
   order. Each patch commit is self-contained and carries its own tests.
 
 Upstream's `.github/workflows/release.yml` targets `ghcr.io/denoland` and
@@ -294,58 +294,58 @@ push to `ghcr.io/denoland`, but still. Pushing a branch named
   longer clears the AUTOINCREMENT counters of tables the dump does not
   name, so those tables cannot reissue the ids of deleted rows. A full
   dump still restores every counter exactly.
-- `0025` (sha TBD at merge) port of meln1k/celld@ea471ee: a newer
+- `0025` (`dd83576`) port of meln1k/celld@ea471ee: a newer
   ownership release retires the in-flight one it supersedes, fixing
   the debug `indexed cell op N has no owning slot` panic and the
   release-build `cell_ops` leak; adds the
   `crates/logic/tests/regressions.rs` scripted-reproduction harness.
-- `0026` (sha TBD at merge) port of meln1k/celld@e46a685: fence
+- `0026` (`ca46f61`) port of meln1k/celld@e46a685: fence
   settles startup confirmation reads, fixing the debug
   `confirming cell left the owner read in Fenced` panic on the
   halting event.
-- `0027` (sha TBD at merge) port of meln1k/celld@e6cb9a3: the alarm
+- `0027` (`589d893`) port of meln1k/celld@e6cb9a3: the alarm
   observer carries `WakeCoverage`, and wake maintenance reports
   `Confirmed` once the flusher says the current installation is
   covered, so a restored alarm no longer pins its cell resident
   forever.
-- `0028` (sha TBD at merge) port of meln1k/celld@6d61462: a reset
+- `0028` (`f4cd289`) port of meln1k/celld@6d61462: a reset
   settles an alarm handler still running without a barrier as a
   failed handler (re-armed, op retired, wake entry kept), fixing
   the `firing an alarm while not resident` panic on failed proofs.
-- `0029` (sha TBD at merge) port of meln1k/celld@18d3bf9: the
+- `0029` (`82503e2`) port of meln1k/celld@18d3bf9: the
   near-alarm eviction refusal applies only when the node has room
   to spare (no shedding, draining, or waiters), so a full node
   sheds instead of parking a waiter until its deadline.
-- `0030` (sha TBD at merge) port of meln1k/celld@9d4c163 (lib.rs
+- `0030` (`bebe38a`) port of meln1k/celld@9d4c163 (lib.rs
   hunks only; sim/docs files not ported): a drain counts every
   handoff against `max_releases` and its pump reads the live
   count; wake hints and alarm timers wait out a balancing move
   and fence clears the handoff mark; preserve settles a
   confirming read. Adds scripted reproductions for the drain
   ceiling, the handoff wait and clear, and the preserve settle.
-- `0031` (sha TBD at merge) port of the two core fixes in
+- `0031` (`10075c8`) port of the two core fixes in
   meln1k/celld@468b456 (lib.rs hunks only; sim/docs files not
   ported): a reset drops the cell's sockets with its runtime,
   fixing the `live transport while not resident` panic, and a
   hibernatable socket's events wait for the restarted runtime
   on a quiescing cell, fixing the swap deadlock. Adds scripted
   reproductions for both.
-- `0032` (sha TBD at merge) port of meln1k/celld@01522b3 (sim file
+- `0032` (`6ad1c53`) port of meln1k/celld@01522b3 (sim file
   not ported): a takeover from an expired lease that never opened
   a log waits for recovery, which CAS-seals the absent log so a
   stale session cannot open one through a renewal and ack into
   the superseded epoch; the seal refuses a lease that reads live.
-- `0033` (sha TBD at merge) port of meln1k/celld@b026226 (logic
+- `0033` (`006104f`) port of meln1k/celld@b026226 (logic
   files only; sim/docs files not ported): 51 behavior-neutral
   code probes counting the core's rare branches, read through
   `State::probes`; prerequisite instrumentation for `0034`.
-- `0034` (sha TBD at merge) port of meln1k/celld@65fdb13 (logic
+- `0034` (`f7cb761`) port of meln1k/celld@65fdb13 (logic
   files only; sim/docs files not ported): a cell whose last
   restore failed keeps its owner record — the drain and the
   balancer skip it — so no peer restores it from the bucket
   alone and loses the acknowledged tail; counted by the new
   `DormantKeptUnfolded` probe. Adds a scripted reproduction.
-- `0035` (sha TBD at merge) wake-coverage follow-ups to the
+- `0035` (`77f722d`) wake-coverage follow-ups to the
   ported `0027`: the startup alarm observation is sent under
   the registry lock after the cell is registered, so a racing
   coverage report finds the handle; coverage reports compare
@@ -357,6 +357,15 @@ push to `ghcr.io/denoland`, but still. Pushing a branch named
   the execution domain through the same shared test runtime,
   since a second `set_host_handle` would trip its
   exactly-once assert in one test binary.
+- `0036` (sha TBD at merge) concurrent requests share one isolate
+  without stalling or borrowing each other's request: stateless entries
+  carry continuation tokens so a shared promise's waiter keeps its own
+  ops, the first turn installs its token for settling work, and event
+  frames, request `/tmp`, subrequest budgets, and body-stream transfers
+  resolve the running entry instead of the turn owner; request-owned
+  sockets, WebSockets, HTMLRewriters and stream tees are accounted to
+  the owning request, and a retired owner throws with nothing
+  registered.
 
 Patches `0025`–`0034` are ported fixes from
 [meln1k/celld](https://github.com/meln1k/celld) by Nikita

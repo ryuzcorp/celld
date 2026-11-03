@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): tenant egress policy.
+// Modified by ryuzcorp (ryuzcorp/celld): tenant egress policy; reaction-aware request resources.
 //! Outbound TCP host ops for `cloudflare:sockets` `connect()`.
 //!
 //! A socket is a split tokio stream in a process-global registry: the
@@ -157,11 +157,19 @@ pub(super) fn op_tcp_connect(
         Ok(request) => request,
         Err(error) => return loader_throw(scope, &format!("connect(): {error}")),
     };
+    // The owner is the running entry's request: a continuation resumed in a
+    // foreign checkpoint must account its socket to its own event. Resolving
+    // the turn owner instead lets the turn owner's retirement close a live
+    // socket — or, mid-connect, insert it with no owner at all. Check first:
+    // a retired owner throws with nothing pushed.
+    let Some(event) = event_context(scope) else {
+        return retired_event_throw(scope);
+    };
     // The id exists before the connection does, so the request context
     // can own the socket even if the event ends mid-connect.
     let id = next_id();
-    current_context().tcp_sockets.lock().unwrap().push(id);
-    let gate = egress_gate_request(&event_context(scope), celld_logic::Channel::Tcp);
+    event.tcp_sockets.lock().unwrap().push(id);
+    let gate = egress_gate_request(&event, celld_logic::Channel::Tcp);
     let async_id =
         asyncrt::enqueue(async move {
             await_egress_gate(gate).await?;
@@ -237,7 +245,10 @@ pub(super) fn op_tcp_write(
         return loader_throw(scope, "socket write needs bytes");
     };
     let half = registry().lock().unwrap().get(&id).map(|s| s.write.clone());
-    let gate = egress_gate_request(&event_context(scope), celld_logic::Channel::Tcp);
+    let Some(event) = event_context(scope) else {
+        return retired_event_throw(scope);
+    };
+    let gate = egress_gate_request(&event, celld_logic::Channel::Tcp);
     let async_id = asyncrt::enqueue(async move {
         await_egress_gate(gate).await?;
         let half = half.ok_or("socket is closed")?;
@@ -263,7 +274,10 @@ pub(super) fn op_tcp_shutdown(
 ) {
     let id = args.get(0).integer_value(scope).unwrap_or(0) as u64;
     let half = registry().lock().unwrap().get(&id).map(|s| s.write.clone());
-    let gate = egress_gate_request(&event_context(scope), celld_logic::Channel::Tcp);
+    let Some(event) = event_context(scope) else {
+        return retired_event_throw(scope);
+    };
+    let gate = egress_gate_request(&event, celld_logic::Channel::Tcp);
     let async_id = asyncrt::enqueue(async move {
         await_egress_gate(gate).await?;
         let half = half.ok_or("socket is closed")?;
@@ -303,9 +317,14 @@ pub(super) fn op_tcp_starttls(
         Ok(request) => request,
         Err(error) => return loader_throw(scope, &format!("startTls(): {error}")),
     };
+    // As for `connect`: the running entry owns the upgraded socket, and a
+    // retired owner throws before anything is pushed.
+    let Some(event) = event_context(scope) else {
+        return retired_event_throw(scope);
+    };
     let new_id = next_id();
-    current_context().tcp_sockets.lock().unwrap().push(new_id);
-    let gate = egress_gate_request(&event_context(scope), celld_logic::Channel::Tcp);
+    event.tcp_sockets.lock().unwrap().push(new_id);
+    let gate = egress_gate_request(&event, celld_logic::Channel::Tcp);
     let async_id = asyncrt::enqueue(async move {
         await_egress_gate(gate).await?;
         // The plaintext socket remains registered while the gate waits so the

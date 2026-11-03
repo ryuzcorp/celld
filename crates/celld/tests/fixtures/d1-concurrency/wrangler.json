@@ -1,0 +1,14 @@
+{
+  "name": "d1-concurrency",
+  "main": "worker.js",
+  "compatibility_date": "2026-01-01",
+  "no_bundle": true,
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "concurrency",
+      "database_id": "00000000-0000-0000-0000-000000000001"
+    }
+  ],
+  "services": [{ "binding": "SELF", "service": "d1-concurrency" }]
+}
