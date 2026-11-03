@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): ported from meln1k/celld: scripted core-bug reproductions (ea471ee, e46a685).
+// Modified by ryuzcorp (ryuzcorp/celld): ported from meln1k/celld: scripted core-bug reproductions (ea471ee, e46a685, 6d61462).
 //! Scripted reproductions of core bugs the deterministic simulator
 //! (`crates/sim`) found. Each drives the core through a minimal shell that
 //! answers every effect at once, except the ones a test holds back to
@@ -8,9 +8,11 @@
 //! these tests rely on; they also call it directly so a release build still
 //! checks the final state.
 
+use celld_logic::wake::{AlarmSnapshot, AlarmSource, PublicationId};
 use celld_logic::{
-    on_event, pressure, CasOutcome, Config, Effect, Event, LeaseCasOutcome, LocalCell,
-    NodeLeaseSpec, OwnerRecord, OwnershipOnEvict, RestoreOutcome, State, Timer,
+    on_event, pressure, CasOutcome, Channel, Config, Effect, Event, Failure, LeaseCasOutcome,
+    LocalCell, NodeLeaseSpec, OwnerRecord, OwnershipOnEvict, ProofSource, RestoreOutcome, State,
+    Timer,
 };
 use std::collections::{BTreeMap, VecDeque};
 
@@ -202,6 +204,26 @@ impl Shell {
         self.next_etag.to_string()
     }
 
+    /// Report `cell`'s alarm at `at_ms` as its runtime does, covered by a
+    /// wake entry.
+    fn observe_alarm(&mut self, cell: &str, at_ms: i64) {
+        let epoch = self.owners[cell].epoch;
+        let alarm = AlarmSnapshot::committed(
+            Some(at_ms),
+            AlarmSource {
+                id: PublicationId { epoch, sequence: 1 },
+                position: 1,
+            },
+        );
+        self.send(Event::AlarmObserved {
+            cell: cell.into(),
+            alarm,
+            covered: true,
+            now_ms: NOW_MS,
+            now_mono_ms: MONO_MS,
+        });
+    }
+
     /// Route one request locally and finish its activity.
     fn serve(&mut self, request: u64, cell: &str) {
         let effects = self.send(Event::RequestAt {
@@ -291,5 +313,84 @@ fn a_fence_settles_startup_confirmation_reads() {
     assert!(effects
         .iter()
         .any(|effect| matches!(effect, Effect::Halt { .. })));
+    shell.state.validate().expect("state invariant");
+}
+
+/// A request's durability proof fails while an alarm handler is running on
+/// the same runtime. The reset discards the runtime, and it used to leave the
+/// alarm `Firing` on a cell that was no longer resident: `validate` failed,
+/// and the firing op stayed half retired until the stop completed.
+#[test]
+fn a_failed_proof_settles_an_alarm_still_running() {
+    let mut shell = Shell::new(4, |effect| {
+        matches!(
+            effect,
+            Effect::AwaitDurable { .. } | Effect::FireAlarm { .. }
+        )
+    });
+    shell.start();
+    let effects = shell.send(Event::RequestAt {
+        request: 1,
+        cell: "a".into(),
+        now_mono_ms: MONO_MS,
+    });
+    assert!(effects
+        .iter()
+        .any(|effect| matches!(effect, Effect::Complete { request: 1, .. })));
+    shell.observe_alarm("a", NOW_MS as i64 - 1);
+    shell.send(Event::OutputAt {
+        request: 1,
+        channel: Channel::Response,
+        position: Some(1),
+        observed: None,
+        epoch: None,
+        now_mono_ms: MONO_MS,
+    });
+    let alarm = shell
+        .timers
+        .iter()
+        .rev()
+        .find(|timer| matches!(timer, Timer::CellAlarm { .. }))
+        .cloned()
+        .expect("the observed alarm arms its timer");
+    shell.send(Event::TimerFired {
+        timer: alarm,
+        now_ms: NOW_MS,
+        now_mono_ms: MONO_MS,
+    });
+    let held = std::mem::take(&mut shell.held);
+    let fire = held
+        .iter()
+        .find_map(|effect| match effect {
+            Effect::FireAlarm {
+                op, cell, epoch, ..
+            } => Some((*op, cell.clone(), *epoch)),
+            _ => None,
+        })
+        .expect("the due alarm fires");
+    let proof = held
+        .iter()
+        .find_map(|effect| match effect {
+            Effect::AwaitDurable { op, .. } => Some(*op),
+            _ => None,
+        })
+        .expect("the write waits for its proof");
+
+    shell.hold = |_| false;
+    shell.send(Event::DurableReached {
+        op: proof,
+        result: Err(Failure::Ambiguous),
+        source: ProofSource::Bucket,
+    });
+    // The handler's answer arrives after its runtime is gone.
+    let (op, cell, epoch) = fire;
+    shell.send(Event::AlarmFinished {
+        op,
+        cell,
+        epoch,
+        now_ms: NOW_MS,
+        now_mono_ms: MONO_MS,
+        result: Ok((AlarmSnapshot::without_wake(None), true, Some(2))),
+    });
     shell.state.validate().expect("state invariant");
 }
