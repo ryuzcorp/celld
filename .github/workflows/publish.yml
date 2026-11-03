@@ -9,8 +9,11 @@
 #   `push`     per architecture: refuse an already-published tag (only
 #              a confirmed "not found" lets it publish), then run the
 #              Dockerfile's test stage and push the arch image
-#   `publish`  stitch the multi-arch tag, print the index digest and
-#              the Dockerfile pin lines to the step summary
+#   `publish`  stitch the multi-arch tag, attest SLSA provenance for
+#              the index digest (each arch build also records
+#              provenance and an SBOM), and print the index digest,
+#              the Dockerfile pin lines, and the attestation verify
+#              command to the step summary
 #
 # A level that is already published is never overwritten: cut a new tag.
 name: publish
@@ -126,6 +129,8 @@ jobs:
             --label "org.opencontainers.image.version=$tag" \
             --label "org.opencontainers.image.revision=$sha" \
             --label "now.ryuzcorp.celld.upstream=$upstream" \
+            --provenance=mode=max \
+            --sbom=true \
             --cache-from "type=registry,ref=$cache" \
             --cache-to "type=registry,ref=$cache,mode=max" \
             --tag "$image:$tag-${{ matrix.suffix }}" \
@@ -140,6 +145,8 @@ jobs:
     permissions:
       contents: read
       packages: write
+      id-token: write
+      attestations: write
     steps:
       - name: Log in to GHCR
         env:
@@ -148,6 +155,7 @@ jobs:
           printf '%s' "$GHCR_TOKEN" |
             docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
       - name: Publish
+        id: publish
         run: |
           set -euo pipefail
           tag="${GITHUB_REF_NAME#v}"
@@ -156,6 +164,7 @@ jobs:
             "$image:$tag-amd64" "$image:$tag-arm64"
           digest=$(docker buildx imagetools inspect "$image:$tag" \
             --format '{{json .Manifest.Digest}}' | tr -d '"')
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
           {
             echo "## celld $tag"
             echo "index digest: \`$digest\`"
@@ -164,4 +173,14 @@ jobs:
             echo "ARG CELLD_VERSION=$tag"
             echo "ARG CELLD_DIGEST=$digest"
             echo '```'
+            echo "Verify the SLSA provenance attestation:"
+            echo '```'
+            echo "gh attestation verify oci://$image@$digest --repo ryuzcorp/celld"
+            echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+      - name: Attest image provenance
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-name: ghcr.io/ryuzcorp/celld
+          subject-digest: ${{ steps.publish.outputs.digest }}
+          push-to-registry: true
