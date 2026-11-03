@@ -9423,8 +9423,11 @@ fn op_stub_export(
     // never validate: export under the facet's root scope and epoch
     // instead, so the stub dies with the root. An own-script facet runs
     // in the root's isolate, so dispatch finds the entry there; a facet
-    // in a loaded Worker's isolate keeps failing closed (its generation
-    // never matches the root's, and the root isolate holds no entry).
+    // in a loaded Worker's isolate keeps failing closed because the root
+    // isolate holds no `__hostStubs` entry for it (the drive returns a
+    // released-stub error envelope, never a call into the facet isolate).
+    // Loaded workers inherit their parent's generation, so generation
+    // alone does not separate them.
     let (root, epoch) = match crate::storage::embedded_root_gate(&cell) {
         Some(gate) => (gate.cell, gate.epoch),
         None => {
