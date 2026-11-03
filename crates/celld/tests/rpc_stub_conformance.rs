@@ -57,11 +57,33 @@ fn free_port() -> u16 {
     listener.local_addr().expect("probe addr").port()
 }
 
+/// Tempdir for one fixture copy: `/dev/shm` when usable, else the
+/// default tempdir.
+///
+/// Each booted `celld dev` keeps its SQLite store beside its fixture
+/// copy, and the node self-fences when a lease commit stalls past the
+/// TTL bound. Parallel suites on a loaded disk stall commits for
+/// seconds (observed: a 700-byte commit taking 4.4 s), fencing healthy
+/// nodes and failing the run with refused/reset/empty reads. Tmpfs has
+/// no fsync/writeback latency, so the stores stop sharing the box's
+/// disk queue; the suites test RPC behavior, not store durability (the
+/// fence path has its own tests), so coverage is unchanged. Where
+/// `/dev/shm` is missing or unwritable the default tempdir applies, as
+/// before.
+fn fixture_tempdir(prefix: &str) -> tempfile::TempDir {
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(prefix);
+    match builder.tempdir_in("/dev/shm") {
+        Ok(dir) => dir,
+        Err(error) => {
+            eprintln!("fixture tempdir fell back to disk (/dev/shm unusable: {error})");
+            builder.tempdir().expect("fixture tempdir")
+        }
+    }
+}
+
 fn copy_fixture(name: &str) -> tempfile::TempDir {
-    let dir = tempfile::Builder::new()
-        .prefix(&format!("celld-rpc-stub-{name}-"))
-        .tempdir()
-        .expect("tempdir");
+    let dir = fixture_tempdir(&format!("celld-rpc-stub-{name}-"));
     for file in ["wrangler.json", "index.js"] {
         std::fs::copy(fixture_source().join(file), dir.path().join(file)).expect("copy fixture");
     }
@@ -326,6 +348,23 @@ fn poll_until(
 }
 
 #[test]
+fn fixture_tempdir_prefers_shm() {
+    // Pins the flake fix: when /dev/shm takes a tempdir, fixtures must
+    // live there, not on the box's disk queue.
+    let probe = tempfile::Builder::new()
+        .prefix("celld-shm-probe-")
+        .tempdir_in("/dev/shm");
+    if probe.is_ok() {
+        assert!(
+            fixture_tempdir("celld-shm-pin-")
+                .path()
+                .starts_with("/dev/shm"),
+            "fixtures must prefer /dev/shm when usable"
+        );
+    }
+}
+
+#[test]
 fn rpc_stub_conformance() {
     let fixture = copy_fixture("flow");
     // The JS-side drain asserts below read the test-only stats hook, so
@@ -435,9 +474,15 @@ fn rpc_stub_conformance() {
     assert_eq!(upload["echo"]["text"], "up-1\nup-2\n", "{upload}");
     assert_eq!(upload["first"]["first"], "first\n", "{upload}");
     assert_eq!(upload["firstCancelled"], true, "{upload}");
-    poll_until("upload drain", Duration::from_secs(30), || {
-        (upload_count(&node) == 0).then(|| "drained".to_string())
-    });
+    // The host entries drain synchronously with the request: context
+    // end aborts every upload the invocation created, so the count is
+    // already zero when the response lands. (The caller pumps unregister
+    // through an async finally, so they still poll below.)
+    assert_eq!(
+        upload_count(&node),
+        0,
+        "request end aborts the invocation's uploads"
+    );
     poll_until("upload pumps", Duration::from_secs(30), || {
         (caller_stats(&node)["ctxUploads"] == 0).then(|| "drained".to_string())
     });

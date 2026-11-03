@@ -9,7 +9,7 @@ README below is kept intact; this file documents the fork.
 
 - `main` mirrors upstream `main` and carries no patches.
 - `ryuzcorp/v<version>` is a line branch: the upstream tag `v<version>`
-  plus our patches as commits, one commit per patch, in `0001`-`0018`
+  plus our patches as commits, one commit per patch, in `0001`-`0019`
   order. Each patch commit is self-contained and carries its own tests.
 
 Upstream's `.github/workflows/release.yml` targets `ghcr.io/denoland` and
@@ -238,7 +238,7 @@ push to `ghcr.io/denoland`, but still. Pushing a branch named
   decoded keys in UTF-8 byte order while the store walks the encoded
   form, so continuing by `--after` can omit keys. `--json` keeps
   upstream's one-record-per-line output.
-- `0018` (sha TBD at merge) per-node Workers Cache API: `caches.default` and
+- `0018` (`aa4d061`) per-node Workers Cache API: `caches.default` and
   `caches.open(name)` over a process-local store keyed by the script name
   the host read from isolate state, so all isolates of a script on the
   node share entries and no script can name another's. Cloudflare
@@ -247,6 +247,15 @@ push to `ghcr.io/denoland`, but still. Pushing a branch named
   conditional and range answers, `CF-Cache-Status: HIT` on hits,
   `CELLD_CACHE_MAX_BYTES` cap (64 MiB default) with LRU eviction.
   Release note: default 64 MiB per node of new memory; set CELLD_CACHE_MAX_BYTES=0 to disable.
+- `0019` (sha TBD at merge) context end aborts finished uploads: the caller runtime used
+  to abort only pumps still registered at context end, so an upload
+  whose pump already finished lingered sender-alive until isolate
+  retirement; context end now aborts every upload id the context
+  created, and the flow test asserts the host count is zero the moment
+  the upload response lands. The conformance suites keep their
+  fixture stores on tmpfs (a loud disk fallback where it is missing),
+  so parallel suites on a loaded disk no longer stall lease commits
+  into a node self-fence.
 
 ## Releases
 

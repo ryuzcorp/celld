@@ -54,6 +54,31 @@ fn copy_dir(src: &Path, dst: &Path) {
     }
 }
 
+/// Tempdir for one fixture copy: `/dev/shm` when usable, else the
+/// default tempdir.
+///
+/// Each booted `celld dev` keeps its SQLite store beside its fixture
+/// copy, and the node self-fences when a lease commit stalls past the
+/// TTL bound. Parallel suites on a loaded disk stall commits for
+/// seconds (observed: a 700-byte commit taking 4.4 s), fencing healthy
+/// nodes and failing the run with refused/reset/empty reads. Tmpfs has
+/// no fsync/writeback latency, so the stores stop sharing the box's
+/// disk queue; the suites test RPC behavior, not store durability (the
+/// fence path has its own tests), so coverage is unchanged. Where
+/// `/dev/shm` is missing or unwritable the default tempdir applies, as
+/// before.
+fn fixture_tempdir(prefix: &str) -> tempfile::TempDir {
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(prefix);
+    match builder.tempdir_in("/dev/shm") {
+        Ok(dir) => dir,
+        Err(error) => {
+            eprintln!("fixture tempdir fell back to disk (/dev/shm unusable: {error})");
+            builder.tempdir().expect("fixture tempdir")
+        }
+    }
+}
+
 /// Deploy the controller into the app project's dev bucket before `dev`
 /// boots, so the node loads both scripts. `dev` deploys the app itself and
 /// becomes primary (last write wins `deploy/current.json`); the
@@ -225,11 +250,25 @@ fn poll_until(
 }
 
 #[test]
+fn fixture_tempdir_prefers_shm() {
+    // Pins the flake fix: when /dev/shm takes a tempdir, fixtures must
+    // live there, not on the box's disk queue.
+    let probe = tempfile::Builder::new()
+        .prefix("celld-shm-probe-")
+        .tempdir_in("/dev/shm");
+    if probe.is_ok() {
+        assert!(
+            fixture_tempdir("celld-shm-pin-")
+                .path()
+                .starts_with("/dev/shm"),
+            "fixtures must prefer /dev/shm when usable"
+        );
+    }
+}
+
+#[test]
 fn svc_stub_wait_conformance() {
-    let dir = tempfile::Builder::new()
-        .prefix("celld-svc-stub-wait-")
-        .tempdir()
-        .expect("tempdir");
+    let dir = fixture_tempdir("celld-svc-stub-wait-");
     let app_project = dir.path().join("app");
     let controller_src = dir.path().join("controller");
     copy_dir(&fixture_dir().join("app"), &app_project);
