@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): exec() waits for start(); exec pty/resize; test-only fake exec engine; fake kill completion.
+// Modified by ryuzcorp (ryuzcorp/celld): exec() waits for start(); exec pty/resize; test-only fake exec engine; fake kill completion; exec reads survive their subscribing event.
 //! Host ops behind `ctx.container`.
 //!
 //! JavaScript owns the surface and every validation message, copied from
@@ -326,6 +326,10 @@ fn process_arg(
 }
 
 /// One chunk of stdout (1) or stderr (2); an empty chunk is the end.
+/// `lease` names the read and `prev_sub`/`my_sub` chain this
+/// subscription after the previous one; a subscription that arrives
+/// after another already acted for the lease rejects with the
+/// superseded message, which the harness swallows.
 pub(super) fn op_container_exec_read(
     scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
@@ -339,11 +343,26 @@ pub(super) fn op_container_exec_read(
     }
     let process = process_arg(scope, &args);
     let which = number_arg(scope, &args, 1) as u8;
+    let lease = number_arg(scope, &args, 2);
+    let prev_sub = number_arg(scope, &args, 3);
+    let my_sub = number_arg(scope, &args, 4);
     let async_id = asyncrt::enqueue_unrefed(async move {
         let process = process?;
-        Ok::<Vec<u8>, String>(process.read(which).await.to_vec())
+        match process.read_retained(which, lease, prev_sub, my_sub).await {
+            container::ExecRead::Bytes(bytes) => Ok::<Vec<u8>, String>(bytes.to_vec()),
+            container::ExecRead::Superseded => Err(container::EXEC_READ_SUPERSEDED.to_string()),
+        }
     });
     rv.set(promise_for(scope, async_id));
+}
+
+/// `__exec_read_seq()` -> a fresh retained-read sequence number.
+pub(super) fn op_exec_read_seq(
+    scope: &mut v8::PinScope,
+    _args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    rv.set(v8::Number::new(scope, container::next_exec_read_seq() as f64).into());
 }
 
 pub(super) fn op_container_exec_write(
@@ -738,4 +757,62 @@ pub(super) fn op_testexec_params(
         return loader_throw(scope, "unknown test exec");
     };
     rv.set(v8::String::new(scope, &process.params).unwrap().into());
+}
+
+/// `__testproc_spawn()` -> process id; a test-only in-memory exec process
+/// the test feeds itself through the real process table. Throws unless
+/// `CELLD_TEST_WAIT=1`.
+pub(super) fn op_testproc_spawn(
+    scope: &mut v8::PinScope,
+    _args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    if !test_wait_enabled() {
+        return loader_throw(scope, "test procs are disabled on this node");
+    }
+    rv.set(v8::Number::new(scope, container::test_proc_spawn() as f64).into());
+}
+
+/// `__testproc_emit(id, which, bytes)`; push one chunk into a test-only
+/// in-memory exec pipe. Throws unless `CELLD_TEST_WAIT=1`.
+pub(super) fn op_testproc_emit(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue<v8::Value>,
+) {
+    if !test_wait_enabled() {
+        return loader_throw(scope, "test procs are disabled on this node");
+    }
+    let id = number_arg(scope, &args, 0);
+    let which = number_arg(scope, &args, 1) as u8;
+    if which != 1 && which != 2 {
+        return loader_throw(scope, "test proc pipe must be 1 (stdout) or 2 (stderr)");
+    }
+    let Some(bytes) = view_bytes(args.get(2)) else {
+        return loader_throw(scope, "test proc emit needs bytes");
+    };
+    if bytes.len() > 1024 * 1024 {
+        return loader_throw(scope, "test proc chunk must be 0..=1048576 bytes");
+    }
+    if let Err(error) = container::test_proc_emit(id, which, bytes.into()) {
+        loader_throw(scope, &error);
+    }
+}
+
+/// `__testproc_eof(id, which)`; end one test-only in-memory exec pipe.
+/// Throws unless `CELLD_TEST_WAIT=1`.
+pub(super) fn op_testproc_eof(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue<v8::Value>,
+) {
+    if !test_wait_enabled() {
+        return loader_throw(scope, "test procs are disabled on this node");
+    }
+    let id = number_arg(scope, &args, 0);
+    let which = number_arg(scope, &args, 1) as u8;
+    if which != 1 && which != 2 {
+        return loader_throw(scope, "test proc pipe must be 1 (stdout) or 2 (stderr)");
+    }
+    container::test_proc_eof(id, which);
 }

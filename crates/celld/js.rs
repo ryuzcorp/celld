@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): node:crypto scrypt; container exec resize op; cross-isolate RPC stubs and streams; test-only fake exec ops; fake kill completion op.
+// Modified by ryuzcorp (ryuzcorp/celld): node:crypto scrypt; container exec resize op; cross-isolate RPC stubs and streams; test-only fake exec ops; fake kill completion op; exec reads survive their subscribing event.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 // The raw V8 adapter and its child modules remain outside the Actor execution
@@ -6875,6 +6875,10 @@ ops! { OP_NAMES, install_op_functions,
         "__container_exec_kill" => container::op_container_exec_kill,
         "__container_exec_resize" => container::op_container_exec_resize,
         "__container_exec_drop" => container::op_container_exec_drop,
+        "__exec_read_seq" => container::op_exec_read_seq,
+        "__testproc_spawn" => container::op_testproc_spawn,
+        "__testproc_emit" => container::op_testproc_emit,
+        "__testproc_eof" => container::op_testproc_eof,
         "__storage_get" => storage_ops::op_storage_get,
         "__storage_get_many" => storage_ops::op_storage_get_many,
         "__sql_ingest" => storage_ops::op_sql_ingest,

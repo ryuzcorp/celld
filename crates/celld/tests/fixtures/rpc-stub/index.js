@@ -1,5 +1,5 @@
 // Modified by ryuzcorp (ryuzcorp/celld): cross-isolate RPC
-// stubs and streams. Apache-2.0.
+// stubs and streams; response bodies across events. Apache-2.0.
 //
 // Conformance fixture for cross-isolate Durable Object RPC stubs and byte
 // streams (Worker<->DO and DO<->DO, same node). Each Worker route drives one
@@ -51,6 +51,12 @@ class Capability extends RpcTarget {
     if (operation === "exitCode") {
       this.state.exitCodeCalls++;
       return 0;
+    }
+    if (operation === "readAhead") {
+      return this.state.readFileLike();
+    }
+    if (operation === "readBuffered") {
+      return this.state.readFileBuffered();
     }
     throw new TypeError(`unknown operation ${operation}`);
   }
@@ -400,6 +406,57 @@ export class Cap extends DurableObject {
       class: FacetClass, id: "stub-facet-id",
     }));
     return facet.makeThing();
+  }
+
+  // A file read in the shape of a sandbox readFile: the body streams
+  // from an exec pipe with a read issued here, in this call's event,
+  // and consumed after it, when the caller pulls. The test-only exec
+  // stands in for the container exec (same native read ops); the test
+  // feeds it through emitProc/eofProc between the call and the read.
+  async readFileLike() {
+    const T = globalThis.__celldTestProcForTestOnly;
+    if (!T) throw new Error("test exec unavailable");
+    const id = T.spawn();
+    this.lastProc = id;
+    const reader = T.stream(id, 1).getReader();
+    let pending = reader.read();
+    const pump = async () => {
+      const current = pending;
+      pending = null;
+      const result = await current;
+      if (!result.done) pending = reader.read();
+      return result;
+    };
+    const body = new ReadableStream({
+      pull: async (controller) => {
+        const result = await pump();
+        if (result.done) controller.close();
+        else controller.enqueue(result.value);
+      },
+    });
+    return new Response(body);
+  }
+
+  async readFileBuffered() {
+    return new Response(JSON.stringify({ ok: true, n: 3 }), {
+      headers: { "content-type": "application/json" },
+    });
+  }
+
+  async emitProc(which, text) {
+    globalThis.__celldTestProcForTestOnly.emit(this.lastProc, which, utf8.encode(text));
+    return { ok: true };
+  }
+
+  async eofProc(which) {
+    globalThis.__celldTestProcForTestOnly.eof(this.lastProc, which);
+    return { ok: true };
+  }
+
+  async dropProc() {
+    globalThis.__celldTestProcForTestOnly.drop(this.lastProc);
+    this.lastProc = null;
+    return { ok: true };
   }
 
   async transcript() {
@@ -1200,6 +1257,45 @@ export default {
         error = String((caught && caught.message) || caught);
       }
       return json({ error });
+    }
+
+    // A stub method returning a Response whose streamed body reads
+    // across native events: the read-ahead went out in the call's
+    // event and the bytes arrive after it. The caller feeds the pipe
+    // between the call and the read, the way a shim produces bytes
+    // while the caller drains.
+    if (url.pathname === "/response-read-ahead") {
+      const name = url.searchParams.get("name") || "resp";
+      const file = await stub(name).readFileLike();
+      await stub(name).emitProc(1, '{"ok":true,"n":');
+      await stub(name).emitProc(1, "3}");
+      await stub(name).eofProc(1);
+      const data = await file.json();
+      await stub(name).dropProc();
+      return json({ data, status: file.status });
+    }
+
+    // The buffered control: a Response with buffered bytes crosses by
+    // value and never touches the read path.
+    if (url.pathname === "/response-buffered") {
+      const file = await stub("respbuf").readFileBuffered();
+      const data = await file.json();
+      return json({ data, status: file.status });
+    }
+
+    // The same two shapes through a nested stub op.
+    if (url.pathname === "/response-nested") {
+      const wire = await stub("respdo").makeCapability();
+      const file = await wire.capability.invoke("readAhead", []);
+      await stub("respdo").emitProc(1, '{"ok":true,"n":');
+      await stub("respdo").emitProc(1, "3}");
+      await stub("respdo").eofProc(1);
+      const data = await file.json();
+      const buf = await wire.capability.invoke("readBuffered", []);
+      const bufData = await buf.json();
+      await stub("respdo").dropProc();
+      await wire[Symbol.dispose]();
+      return json({ data, bufData });
     }
 
     if (url.pathname === "/scope") {

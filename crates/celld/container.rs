@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): exec() waits for start(); exec pty/resize; fence node-netns exception; process-granularity exec kill; kill conformance tests.
+// Modified by ryuzcorp (ryuzcorp/celld): exec() waits for start(); exec pty/resize; fence node-netns exception; process-granularity exec kill; kill conformance tests; exec reads survive their subscribing event.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! Containers attached to Durable Objects: the engine side of
@@ -1735,8 +1735,8 @@ impl ContainerEngine {
             is_pty,
             docker: self.docker.clone(),
             stdin: tokio::sync::Mutex::new(Some(write)),
-            stdout: tokio::sync::Mutex::new(stdout_rx),
-            stderr: tokio::sync::Mutex::new(stderr_rx),
+            stdout: tokio::sync::Mutex::new(ExecPipe::new(stdout_rx)),
+            stderr: tokio::sync::Mutex::new(ExecPipe::new(stderr_rx)),
             ended,
             exit_code: tokio::sync::Mutex::new(None),
         });
@@ -1868,6 +1868,46 @@ async fn kill_via_exec(
 
 type WriteHalf = tokio::io::WriteHalf<Box<dyn Stream>>;
 
+/// One exec output pipe (stdout or stderr): the pump's receiver plus the
+/// exactly-once state that lets a read survive its subscribing event.
+/// A read is one lease (one pull); each event that finds it still
+/// pending files a new subscription chained after the previous one.
+struct ExecPipe {
+    rx: mpsc::Receiver<Bytes>,
+    /// The last consumed chunk, keyed by the subscription that consumed
+    /// it. A re-subscription chained after a dropped op takes these
+    /// bytes instead of reading ahead: the drop may have discarded a
+    /// completed result, and reading on would lose the chunk.
+    stash: Option<(u64, Bytes)>,
+    /// The latest read lease and the subscription that last acted for
+    /// it. A late pile-up — a re-subscription from an event that began
+    /// while an earlier one was still alive — aborts instead of
+    /// consuming the next chunk into a promise nobody awaits.
+    slot: Option<(u64, u64)>,
+}
+
+impl ExecPipe {
+    fn new(rx: mpsc::Receiver<Bytes>) -> Self {
+        Self {
+            rx,
+            stash: None,
+            slot: None,
+        }
+    }
+}
+
+/// What one retained read subscription found.
+pub enum ExecRead {
+    Bytes(Bytes),
+    /// Another subscription already acted for this lease: the caller
+    /// owns no bytes and must not settle the read.
+    Superseded,
+}
+
+/// The harness matches this message to swallow a superseded
+/// subscription; keep it identical to `__EXEC_READ_SUPERSEDED`.
+pub const EXEC_READ_SUPERSEDED: &str = "exec read superseded by a newer subscription";
+
 pub struct ExecProcess {
     pub id: u64,
     exec_id: String,
@@ -1877,8 +1917,8 @@ pub struct ExecProcess {
     pub is_pty: bool,
     docker: Docker,
     stdin: tokio::sync::Mutex<Option<WriteHalf>>,
-    stdout: tokio::sync::Mutex<mpsc::Receiver<Bytes>>,
-    stderr: tokio::sync::Mutex<mpsc::Receiver<Bytes>>,
+    stdout: tokio::sync::Mutex<ExecPipe>,
+    stderr: tokio::sync::Mutex<ExecPipe>,
     /// True once the hijacked stream reached EOF, which the daemon sends
     /// when the process exits.
     ended: watch::Sender<bool>,
@@ -1895,6 +1935,15 @@ fn next_exec_id() -> u64 {
     NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
+/// Fresh retained-read sequence numbers, starting at 1 (`0` is "no
+/// previous subscription"). One counter serves leases and
+/// subscriptions alike; uniqueness is all the pipe slot and stash
+/// compare.
+pub fn next_exec_read_seq() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
 pub fn process(id: u64) -> Option<Arc<ExecProcess>> {
     processes().lock().unwrap().get(&id).cloned()
 }
@@ -1903,14 +1952,103 @@ pub fn drop_process(id: u64) {
     processes().lock().unwrap().remove(&id);
 }
 
+/// Senders feeding test-only in-memory exec processes, by (process id, pipe).
+/// The ops guard every entry point with the test-wait flag; without it
+/// this map stays empty and no fake process exists.
+type TestProcSenders = Mutex<HashMap<(u64, u8), mpsc::Sender<Bytes>>>;
+
+fn test_proc_senders() -> &'static TestProcSenders {
+    static SENDERS: OnceLock<TestProcSenders> = OnceLock::new();
+    SENDERS.get_or_init(Default::default)
+}
+
+/// Spawn a test-only in-memory exec process: a real table entry whose pipes a test
+/// feeds with [`test_proc_emit`] instead of a daemon pump, so the
+/// cross-event read path runs where no container engine exists. Only the
+/// read path is usable: `wait`/`kill`/`resize` would dial the dummy
+/// socket and fail, and the harness never calls them on a fake.
+pub fn test_proc_spawn() -> u64 {
+    let id = next_exec_id();
+    let (stdout_tx, stdout_rx) = mpsc::channel(16);
+    let (stderr_tx, stderr_rx) = mpsc::channel(16);
+    let process = Arc::new(ExecProcess {
+        id,
+        exec_id: format!("test-exec-{id}"),
+        container: "test-container".to_string(),
+        pid: 0,
+        user: None,
+        is_pty: false,
+        docker: Docker::new("/nonexistent-celld-test.sock"),
+        stdin: tokio::sync::Mutex::new(None),
+        stdout: tokio::sync::Mutex::new(ExecPipe::new(stdout_rx)),
+        stderr: tokio::sync::Mutex::new(ExecPipe::new(stderr_rx)),
+        ended: watch::channel(false).0,
+        exit_code: tokio::sync::Mutex::new(None),
+    });
+    processes().lock().unwrap().insert(id, process);
+    let mut senders = test_proc_senders().lock().unwrap();
+    senders.insert((id, 1), stdout_tx);
+    senders.insert((id, 2), stderr_tx);
+    id
+}
+
+/// Push one chunk into a test-only exec pipe. Fails when the pipe is
+/// full, so an over-eager test fails loudly instead of wedging the
+/// emitting event.
+pub fn test_proc_emit(id: u64, which: u8, bytes: Bytes) -> Result<(), String> {
+    let senders = test_proc_senders().lock().unwrap();
+    let sender = senders
+        .get(&(id, which))
+        .ok_or_else(|| "no such test proc pipe".to_string())?;
+    sender
+        .try_send(bytes)
+        .map_err(|_| "test proc pipe is full".to_string())
+}
+
+/// End one test-only exec pipe: later reads see end of stream.
+pub fn test_proc_eof(id: u64, which: u8) {
+    test_proc_senders().lock().unwrap().remove(&(id, which));
+}
+
 impl ExecProcess {
     /// One chunk of stdout (`1`) or stderr (`2`); empty at end of stream.
-    pub async fn read(&self, which: u8) -> Bytes {
-        let mut receiver = match which {
+    ///
+    /// `lease` names the read (one pull) and `prev_sub`/`my_sub` chain
+    /// this subscription after the previous one, so a read dropped
+    /// with its subscribing event resumes in a later one without
+    /// losing, duplicating, or reordering bytes. Everything below runs
+    /// under the pipe lock, so the stash and slot the next subscriber
+    /// sees are exactly what this one left: a completed result the
+    /// event discarded is taken from the stash, and a subscription
+    /// that arrives after another already acted for the lease comes
+    /// back [`ExecRead::Superseded`] instead of consuming the next
+    /// chunk into a promise nobody awaits.
+    pub async fn read_retained(
+        &self,
+        which: u8,
+        lease: u64,
+        prev_sub: u64,
+        my_sub: u64,
+    ) -> ExecRead {
+        let mut pipe = match which {
             1 => self.stdout.lock().await,
             _ => self.stderr.lock().await,
         };
-        receiver.recv().await.unwrap_or_default()
+        if pipe
+            .slot
+            .is_some_and(|(slot_lease, taker)| slot_lease == lease && taker != prev_sub)
+        {
+            return ExecRead::Superseded;
+        }
+        if let Some((_, bytes)) = pipe.stash.take_if(|(sub, _)| *sub == prev_sub) {
+            pipe.stash = Some((my_sub, bytes.clone()));
+            pipe.slot = Some((lease, my_sub));
+            return ExecRead::Bytes(bytes);
+        }
+        let bytes = pipe.rx.recv().await.unwrap_or_default();
+        pipe.stash = Some((my_sub, bytes.clone()));
+        pipe.slot = Some((lease, my_sub));
+        ExecRead::Bytes(bytes)
     }
 
     pub async fn write(&self, bytes: &[u8]) -> Result<(), String> {
@@ -2323,8 +2461,8 @@ mod pty_tests {
             is_pty,
             docker: Docker::new("/nonexistent-celld-test.sock"),
             stdin: tokio::sync::Mutex::new(None),
-            stdout: tokio::sync::Mutex::new(stdout_rx),
-            stderr: tokio::sync::Mutex::new(stderr_rx),
+            stdout: tokio::sync::Mutex::new(ExecPipe::new(stdout_rx)),
+            stderr: tokio::sync::Mutex::new(ExecPipe::new(stderr_rx)),
             ended: watch::channel(false).0,
             exit_code: tokio::sync::Mutex::new(None),
         }
@@ -3052,5 +3190,132 @@ mod kill_tests {
             .call("DELETE", &format!("/containers/{name}?force=true"), None)
             .await
             .expect("remove test container");
+    }
+}
+
+#[cfg(test)]
+mod retained_read_tests {
+    use super::*;
+    use futures_util::task::noop_waker;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    fn retained_pipe() -> (ExecProcess, mpsc::Sender<Bytes>) {
+        let (stdout_tx, stdout_rx) = mpsc::channel(16);
+        let (_stderr_tx, stderr_rx) = mpsc::channel(1);
+        let process = ExecProcess {
+            id: 1,
+            exec_id: "test-exec".to_string(),
+            container: "test-container".to_string(),
+            pid: 1234,
+            user: None,
+            is_pty: false,
+            docker: Docker::new("/nonexistent-celld-test.sock"),
+            stdin: tokio::sync::Mutex::new(None),
+            stdout: tokio::sync::Mutex::new(ExecPipe::new(stdout_rx)),
+            stderr: tokio::sync::Mutex::new(ExecPipe::new(stderr_rx)),
+            ended: watch::channel(false).0,
+            exit_code: tokio::sync::Mutex::new(None),
+        };
+        (process, stdout_tx)
+    }
+
+    /// Poll one retained read once. The tests drive the protocol, not
+    /// the clock: every assertion below is a poll, never a wait.
+    fn poll_read(process: &ExecProcess, lease: u64, prev_sub: u64, my_sub: u64) -> Poll<ExecRead> {
+        let mut future = Box::pin(process.read_retained(1, lease, prev_sub, my_sub));
+        Pin::new(&mut future).poll(&mut Context::from_waker(&noop_waker()))
+    }
+
+    fn read_bytes(outcome: Poll<ExecRead>) -> Bytes {
+        match outcome {
+            Poll::Ready(ExecRead::Bytes(bytes)) => bytes,
+            Poll::Ready(ExecRead::Superseded) => panic!("read was superseded"),
+            Poll::Pending => panic!("read is pending"),
+        }
+    }
+
+    /// A subscription whose completed result the event discarded (the
+    /// op future ran to Ready, the driver dropped the outcome) hands
+    /// its bytes to the chained re-subscription: the chunk arrives
+    /// exactly once instead of being lost to a read-ahead.
+    #[tokio::test]
+    async fn chained_resubscription_takes_discarded_bytes() {
+        let (process, stdout) = retained_pipe();
+        stdout.try_send(Bytes::from("chunk-1\n")).unwrap();
+        assert!(
+            matches!(poll_read(&process, 7, 0, 1), Poll::Ready(_)),
+            "first poll consumes"
+        );
+        let taken = read_bytes(poll_read(&process, 7, 1, 2));
+        assert_eq!(taken, Bytes::from("chunk-1\n"));
+        // The take re-stashes under its own subscription, so a second
+        // discard chains onward instead of losing the chunk.
+        assert!(matches!(
+            poll_read(&process, 7, 2, 3),
+            Poll::Ready(ExecRead::Bytes(_))
+        ));
+        let retaken = read_bytes(poll_read(&process, 7, 3, 4));
+        assert_eq!(retaken, Bytes::from("chunk-1\n"));
+    }
+
+    /// A subscription dropped while still pending consumed nothing, so
+    /// the chained re-subscription reads the channel itself.
+    #[tokio::test]
+    async fn pending_drop_consumes_nothing() {
+        let (process, stdout) = retained_pipe();
+        assert!(matches!(poll_read(&process, 7, 0, 1), Poll::Pending));
+        stdout.try_send(Bytes::from("chunk-1\n")).unwrap();
+        let taken = read_bytes(poll_read(&process, 7, 1, 2));
+        assert_eq!(taken, Bytes::from("chunk-1\n"));
+    }
+
+    /// A late pile-up — a subscription chained after a subscription
+    /// that is no longer the latest taker — aborts instead of
+    /// consuming the next chunk into a promise nobody awaits, and the
+    /// abort itself consumes nothing.
+    #[tokio::test]
+    async fn late_pileup_is_superseded_and_consumes_nothing() {
+        let (process, stdout) = retained_pipe();
+        stdout.try_send(Bytes::from("chunk-1\n")).unwrap();
+        assert!(
+            matches!(poll_read(&process, 7, 0, 1), Poll::Ready(_)),
+            "first poll consumes"
+        );
+        let second = read_bytes(poll_read(&process, 7, 1, 2));
+        assert_eq!(second, Bytes::from("chunk-1\n"));
+        let stale = poll_read(&process, 7, 1, 3);
+        assert!(
+            matches!(stale, Poll::Ready(ExecRead::Superseded)),
+            "stale chain aborts"
+        );
+        stdout.try_send(Bytes::from("chunk-2\n")).unwrap();
+        let fresh = read_bytes(poll_read(&process, 8, 0, 4));
+        assert_eq!(fresh, Bytes::from("chunk-2\n"));
+    }
+
+    /// A fresh lease (the next pull) ignores a stale stash and reads
+    /// the channel.
+    #[tokio::test]
+    async fn fresh_lease_reads_past_a_stale_stash() {
+        let (process, stdout) = retained_pipe();
+        stdout.try_send(Bytes::from("chunk-1\n")).unwrap();
+        let first = read_bytes(poll_read(&process, 7, 0, 1));
+        assert_eq!(first, Bytes::from("chunk-1\n"));
+        stdout.try_send(Bytes::from("chunk-2\n")).unwrap();
+        let fresh = read_bytes(poll_read(&process, 8, 0, 2));
+        assert_eq!(fresh, Bytes::from("chunk-2\n"));
+    }
+
+    /// End of stream reads empty, repeatedly.
+    #[tokio::test]
+    async fn eof_reads_empty() {
+        let (process, _stdout) = retained_pipe();
+        drop(_stdout);
+        let end = read_bytes(poll_read(&process, 7, 0, 1));
+        assert!(end.is_empty());
+        let again = read_bytes(poll_read(&process, 8, 0, 2));
+        assert!(again.is_empty());
     }
 }
