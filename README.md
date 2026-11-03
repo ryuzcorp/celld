@@ -1,3 +1,7 @@
+> **ryuzcorp/celld fork:** our branches, tags, and patches are documented in
+> [FORK.md](FORK.md); what follows is upstream's README, kept intact.
+> *(This pointer is a ryuzcorp modification.)*
+
 # celld
 
 Self-hosted, distributed **Durable Objects**.
