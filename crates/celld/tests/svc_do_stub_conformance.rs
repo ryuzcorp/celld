@@ -1,6 +1,6 @@
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 //
-// Noite's addition (ryuzcorp/noite, docker/celld/patches): DO stubs on the
+// Modified by ryuzcorp (ryuzcorp/celld): DO stubs on the
 // service-binding RPC path. Apache-2.0.
 
 // A black-box runner, not node code: it boots the binary, copies fixtures,
@@ -11,7 +11,8 @@
 //! Conformance for Durable Object stubs over cross-isolate service bindings
 //! (R7): a `WorkerEntrypoint` method can return (and accept) a DO stub, while
 //! `RpcTarget` and stream values keep today's `DataCloneError` both ways and
-//! forged `__celld$do` markers are refused.
+//! forged `__celld$do` markers are refused. The two-hop case drives the
+//! returned stub over DO RPC (0007): the managed-sandbox two-hop path.
 //!
 //! One `celld dev` boots the app fixture; the controller fixture is
 //! pre-seeded into the dev bucket via the library (the same `build` + `write`
@@ -289,6 +290,46 @@ fn svc_do_stub_conformance() {
     assert_eq!(facet["ok"], true, "{facet}");
     assert_eq!(facet["result"]["threw"], true, "{facet}");
     assert_eq!(facet["result"]["name"], "DataCloneError", "{facet}");
+
+    // 0005+v2: the managed-sandbox two-hop. The controller DO stub
+    // arrives over the service binding (0005); exec over DO RPC returns a
+    // PTY-shaped process stub + byte streams (v2) while the abort carrier
+    // and signal cross as args (upload channel + live signal).
+    let two_hop = get_json(&node, "/two-hop");
+    assert_eq!(two_hop["ok"], true, "{two_hop}");
+    assert_eq!(two_hop["result"]["pid"], 4242, "{two_hop}");
+    assert_eq!(two_hop["result"]["isPty"], true, "{two_hop}");
+    assert_eq!(two_hop["result"]["stdout"], "pty-1\npty-2\n", "{two_hop}");
+    assert_eq!(two_hop["result"]["stderr"], "pty-err\n", "{two_hop}");
+    assert_eq!(two_hop["result"]["exitBefore"], 0, "{two_hop}");
+    assert_eq!(two_hop["result"]["exitAfter"], 137, "{two_hop}");
+    assert_eq!(
+        two_hop["result"]["transcript"]["writes"],
+        serde_json::json!(["pty-in\n"]),
+        "{two_hop}"
+    );
+    assert_eq!(
+        two_hop["result"]["transcript"]["stdinClosed"], true,
+        "{two_hop}"
+    );
+    assert_eq!(
+        two_hop["result"]["transcript"]["carrierText"], "carrier\n",
+        "{two_hop}"
+    );
+    assert_eq!(
+        two_hop["result"]["transcript"]["signalAborted"], true,
+        "{two_hop}"
+    );
+    assert_eq!(
+        two_hop["result"]["transcript"]["exitCodeCalls"], 2,
+        "{two_hop}"
+    );
+    assert_eq!(two_hop["result"]["transcript"]["killed"], true, "{two_hop}");
+    assert_eq!(
+        two_hop["result"]["transcript"]["resized"],
+        serde_json::json!([[{"cols": 80, "rows": 24}]]),
+        "{two_hop}"
+    );
 
     // D3: mutating `stub.name` sender-side neither changes the marker's
     // `n` the receiver revives nor breaks the subsequent dispatch.

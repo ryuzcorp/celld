@@ -1,3 +1,4 @@
+// Modified by ryuzcorp (ryuzcorp/celld): cross-isolate RPC stubs and streams.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! The channels a cell runtime uses to hand work to the host: one request
@@ -194,6 +195,49 @@ pub(crate) static RPC_CALL_TX: OnceLock<tokio::sync::mpsc::UnboundedSender<RpcCa
     OnceLock::new();
 pub fn set_rpc_call_tx(tx: tokio::sync::mpsc::UnboundedSender<RpcCallReq>) {
     let _ = RPC_CALL_TX.set(tx);
+}
+
+/// One operation on a cross-isolate RPC stub (`__celld$stub`/`__celld$rs`/
+/// `__celld$ws` with `h: 1`). A call runs a method/property path against
+/// the entry in the owning cell's isolate; a release frees it. Stream
+/// reads, writes, cancels, closes, and aborts are calls on the bridge
+/// entry, exactly the same-isolate bridge method names.
+pub enum StubOperation {
+    Call {
+        path: Vec<String>,
+        /// Structured-clone arguments, or `None` for a property GET.
+        args: Option<RpcData>,
+    },
+    Release {
+        /// The minted epoch, so the release disposes only the residency
+        /// that minted the entry and never activates an evicted cell.
+        epoch: u64,
+    },
+}
+
+/// An operation on a Durable Object RPC stub owned by another isolate.
+/// Routing/activation is identical to a fetch or RPC call on the owner.
+/// No caller generation travels: validity is the minting residency (scope,
+/// epoch, generation) still serving, not who calls. But the calling heap
+/// does travel, read host-side from the op's own isolate: a stub id is a
+/// capability only its holders may use, so a stolen id alone is useless
+/// and a forged release frees nothing.
+pub struct RpcStubReq {
+    /// The owning cell scope, from the wire marker. Checked against the
+    /// host table before anything routes: the table is authoritative.
+    pub scope: String,
+    pub stub_id: String,
+    pub operation: StubOperation,
+    /// The heap driving the op, for the holder check. `None` only when no
+    /// isolate drives (the retirement backstop's releases): calls with no
+    /// caller fail closed, and releases carry no caller at all.
+    pub caller: Option<celld_logic::isolate::HeapId>,
+    pub reply: tokio::sync::oneshot::Sender<Result<RpcData>>,
+}
+pub(crate) static STUB_CALL_TX: OnceLock<tokio::sync::mpsc::UnboundedSender<RpcStubReq>> =
+    OnceLock::new();
+pub fn set_stub_call_tx(tx: tokio::sync::mpsc::UnboundedSender<RpcStubReq>) {
+    let _ = STUB_CALL_TX.set(tx);
 }
 
 static OUTBOUND_WS_TX: OnceLock<tokio::sync::mpsc::UnboundedSender<OutboundWsReq>> =

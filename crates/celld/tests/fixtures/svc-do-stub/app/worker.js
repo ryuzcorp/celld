@@ -1,4 +1,4 @@
-// Noite's addition (ryuzcorp/noite, docker/celld/patches): R7 SvcRpc DO-stub fixture. Apache-2.0.
+// Modified by ryuzcorp (ryuzcorp/celld): R7 service-RPC DO-stub fixture. Apache-2.0.
 import { DurableObject, RpcTarget } from 'cloudflare:workers';
 
 class AppCap extends RpcTarget {
@@ -115,6 +115,49 @@ export default {
         case 'forged-facet': {
           const target = env.PROBE.get(env.PROBE.idFromName('r7'));
           return await target.facetForge();
+        }
+        case 'two-hop': {
+          // Hop 1 (0005): the controller DO stub arrives over the
+          // cross-isolate service binding. Hop 2 (v2): exec over DO RPC
+          // returns a PTY-shaped process stub + byte streams, while the
+          // abort carrier and signal cross as upload args.
+          const stub = await SB.getControllerStub('two-hop');
+          const carrier = new ReadableStream({
+            start(c) {
+              c.enqueue(new TextEncoder().encode('carrier\n'));
+              c.close();
+            },
+          });
+          const ctl = new AbortController();
+          const wire = await stub.exec(['node', '--version'], {
+            abort: carrier,
+            signal: ctl.signal,
+          });
+          const writer = wire.stdin.getWriter();
+          await writer.write(new TextEncoder().encode('pty-in\n'));
+          await writer.close();
+          const stdout = await new Response(wire.stdout).text();
+          const stderr = await new Response(wire.stderr).text();
+          const exitBefore = await wire.capability.invoke('exitCode', []);
+          await wire.capability.invoke('resize', [{ cols: 80, rows: 24 }]);
+          await wire.capability.invoke('kill', []);
+          const exitAfter = await wire.capability.invoke('exitCode', []);
+          ctl.abort(new Error('two-hop-done'));
+          let transcript = null;
+          for (let i = 0; i < 300; i++) {
+            transcript = await stub.transcript();
+            if (transcript.signalAborted === true) break;
+            await new Promise((r) => setTimeout(r, 10));
+          }
+          return {
+            pid: wire.pid,
+            isPty: wire.isPty,
+            stdout,
+            stderr,
+            exitBefore,
+            exitAfter,
+            transcript,
+          };
         }
         case 'mutated-name': {
           const stub = env.PROBE.get(env.PROBE.idFromName('r7'));

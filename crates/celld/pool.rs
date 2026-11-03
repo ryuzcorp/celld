@@ -1,3 +1,4 @@
+// Modified by ryuzcorp (ryuzcorp/celld): cross-isolate RPC stubs and streams.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 // Isolate admission and deadlines are in the V8 arm outside the Actor execution
@@ -854,6 +855,7 @@ impl Pool {
             };
             if worker.take().is_some() {
                 tracing::info!(isolate = %slot.heap_id, slot = slot.id, "isolate freed");
+                release_retired_heap_holds(slot.heap_id);
             }
         }
     }
@@ -912,6 +914,50 @@ impl Pool {
         }
         census
     }
+}
+
+/// The stub backstop: a freed heap is provably gone (drained, no turns,
+/// nothing can enter it again), so every RPC stub hold and every upload
+/// it still owned is released here. Stub orphans route their dispose to
+/// the owner through the normal release path, exactly like an invocation
+/// end that disposed them; uploads terminate, and their receivers
+/// observe the disconnect. Holds of live heaps are untouched: the
+/// backstop never fires on a stub whose holder is alive.
+///
+/// Runs on the maintenance pass that frees the heap. The release sends
+/// are non-blocking (unbounded channel, reply dropped); ids stay out of
+/// the log.
+fn release_retired_heap_holds(heap: HeapId) {
+    crate::upload_table::terminate_upload_owner(heap);
+    let orphaned = crate::stub_table::release_stub_holder(heap);
+    if orphaned.is_empty() {
+        return;
+    }
+    let Some(tx) = crate::host_channels::STUB_CALL_TX.get() else {
+        return;
+    };
+    let mut routed = 0;
+    for orphan in &orphaned {
+        let (reply, _) = tokio::sync::oneshot::channel();
+        let request = crate::host_channels::RpcStubReq {
+            scope: orphan.scope.clone(),
+            stub_id: orphan.id.clone(),
+            operation: crate::host_channels::StubOperation::Release {
+                epoch: orphan.epoch,
+            },
+            caller: None,
+            reply,
+        };
+        if tx.send(request).is_ok() {
+            routed += 1;
+        }
+    }
+    tracing::info!(
+        isolate = %heap,
+        orphaned = orphaned.len(),
+        routed,
+        "isolate freed; released its held RPC stubs"
+    );
 }
 
 /// The property the whole design rests on: an isolate and everything hanging

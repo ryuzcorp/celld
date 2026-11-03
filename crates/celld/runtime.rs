@@ -1,3 +1,4 @@
+// Modified by ryuzcorp (ryuzcorp/celld): cross-isolate RPC stubs and streams.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 // RuntimeManager is the V8 cell-host arm, so its executor and observability
@@ -1653,6 +1654,18 @@ impl RuntimeManager {
             .map(|handle| handle.epoch)
     }
 
+    /// The application generation whose isolate holds `cell`, when the
+    /// cell is resident. Read beside [`Self::published_epoch`]: the two
+    /// are the serving residency cross-isolate stub validation matches.
+    pub fn published_generation(&self, cell: &str) -> Option<GenerationId> {
+        self.cells
+            .lock()
+            .expect("cell registry poisoned")
+            .published
+            .get(cell)
+            .map(|handle| handle.generation)
+    }
+
     pub fn alarm(&self, cell: &str) -> Option<i64> {
         self.with_alarm(cell, |at_ms| at_ms)
     }
@@ -1844,6 +1857,31 @@ impl RuntimeManager {
             reply,
         };
         self.cell_event(&cell, job, receive, "cell isolate dropped RPC result")
+            .await
+    }
+
+    /// Run one operation on a cross-isolate RPC stub the cell exported: a
+    /// method/property path against the exporting entry, or a release of
+    /// it. Answers an `RpcOutcome` like [`Self::rpc`], so the reply gates
+    /// the same way.
+    pub async fn stub_op(
+        &self,
+        cell: String,
+        stub_id: String,
+        path: Vec<String>,
+        args: Option<js::RpcData>,
+        release: bool,
+    ) -> anyhow::Result<js::RpcOutcome> {
+        let (reply, receive) = tokio::sync::oneshot::channel();
+        let job = CellJob::StubOp {
+            scope: cell.clone(),
+            stub_id,
+            path,
+            args,
+            release,
+            reply,
+        };
+        self.cell_event(&cell, job, receive, "cell isolate dropped stub result")
             .await
     }
 
@@ -3351,6 +3389,7 @@ async fn drive_cell_inner(
             CellJob::Fetch { .. } => "celld.cell_fetch",
             CellJob::Alarm { .. } => "celld.alarm",
             CellJob::Rpc { .. } => "celld.rpc",
+            CellJob::StubOp { .. } => "celld.stub_op",
             CellJob::WsOpen { .. } => "celld.ws_open",
             CellJob::WsMessage { .. } => "celld.ws_message",
             CellJob::WsClosed { .. } => "celld.ws_close",

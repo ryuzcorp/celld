@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): ctx.container.images; clone() of streaming and disturbed bodies; __celld$do on the service-binding RPC path; container exec pty/resize.
+// Modified by ryuzcorp (ryuzcorp/celld): ctx.container.images; clone() of streaming and disturbed bodies; __celld$do on the service-binding RPC path; container exec pty/resize; cross-isolate RPC stubs and streams.
 // The DO object model and the Cloudflare-compatible runtime surface, run
 // once per isolate by `js.rs::install_harness` after the Web-API prelude.
 // Lived as a 4,000-line raw string inside js.rs until 2026-07-29; it is a
@@ -3637,9 +3637,15 @@ const __makeServiceBinding = __celld.__makeServiceBinding =
           "Service binding recursion limit exceeded (8)");
       __cell.svcDepth = (__cell.svcDepth || 0) + 1;
       const ctx = __beginEvent();
+      // The sub-dispatch runs under the caller's context, so stubs and
+      // streams its handler revives register into the live invocation
+      // and stay usable (a fresh never-live scope would dispose them
+      // on arrival). They die with the caller, like its own; a caller
+      // past its end still takes the dead path through __ctxAdopt.
+      const callerCtx = __ctxNow();
       try {
         return __finishServiceFetch(
-          await __ctxRun(undefined,
+          await __ctxRun(callerCtx,
             () => __cell.selfFetch(req, __cell.env, ctx)),
           req, redirectState);
       } finally {
@@ -3866,9 +3872,21 @@ const __tagged = (tag, sc) => {
 // foreign awaits and calls -- each with Workerd's exact error.
 let __nextCtxId = 1;
 const __ctxKey = Symbol("celld.ctx");
+// The innermost `__ctxRun` id for synchronous execution. V8 snapshots
+// CPED when a promise reaction is registered and restores it while the
+// reaction runs -- but synchronous execution runs under no reaction, so
+// the frame reads undefined there (e.g. an argument lift in a handler's
+// sync prefix, before its first await). `__ctxRun` therefore also
+// records its id here for the sync span; continuations keep using the
+// CPED frame, which wins whenever it is defined.
+let __ctxSync = undefined;
 const __ctxNow = () => {
   const frame = __als_get();
-  return frame === undefined ? undefined : frame.get(__ctxKey);
+  if (frame !== undefined) {
+    const id = frame.get(__ctxKey);
+    if (id !== undefined) return id;
+  }
+  return __ctxSync;
 };
 // Run `fn` under context `id` (undefined = a fresh one). An async
 // fn started inside keeps the frame across its awaits. The prior
@@ -3876,13 +3894,17 @@ const __ctxNow = () => {
 // same-isolate callees, as they did before contexts existed.
 const __ctxRun = (id, fn) => {
   const prior = __als_get();
+  const syncPrior = __ctxSync;
   const frame = new Map(prior);
-  frame.set(__ctxKey, id ?? __nextCtxId++);
+  const ctxId = id ?? __nextCtxId++;
+  frame.set(__ctxKey, ctxId);
   __als_set(frame);
+  __ctxSync = ctxId;
   try {
     return fn();
   } finally {
     __als_set(prior);
+    __ctxSync = syncPrior;
   }
 };
 const __ctxError = (kind) => new Error(
@@ -3912,6 +3934,31 @@ const __postAbortError = (aborted) => aborted instanceof __ActorAbort
   : aborted;
 // ctx id -> Set of live stub handles (metas) the context holds.
 const __ctxStubs = new Map();
+// Live invocation contexts: every dispatch site mints its id through
+// __ctxNext (count 1), and __ctxEnd drops it. A drive on a stub rooted
+// in an ended context runs under a fresh per-drive rescue id instead,
+// so nested revives land in a live context again and each drive's end
+// disposes exactly what that drive registered -- concurrent drives
+// never dispose each other's handles. Revives landing with no live
+// context -- a floating call settling after response end, a dup() or
+// an upload pump in post-end work -- take the dead path instead of
+// registering: host holds release immediately, same-isolate handles
+// stay usable but unowned. `__ctxRun(undefined)` fresh ids are op
+// scopes, never invocations, and are intentionally not live.
+const __ctxLive = new Map();
+// Mint one invocation context id and mark it live.
+const __ctxNext = () => {
+  const id = __nextCtxId++;
+  __ctxLive.set(id, 1);
+  return id;
+};
+// The context a revive/dup/pump registers into: the current frame's id
+// when that invocation is live, else undefined (the dead path). A dead id
+// never re-registers.
+const __ctxAdopt = () => {
+  const now = __ctxNow();
+  return now !== undefined && __ctxLive.has(now) ? now : undefined;
+};
 // ctx id -> Set of reject callbacks for stub ops in flight against
 // that context. A hung callee never settles, so a context abort
 // must reject its pending callers directly.
@@ -3926,7 +3973,9 @@ const __opTrack = (ctx, reject) => {
   };
 };
 const __ctxRegister = (meta) => {
-  if (meta.ctx === undefined) return;
+  // Revive sites adopt a live context first; this stays total so a
+  // direct caller can never re-create an ended context's set.
+  if (meta.ctx === undefined || !__ctxLive.has(meta.ctx)) return;
   let set = __ctxStubs.get(meta.ctx);
   if (set === undefined) __ctxStubs.set(meta.ctx, set = new Set());
   set.add(meta);
@@ -3937,13 +3986,35 @@ const __ctxUnregister = (meta) => {
   set.delete(meta);
   if (set.size === 0) __ctxStubs.delete(meta.ctx);
 };
-// Tear down a context: dispose every handle it still holds, so a
-// dup() leaked into it reaches the sender's disposal callback.
+// Tear down a context: drop it from the live set, stop every upload pump
+// it owns and dispose every handle it still holds, so a dup() leaked
+// into it reaches the sender's disposal callback. Runs at invocation end
+// (fetch/RPC/alarm/queue), which is what makes a received stub owned by
+// its request: the caller side dies with the call, and every release
+// routes to the owner.
 const __ctxEnd = (id) => {
+  __ctxLive.delete(id);
+  __ctxEndUploads(id);
+  // Worker isolates never release cells, so entrypoint-ctx.abort records
+  // would accumulate one per aborted ctx until heap retirement: prune
+  // past a threshold. Steady-state cost is one field read.
+  if (__abortedCtxs.size > 1024) __pruneAbortedCtxs();
   const set = __ctxStubs.get(id);
   if (set === undefined) return;
   __ctxStubs.delete(id);
   for (const meta of set) __disposeStub(meta);
+};
+// Drop abort records no live entry or handle references anymore. A stub
+// rooted in a dead context must keep rejecting with its reason, but every
+// check reads through a live entry or handle context: with none left,
+// the record is unobservable.
+const __pruneAbortedCtxs = () => {
+  const live = new Set();
+  for (const entry of __stubEntries.values()) live.add(entry.ctx);
+  for (const id of __ctxStubs.keys()) live.add(id);
+  for (const id of [...__abortedCtxs.keys()]) {
+    if (!live.has(id)) __abortedCtxs.delete(id);
+  }
 };
 const __ctxAbort = (id, reason) => {
   if (id === undefined || __abortedCtxs.has(id)) return;
@@ -3965,6 +4036,31 @@ const __ctxAbort = (id, reason) => {
 // is the request being served, which matches Workerd observably.
 const __ctxAbortCurrent =
   (reason) => __ctxAbort(__ctxNow(), reason);
+// A fetch response awaiting its read: the invocation context that produced
+// it. The response reader ends the context once the body no longer needs
+// it (immediately for bytes bodies, when the bridge pump settles for live
+// ones), so received stubs die with the fetch that received them without
+// breaking a body still streaming. A side table, not a property: the
+// response object stays exactly what the handler returned.
+const __fetchCtxs = new WeakMap();
+// ctx id -> Set of live upload pumps (caller-pushed streams) the context
+// owns. Context end/abort stops every pump: the reader cancels (the origin
+// sees it) and the channel aborts (the receiver observes the disconnect),
+// so an upload never outlives its sender's invocation.
+const __ctxUploads = new Map();
+const __ctxEndUploads = (id) => {
+  const pumps = __ctxUploads.get(id);
+  if (pumps === undefined) return;
+  __ctxUploads.delete(id);
+  for (const pump of pumps) {
+    try {
+      pump.reader.cancel().catch(() => {});
+    } catch {}
+    try {
+      __upload_abort(pump.id);
+    } catch {}
+  }
+};
 // ---- same-process RPC stubs ------------------------------------
 // A stub entry owns a local target; `refs` counts live handles
 // across dup()s. When the last handle is disposed the target's own
@@ -3977,6 +4073,11 @@ const __ctxAbortCurrent =
 // check.
 const __stubEntries = new Map();
 const __stubMeta = new WeakMap();
+// Cross-isolate RPC stubs: the owning isolate maps each host-routable id
+// back to its local entry, and the inverse for release. The host table is
+// authoritative for routing; these only find the entry to run.
+const __hostStubs = new Map();
+const __hostStubLocals = new Map();
 // Keep the Durable Object brand outside the user-visible object. Reading a
 // string property here would invoke an inherited getter before validation can
 // reject its unsupported prototype. The entry snapshots the id and the
@@ -4042,11 +4143,27 @@ const __cellRelease = (scope) => {
     if (entry.scope !== scope) continue;
     entry.released = true;
     __stubEntries.delete(entry.id);
+    // Revoke every host id this residency exported for the entry, so
+    // cross-isolate handles fail instead of reaching a new residency.
+    // Synchronous: the isolate may be going away with the residency.
+    const exported = __hostStubLocals.get(entry.id);
+    if (exported !== undefined) {
+      __hostStubLocals.delete(entry.id);
+      for (const id of exported) {
+        __hostStubs.delete(id);
+        __stub_unexport(id);
+      }
+    }
     // Break in-flight ops as an abort would, but not through
     // `__actorBreak`: that records the scope broken for the life of the
     // isolate, which is the state this function drops.
     __ctxAbort(entry.ctx, new __ActorAbort(__releasedStubError()));
   }
+  // Drop abort records no live handle references anymore, so aborted
+  // ids do not grow by one per aborted context for the life of the
+  // isolate. Context end prunes the same way past a threshold, which is
+  // what bounds Worker isolates that never release cells.
+  if (__abortedCtxs.size !== 0) __pruneAbortedCtxs();
 };
 const __releasedStubError = () => new Error(
   "The Durable Object that returned this RPC stub no longer runs on " +
@@ -4056,14 +4173,127 @@ const __disposeStub = (meta) => {
   meta.disposed = true;
   __ctxUnregister(meta);
   const entry = meta.entry;
+  // Host-backed handles each own one host hold (revive, dup, unlift
+  // restore), so every dispose drops exactly one. A host entry holds no
+  // other local state: it is never in `__stubEntries` and carries no
+  // upload or target, so only the shared refcount still ticks.
+  if (entry.host !== undefined) {
+    __stub_release(entry.host.id).catch(() => {});
+    --entry.refs;
+    return;
+  }
   if (--entry.refs > 0) return;
   __stubEntries.delete(entry.id);
+  // A received upload's dispose cancels it: the sender's pump stops and
+  // the channel frees. Fire-and-forget, like the disposal below.
+  if (entry.upload !== undefined) {
+    try {
+      __upload_cancel(entry.upload.id);
+    } catch {}
+    return;
+  }
   const disposer = entry.target?.[Symbol.dispose];
   if (typeof disposer === "function")
     Promise.resolve().then(() => disposer.call(entry.target));
 };
+// A mint-cap refusal from `__stub_export`/`__upload_new`. Caps fail the
+// call with a clear error; every other export throw falls back to an
+// upload channel or a same-isolate marker.
+const __isCapExceeded = (error) =>
+  String(error?.message ?? error).startsWith("celld_cap_exceeded:");
+const __capError = (error) =>
+  new Error(String(error?.message ?? error).slice("celld_cap_exceeded:".length).trimStart());
+// Mint one host-routable id for `scope`, or null when the scope has no
+// live residency here (a stateless sender). A mint cap throws through.
+const __exportHostScope = (scope, kind) => {
+  try {
+    return JSON.parse(__stub_export(scope, kind));
+  } catch (error) {
+    if (__isCapExceeded(error)) throw __capError(error);
+    return null;
+  }
+};
+// Record one minted id against its local entry.
+const __recordHostStub = (entry, kind, coords) => {
+  entry.hostKind = kind;
+  __hostStubs.set(coords.id, entry.id);
+  let locals = __hostStubLocals.get(entry.id);
+  if (locals === undefined)
+    __hostStubLocals.set(entry.id, locals = new Set());
+  locals.add(coords.id);
+  return coords;
+};
+// Export one local entry under a host-routable id, or null when the
+// entry's scope has no live residency here (a Worker-owned entry); the
+// lifter then pushes the value through an upload channel or keeps a
+// same-isolate marker instead.
+const __exportHostStub = (entry, kind) => {
+  const coords = __exportHostScope(entry.scope ?? "", kind);
+  if (coords === null) return null;
+  return __recordHostStub(entry, kind, coords);
+};
+// Undo a host lift whose envelope never sent (a mint cap threw, or the
+// marker tree failed to encode): restore moved handles to the sender
+// (re-acquiring handed-off holds) and drop fresh entries (unexporting
+// their host ids, cancelling fresh bridges whose origins never reached
+// a receiver). A failed send keeps the sender's handles and leaks
+// nothing on either side; without this a cap-hit would strand table
+// entries toward the same cap it enforces.
+const __unliftFailed = (collected) => {
+  if (collected === null) return;
+  for (const { entry, bridge } of collected.entries) {
+    const exported = __hostStubLocals.get(entry.id);
+    if (exported !== undefined) {
+      __hostStubLocals.delete(entry.id);
+      for (const id of exported) {
+        __hostStubs.delete(id);
+        try {
+          __stub_unexport(id);
+        } catch {}
+      }
+    }
+    __stubEntries.delete(entry.id);
+    if (bridge) {
+      try {
+        entry.target[Symbol.dispose]?.();
+      } catch {}
+    }
+  }
+  for (const meta of collected.handles) {
+    meta.disposed = false;
+    __ctxRegister(meta);
+    if (meta.entry.host !== undefined) {
+      try {
+        __stub_acquire(meta.entry.host.id);
+      } catch {}
+    }
+  }
+};
+// A revived host stub's local entry: not in `__stubEntries` (its id is the
+// host id, meaningless here), but refcounted like one, so dup() shares the
+// release and the last dispose frees it.
+const __hostStubEntry = (id, marker) => ({
+  id: "h:" + id,
+  host: { id, scope: marker.scope, epoch: marker.epoch, gen: marker.gen },
+  refs: 1,
+});
 const __stubDisposedError = () =>
   new Error("RPC stub used after being disposed.");
+// Dispose host-backed handles revived into `ctx` since `before` (a snapshot
+// Set of its handles, or null when it held none): a drive's nested revives
+// that its reply did not move out. Same-isolate handles keep their
+// lifetime; only what crosses isolates shortens.
+const __disposeNewHostHandles = (ctx, before) => {
+  if (ctx === undefined) return;
+  const set = __ctxStubs.get(ctx);
+  if (set === undefined) return;
+  for (const meta of [...set]) {
+    if (before !== null && before.has(meta)) continue;
+    if (meta.entry.host === undefined && meta.entry.upload === undefined)
+      continue;
+    __disposeStub(meta);
+  }
+};
 // Shared brand value for RpcTarget instances; see the RpcTarget
 // constructor.
 const __rpcNoClone = () => {};
@@ -4156,7 +4386,7 @@ const __writableBridge = (writer) => {
   };
   return bridge;
 };
-const __liftStream = (v) => {
+const __liftStream = (v, host = false, collector = null) => {
   const readable = v instanceof ReadableStream;
   const key = readable ? "__celld$rs" : "__celld$ws";
   const meta = __rpcStreamMeta.get(v);
@@ -4166,16 +4396,142 @@ const __liftStream = (v) => {
     // the local wrapper is dead -- a round trip stays one hop.
     meta.disposed = true;
     __ctxUnregister(meta);
+    if (collector !== null) collector.handles.push(meta);
+    // A received host stream forwards its host id, so the round
+    // trip stays one hop across isolates too. This isolate's hold
+    // moves with the reference; the receiver acquires on revive.
+    if (meta.entry.host !== undefined) {
+      const coords = meta.entry.host;
+      try {
+        __stub_handoff(coords.id);
+      } catch {}
+      return { [key]: coords.id, t: __stubIsolate, h: 1,
+               scope: coords.scope, epoch: coords.epoch, gen: coords.gen };
+    }
+    // A received upload forwards its channel id the same way. Uploads
+    // track no reader holds, so nothing else moves.
+    if (meta.entry.upload !== undefined) {
+      return { [key]: meta.entry.upload.id, t: __stubIsolate, h: 2 };
+    }
     return { [key]: meta.entry.id, t: __stubIsolate };
   }
   if (v.locked)
     throw new TypeError(readable
       ? "The ReadableStream has been locked to a reader."
       : "The WritableStream has been locked to a writer.");
+  const kind = readable ? "readable" : "writable";
+  if (host) {
+    // A cell-owned stream mints a routed id; a stream no cell owns (a
+    // stateless sender lifting call arguments) pushes a readable through
+    // an upload channel instead. The mint runs before any lock: the
+    // bridge locks the origin, and an upload pumps the origin directly.
+    // A caller-owned writable has no reverse path: it keeps a
+    // same-isolate marker and fails on use across isolates, as before.
+    const coords = __exportHostScope(__currentActorScope() || "", kind);
+    if (coords !== null) {
+      const entry = __newEntry(readable
+        ? __readableBridge(v.getReader())
+        : __writableBridge(v.getWriter()));
+      __recordHostStub(entry, kind, coords);
+      if (collector !== null) collector.entries.push({ entry, bridge: true });
+      return { [key]: coords.id, t: __stubIsolate, h: 1,
+               scope: coords.scope, epoch: coords.epoch,
+               gen: coords.generation };
+    }
+    if (readable) {
+      const upload = __exportUpload(v);
+      if (upload !== null)
+        return { [key]: upload, t: __stubIsolate, h: 2 };
+    }
+  }
   const bridge = readable
     ? __readableBridge(v.getReader())
     : __writableBridge(v.getWriter());
-  return { [key]: __newEntry(bridge).id, t: __stubIsolate };
+  const entry = __newEntry(bridge);
+  if (collector !== null) collector.entries.push({ entry, bridge: true });
+  return { [key]: entry.id, t: __stubIsolate };
+};
+// A received upload's local entry: not in `__stubEntries` (its id is the
+// channel id, meaningless here). Disposing it cancels the channel; the
+// sender's pump stops and the channel frees.
+const __uploadEntry = (id) => ({
+  id: "u:" + id,
+  upload: { id },
+  refs: 1,
+});
+// Open an upload channel for a caller-owned readable and start its pump:
+// the sender reads the origin and pushes each chunk host-side, where the
+// receiver pulls. Returns the upload id, or null when no sender context
+// can own it (the caller keeps a same-isolate marker). A mint cap throws
+// through: caps fail the call with a clear error. Only byte chunks cross:
+// a non-bytes chunk fails the stream rather than mangling it.
+const __exportUpload = (v) => {
+  // No live sender context owns the pump (or none at all): refuse, so the
+  // caller keeps a same-isolate marker instead of a channel no context
+  // end will ever abort.
+  const ctx = __ctxAdopt();
+  if (ctx === undefined) return null;
+  let id;
+  try {
+    id = JSON.parse(__upload_new()).id;
+  } catch (error) {
+    if (__isCapExceeded(error)) throw __capError(error);
+    return null;
+  }
+  const reader = v.getReader();
+  let pumps = __ctxUploads.get(ctx);
+  if (pumps === undefined) __ctxUploads.set(ctx, pumps = new Set());
+  const pump = { id, reader };
+  pumps.add(pump);
+  // The pump is floating work: each push awaits buffer room (the receiver
+  // pulls), so a fast producer cannot outrun a slow consumer. Context end
+  // cancels the reader and aborts the channel, which rejects a parked
+  // push; receiver cancel rejects the next push, which cancels the
+  // origin. Every exit unregisters the pump, and every unclean exit
+  // cancels the origin: a finished origin completed, but anything else
+  // must observe the teardown (like a bridge disposer).
+  (async () => {
+    let clean = false;
+    try {
+      for (;;) {
+        const next = await reader.read();
+        if (next.done) {
+          __upload_close(id);
+          clean = true;
+          return;
+        }
+        const value = next.value;
+        if (!(value instanceof Uint8Array) && !ArrayBuffer.isView(value)) {
+          __upload_fail(id);
+          return;
+        }
+        const bytes = new Uint8Array(
+          value.buffer, value.byteOffset, value.byteLength);
+        for (let offset = 0; offset < bytes.byteLength; offset += 64 * 1024) {
+          await __upload_push(id, bytes.subarray(offset, offset + 64 * 1024));
+        }
+        if (bytes.byteLength === 0) await __upload_push(id, bytes);
+      }
+    } catch {
+      // Cancelled by context end, rejected at a terminal, or unreadable:
+      // the channel already carries (or, for a bare read error, now gets)
+      // the terminal state the receiver observes.
+      try {
+        __upload_fail(id);
+      } catch {}
+    } finally {
+      pumps.delete(pump);
+      if (!clean) {
+        try {
+          await reader.cancel();
+        } catch {}
+      }
+      try {
+        reader.releaseLock();
+      } catch {}
+    }
+  })();
+  return id;
 };
 // A signal is not a snapshot on the RPC wire. The marker carries a
 // process-wide identity, and the host forwards the source's single state
@@ -4263,25 +4619,30 @@ const __rpcSignalRefresh = () => {
 // it. Passing an existing stub transfers its reference: the
 // sender's handle is disposed (dup() first to keep one) and the
 // receiver adopts it. Returns null when nothing was liftable.
-const __stubLift = (value, allowCapabilities = true, originals) => {
+// `allowCapabilities` is also the lift mode: truthy lifts, and
+// "host" mints host-routable ids for entries a cell owns (Durable
+// Object RPC across isolates), falling back to same-isolate markers
+// for values no cell owns. "do" is the cross-isolate
+// service-binding mode: only Durable Object stubs cross (by value,
+// no caps), every other capability stays a DataCloneError as with
+// false.
+const __stubLift = (value, allowCapabilities = true, originals, collector = null) => {
   let lifted = false;
   // Capabilities (stubs, disposers) root the callee context;
   // by-value host types do not -- they pick the 0x02 envelope.
   let caps = false;
   const seen = new Map();
   const ctx = __ctxNow();
-  // "do" is the cross-isolate service-binding mode: only Durable Object
-  // stubs cross (by value, no caps), every other capability stays a
-  // DataCloneError as with false.
   const doOnly = allowCapabilities === "do";
   const allowAll = allowCapabilities === true;
+  const host = allowCapabilities === "host";
   // A buffered body crosses as its bytes; a live-stream body
   // crosses as a stream handle (a capability, so the reply
   // roots its callee context and the pulls keep working).
   const liftBody = (v) => {
     if (v._bodyBytes !== null) return v._bodyBytes;
     caps = true;
-    return __liftStream(v.body);
+    return __liftStream(v.body, host, collector);
   };
   const lift = (v) => {
     if (v === null ||
@@ -4290,7 +4651,7 @@ const __stubLift = (value, allowCapabilities = true, originals) => {
     if (cached !== undefined) return cached;
     const meta = __stubMeta.get(v);
     if (meta) {
-      if (!allowAll) return v;
+      if (!allowAll && !host) return v;
       lifted = true;
       caps = true;
       if (meta.disposed) throw __stubDisposedError();
@@ -4299,6 +4660,33 @@ const __stubLift = (value, allowCapabilities = true, originals) => {
       if (meta.ctx !== ctx) throw __ctxError("Client");
       meta.disposed = true; // the ref moves to the receiver
       __ctxUnregister(meta);
+      if (collector !== null) collector.handles.push(meta);
+      // A received host stub forwards its host id: the reference moves
+      // and the round trip stays one hop. This isolate's hold moves with
+      // it; the receiver acquires on revive.
+      if (meta.entry.host !== undefined) {
+        const coords = meta.entry.host;
+        try {
+          __stub_handoff(coords.id);
+        } catch {}
+        const marker = { "__celld$stub": coords.id,
+                         t: __stubIsolate, h: 1,
+                         scope: coords.scope, epoch: coords.epoch,
+                         gen: coords.gen, c: meta.callable };
+        seen.set(v, marker);
+        return marker;
+      }
+      if (host) {
+        const coords = __exportHostStub(meta.entry, "target");
+        if (coords !== null) {
+          const marker = { "__celld$stub": coords.id,
+                           t: __stubIsolate, h: 1,
+                           scope: coords.scope, epoch: coords.epoch,
+                           gen: coords.generation, c: meta.callable };
+          seen.set(v, marker);
+          return marker;
+        }
+      }
       const marker = { "__celld$stub": meta.entry.id,
                        t: __stubIsolate, c: meta.callable };
       seen.set(v, marker);
@@ -4306,7 +4694,7 @@ const __stubLift = (value, allowCapabilities = true, originals) => {
     }
     const svc = __svcMeta.get(v);
     if (svc !== undefined) {
-      if (!allowAll) return v;
+      if (!allowAll && !host) return v;
       // A loopback service stub (ctx.exports): name + props cross
       // as plain data and revive as a fresh loopback stub. Props
       // are lifted too -- they may nest further stubs (Workerd's
@@ -4326,20 +4714,34 @@ const __stubLift = (value, allowCapabilities = true, originals) => {
         '". This type does not support serialization.',
         "DataCloneError");
     if (typeof v === "function" || v instanceof __cf.RpcTarget) {
-      if (!allowAll) return v;
+      if (!allowAll && !host) return v;
       lifted = true;
       caps = true;
-      const marker = { "__celld$stub": __newEntry(v).id,
+      const entry = __newEntry(v);
+      if (collector !== null) collector.entries.push({ entry, bridge: false });
+      const callable = typeof v === "function";
+      if (host) {
+        const coords = __exportHostStub(entry, "target");
+        if (coords !== null) {
+          const marker = { "__celld$stub": coords.id,
+                           t: __stubIsolate, h: 1,
+                           scope: coords.scope, epoch: coords.epoch,
+                           gen: coords.generation, c: callable };
+          seen.set(v, marker);
+          return marker;
+        }
+      }
+      const marker = { "__celld$stub": entry.id,
                        t: __stubIsolate,
-                       c: typeof v === "function" };
+                       c: callable };
       seen.set(v, marker);
       return marker;
     }
     const doMeta = __doStubMeta.get(v);
     if (doMeta !== undefined) {
-      if (!allowAll && !doOnly) return v;
+      if (!allowAll && !doOnly && !host) return v;
       lifted = true;
-      if (allowAll) caps = true;
+      if (allowAll || host) caps = true;
       const marker = { "__celld$do": doMeta.id._className,
                        v: doMeta.id._value, n: doMeta.name ?? null };
       seen.set(v, marker);
@@ -4352,22 +4754,22 @@ const __stubLift = (value, allowCapabilities = true, originals) => {
     // a fresh one. A live stream body cannot cross yet.
     let marker;
     if (v instanceof Headers) {
-      if (!allowAll) return v;
+      if (!allowAll && !host) return v;
       marker = { "__celld$hdr": [...v] };
     } else if (v instanceof Blob) {
-      if (!allowAll) return v;
+      if (!allowAll && !host) return v;
       marker = { "__celld$blob": v._bytes, y: v.type };
       if (v instanceof File) {
         marker.n = v.name;
         marker.m = v.lastModified;
       }
     } else if (v instanceof Request) {
-      if (!allowAll) return v;
+      if (!allowAll && !host) return v;
       marker = { "__celld$req": v.url, m: v.method,
                  h: [...v.headers], r: v.redirect, c: v.cf,
                  b: liftBody(v) };
     } else if (v instanceof Response) {
-      if (!allowAll) return v;
+      if (!allowAll && !host) return v;
       marker = { "__celld$res": v.status,
                  t: v.statusText ||
                     __STATUS_TEXT[v.status] || "",
@@ -4376,9 +4778,9 @@ const __stubLift = (value, allowCapabilities = true, originals) => {
                  b: v.body === null ? null : liftBody(v) };
     } else if (v instanceof ReadableStream ||
                v instanceof WritableStream) {
-      if (!allowAll) return v;
+      if (!allowAll && !host) return v;
       caps = true;
-      marker = __liftStream(v);
+      marker = __liftStream(v, host, collector);
     } else if (v instanceof AbortSignal) {
       marker = __liftSignal(v);
     }
@@ -4415,12 +4817,24 @@ const __stubLift = (value, allowCapabilities = true, originals) => {
     }
     const disposerSource = originals?.get(v) ?? v;
     const disposer = disposerSource[Symbol.dispose];
-    if (allowAll && !Array.isArray(v) &&
+    if ((allowAll || host) && !Array.isArray(v) &&
         typeof disposer === "function") {
       lifted = true;
       caps = true;
-      out["__celld$disp"] =
-        __newEntry(__rpcBindMethod(disposer, disposerSource)).id;
+      const entry =
+        __newEntry(__rpcBindMethod(disposer, disposerSource));
+      if (collector !== null) collector.entries.push({ entry, bridge: false });
+      // A host disposer crosses as its coordinates; an old reader looks
+      // a bare id up and drops a shape it cannot use (fail-closed).
+      if (host) {
+        const coords = __exportHostStub(entry, "disposer");
+        out["__celld$disp"] = coords === null ? entry.id
+          : { h: 1, id: coords.id,
+              scope: coords.scope, epoch: coords.epoch,
+              gen: coords.generation };
+      } else {
+        out["__celld$disp"] = entry.id;
+      }
     }
     return out;
   };
@@ -4478,6 +4892,88 @@ const __reviveResponse = (marker, revive) => {
 const __foreignStreamOp = () => Promise.reject(new Error(
   "RPC streams cannot cross isolate boundaries yet."));
 const __reviveStream = (marker, id, readable, handles) => {
+  // A host marker revives over the stub channel, whichever isolate this
+  // is -- including the minting one. Same wrappers as below, same
+  // disconnect errors, one bounded op per chunk. The revive acquires
+  // this isolate's hold; dispose, handoff, and context end drop it.
+  if (marker.h === 1) {
+    // The sender moved its hold with the reference, so the revive
+    // acquires first; a revive after its invocation ended releases
+    // immediately and arrives disposed instead of registering.
+    const rctx = __ctxAdopt();
+    try {
+      __stub_acquire(id);
+    } catch {}
+    const meta = {
+      entry: __hostStubEntry(id, marker),
+      disposed: rctx === undefined, ctx: rctx,
+    };
+    if (rctx === undefined) __stub_release(id).catch(() => {});
+    else __ctxRegister(meta);
+    handles.push(meta);
+    const stream = readable
+      ? new ReadableStream({
+          async pull(controller) {
+            let result;
+            try {
+              result = await __hostStubOp(meta, ["read"], []);
+            } catch {
+              throw __rsDisconnect();
+            }
+            if (result.done) controller.close();
+            else controller.enqueue(result.value);
+          },
+          cancel: () =>
+            __hostStubOp(meta, ["cancel"], []).catch(() => {}),
+        }, { highWaterMark: 0 })
+      : new WritableStream({
+          write: (chunk) => __hostStubOp(meta, ["write"], [chunk]),
+          close: () => __hostStubOp(meta, ["close"], []),
+          abort: () =>
+            __hostStubOp(meta, ["abort"], []).catch(() => {}),
+        });
+    __rpcStreamMeta.set(stream, meta);
+    return stream;
+  }
+  // A caller-pushed upload revives as a pull reader over the sender's
+  // host channel, whichever isolate this is. Same disconnect errors,
+  // one bounded op per chunk. Old readers see no `h: 1` and fail
+  // closed as foreign, as before.
+  if (marker.h === 2 && readable) {
+    // Uploads track no reader holds: a revive after its invocation ended
+    // cancels the channel (the sender's pump stops) and arrives disposed,
+    // reading EOF.
+    const rctx = __ctxAdopt();
+    const meta = {
+      entry: __uploadEntry(id),
+      disposed: rctx === undefined, ctx: rctx,
+    };
+    if (rctx === undefined) {
+      try {
+        __upload_cancel(id);
+      } catch {}
+    } else __ctxRegister(meta);
+    handles.push(meta);
+    const stream = new ReadableStream({
+      async pull(controller) {
+        let bytes;
+        try {
+          bytes = await __upload_pull(id);
+        } catch {
+          throw __rsDisconnect();
+        }
+        if (bytes[0] === 1) controller.close();
+        else controller.enqueue(bytes.subarray(1));
+      },
+      cancel: () => {
+        try {
+          __upload_cancel(id);
+        } catch {}
+      },
+    }, { highWaterMark: 0 });
+    __rpcStreamMeta.set(stream, meta);
+    return stream;
+  }
   const entry = marker.t === __stubIsolate
     ? __stubEntries.get(id) : undefined;
   if (entry === undefined)
@@ -4485,7 +4981,7 @@ const __reviveStream = (marker, id, readable, handles) => {
       ? new ReadableStream({ pull: __foreignStreamOp })
       : new WritableStream({ write: __foreignStreamOp,
           close: __foreignStreamOp, abort: __foreignStreamOp });
-  const meta = { entry, disposed: false, ctx: __ctxNow() };
+  const meta = { entry, disposed: false, ctx: __ctxAdopt() };
   __ctxRegister(meta);
   handles.push(meta);
   const stream = readable
@@ -4541,6 +5037,28 @@ const __stubRevive = (value) => {
     if (v === null || typeof v !== "object") return v;
     const stubId = v["__celld$stub"];
     if (stubId !== undefined) {
+      // A host marker revives over the stub channel, whichever isolate
+      // this is -- including the minting one. The revive acquires this
+      // isolate's hold; dispose, handoff, and context end drop it.
+      if (v.h === 1) {
+        // Like the host stream revive above: acquire the moved hold, but
+        // a revive after its invocation ended releases immediately and
+        // arrives disposed instead of registering.
+        const rctx = __ctxAdopt();
+        try {
+          __stub_acquire(stubId);
+        } catch {}
+        const stub = __makeStub(__hostStubEntry(stubId, v), v.c, rctx);
+        const meta = __stubMeta.get(stub);
+        if (meta) {
+          if (rctx === undefined) {
+            meta.disposed = true;
+            __stub_release(stubId).catch(() => {});
+          }
+          handles.push(meta);
+        }
+        return stub;
+      }
       const entry = v.t === __stubIsolate
         ? __stubEntries.get(stubId) : undefined;
       const stub = entry === undefined
@@ -4597,8 +5115,24 @@ const __stubRevive = (value) => {
     if (proto !== Object.prototype && proto !== null) return v;
     for (const key of Object.keys(v)) {
       if (key === "__celld$disp") {
-        const entry = __stubEntries.get(v[key]);
-        if (entry) disposers.push(entry);
+        const disp = v[key];
+        // A host disposer crosses as its coordinates; invoking it is a
+        // stub op with an empty path, then a release. The revive
+        // acquires the hold the release drops.
+        if (disp !== null && typeof disp === "object" && disp.h === 1) {
+          // A post-end revive cannot own the disposer: acquire the moved
+          // hold and release it immediately, so the handoff completes
+          // and the owner entry frees without running anything.
+          const rctx = __ctxAdopt();
+          try {
+            __stub_acquire(disp.id);
+          } catch {}
+          if (rctx === undefined) __stub_release(disp.id).catch(() => {});
+          else disposers.push(__hostStubEntry(disp.id, disp));
+        } else {
+          const entry = __stubEntries.get(disp);
+          if (entry) disposers.push(entry);
+        }
         delete v[key];
         continue;
       }
@@ -4659,8 +5193,17 @@ const __rpcWalk = async (root, path, args, entrypointRoot) => {
     const meta = __stubMeta.get(value);
     if (meta) {
       if (meta.disposed) throw __stubDisposedError();
+      // A host stub mid-walk continues over the stub channel.
+      if (meta.entry.host !== undefined)
+        return await __hostStubOp(meta, path.slice(i), args);
       const rest = path.slice(i);
-      return await __ctxRun(meta.entry.ctx,
+      // A mid-walk stub rooted in an ended context continues in the
+      // ambient (drive) context instead: reviving under the dead id would
+      // take the dead path and break a nested capability the walk returns
+      // for the drive's reply lift.
+      const mid = meta.entry.ctx;
+      const runCtx = mid !== undefined && __ctxLive.has(mid) ? mid : __ctxNow();
+      return await __ctxRun(runCtx,
         () => __rpcWalk(meta.entry.target, rest, args, false));
     }
     if (i > 0 && !__walkable(value))
@@ -4711,7 +5254,20 @@ const __stubOp = (meta, path, args) => {
       return Promise.reject(__postAbortError(aborted));
   }
   const argsSc = args === null ? null : __rpcOut(args, true);
+  // An entry outlives its minting invocation, so a drive usually runs
+  // under an ended context: run it under a fresh per-drive rescue
+  // instead, so nested revives register again and concurrent drives
+  // never dispose each other's handles at their ends. A drive under a
+  // still-live entry context shares that invocation (its owner). The
+  // drive ends its rescue after its reply lift; abort tracking below
+  // still keys on the entry's own context, exactly as before.
+  const entryCtx = entry.ctx;
+  const rescue = entryCtx === undefined || !__ctxLive.has(entryCtx)
+    ? __nextCtxId++ : null;
+  if (rescue !== null) __ctxLive.set(rescue, 1);
+  const runCtx = rescue ?? entryCtx;
   const dispatch = (async () => {
+    try {
     // Workerd delivers RPC asynchronously: the callee must not run
     // before the caller's synchronous code. A call made just after
     // a not-yet-delivered ctx.abort counts as in flight (rejects
@@ -4731,7 +5287,7 @@ const __stubOp = (meta, path, args) => {
           entry.section !== block.holder))
         await __gate_wait(cell);
     }
-    const reply = await __ctxRun(entry.ctx,
+    const reply = await __ctxRun(runCtx,
       () => __rpcRun(async () => {
         const decoded =
           argsSc === null ? null : __rpcDesArgs(argsSc);
@@ -4751,6 +5307,9 @@ const __stubOp = (meta, path, args) => {
           ? aborted.reason : aborted;
     }
     return __rpcDes(reply);
+    } finally {
+      if (rescue !== null) __ctxEnd(rescue);
+    }
   })();
   if (entry.ctx === undefined) return dispatch;
   // Race the op against its hosting context's abort: a hung callee
@@ -4763,6 +5322,32 @@ const __stubOp = (meta, path, args) => {
       (error) => { untrack(); reject(error); });
   });
 };
+// One stub-mediated op against another isolate: the caller's half of
+// `__dispatchStubOp`. Args serialize with host lift (a Durable Object
+// caller mints host ids back; a Worker-owned value keeps a same-isolate
+// marker and fails on use, as before); the reply decodes like any RPC
+// reply, so nested capabilities revive. Races the caller's context abort
+// the way `__stubOp` races its hosting context.
+const __hostStubOp = (meta, path, args) => {
+  if (meta.disposed) return Promise.reject(__stubDisposedError());
+  const host = meta.entry.host;
+  if (__abortedCtxs.size !== 0 && meta.ctx !== undefined) {
+    const aborted = __abortedCtxs.get(meta.ctx);
+    if (aborted !== undefined)
+      return Promise.reject(__postAbortError(aborted));
+  }
+  const argsSc = args === null ? null : __rpcOut(args, "host");
+  const dispatch = (async () =>
+    __rpcDes(await __stub_call(
+      host.id, host.scope, JSON.stringify(path), argsSc)))();
+  if (meta.ctx === undefined) return dispatch;
+  return new Promise((resolve, reject) => {
+    const untrack = __opTrack(meta.ctx, reject);
+    dispatch.then(
+      (value) => { untrack(); resolve(value); },
+      (error) => { untrack(); reject(error); });
+  });
+};
 // Resolve a path against a local, already-revived value. A hop
 // landing on a same-isolate stub delegates the rest of the path
 // to the stub's target; everything else is a plain [[Get]] so
@@ -4770,7 +5355,11 @@ const __stubOp = (meta, path, args) => {
 const __walkLocal = (parent, path, args) => {
   for (let i = 0; i < path.length; i++) {
     const meta = __stubMeta.get(parent);
-    if (meta) return __stubOp(meta, path.slice(i), args);
+    if (meta) {
+      if (meta.entry.host !== undefined)
+        return __hostStubOp(meta, path.slice(i), args);
+      return __stubOp(meta, path.slice(i), args);
+    }
     const prop = path[i];
     const member = parent == null ? undefined : parent[prop];
     if (i < path.length - 1) {
@@ -4788,7 +5377,11 @@ const __walkLocal = (parent, path, args) => {
   }
   if (args === null) return parent;
   const meta = __stubMeta.get(parent);
-  if (meta) return __stubOp(meta, [], args);
+  if (meta) {
+    if (meta.entry.host !== undefined)
+      return __hostStubOp(meta, [], args);
+    return __stubOp(meta, [], args);
+  }
   if (typeof parent !== "function")
     throw new TypeError("The RPC value is not callable.");
   return parent(...args);
@@ -4802,10 +5395,15 @@ const __valueSession = (promise) => ({
   call: (path, args) =>
     promise.then((v) => __walkLocal(v, path, args)),
 });
-const __stubSession = (meta) => ({
-  get: (path) => __stubOp(meta, path, null),
-  call: (path, args) => __stubOp(meta, path, args),
-});
+const __stubSession = (meta) => meta.entry.host !== undefined
+  ? {
+      get: (path) => __hostStubOp(meta, path, null),
+      call: (path, args) => __hostStubOp(meta, path, args),
+    }
+  : {
+      get: (path) => __stubOp(meta, path, null),
+      call: (path, args) => __stubOp(meta, path, args),
+    };
 const __entrypointSession = (name, local, script, makeInst, propsSc) => ({
   get: (path) => local
     ? (async () => __rpcDes(
@@ -4870,9 +5468,9 @@ const __makeNode = (session, path, ctx) => {
     },
   });
 };
-const __makeStub = (entry, callable) => {
+const __makeStub = (entry, callable, rctx = __ctxAdopt()) => {
   const meta =
-    { entry, callable, disposed: false, ctx: __ctxNow() };
+    { entry, callable, disposed: false, ctx: rctx };
   __ctxRegister(meta);
   const stub = new Proxy(function () {}, {
     getPrototypeOf: () => __cf.RpcStub.prototype,
@@ -4881,14 +5479,32 @@ const __makeStub = (entry, callable) => {
       if (prop === Symbol.dispose) return () => __disposeStub(meta);
       if (prop === "dup") return () => {
         if (meta.disposed) throw __stubDisposedError();
+        const dupCtx = __ctxAdopt();
+        // A dup after its invocation ended is already disposed (like a
+        // post-end revive): it takes no hold and no ref, and fails on
+        // use. Same-isolate dups keep today's behavior.
+        if (dupCtx === undefined && entry.host !== undefined) {
+          const dead = __makeStub(entry, callable, dupCtx);
+          __stubMeta.get(dead).disposed = true;
+          return dead;
+        }
         entry.refs++;
-        return __makeStub(entry, callable);
+        // A dup'd host handle is a second live handle: it acquires its
+        // own hold, and each dispose drops one.
+        if (entry.host !== undefined) {
+          try {
+            __stub_acquire(entry.host.id);
+          } catch {}
+        }
+        return __makeStub(entry, callable, dupCtx);
       };
       if (typeof prop !== "string") return undefined;
       return __makeNode(__stubSession(meta), [prop], __ctxNow());
     },
     apply: (_b, _this, args) => __makeNode(
-      __valueSession(__stubOp(meta, [], args)), [], __ctxNow()),
+      __valueSession(meta.entry.host !== undefined
+        ? __hostStubOp(meta, [], args)
+        : __stubOp(meta, [], args)), [], __ctxNow()),
   });
   __stubMeta.set(stub, meta);
   return stub;
@@ -5098,10 +5714,12 @@ const __ctxExports = () => __ctxExportsCache ??= (() => {
   return out;
 })();
 // ---- RPC envelope ----------------------------------------------
-// Serialize one payload. `lift` marks a same-isolate transport,
-// where stub-able values may cross as markers; elsewhere they stay
-// a DataCloneError, exactly as before stubs existed. "do" is the
-// cross-isolate service-binding mode: DO stubs plus signals only.
+// Serialize one payload. `lift` marks a transport where stub-able
+// values may cross as markers: `true` mints same-isolate markers,
+// "host" mints host-routable ids for entries a cell owns (Durable
+// Object RPC across isolates), "do" is the cross-isolate
+// service-binding mode (DO stubs plus signals only); elsewhere they
+// stay a DataCloneError, exactly as before stubs existed.
 const __rpcOut = (value, lift) => {
   const projected = __rpcProject(value);
   try {
@@ -5110,12 +5728,25 @@ const __rpcOut = (value, lift) => {
     // A cross-isolate call lifts only a live signal (plus DO stubs in "do"
     // mode). A same-isolate call can also transfer the existing host values
     // and JS capability handles.
-    const lifted = __stubLift(projected.tree, lift, projected.originals);
+    // A host lift that throws (a mint cap) or whose marker tree fails to
+    // encode restores what it moved and drops what it minted: a failed
+    // send keeps the sender's handles and leaks nothing on either side.
+    const collector =
+      lift === "host" ? { entries: [], handles: [] } : null;
+    let lifted;
+    try {
+      lifted =
+        __stubLift(projected.tree, lift, projected.originals, collector);
+    } catch (liftError) {
+      __unliftFailed(collector);
+      throw liftError;
+    }
     if (lifted === null) throw __dataCloneError(error);
     try {
       return __tagged(
         lifted.caps ? 1 : 2, __sc_encode(lifted.tree));
     } catch (error_) {
+      __unliftFailed(collector);
       throw __dataCloneError(error_);
     }
   }
@@ -5166,6 +5797,17 @@ const __rpcDes = (bytes) => {
         value: () => {
           for (const handle of handles) __disposeStub(handle);
           for (const entry of disposers) {
+            // A host disposer runs remotely, then releases; the release
+            // waits for the invocation so the id stays valid for it.
+            if (entry.host !== undefined) {
+              __hostStubOp(
+                { entry, disposed: false, ctx: undefined }, [], [])
+                .catch(() => {})
+                .finally(() => {
+                  __stub_release(entry.host.id).catch(() => {});
+                });
+              continue;
+            }
             __stubEntries.delete(entry.id);
             Promise.resolve().then(() => entry.target());
           }
@@ -5376,11 +6018,12 @@ class DurableObjectNamespace {
         return __fetcherHelper(doFetch, prop);
       // Every cell RPC goes out through the host, whichever node owns the
       // target. Same-process dispatch re-enters this isolate, where the
-      // abort and exit markers revive; bytes that land elsewhere revive as
-      // loud foreign stubs.
+      // abort and exit markers revive. Arguments lift with host ids where
+      // a cell owns them; anything else keeps a same-isolate marker and
+      // fails on use across isolates, as before.
       return async (...args) => invoke(
         async () => __rpcDes(await __rpc_call(
-          scope, dispatchName ?? null, prop, __rpcOut(args, true),
+          scope, dispatchName ?? null, prop, __rpcOut(args, "host"),
         )),
       );
     }});
@@ -5461,10 +6104,14 @@ const __dispatchTo = __celld.__dispatchTo = async (
     __incomingRequestSignals.set(
       String(requestId), requestController.signal);
   const actorEvent = __beginActorEvent(scope);
+  // A stub received by this invocation dies with it: the response reader
+  // ends the context once the body no longer needs it. A non-Response
+  // answer has no body, and a throw has no answer: end those here.
+  const ctxId = __ctxNext();
   try {
     const dispatch = (async () => {
       const inst = await _readyInstance(scope);
-      return await __ctxRun(undefined, () => inst.fetch(
+      return await __ctxRun(ctxId, () => inst.fetch(
         __makeRequest(
           url,
           method,
@@ -5495,7 +6142,12 @@ const __dispatchTo = __celld.__dispatchTo = async (
         socket._flushPending();
       }
     }
+    if (response instanceof Response) __fetchCtxs.set(response, ctxId);
+    else __ctxEnd(ctxId);
     return response;
+  } catch (error) {
+    __ctxEnd(ctxId);
+    throw error;
   } finally {
     if (requestId !== null)
       __incomingRequestSignals.delete(String(requestId));
@@ -5516,42 +6168,192 @@ const __rpcTargetMethod = async (scope, method) => {
     throw new TypeError(method + " is not a function");
   return [inst, fn];
 };
-// The byte path always lifts stub-able values into the reply: the
-// markers carry the isolate token, so they revive only back in this
-// isolate (same-process routed dispatch re-enters it) and fail loudly
-// on use anywhere else. Callee exceptions cross in
+// The byte path always lifts stub-able values into the reply, with
+// host-routable ids: they revive over the stub channel in any isolate
+// on this node, including this one. Callee exceptions cross in
 // the error envelope on every flavor.
 __celld.__dispatchRpc = async (scope, method, args) => {
   const actorEvent = __beginActorEvent(scope);
+  // A stub received by this invocation dies with it: the reply lift
+  // already moved what the call returned, so ending the context only
+  // disposes what the handler dropped. Every release routes to the
+  // owner; a quiet-but-open handle never dies on a timer.
+  const ctxId = __ctxNext();
   try {
-    // A string is the legacy JSON flavor; bytes are V8 structured clone.
-    // Answer in kind.
-    if (typeof args === "string") {
-      const [inst, fn] = await __rpcTargetMethod(scope, method);
-      const result = await fn.apply(inst, JSON.parse(args));
-      return JSON.stringify(result) ?? "null";
-    }
-    return await __ctxRun(undefined, () => (async () => {
-      const decoded = __rpcDesArgs(args);
-      try {
-        return await __rpcRun(async () => {
-          // A broken actor (JS-flavored ctx.abort) rejects every
-          // later call with the reason. One gated field read.
-          if (__brokenActors.size !== 0) {
-            const broken = __brokenActors.get(scope);
-            if (broken !== undefined) throw broken;
-          }
+    try {
+      // A string is the legacy JSON flavor; bytes are V8 structured clone.
+      // Answer in kind.
+      if (typeof args === "string") {
+        return await __ctxRun(ctxId, async () => {
           const [inst, fn] = await __rpcTargetMethod(scope, method);
-          return fn.apply(inst, decoded.args);
-        }, true);
-      } finally {
-        for (const handle of decoded.received) __disposeStub(handle);
+          const result = await fn.apply(inst, JSON.parse(args));
+          return JSON.stringify(result) ?? "null";
+        });
       }
-    })());
+      return await __ctxRun(ctxId, () => (async () => {
+        const decoded = __rpcDesArgs(args);
+        try {
+          return await __rpcRun(async () => {
+            // A broken actor (JS-flavored ctx.abort) rejects every
+            // later call with the reason. One gated field read.
+            if (__brokenActors.size !== 0) {
+              const broken = __brokenActors.get(scope);
+              if (broken !== undefined) throw broken;
+            }
+            const [inst, fn] = await __rpcTargetMethod(scope, method);
+            return fn.apply(inst, decoded.args);
+          }, "host");
+        } finally {
+          for (const handle of decoded.received) __disposeStub(handle);
+        }
+      })());
+    } finally {
+      __ctxEnd(ctxId);
+    }
   } finally {
     __endActorEvent(actorEvent);
   }
 };
+// The owner half of one cross-isolate stub op: the `__stubOp` dispatch
+// body as a drive. Looks the host id up, gates on the minting cell the
+// way `__stubOp` does (the drive already joined the input gate), and runs
+// the walk in the entry's context. Answers envelope bytes, never throws:
+// errors cross in the 0x00 tag, so the caller decodes them like any RPC
+// reply.
+__celld.__dispatchStubOp = async (scope, hostId, path, args) => {
+  const actorEvent = __beginActorEvent(scope);
+  try {
+    const local = __hostStubs.get(hostId);
+    const entry = local === undefined ? undefined : __stubEntries.get(local);
+    // The cell that minted this stub left residency, or the caller raced
+    // a release: fail here rather than calling into a foreign instance.
+    if (entry === undefined || entry.released)
+      return __rpcErrOut(__releasedStubError());
+    if (__abortedCtxs.size !== 0) {
+      const aborted = __abortedCtxs.get(entry.ctx);
+      if (aborted !== undefined)
+        return __rpcErrOut(__postAbortError(aborted));
+    }
+    // Nested revives (an op whose target calls out and drops the result)
+    // land in the drive's context; the reply lift moves what the op
+    // returned, so ending the op disposes the host-backed rest. Without
+    // this a dropped nested handle lingers for the entry's lifetime.
+    // Every drive runs under a fresh per-drive rescue (like the
+    // same-isolate drive), so concurrent drives never dispose each
+    // other's handles -- sharing a still-live entry context would let
+    // the first drive to end dispose revives a sibling registered
+    // after its snapshot. Abort tracking below still keys on the
+    // entry's own context, exactly as before.
+    const rescue = __nextCtxId++;
+    __ctxLive.set(rescue, 1);
+    const runCtx = rescue;
+    const run = async () => {
+      const cell = entry.scope;
+      if (cell !== undefined) {
+        const block = __cellBlocks.get(cell);
+        if (block !== undefined && (entry.section === null ||
+            entry.section !== block.holder))
+          await __gate_wait(cell);
+      }
+      const reply = await __ctxRun(runCtx,
+        () => __rpcRun(async () => {
+          const decoded = args === null ? null : __rpcDesArgs(args);
+          try {
+            if (__brokenActors.size !== 0) {
+              const broken = __brokenActors.get(scope);
+              if (broken !== undefined) throw broken;
+            }
+            return await __rpcWalk(entry.target, path,
+              decoded === null ? null : decoded.args, false);
+          } finally {
+            if (decoded !== null)
+              for (const handle of decoded.received)
+                __disposeStub(handle);
+          }
+        }, "host"));
+      if (__abortedCtxs.size !== 0) {
+        const aborted = __abortedCtxs.get(entry.ctx);
+        if (aborted !== undefined)
+          return __rpcErrOut(aborted instanceof __ActorAbort
+            ? aborted.reason : aborted);
+      }
+      return reply;
+    };
+    // Race the op against its hosting context's abort, as `__stubOp`
+    // does: a hung callee never settles, so the settlement check above
+    // cannot reach it. A late settlement lands on an already-settled
+    // promise (no-op). Abort reasons and gate failures envelope like
+    // any other error, so the caller decodes them like any RPC reply.
+    try {
+      if (entry.ctx === undefined) return await run();
+      try {
+        return await new Promise((resolve, reject) => {
+          const untrack = __opTrack(entry.ctx, reject);
+          run().then(
+            (value) => { untrack(); resolve(value); },
+            (error) => { untrack(); reject(error); });
+        });
+      } catch (error) {
+        return __rpcErrOut(error);
+      }
+    } finally {
+      __ctxEnd(rescue);
+    }
+  } finally {
+    __endActorEvent(actorEvent);
+  }
+};
+// The owner half of a cross-isolate stub release: forget the host id and
+// dispose the local entry. A disposer entry is deleted without running its
+// target -- the caller already invoked it remotely -- mirroring the local
+// disposer path, which deletes the entry and calls the target directly.
+__celld.__disposeHostStub = async (scope, hostId) => {
+  const actorEvent = __beginActorEvent(scope);
+  try {
+    const local = __hostStubs.get(hostId);
+    if (local === undefined) return;
+    __hostStubs.delete(hostId);
+    const exported = __hostStubLocals.get(local);
+    if (exported !== undefined) {
+      exported.delete(hostId);
+      if (exported.size === 0) __hostStubLocals.delete(local);
+    }
+    const entry = __stubEntries.get(local);
+    if (entry === undefined || entry.released) return;
+    if (entry.hostKind === "disposer") {
+      if (--entry.refs <= 0) __stubEntries.delete(entry.id);
+      return;
+    }
+    __disposeStub({ entry, disposed: false, ctx: undefined });
+  } finally {
+    __endActorEvent(actorEvent);
+  }
+};
+// Test-only observability for cross-isolate stub lifetime: counts of owner
+// entries, host mappings, live caller handles, sender pumps, and live
+// invocation contexts held by THIS isolate. Counts only -- ids never
+// surface. The global exists only
+// on nodes booted with CELLD_TEST_STUB_STATS=1 (the conformance suites);
+// production isolates never define it, so tenant code cannot probe
+// neighbor-invocation liveness on a shared heap. The fixture tolerates
+// its absence and reports { unavailable: true }.
+__celld.__stubStats = () => {
+  let ctxHandles = 0;
+  for (const set of __ctxStubs.values()) ctxHandles += set.size;
+  let ctxUploads = 0;
+  for (const set of __ctxUploads.values()) ctxUploads += set.size;
+  return {
+    ownerEntries: __stubEntries.size,
+    hostIds: __hostStubs.size,
+    hostLocalEntries: __hostStubLocals.size,
+    ctxHandles,
+    ctxUploads,
+    abortedCtxs: __abortedCtxs.size,
+    liveCtxs: __ctxLive.size,
+  };
+};
+if (__test_stub_stats_enabled())
+  globalThis.__celldStubStatsForTestOnly = __celld.__stubStats;
 const __entrypointClass = (name) => {
   const cls = __cell.entrypoints[name];
   if (typeof cls !== "function") {
@@ -5605,14 +6407,29 @@ const __noHandler = (name, method) =>
       `Entrypoint ${JSON.stringify(name)} has no ${method} handler`);
 
 const __dispatchEntrypointMethod = async (name, method, arg, props) => {
+  // A stub received by this invocation dies with it. A fetch answer may
+  // carry a live body, so the response reader ends its context once the
+  // body no longer needs it; every other method ends here, and a throw
+  // ends before it propagates.
+  const ctxId = __ctxNext();
+  const endValue = (value) => {
+    if (method === "fetch" && value instanceof Response)
+      __fetchCtxs.set(value, ctxId);
+    else
+      __ctxEnd(ctxId);
+    return value;
+  };
   const handler = __cell.objectEntrypoints[name];
   if (handler !== undefined) {
     if (typeof handler[method] !== "function")
       throw __noHandler(name, method);
     const ctx = __beginEvent(props);
     try {
-      return await __ctxRun(undefined,
-        () => handler[method](arg, __cell.env, ctx));
+      return endValue(await __ctxRun(ctxId,
+        () => handler[method](arg, __cell.env, ctx)));
+    } catch (error) {
+      __ctxEnd(ctxId);
+      throw error;
     } finally {
       __endEvent();
     }
@@ -5622,23 +6439,35 @@ const __dispatchEntrypointMethod = async (name, method, arg, props) => {
   const inst = __newEntrypointInstance(name, props);
   if (typeof inst[method] !== "function")
     throw __noHandler(name, method);
-  return await __ctxRun(undefined, () => inst[method](arg));
+  try {
+    return endValue(await __ctxRun(ctxId, () => inst[method](arg)));
+  } catch (error) {
+    __ctxEnd(ctxId);
+    throw error;
+  }
 };
 // Invoke a handler inside the event frame that the host already opened. A
 // Queue dispatch uses this form because its host driver must receive and keep
 // driving the handler's waitUntil aggregate after the settlement is returned.
 const __dispatchEntrypointMethodInCurrentEvent = async (name, method, arg) => {
-  const handler = __cell.objectEntrypoints[name];
-  if (handler !== undefined) {
-    if (typeof handler[method] !== "function")
+  // Queue answers carry no body: a stub received by this invocation dies
+  // with it, here.
+  const ctxId = __ctxNext();
+  try {
+    const handler = __cell.objectEntrypoints[name];
+    if (handler !== undefined) {
+      if (typeof handler[method] !== "function")
+        throw __noHandler(name, method);
+      return await __ctxRun(ctxId,
+        () => handler[method](arg, __cell.env, __entrypointContext()));
+    }
+    const inst = __newEntrypointInstance(name, undefined);
+    if (typeof inst[method] !== "function")
       throw __noHandler(name, method);
-    return await __ctxRun(undefined,
-      () => handler[method](arg, __cell.env, __entrypointContext()));
+    return await __ctxRun(ctxId, () => inst[method](arg));
+  } finally {
+    __ctxEnd(ctxId);
   }
-  const inst = __newEntrypointInstance(name, undefined);
-  if (typeof inst[method] !== "function")
-    throw __noHandler(name, method);
-  return await __ctxRun(undefined, () => inst[method](arg));
 };
 const __dispatchEntrypointFetch = __celld.__dispatchEntrypointFetch =
   (name, request, propsSc = null) =>
@@ -5646,6 +6475,40 @@ const __dispatchEntrypointFetch = __celld.__dispatchEntrypointFetch =
     name, "fetch", request,
     propsSc === null || propsSc.length === 0
       ? undefined : __sc_decode(propsSc));
+// The plain-object-handler entry the drive calls directly with the
+// handler and its request/env/context. Establishes the invocation's
+// stub context (like `__dispatchEntrypointMethod` does for named
+// entrypoints) and ends it when the answer settles: a Response hands
+// its context to the response reader (which ends it once the body no
+// longer needs it), anything else ends here, and a throw ends before
+// it propagates.
+__celld.__dispatchDefaultFetch = (fetchFn, req, env, executionCtx) => {
+  const ctxId = __ctxNext();
+  const endValue = (value) => {
+    if (value instanceof Response) __fetchCtxs.set(value, ctxId);
+    else __ctxEnd(ctxId);
+    return value;
+  };
+  let result;
+  try {
+    result = __ctxRun(ctxId, () => fetchFn(req, env, executionCtx));
+  } catch (error) {
+    __ctxEnd(ctxId);
+    throw error;
+  }
+  if (result === null ||
+      (typeof result !== "object" && typeof result !== "function") ||
+      typeof result.then !== "function") {
+    return endValue(result);
+  }
+  return result.then(
+    (value) => endValue(value),
+    (error) => {
+      __ctxEnd(ctxId);
+      throw error;
+    },
+  );
+};
 __celld.__dispatchEntrypointScheduled = (name, ctrl) =>
   __dispatchEntrypointMethod(name, "scheduled", ctrl);
 // A queue batch owns mutable settlement state only while its handler runs.
@@ -5794,7 +6657,7 @@ __celld.__cancelPendingEvents = (ids) => {
 // getEntrypoint(name, { props })); undefined leaves the entrypoint's
 // default empty props.
 const __entrypointOp = (name, path, argsSc, local, makeInst, props) => {
-  const id = __nextCtxId++;
+  const id = __ctxNext();
   return __ctxRun(id, () => {
   const pendingId = __nextPendingEventId++;
   let cancel;
@@ -5802,9 +6665,13 @@ const __entrypointOp = (name, path, argsSc, local, makeInst, props) => {
   __pendingEvents.set(pendingId, cancel);
   __pending_event_begin(pendingId);
   const running = (async () => {
-  const decoded = argsSc === null ? null : __rpcDesArgs(argsSc);
+  // Decoded inside the try: a corrupt-args throw rejects the call after
+  // the outer finally ends the context (below), instead of escaping
+  // with the fresh id still live plus any partial revives.
+  let decoded = null;
   let drain = null;
   try {
+    decoded = argsSc === null ? null : __rpcDesArgs(argsSc);
     const reply = await __rpcRun(async () => {
       // The handler's synchronous part runs inside its own event so
       // ctx.waitUntil and the imported waitUntil have a target. The
@@ -5838,26 +6705,40 @@ const __entrypointOp = (name, path, argsSc, local, makeInst, props) => {
       }
       return await result;
     }, local ? true : "do");
-    // Registered work drains before a plain reply. A
-    // capability-bearing reply (tag 1) must not wait: a returned
-    // stream's chunks may be produced by that very work, which
-    // cannot finish until the caller pulls (returnReadableStream's
-    // waitUntil writer would deadlock behind its own reply).
-    if (reply[0] !== 1 && drain !== null) await drain;
-    // ctx.abort() during the call supersedes its result; the raw
-    // reason rejects the caller (same isolate -- identity holds).
-    if (__abortedCtxs.size !== 0) {
-      const reason = __abortedCtxs.get(id);
-      if (reason !== undefined) throw reason;
+    // The call ended: tear its context down in a finally, so a drain
+    // or abort throw below cannot skip it and leak a live context. A
+    // service callee that called out and dropped the result holds host
+    // handles here; the reply lift already moved what it returned, so
+    // what remains is dropped: dispose it. Same-isolate handles keep
+    // their lifetime below. Returned capabilities survive through their
+    // entries' refs (the reply lift already moved them out), the way a
+    // DO RPC callee's do: that path ends its context unconditionally
+    // too. An upload pump the callee started for a nested call's stream
+    // argument stops here; the nested call already replied, so its
+    // reader drained or disposed.
+    try {
+      __disposeNewHostHandles(id, null);
+      // Registered work drains before a plain reply. A
+      // capability-bearing reply (tag 1) must not wait: a returned
+      // stream's chunks may be produced by that very work, which
+      // cannot finish until the caller pulls (returnReadableStream's
+      // waitUntil writer would deadlock behind its own reply).
+      if (reply[0] !== 1 && drain !== null) await drain;
+      // ctx.abort() during the call supersedes its result; the raw
+      // reason rejects the caller (same isolate -- identity holds).
+      if (__abortedCtxs.size !== 0) {
+        const reason = __abortedCtxs.get(id);
+        if (reason !== undefined) throw reason;
+      }
+    } finally {
+      __ctxEnd(id);
     }
-    // A reply that exports no stubs (tag 0xff plain, tag 0 error)
-    // leaves nothing rooting this context: tear it down now, so a
-    // dup() the callee leaked reaches its disposal callback
-    // promptly (Workerd tears the IoContext down at call end
-    // unless returned capabilities hold it open).
-    if (reply[0] !== 1) __ctxEnd(id);
     return reply;
   } finally {
+    // Idempotent with the inner end above: a decode throw (or any future
+    // early throw) still tears the context down, disposing partial
+    // revives with it.
+    __ctxEnd(id);
     if (decoded !== null)
       for (const handle of decoded.received) __disposeStub(handle);
   }
@@ -5897,73 +6778,96 @@ const __wsStub = __celld.__wsStub = (wsId) => ({
 });
 __celld.__wsOpen = async (scope, wsId, protocol) => {
   const actorEvent = __beginActorEvent(scope);
+  // Socket events are invocations too: a stub the handler revives dies
+  // with the event. Without a context the handle would register
+  // nowhere and its release would never route.
+  const ctxId = __ctxNext();
   try {
     const inst = await _readyInstance(scope);
     const socket = inst.__celldState._socket(wsId);
     if (socket.readyState !== WebSocket.READY_STATE_CONNECTING) return;
-    socket.protocol = protocol;
-    socket.readyState = WebSocket.READY_STATE_OPEN;
-    socket.dispatchEvent(new Event("open"));
+    await __ctxRun(ctxId, async () => {
+      socket.protocol = protocol;
+      socket.readyState = WebSocket.READY_STATE_OPEN;
+      socket.dispatchEvent(new Event("open"));
+    });
   } finally {
+    __ctxEnd(ctxId);
     __endActorEvent(actorEvent);
   }
 };
 __celld.__wsMessage = async (scope, wsId, msg) => {
   const actorEvent = __beginActorEvent(scope);
+  const ctxId = __ctxNext();
   try {
     const inst = await _readyInstance(scope);
     const socket = inst.__celldState._socket(wsId);
-    if (!socket._hibernatable && typeof socket._dispatchMessage === "function")
-      socket._dispatchMessage(msg);
-    else if (typeof inst.webSocketMessage === "function")
-      await inst.webSocketMessage(socket, msg);
+    await __ctxRun(ctxId, async () => {
+      if (!socket._hibernatable && typeof socket._dispatchMessage === "function")
+        socket._dispatchMessage(msg);
+      else if (typeof inst.webSocketMessage === "function")
+        await inst.webSocketMessage(socket, msg);
+    });
   } finally {
+    __ctxEnd(ctxId);
     __endActorEvent(actorEvent);
   }
 };
 __celld.__wsBinary = async (scope, wsId, data) => {
   const actorEvent = __beginActorEvent(scope);
+  const ctxId = __ctxNext();
   try {
     const inst = await _readyInstance(scope);
     const socket = inst.__celldState._socket(wsId);
     const bytes = data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
-    if (!socket._hibernatable && typeof socket._dispatchMessage === "function")
-      socket._dispatchMessage(bytes);
-    else if (typeof inst.webSocketMessage === "function")
-      await inst.webSocketMessage(socket, bytes);
+    await __ctxRun(ctxId, async () => {
+      if (!socket._hibernatable && typeof socket._dispatchMessage === "function")
+        socket._dispatchMessage(bytes);
+      else if (typeof inst.webSocketMessage === "function")
+        await inst.webSocketMessage(socket, bytes);
+    });
   } finally {
+    __ctxEnd(ctxId);
     __endActorEvent(actorEvent);
   }
 };
 __celld.__wsClosed = async (scope, wsId, code, reason, wasClean) => {
   const actorEvent = __beginActorEvent(scope);
+  const ctxId = __ctxNext();
   try {
     const inst = await _readyInstance(scope);
     const socket = inst.__celldState._socket(wsId);
-    if (!socket._hibernatable && typeof socket._dispatchClose === "function")
-      socket._dispatchClose(code, reason, wasClean);
-    else if (!wasClean && typeof inst.webSocketError === "function")
-      // A hibernatable socket reports an abnormal closure through
-      // webSocketError, which celld listed as a handler name and never
-      // called.
-      await inst.webSocketError(
-        socket,
-        new Error(reason ? `WebSocket closed abnormally: ${reason}` : "WebSocket closed abnormally"),
-      );
-    else if (typeof inst.webSocketClose === "function")
-      await inst.webSocketClose(socket, code, reason, wasClean);
+    await __ctxRun(ctxId, async () => {
+      if (!socket._hibernatable && typeof socket._dispatchClose === "function")
+        socket._dispatchClose(code, reason, wasClean);
+      else if (!wasClean && typeof inst.webSocketError === "function")
+        // A hibernatable socket reports an abnormal closure through
+        // webSocketError, which celld listed as a handler name and never
+        // called.
+        await inst.webSocketError(
+          socket,
+          new Error(reason ? `WebSocket closed abnormally: ${reason}` : "WebSocket closed abnormally"),
+        );
+      else if (typeof inst.webSocketClose === "function")
+        await inst.webSocketClose(socket, code, reason, wasClean);
+    });
   } finally {
+    __ctxEnd(ctxId);
     __endActorEvent(actorEvent);
   }
 };
 // called by celld's scheduler when an alarm is due. Returns a promise.
 __celld.__fireAlarm = async (scope, scheduledTime, retryCount) => {
   const actorEvent = __beginActorEvent(scope);
+  // An alarm is an invocation: a stub the handler revives dies with it.
+  const ctxId = __ctxNext();
   try {
     const inst = await _readyInstance(scope);
     if (typeof inst.alarm !== "function") return;
-    await inst.alarm({ scheduledTime, retryCount, isRetry: retryCount > 0 });
+    await __ctxRun(ctxId, () =>
+      inst.alarm({ scheduledTime, retryCount, isRetry: retryCount > 0 }));
   } finally {
+    __ctxEnd(ctxId);
     __endActorEvent(actorEvent);
   }
 };
@@ -11487,59 +12391,85 @@ __celld.__fs = __fsNamespaceProxy(
   __fsNamespaceNames,
   ["readdirSync", "readlinkSync"],
 );
-const __bridgeResponseStream = (body, requestControllers) => {
-  const streamId = __response_stream_create();
+const __bridgeResponseStream = (body, requestControllers, onSettle) => {
+  let streamId;
+  try {
+    streamId = __response_stream_create();
+  } catch (error) {
+    onSettle?.();
+    throw error;
+  }
   const pump = (async () => {
-    const reader = body.getReader();
-    const consumerClosed = __response_stream_closed(streamId)
-      .then((status) => status === "cancelled"
-        ? { consumerClosed: true }
-        : new Promise(() => {}));
-    const cancelProducer = async () => {
-      const reason = new Error("The client has disconnected");
-      for (const controller of requestControllers || []) {
-        if (!controller.signal.aborted) controller.abort(reason);
-      }
-      try {
-        await reader.cancel(reason);
-      } catch {}
-      await __response_stream_close(streamId, "");
-    };
     try {
-      for (;;) {
-        const result = await Promise.race([
-          reader.read().then((read) => ({ read })),
-          consumerClosed,
-        ]);
-        if (result.consumerClosed) {
+      const reader = body.getReader();
+      const consumerClosed = __response_stream_closed(streamId)
+        .then((status) => status === "cancelled"
+          ? { consumerClosed: true }
+          : new Promise(() => {}));
+      const cancelProducer = async () => {
+        const reason = new Error("The client has disconnected");
+        for (const controller of requestControllers || []) {
+          if (!controller.signal.aborted) controller.abort(reason);
+        }
+        try {
+          await reader.cancel(reason);
+        } catch {}
+        await __response_stream_close(streamId, "");
+      };
+      try {
+        for (;;) {
+          const result = await Promise.race([
+            reader.read().then((read) => ({ read })),
+            consumerClosed,
+          ]);
+          if (result.consumerClosed) {
+            await cancelProducer();
+            return;
+          }
+          if (result.read.done) {
+            await __response_stream_close(streamId, "");
+            return;
+          }
+          const bytes = __bodyBytes(result.read.value);
+          for (let offset = 0; offset < bytes.byteLength; offset += 64 * 1024) {
+            await __response_stream_write(
+              streamId,
+              bytes.subarray(offset, offset + 64 * 1024),
+            );
+          }
+        }
+      } catch (error) {
+        if (String(error).includes("response stream consumer canceled")) {
           await cancelProducer();
           return;
         }
-        if (result.read.done) {
-          await __response_stream_close(streamId, "");
-          return;
-        }
-        const bytes = __bodyBytes(result.read.value);
-        for (let offset = 0; offset < bytes.byteLength; offset += 64 * 1024) {
-          await __response_stream_write(
-            streamId,
-            bytes.subarray(offset, offset + 64 * 1024),
-          );
-        }
+        await __response_stream_close(streamId, String(error));
       }
-    } catch (error) {
-      if (String(error).includes("response stream consumer canceled")) {
-        await cancelProducer();
-        return;
-      }
-      await __response_stream_close(streamId, String(error));
+    } finally {
+      // A live body holds its fetch's stubs until it settles: the pump
+      // pulls through their handles, so ending the context earlier
+      // would disconnect the body mid-stream.
+      onSettle?.();
     }
   })();
   __registerWaitUntil(pump);
   return streamId;
 };
 __celld.__readResponse = (r) => {
+  // The fetch context that produced this response, if any: end it once
+  // the body no longer needs it. Bytes bodies end here; a live body ends
+  // when its bridge pump settles (below); a host-stream body needs no JS
+  // handles and ends here too.
+  const fetchCtx = (r !== null &&
+      (typeof r === "object" || typeof r === "function"))
+    ? __fetchCtxs.get(r)
+    : undefined;
+  if (fetchCtx !== undefined) __fetchCtxs.delete(r);
+  const endFetchCtx = () => {
+    if (fetchCtx !== undefined) __ctxEnd(fetchCtx);
+  };
   if (!(r instanceof Response)) {
+    endFetchCtx();
     return {
       status: 200,
       bodyBytes: new TextEncoder().encode(String(r)),
@@ -11552,8 +12482,10 @@ __celld.__readResponse = (r) => {
   // Keep the network-error marker out of the HTTP response fields. If status
   // zero reaches Rust as an ordinary response, the outer server can report
   // only a generic invalid status instead of the Worker contract failure.
-  if (r.type === "error" || r.status === 0)
+  if (r.type === "error" || r.status === 0) {
+    endFetchCtx();
     return { error: __ERROR_RESPONSE_MESSAGE };
+  }
   let workerSocketId = 0;
   let wsTarget = r._wsTarget || (r.webSocket && r.webSocket._target) || null;
   if (r.status === 101 && r.webSocket && wsTarget === null) {
@@ -11571,16 +12503,25 @@ __celld.__readResponse = (r) => {
       server._flushPending();
     }
   }
-  const bodyStreamId = r._bodyBytes === null
-    ? typeof r.body?.__celldStreamId === "number" &&
-        !r.__celldRequestControllers
-      ? r.body.__celldStreamId
-      : __bridgeResponseStream(
+  let bodyStreamId;
+  let pumpEndsCtx = false;
+  if (r._bodyBytes === null) {
+    if (typeof r.body?.__celldStreamId === "number" &&
+        !r.__celldRequestControllers) {
+      bodyStreamId = r.body.__celldStreamId;
+    } else {
+      bodyStreamId = __bridgeResponseStream(
         r.body,
         r.__celldRequestControllers,
-      )
-    : 0;
+        endFetchCtx,
+      );
+      pumpEndsCtx = true;
+    }
+  } else {
+    bodyStreamId = 0;
+  }
   if (bodyStreamId) {
+    if (!pumpEndsCtx) endFetchCtx();
     return {
       status: r.status,
       bodyBytes: new Uint8Array(),
@@ -11591,6 +12532,7 @@ __celld.__readResponse = (r) => {
     };
   }
   const bytes = r._bodyBytes;
+  endFetchCtx();
   return {
     status: r.status,
     bodyBytes: bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes),
