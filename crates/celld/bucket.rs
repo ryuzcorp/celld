@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): R2 startAfter compares decoded keys; listing pages carry walk-ordered rows.
+// Modified by ryuzcorp (ryuzcorp/celld): R2 startAfter compares decoded keys; listing pages carry walk-ordered rows; staged activation.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! The engine's single object-store client: the `object_store` crate
@@ -1194,9 +1194,14 @@ impl Bucket {
         gone
     }
 
-    /// Every object under `prefix/`; the client paginates internally.
-    /// Listed keys come back the way the caller wrote them, because the
-    /// caller parses them and knows nothing of the fleet's prefix.
+    /// Every object whose key starts with `prefix`, as raw bytes — S3
+    /// `ListObjectsV2` semantics on every backend, including the local
+    /// development store. A partial segment matches its siblings, and an
+    /// object at the prefix itself is returned, so a caller deleting or
+    /// parsing what it lists must filter to its own directory. The client
+    /// paginates internally. Listed keys come back the way the caller
+    /// wrote them, because the caller parses them and knows nothing of
+    /// the fleet's prefix.
     pub async fn list(&self, prefix: &str) -> anyhow::Result<Vec<ObjectMeta>> {
         let path = Path::from(self.key(prefix.trim_end_matches('/')));
         let mut stream = self.store.list(Some(&path));
@@ -1214,7 +1219,8 @@ impl Bucket {
         Ok(objects)
     }
 
-    /// Does anything exist under `prefix/`? One page at most.
+    /// Does anything exist under the byte prefix `prefix` (see
+    /// [`Self::list`])? One page at most.
     pub async fn list_any(&self, prefix: &str) -> anyhow::Result<bool> {
         let path = Path::from(self.key(prefix.trim_end_matches('/')));
         match self.store.list(Some(&path)).next().await {

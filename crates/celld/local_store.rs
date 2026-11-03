@@ -1,3 +1,4 @@
+// Modified by ryuzcorp (ryuzcorp/celld): staged activation.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! The persistent object store for `celld dev`.
@@ -295,18 +296,21 @@ impl ObjectStore for LocalStore {
     }
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
-        let prefix = prefix.cloned();
+        // S3 byte-prefix semantics, like the fleet backends: the prefix is
+        // raw bytes, so a partial segment matches its siblings and an
+        // object at the prefix itself is returned. A segment-scoped
+        // listing here masked a discard that deleted serving code on S3
+        // while every hermetic test stayed green.
+        let prefix = prefix.cloned().unwrap_or_default();
+        let want: &str = prefix.as_ref();
         let result = self.metadata().and_then(|objects| {
             objects
                 .into_iter()
                 .map(|object| object_meta(&object))
                 .filter(|meta| {
                     meta.as_ref().map_or(true, |meta| {
-                        prefix.as_ref().is_none_or(|prefix| {
-                            meta.location
-                                .prefix_match(prefix)
-                                .is_some_and(|mut remainder| remainder.next().is_some())
-                        })
+                        let location: &str = meta.location.as_ref();
+                        location.starts_with(want)
                     })
                 })
                 .collect::<object_store::Result<Vec<_>>>()

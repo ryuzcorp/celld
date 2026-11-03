@@ -3736,6 +3736,12 @@ export default { fetch() { return new Response('ok'); } };
             version: "test".into(),
             prefix: String::new(),
             script_name: "coverage-test".into(),
+            serving: crate::generation::ServingIdentity {
+                script_name: Some("coverage-test".into()),
+                version: "test".into(),
+                prefix: String::new(),
+                components: None,
+            },
             stateless: StatelessRuntime {
                 node: Arc::from("n0"),
                 region: Arc::from("test"),

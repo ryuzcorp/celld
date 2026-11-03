@@ -176,6 +176,7 @@ fn preseed_victim(app_project: &Path, victim_src: &Path) {
             vars: celld::deploy::VarOverrides::None,
             local_images: true,
             sourcemap: None,
+            no_activate: false,
         })
         .expect("build victim");
         celld::deploy::write(&bucket, &built)

@@ -1,0 +1,9 @@
+{
+  "name": "staged-consumer",
+  "main": "worker.js",
+  "compatibility_date": "2026-02-12",
+  "no_bundle": true,
+  "queues": {
+    "consumers": [{ "queue": "staged-work" }]
+  }
+}

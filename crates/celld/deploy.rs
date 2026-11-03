@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): idempotent content-tagged image create; tag-race tests run the fake engine through sh; deploy --sourcemap writes the bundle's external map; service binding targets validated at deploy.
+// Modified by ryuzcorp (ryuzcorp/celld): idempotent content-tagged image create; tag-race tests run the fake engine through sh; deploy --sourcemap writes the bundle's external map; service binding targets validated at deploy; staged activation.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 // Deployment is an operator control-plane path outside the Actor execution
@@ -16,11 +16,11 @@ use crate::bucket::Bucket;
 use crate::container::ContainerSpec;
 use crate::note;
 use crate::protocol::{
-    asset_blob_key, AssetConfig, AssetEntry, AssetIndex, AssetManifestRef, DeployPointer, Manifest,
-    ModuleKind, ModuleRef, QueueConsumerAttachment, QueueConsumerConfig, QueueConsumerDeployment,
-    Rollout, RunWorkerFirst, FEATURE_ASSETS_V1, FEATURE_CONTAINERS_V1, FEATURE_CRON_V1,
-    FEATURE_D1_V1, FEATURE_KV_V1, FEATURE_PYTHON_WORKERS_V1, FEATURE_QUEUES_V1, FEATURE_R2_V1,
-    FEATURE_SQLITE_VEC_V1, FEATURE_WASM_V1, FEATURE_WORKFLOWS_V1,
+    asset_blob_key, AssetConfig, AssetEntry, AssetIndex, AssetManifestRef, ComponentRef,
+    DeployPointer, Manifest, ModuleKind, ModuleRef, QueueConsumerAttachment, QueueConsumerConfig,
+    QueueConsumerDeployment, Rollout, RunWorkerFirst, FEATURE_ASSETS_V1, FEATURE_CONTAINERS_V1,
+    FEATURE_CRON_V1, FEATURE_D1_V1, FEATURE_KV_V1, FEATURE_PYTHON_WORKERS_V1, FEATURE_QUEUES_V1,
+    FEATURE_R2_V1, FEATURE_SQLITE_VEC_V1, FEATURE_WASM_V1, FEATURE_WORKFLOWS_V1,
     QUEUE_CONSUMER_ATTACHMENT_SCHEMA_VERSION,
 };
 use anyhow::{anyhow, bail, Context};
@@ -214,6 +214,12 @@ pub struct Options {
     /// Only the esbuild bundle gets a map; anything else warns and writes
     /// nothing. The deployed bytes are identical with or without the flag.
     pub sourcemap: Option<PathBuf>,
+    /// Upload and validate the version without moving any pointer: the
+    /// version is staged, invisible to serving, until `celld activate`
+    /// names it. Queue attachments stay too — an attachment names an exact
+    /// deployment, so moving it early would leak the staged version into
+    /// the next adoption's queue resolution.
+    pub no_activate: bool,
 }
 
 /// Local Worker variables, tagged with the kind of file that supplied them.
@@ -239,7 +245,7 @@ pub fn print_help() {
 USAGE:\n  celld deploy [PROJECT] --bucket [s3://|gs://|az://]NAME[/PREFIX] [OPTIONS]\n\n\
 PROJECT is a directory or a Wrangler config; it defaults to the working\n\
 directory, where celld looks for wrangler.jsonc or wrangler.json.\n\n\
-OPTIONS:\n  --sourcemap PATH       Write the bundled Worker's external source map to PATH.\n                         Only the bundled JS entry is mapped, never wasm siblings;\n                         asset-only, `no_bundle`, and Python projects warn and write\n                         nothing. The deployed bytes are identical with or without it\n  --config PATH          Same as passing PROJECT positionally\n  --bucket [s3://|gs://|az://]NAME[/PREFIX]\n                         Fleet bucket and prefix; defaults to CELLD_BUCKET.\n                         gs:// selects a Google Cloud Storage bucket, az://\n                         an Azure Blob Storage container with its account in\n                         AZURE_STORAGE_ACCOUNT_NAME; celld then rejects\n                         --endpoint and ignores --region\n  --endpoint URL         S3-compatible endpoint; defaults to S3_ENDPOINT\n  --region REGION        Storage region; defaults to AWS_REGION\n  --dry-run              Bundle and print the version without writing\n  --json                 Print the deployment as one JSON object\n  -h, --help             Show this help\n\n\
+OPTIONS:\n  --sourcemap PATH       Write the bundled Worker's external source map to PATH.\n                         Only the bundled JS entry is mapped, never wasm siblings;\n                         asset-only, `no_bundle`, and Python projects warn and write\n                         nothing. The deployed bytes are identical with or without it\n  --config PATH          Same as passing PROJECT positionally\n  --bucket [s3://|gs://|az://]NAME[/PREFIX]\n                         Fleet bucket and prefix; defaults to CELLD_BUCKET.\n                         gs:// selects a Google Cloud Storage bucket, az://\n                         an Azure Blob Storage container with its account in\n                         AZURE_STORAGE_ACCOUNT_NAME; celld then rejects\n                         --endpoint and ignores --region\n  --endpoint URL         S3-compatible endpoint; defaults to S3_ENDPOINT\n  --region REGION        Storage region; defaults to AWS_REGION\n  --dry-run              Bundle and print the version without writing\n  --no-activate          Upload and validate without moving any pointer;\n                         the staged version serves only once `celld activate`\n                         names it\n  --json                 Print the deployment as one JSON object\n  -h, --help             Show this help\n\n\
 Credentials come from the standard AWS credential chain, from Google\n\
 Application Default Credentials for a gs:// bucket, or from an Azure storage\n\
 account key, managed identity, or workload identity for an az:// bucket.\n\n\
@@ -247,7 +253,8 @@ Worker projects require `esbuild` on PATH; asset-only projects do not. Static\n\
 assets, service bindings, and string vars are supported. Routes are not; use\n\
 Wrangler for route configuration.\n\
 A running node polls the deployment pointer and adopts the new version in\n\
-place; nothing restarts."
+place; nothing restarts. Never run deploy concurrently with another deploy\n\
+or activate."
     ;
     let text = format!(
         "{text}\nThe config `name` uses lowercase ASCII letters, digits, and internal hyphens. \
@@ -269,6 +276,7 @@ pub fn options_from_arguments(
         json: false,
         vars: VarOverrides::None,
         sourcemap: None,
+        no_activate: false,
     };
     let mut arguments = arguments.into_iter();
     while let Some(argument) = arguments.next() {
@@ -276,6 +284,7 @@ pub fn options_from_arguments(
             "--help" | "-h" => return Ok(None),
             "--dry-run" => options.dry_run = true,
             "--json" => options.json = true,
+            "--no-activate" => options.no_activate = true,
             "--config" => {
                 options.config = Some(PathBuf::from(
                     arguments.next().context("--config requires a value")?,
@@ -302,6 +311,137 @@ pub fn options_from_arguments(
             other if options.config.is_none() => options.config = Some(PathBuf::from(other)),
             other => bail!("`celld deploy` takes one project path, and already has one: {other}"),
         }
+    }
+    Ok(Some(options))
+}
+
+#[derive(Debug)]
+pub struct ActivateOptions {
+    pub bucket: Option<String>,
+    pub endpoint: Option<String>,
+    pub region: Option<String>,
+    pub primary: Option<String>,
+    pub json: bool,
+    pub scripts: Vec<VersionRef>,
+}
+
+pub fn print_activate_help() {
+    let text = "celld activate — serve staged versions as one atomic generation\n\n\
+USAGE:\n  celld activate SCRIPT=VERSION [SCRIPT=VERSION...] --bucket [s3://|gs://|az://]NAME[/PREFIX] [OPTIONS]\n\n\
+Each version is a `celld deploy --no-activate` upload. The fleet-wide pointer is\n\
+replaced by one write naming every script's version — the named ones move, the\n\
+rest keep their activated versions — so nodes adopt the whole generation at\n\
+once. A running node polls the deployment pointer and adopts the new version in\n\
+place; nothing restarts. A concurrent deploy or activate that lands first wins;\n\
+the loser heals what it converged toward the winner and fails with a re-run\n\
+error. A crashed writer's residue heals on the next activate, or a deploy\n\
+of the skewed script. Never run activate concurrently with another activate\n\
+or deploy.\n\n\
+OPTIONS:\n  --primary SCRIPT       The script ingress serves. Defaults to the serving\n                         primary, or to the one named script on a first deploy\n  --bucket [s3://|gs://|az://]NAME[/PREFIX]\n                         Fleet bucket and prefix; defaults to CELLD_BUCKET\n  --endpoint URL         S3-compatible endpoint; defaults to S3_ENDPOINT\n  --region REGION        Storage region; defaults to AWS_REGION\n  --json                 Print the activation as one JSON object\n  -h, --help             Show this help"
+    ;
+    let _ = crate::cli_output::Output::new(crate::cli_output::Format::Text).help(text);
+}
+
+pub fn activate_options_from_arguments(
+    arguments: impl IntoIterator<Item = String>,
+) -> anyhow::Result<Option<ActivateOptions>> {
+    let mut options = ActivateOptions {
+        bucket: None,
+        endpoint: None,
+        region: None,
+        primary: None,
+        json: false,
+        scripts: Vec::new(),
+    };
+    let mut arguments = arguments.into_iter();
+    while let Some(argument) = arguments.next() {
+        match argument.as_str() {
+            "--help" | "-h" => return Ok(None),
+            "--json" => options.json = true,
+            "--primary" => {
+                options.primary = Some(arguments.next().context("--primary requires a value")?);
+            }
+            "--bucket" => {
+                let value = arguments.next().context("--bucket requires a value")?;
+                options.bucket = Some(value);
+            }
+            "--endpoint" => {
+                options.endpoint = Some(arguments.next().context("--endpoint requires a value")?);
+            }
+            "--region" => {
+                options.region = Some(arguments.next().context("--region requires a value")?);
+            }
+            other if other.starts_with('-') => {
+                bail!("unknown argument for `celld activate`: {other}")
+            }
+            other => options.scripts.push(parse_version_ref(other, "activate")?),
+        }
+    }
+    if options.scripts.is_empty() {
+        bail!("`celld activate` names at least one SCRIPT=VERSION");
+    }
+    Ok(Some(options))
+}
+
+#[derive(Debug)]
+pub struct DiscardOptions {
+    pub bucket: Option<String>,
+    pub endpoint: Option<String>,
+    pub region: Option<String>,
+    pub json: bool,
+    pub scripts: Vec<VersionRef>,
+}
+
+pub fn print_discard_help() {
+    let text = "celld discard — delete staged versions from the fleet bucket\n\n\
+USAGE:\n  celld discard SCRIPT=VERSION [SCRIPT=VERSION...] --bucket [s3://|gs://|az://]NAME[/PREFIX] [OPTIONS]\n\n\
+Each version is a `celld deploy --no-activate` upload that will never serve.\n\
+A version any pointer names is refused; anything else is inert, so removing\n\
+it is safe. Shared content-addressed objects (asset bodies, image tars) stay:\n\
+other versions reference them. Never run discard concurrently with activate\n\
+or deploy, and hold a superseded version past CELLD_DEPLOY_MAX_AGE_S with\n\
+the replacement's adoption verified before discarding a rollback target.\n\
+A commit landing after the re-check names deleted code: adoption fails loudly\n\
+on the missing manifest, and re-deploying from the same source reproduces the\n\
+version for a re-activate.\n\n\
+OPTIONS:\n  --bucket [s3://|gs://|az://]NAME[/PREFIX]\n                         Fleet bucket and prefix; defaults to CELLD_BUCKET\n  --endpoint URL         S3-compatible endpoint; defaults to S3_ENDPOINT\n  --region REGION        Storage region; defaults to AWS_REGION\n  --json                 Print the discard as one JSON object\n  -h, --help             Show this help"
+    ;
+    let _ = crate::cli_output::Output::new(crate::cli_output::Format::Text).help(text);
+}
+
+pub fn discard_options_from_arguments(
+    arguments: impl IntoIterator<Item = String>,
+) -> anyhow::Result<Option<DiscardOptions>> {
+    let mut options = DiscardOptions {
+        bucket: None,
+        endpoint: None,
+        region: None,
+        json: false,
+        scripts: Vec::new(),
+    };
+    let mut arguments = arguments.into_iter();
+    while let Some(argument) = arguments.next() {
+        match argument.as_str() {
+            "--help" | "-h" => return Ok(None),
+            "--json" => options.json = true,
+            "--bucket" => {
+                let value = arguments.next().context("--bucket requires a value")?;
+                options.bucket = Some(value);
+            }
+            "--endpoint" => {
+                options.endpoint = Some(arguments.next().context("--endpoint requires a value")?);
+            }
+            "--region" => {
+                options.region = Some(arguments.next().context("--region requires a value")?);
+            }
+            other if other.starts_with('-') => {
+                bail!("unknown argument for `celld discard`: {other}")
+            }
+            other => options.scripts.push(parse_version_ref(other, "discard")?),
+        }
+    }
+    if options.scripts.is_empty() {
+        bail!("`celld discard` names at least one SCRIPT=VERSION");
     }
     Ok(Some(options))
 }
@@ -970,11 +1110,1206 @@ async fn ensure_image_tar(bucket: &Bucket, image: &str) -> anyhow::Result<()> {
 }
 
 pub async fn write(bucket: &Bucket, built: &Built) -> anyhow::Result<()> {
+    // The fleet pointer's token before anything moves: the commit below
+    // CASes on it, so a concurrent deploy or activate that lands first
+    // produces a loser, not a lost write.
+    let commit_token = bucket
+        .head(crate::fleet::CURRENT_POINTER_KEY)
+        .await?
+        .map(|(_, token)| token);
     // Read every attachment before uploading immutable deployment objects.
     // A competing consumer is a deploy refusal, so it must not leave a new
     // version in the bucket that an operator can mistake for a published one.
     let queue_attachments = prepare_queue_attachments(bucket, &built.manifest).await?;
+    upload_version(bucket, built).await?;
 
+    // An attachment names this exact immutable prefix. Publish it only after
+    // the prefix is complete, so a node can never resolve a consumer to a
+    // half-uploaded deployment.
+    //
+    // Everything below moves node-visible state, so any error heals
+    // first: the current pointer is re-read and the attachments and named
+    // pointers converge toward it before the error returns. A lost commit
+    // race therefore heals toward the winner instead of wedging it.
+    let commit: anyhow::Result<Vec<u8>> = async {
+        publish_queue_attachments(
+            bucket,
+            &built.manifest,
+            &built.prefix,
+            queue_attachments,
+            "deploy",
+        )
+        .await?;
+
+        let pointer = DeployPointer {
+            script_name: Some(built.script_name.clone()),
+            version: built.version.clone(),
+            prefix: built.prefix.clone(),
+            rollout: Rollout { percent: 100 },
+            components: None,
+        };
+        let encoded = serde_json::to_vec_pretty(&pointer)?;
+        commit_pointer(
+            bucket,
+            crate::fleet::CURRENT_POINTER_KEY,
+            encoded.clone(),
+            commit_token.as_deref(),
+            "deploy",
+        )
+        .await?;
+        Ok(encoded)
+    }
+    .await;
+    let encoded = match commit {
+        Ok(encoded) => encoded,
+        Err(error) => return Err(heal_on_error(bucket, error, "deploy").await),
+    };
+    // The named pointer resolves service-binding components; it moves
+    // AFTER the commit, so a deploy that never commits leaves every
+    // named pointer at its committed version. A failure here lands after
+    // the commit: the deployment is serving, and the error says to
+    // re-run to converge.
+    if let Err(error) = put_pointer(
+        bucket,
+        &format!("deploy/{}/current.json", built.script_name),
+        encoded,
+        "deploy",
+    )
+    .await
+    {
+        if let Err(heal) = heal_derivative_state(bucket, "deploy").await {
+            note!("warning: healing toward the serving pointer failed: {heal:#}");
+        }
+        anyhow::bail!(
+            "the deployment committed, but its named pointer did not converge: {error:#}; \
+             re-run `celld deploy` to converge it"
+        );
+    }
+    Ok(())
+}
+
+/// Upload the immutable version objects — images, asset bodies, modules,
+/// the asset index, the manifest — without moving anything that serving
+/// reads: no queue attachment, no named pointer, no fleet pointer.
+///
+/// This is `celld deploy --no-activate`. The version is complete and
+/// validated (bundling already failed the tenant errors), but the next
+/// adoption cannot see it: the pointer watcher and `POST /reload` both
+/// read `deploy/current.json`, and the graph walk reads the named
+/// pointers and the queue attachments, all untouched. `celld activate`
+/// moves them all at once; `celld discard` removes the version.
+pub async fn write_staged(bucket: &Bucket, built: &Built) -> anyhow::Result<()> {
+    // No attachment prepare here, deliberately: it reads the *current*
+    // named pointer, but the attachments publish at activate time against
+    // whatever is current then. Validating now would refuse a queue whose
+    // owner is itself replaced by the same activation. `activate`
+    // prepares and publishes together, still before its pointer write.
+    upload_version(bucket, built).await
+}
+
+/// One `SCRIPT=VERSION` argument to `celld activate` or `celld discard`.
+/// The version is a deployment version as `celld deploy` printed it, not a
+/// pointer: the script disambiguates, because a version alone names no
+/// script and two scripts hash independently.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VersionRef {
+    pub script: String,
+    pub version: String,
+}
+
+fn parse_version_ref(argument: &str, command: &str) -> anyhow::Result<VersionRef> {
+    let Some((script, version)) = argument.split_once('=') else {
+        bail!("`celld {command}` takes SCRIPT=VERSION arguments, not {argument:?}");
+    };
+    anyhow::ensure!(
+        valid_script_name(script),
+        "invalid script name {script:?}: lowercase ASCII letters, digits, and internal hyphens, \
+         at most {MAX_SCRIPT_NAME_BYTES} bytes"
+    );
+    anyhow::ensure!(
+        crate::protocol::valid_deployment_version(version),
+        "invalid version {version:?}: a deployment version as `celld deploy` printed it, 16 \
+         lowercase hex characters"
+    );
+    Ok(VersionRef {
+        script: script.to_string(),
+        version: version.to_string(),
+    })
+}
+
+/// What `celld activate` concluded.
+#[derive(Debug)]
+pub struct Activated {
+    /// The primary script: the one ingress serves.
+    pub primary: String,
+    pub version: String,
+    pub prefix: String,
+    /// Every script's activated version, as written to the fleet pointer.
+    pub components: BTreeMap<String, ComponentRef>,
+    /// The pointer already named this exact generation; nothing was
+    /// rewritten, but the attachments and named pointers were converged.
+    pub unchanged: bool,
+}
+
+/// Activate staged versions as one atomic generation.
+///
+/// Every named `SCRIPT=VERSION` must exist in the bucket (a `celld deploy
+/// --no-activate` wrote it); scripts the call does not name keep their
+/// currently activated versions. Validation (staged manifests present
+/// and identified, primary resolvable, no competing queue consumer)
+/// happens first, then the queue attachments converge, and the
+/// fleet-wide pointer is replaced by one compare-and-swap write naming
+/// the primary script and every script's version, so the poll watcher
+/// and `POST /reload` adopt either the whole old generation's code or the
+/// whole new one's — never a mix of code. (The asset fallback on a miss
+/// may serve a newer committed deployment's assets during a rolling
+/// restart; those bytes are immutable and content-verified.) The named
+/// pointers converge after the commit: a generation's code resolves from
+/// the pointer's map, never from the named pointers, so the post-commit
+/// convergence moves no code a new node adopts; the named pointers serve
+/// older nodes, later plain deploys, and the asset fallback.
+///
+/// The commit CASes on the token of the opening pointer read: a
+/// concurrent deploy or activate that moved the pointer first wins, and
+/// the loser heals what it converged toward the winner before its re-run
+/// error returns, instead of overwriting it. Any error after convergence
+/// started heals the same way; a crash cannot heal itself, but the next
+/// activate — or a deploy of the skewed script — converges the same
+/// state toward its own generation, which heals crash residue. A plain
+/// deploy converges only its own script's attachments, so residue on
+/// another script's queue survives it. Never run writers concurrently:
+/// only sequential runs converge cleanly.
+pub async fn activate(
+    bucket: &Bucket,
+    scripts: &[VersionRef],
+    primary: Option<&str>,
+) -> anyhow::Result<Activated> {
+    anyhow::ensure!(
+        !scripts.is_empty(),
+        "celld activate names at least one SCRIPT=VERSION"
+    );
+    if let Some(primary) = primary {
+        anyhow::ensure!(
+            valid_script_name(primary),
+            "invalid primary script name {primary:?}: lowercase ASCII letters, digits, and \
+             internal hyphens, at most {MAX_SCRIPT_NAME_BYTES} bytes"
+        );
+    }
+    let mut seen = BTreeSet::new();
+    for reference in scripts {
+        anyhow::ensure!(
+            seen.insert(reference.script.clone()),
+            "script {:?} is named twice; one version per script",
+            reference.script
+        );
+    }
+
+    // The token is the commit's compare-and-swap precondition: the
+    // pointer must still be this value when the fleet pointer moves, or a
+    // concurrent writer landed first and this activation re-runs.
+    let (current, commit_token): (Option<DeployPointer>, Option<String>) =
+        match bucket.get(crate::fleet::CURRENT_POINTER_KEY).await? {
+            Some((body, token)) => (
+                Some(serde_json::from_slice(&body).context("decode deploy/current.json")?),
+                Some(token),
+            ),
+            None => (None, None),
+        };
+
+    // Every named version must exist and identify itself before anything
+    // moves. The prefix is deterministic — `deploy/<script>/<version>` —
+    // so a staged version needs no registry to be found.
+    let mut staged = Vec::with_capacity(scripts.len());
+    for reference in scripts {
+        let prefix = format!("deploy/{}/{}", reference.script, reference.version);
+        let key = format!("{prefix}/manifest.json");
+        let Some((body, _)) = bucket.get(&key).await? else {
+            bail!(
+                "no staged version {:?} of script {:?}; run `celld deploy --no-activate` first",
+                reference.version,
+                reference.script
+            );
+        };
+        let manifest: Manifest =
+            serde_json::from_slice(&body).with_context(|| format!("decode {key}"))?;
+        anyhow::ensure!(
+            manifest.script_name == reference.script,
+            "staged version {:?} identifies script {:?}, not {:?}",
+            reference.version,
+            manifest.script_name,
+            reference.script
+        );
+        anyhow::ensure!(
+            manifest.version == reference.version,
+            "staged version {:?} of script {:?} holds manifest version {:?}",
+            reference.version,
+            reference.script,
+            manifest.version
+        );
+        staged.push((reference.clone(), prefix, manifest));
+    }
+
+    // Scripts the call does not name keep what is activated now. A
+    // components generation carries itself; a legacy pointer (plain
+    // `celld deploy`, or a managed apply) carries its primary from the
+    // top level — what serves today — and every other script from its
+    // named pointer. Carried entries are trusted, not re-verified: their
+    // manifests are what the fleet already serves, and a stale named
+    // pointer for a script nothing references must not block an
+    // activation that does not touch it.
+    let mut components: BTreeMap<String, ComponentRef> = BTreeMap::new();
+    if let Some(pointer) = &current {
+        if let Some(generation) = &pointer.components {
+            components.clone_from(generation);
+        } else {
+            for (script, component) in legacy_components(bucket).await? {
+                components.insert(script, component);
+            }
+            let primary_script = pointer.script_name.as_deref().with_context(|| {
+                "deploy/current.json names no primary script; the pointer is corrupt"
+            })?;
+            components.insert(
+                primary_script.to_string(),
+                ComponentRef {
+                    version: pointer.version.clone(),
+                    prefix: pointer.prefix.clone(),
+                },
+            );
+        }
+    }
+    for (reference, prefix, _) in &staged {
+        components.insert(
+            reference.script.clone(),
+            ComponentRef {
+                version: reference.version.clone(),
+                prefix: prefix.clone(),
+            },
+        );
+    }
+
+    let primary = primary
+        .map(str::to_string)
+        .or_else(|| {
+            current
+                .as_ref()
+                .and_then(|pointer| pointer.script_name.clone())
+        })
+        .or_else(|| (scripts.len() == 1).then(|| scripts[0].script.clone()))
+        .with_context(|| {
+            "no fleet pointer yet and several scripts named; pass --primary SCRIPT to choose \
+             the one ingress serves"
+        })?;
+    let primary_component = components.get(&primary).with_context(|| {
+        format!("primary script {primary:?} names no activated version; name it as SCRIPT=VERSION")
+    })?;
+    let desired = DeployPointer {
+        script_name: Some(primary.clone()),
+        version: primary_component.version.clone(),
+        prefix: primary_component.prefix.clone(),
+        rollout: Rollout { percent: 100 },
+        components: Some(components.clone()),
+    };
+
+    // Convergence, before the commit: the staged scripts' queue
+    // attachments validate handoff-aware across all staged manifests at
+    // once — a queue handed from one staged script to another resolves
+    // the same regardless of CLI argument order — and publish, then the
+    // carried scripts' attachments converge to the generation about to
+    // commit. Adoption fails closed on a stale attachment, so the new
+    // attachments must be in place before any node can adopt. All
+    // idempotent, so a re-run repairs a partial one. The named pointers
+    // do NOT converge here: they move after the commit, so an activation
+    // that never commits leaves every named pointer at its committed
+    // version, and a node polling mid-activation still reads the old
+    // generation whole.
+    let carried = carried_manifests(bucket, &staged, &components).await?;
+    let activation_queues = prepare_activation_queues(bucket, &staged, &carried).await?;
+    // Everything below moves node-visible state, so any error heals
+    // first: the current pointer is re-read and the attachments and
+    // named pointers converge toward it before the error returns. A
+    // lost commit race therefore heals toward the winner instead of
+    // wedging it.
+    let commit: anyhow::Result<bool> = async {
+        publish_activation_queues(bucket, activation_queues).await?;
+        converge_carried_queues(bucket, &carried).await?;
+        if std::env::var("CELLD_TEST_ACTIVATE_ABORT").as_deref() == Ok("1") {
+            bail!("injected activate abort after convergence, before the fleet-pointer commit");
+        }
+        // The commit point: one pointer write, CASed on the opening
+        // read. A concurrent deploy or activate that moved the pointer
+        // first wins; the loser heals and re-runs. When the pointer
+        // already names this generation the write is skipped, but the
+        // convergence above still ran: attachments skewed from under a
+        // committed generation heal on every activate, including a
+        // re-run.
+        let unchanged = current.as_ref().is_some_and(|pointer| {
+            pointer.script_name.as_deref() == Some(primary.as_str())
+                && pointer.version == desired.version
+                && pointer.prefix == desired.prefix
+                && pointer.components.as_ref() == desired.components.as_ref()
+        });
+        if !unchanged {
+            if std::env::var("CELLD_TEST_DISCARD_MID_ACTIVATE").as_deref() == Ok("1") {
+                // A discard that landed after the opening reads and
+                // before the commit: the manifest re-check below must
+                // refuse to commit a generation naming deleted code.
+                // Deletes the first staged script's manifest outright,
+                // exactly what the discard's delete leaves behind.
+                let (reference, prefix, _) = &staged[0];
+                bucket
+                    .delete(&format!("{prefix}/manifest.json"))
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "delete the injected discard victim {}={}",
+                            reference.script, reference.version
+                        )
+                    })?;
+            }
+            verify_precommit_manifests(bucket, &staged, &components).await?;
+            commit_pointer(
+                bucket,
+                crate::fleet::CURRENT_POINTER_KEY,
+                serde_json::to_vec_pretty(&desired)?,
+                commit_token.as_deref(),
+                "activate",
+            )
+            .await?;
+        }
+        Ok(unchanged)
+    }
+    .await;
+    let unchanged = match commit {
+        Ok(unchanged) => unchanged,
+        Err(error) => return Err(heal_on_error(bucket, error, "activate").await),
+    };
+
+    // The named pointers converge AFTER the commit. A generation's
+    // components resolve from the pointer's map — never from the named
+    // pointers — so this moves nothing a new node adopts; it serves
+    // older nodes and later plain deploys. On the unchanged path the
+    // pointer already named this generation, and this still heals skew
+    // from under it. A failure here lands after the commit: the
+    // generation is serving, and the error says to re-run to converge.
+    if let Err(error) = converge_named_pointers(bucket, &components, "activate").await {
+        if let Err(heal) = heal_derivative_state(bucket, "activate").await {
+            note!("warning: healing toward the serving pointer failed: {heal:#}");
+        }
+        if unchanged {
+            anyhow::bail!(
+                "the serving generation's named pointers did not converge: {error:#}; \
+                 re-run `celld activate` to converge them"
+            );
+        }
+        anyhow::bail!(
+            "the generation committed, but its named pointers did not converge: {error:#}; \
+             re-run `celld activate` to converge them"
+        );
+    }
+
+    Ok(Activated {
+        primary,
+        version: desired.version,
+        prefix: desired.prefix,
+        components,
+        unchanged,
+    })
+}
+
+pub(crate) struct ActivationQueueState {
+    queue: String,
+    key: String,
+    current: Option<QueueConsumerAttachment>,
+    token: Option<String>,
+    final_consumer: Option<QueueConsumerDeployment>,
+}
+
+/// The queue attachments an activation will publish, validated before
+/// anything moves.
+///
+/// Every staged manifest's desired queues resolve against one fresh
+/// read each: two staged scripts consuming one queue fail, and a queue
+/// owned by a script the activation does not name fails, but a handoff
+/// between two staged scripts is allowed — the releasing script's new
+/// manifest drops the queue, so the current owner being staged means
+/// the queue is genuinely changing hands. Argument order plays no
+/// part: no publish happens until every queue validated.
+async fn prepare_activation_queues(
+    bucket: &Bucket,
+    staged: &[(VersionRef, String, Manifest)],
+    carried: &[(String, String, Manifest)],
+) -> anyhow::Result<Vec<ActivationQueueState>> {
+    let mut desired: BTreeMap<String, QueueConsumerDeployment> = BTreeMap::new();
+    for (reference, prefix, manifest) in staged {
+        for consumer in &manifest.queue_consumers {
+            let deployment = QueueConsumerDeployment {
+                script_name: manifest.script_name.clone(),
+                version: manifest.version.clone(),
+                prefix: prefix.clone(),
+            };
+            if let Some(previous) = desired.insert(consumer.queue.clone(), deployment) {
+                bail!(
+                    "queue {:?} is consumed by both {} and {} in one activation; \
+                     stage versions that consume it from one script",
+                    consumer.queue,
+                    previous.script_name,
+                    reference.script
+                );
+            }
+        }
+    }
+    // A queue a serving script keeps consuming cannot move to a staged
+    // script in the same activation: the carried script's version is
+    // not changing, so both manifests would consume it at once.
+    let mut kept: BTreeMap<String, String> = BTreeMap::new();
+    for (script, _, manifest) in carried {
+        for consumer in &manifest.queue_consumers {
+            kept.insert(consumer.queue.clone(), script.clone());
+        }
+    }
+    for (queue, deployment) in &desired {
+        if let Some(keeper) = kept.get(queue) {
+            bail!(
+                "queue {:?} is consumed by serving script {:?}, which this activation carries \
+                 unchanged; stage a version of {:?} that drops the queue before activating {}",
+                queue,
+                keeper,
+                keeper,
+                deployment.script_name
+            );
+        }
+    }
+    let staged_scripts: BTreeSet<&str> = staged
+        .iter()
+        .map(|(reference, _, _)| reference.script.as_str())
+        .collect();
+    let mut previous = BTreeSet::new();
+    for (reference, _, _) in staged {
+        previous.extend(current_queue_consumers(bucket, &reference.script).await?);
+    }
+    let mut states = Vec::new();
+    for queue in desired.keys().chain(&previous).collect::<BTreeSet<_>>() {
+        let key = crate::protocol::queue_consumer_attachment_key(queue)
+            .expect("deploy validated the queue name");
+        let (current, token) = match bucket.get(&key).await? {
+            Some((body, token)) => {
+                let attachment: QueueConsumerAttachment = serde_json::from_slice(&body)
+                    .with_context(|| format!("decode queue consumer attachment {key}"))?;
+                crate::protocol::validate_queue_consumer_attachment(queue, &attachment)?;
+                (Some(attachment), Some(token))
+            }
+            None => (None, None),
+        };
+        let final_consumer = match desired.get(queue.as_str()) {
+            Some(deployment) => {
+                if let Some(owner) = current
+                    .as_ref()
+                    .and_then(|attachment| attachment.consumer.as_ref())
+                    .filter(|consumer| {
+                        consumer.script_name != deployment.script_name
+                            && !staged_scripts.contains(consumer.script_name.as_str())
+                    })
+                {
+                    bail!(
+                        "queue {:?} already has consumer script {:?}; remove that consumer \
+                         before activating {}",
+                        queue,
+                        owner.script_name,
+                        deployment.script_name
+                    );
+                }
+                Some(deployment.clone())
+            }
+            // A queue no staged script wants is detached only when a
+            // staged script owns it; an owner outside this activation
+            // keeps its queue.
+            None => match current
+                .as_ref()
+                .and_then(|attachment| attachment.consumer.as_ref())
+            {
+                None => None,
+                Some(owner) if staged_scripts.contains(owner.script_name.as_str()) => None,
+                Some(_) => continue,
+            },
+        };
+        states.push(ActivationQueueState {
+            queue: (*queue).clone(),
+            key,
+            current,
+            token,
+            final_consumer,
+        });
+    }
+    Ok(states)
+}
+
+/// Publish one activation's queue attachments: one conditional write
+/// per queue that changes, against the token [`prepare_activation_queues`]
+/// read. Every state here was blessed by that prepare; an unchanged
+/// attachment is still skipped, so a healthy fleet converges quietly.
+async fn publish_activation_queues(
+    bucket: &Bucket,
+    states: Vec<ActivationQueueState>,
+) -> anyhow::Result<()> {
+    for state in states {
+        let next = QueueConsumerAttachment {
+            schema_version: QUEUE_CONSUMER_ATTACHMENT_SCHEMA_VERSION,
+            queue: state.queue,
+            consumer: state.final_consumer,
+        };
+        if state.current.as_ref() == Some(&next) {
+            continue;
+        }
+        publish_one_queue_attachment(
+            bucket,
+            &state.key,
+            state.token.as_deref(),
+            &next,
+            "activate",
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+/// A script's manifest at one version prefix, when it reads and
+/// identifies that script and version. `None` is not an error here:
+/// callers decide whether an unreadable manifest warns (convergence,
+/// which heals what it can) or refuses (the pre-commit re-check, which
+/// guards the commit).
+async fn read_identified_manifest(
+    bucket: &Bucket,
+    script: &str,
+    version: &str,
+    prefix: &str,
+) -> anyhow::Result<Option<Manifest>> {
+    let key = format!("{prefix}/manifest.json");
+    match bucket.get(&key).await? {
+        Some((body, _)) => Ok(serde_json::from_slice::<Manifest>(&body)
+            .ok()
+            .filter(|manifest| manifest.script_name == script && manifest.version == version)),
+        None => Ok(None),
+    }
+}
+
+/// The carried scripts' manifests for queue convergence: script, prefix,
+/// manifest. A carried version without a readable, self-identifying
+/// manifest cannot converge, so it warns instead; the pre-commit
+/// re-check refuses to name it, so the warning never becomes a wedge.
+async fn carried_manifests(
+    bucket: &Bucket,
+    staged: &[(VersionRef, String, Manifest)],
+    components: &BTreeMap<String, ComponentRef>,
+) -> anyhow::Result<Vec<(String, String, Manifest)>> {
+    let staged_scripts: BTreeSet<&str> = staged
+        .iter()
+        .map(|(reference, _, _)| reference.script.as_str())
+        .collect();
+    let mut carried = Vec::new();
+    for (script, component) in components {
+        if staged_scripts.contains(script.as_str()) {
+            continue;
+        }
+        let usable =
+            read_identified_manifest(bucket, script, &component.version, &component.prefix).await?;
+        match usable {
+            Some(manifest) => carried.push((script.clone(), component.prefix.clone(), manifest)),
+            None => note!(
+                "warning: carried script {script}={} has no readable manifest; its queue \
+                 attachments cannot converge — stage and activate a replacement",
+                component.version
+            ),
+        }
+    }
+    Ok(carried)
+}
+
+/// Re-read every manifest this commit is about to name — staged and
+/// carried — immediately before the pointer moves.
+///
+/// A discard that landed after the opening reads would otherwise commit
+/// a generation naming deleted code: the next adoption fails loudly,
+/// and the fleet cannot advance until someone re-deploys. Failing here
+/// instead keeps the serving generation adoptable. Unlike the opening
+/// carried read — which warns so convergence still heals what it can —
+/// this refuses: the commit would name the unreadable version either
+/// way, so refusing is fail-closed at write time instead of a wedge at
+/// read time.
+async fn verify_precommit_manifests(
+    bucket: &Bucket,
+    staged: &[(VersionRef, String, Manifest)],
+    components: &BTreeMap<String, ComponentRef>,
+) -> anyhow::Result<()> {
+    for (reference, prefix, _) in staged {
+        let usable =
+            read_identified_manifest(bucket, &reference.script, &reference.version, prefix).await?;
+        anyhow::ensure!(
+            usable.is_some(),
+            "staged version {:?} of script {:?} vanished before the commit — a concurrent \
+             `celld discard` may have removed it; re-run `celld deploy --no-activate` for it, \
+             then re-run `celld activate`",
+            reference.version,
+            reference.script
+        );
+    }
+    let staged_scripts: BTreeSet<&str> = staged
+        .iter()
+        .map(|(reference, _, _)| reference.script.as_str())
+        .collect();
+    for (script, component) in components {
+        if staged_scripts.contains(script.as_str()) {
+            continue;
+        }
+        let usable =
+            read_identified_manifest(bucket, script, &component.version, &component.prefix).await?;
+        anyhow::ensure!(
+            usable.is_some(),
+            "carried script {script}={} has no readable manifest — its version may have been \
+             discarded; restore it with `celld deploy` from the same source, then re-run \
+             `celld activate`",
+            component.version
+        );
+    }
+    Ok(())
+}
+
+/// Converge the carried scripts' queue attachments to their serving
+/// manifests: idempotent when the fleet is healthy, healing when an
+/// attachment skewed from under its generation. Runs after the staged
+/// publish, so a queue a staged script releases to a carried one ends
+/// attached to the carried script, not detached.
+async fn converge_carried_queues(
+    bucket: &Bucket,
+    carried: &[(String, String, Manifest)],
+) -> anyhow::Result<()> {
+    for (_, prefix, manifest) in carried {
+        let states = prepare_queue_attachments(bucket, manifest).await?;
+        publish_queue_attachments(bucket, manifest, prefix, states, "activate").await?;
+    }
+    Ok(())
+}
+
+/// Move one named pointer to its activated version, unless it already
+/// names it. The fleet pointer's component map is the committed truth;
+/// the named pointers exist for older nodes and later plain deploys, so
+/// every activate heals any skew rather than trusting a previous run.
+/// `command` names the re-run — `deploy` or `activate` — because the
+/// hint must repair the path that failed.
+async fn converge_named_pointer(
+    bucket: &Bucket,
+    script: &str,
+    component: &ComponentRef,
+    command: &str,
+) -> anyhow::Result<()> {
+    let key = format!("deploy/{script}/current.json");
+    if let Some((body, _)) = bucket.get(&key).await? {
+        let pointer: DeployPointer =
+            serde_json::from_slice(&body).with_context(|| format!("decode {key}"))?;
+        if pointer.script_name.as_deref() == Some(script)
+            && pointer.version == component.version
+            && pointer.prefix == component.prefix
+        {
+            return Ok(());
+        }
+    }
+    let pointer = DeployPointer {
+        script_name: Some(script.to_string()),
+        version: component.version.clone(),
+        prefix: component.prefix.clone(),
+        rollout: Rollout { percent: 100 },
+        components: None,
+    };
+    put_pointer(bucket, &key, serde_json::to_vec_pretty(&pointer)?, command).await
+}
+
+/// Converge every serving script's named pointer. A script that fails
+/// warns and the rest still converge, so one corrupt pointer cannot pin
+/// the others; the first error returns after the pass.
+async fn converge_named_pointers(
+    bucket: &Bucket,
+    components: &BTreeMap<String, ComponentRef>,
+    command: &str,
+) -> anyhow::Result<()> {
+    let mut first: Option<anyhow::Error> = None;
+    for (script, component) in components {
+        if let Err(error) = converge_named_pointer(bucket, script, component, command).await {
+            note!("warning: named pointer for script {script} did not converge: {error:#}");
+            if first.is_none() {
+                first = Some(error);
+            }
+        }
+    }
+    match first {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
+/// Re-read the fleet-wide pointer and converge every node-visible
+/// derivative of it — the queue attachments and the named pointers —
+/// toward the generation it commits right now.
+///
+/// A writer that fails after its convergence started (a lost commit
+/// race, an attachment write that raced, the pre-commit manifest
+/// re-check) has already published queue attachments toward a generation
+/// that never committed; left alone, the next adoption of the committed
+/// generation fails on them — a queue attachment names an exact
+/// deployment — and the watcher caches the failure fleet-wide. Healing
+/// first turns the loser into the winner's converger: its net effect
+/// points at the committed generation instead of away from it.
+///
+/// The serving generation is the pointer's components map when it
+/// carries one; under a legacy pointer it is the top-level primary —
+/// other scripts' named pointers are read live there, so a named
+/// pointer is the committed truth for its own script and there is
+/// nothing to converge it toward. Attachments converge for every
+/// serving script either way, each from the manifest its committed
+/// version names — under a legacy pointer that is the named version
+/// for a non-primary script. A script whose manifest is unreadable
+/// warns and is skipped: adoption stays fail-closed, and the next
+/// writer retries.
+///
+/// Best-effort under concurrent writers — a heal write can itself lose
+/// a race — and a crash cannot heal at all; both converge on the next
+/// activate, or on a deploy of the skewed script, which runs this same
+/// convergence toward its own generation. Never run writers
+/// concurrently: only sequential runs converge cleanly.
+async fn heal_derivative_state(bucket: &Bucket, command: &str) -> anyhow::Result<()> {
+    let Some((body, _)) = bucket.get(crate::fleet::CURRENT_POINTER_KEY).await? else {
+        // No committed pointer, so no adoption can read anything: a
+        // first generation that never committed leaves nothing serving
+        // to heal, and the next writer converges from scratch.
+        return Ok(());
+    };
+    let current: DeployPointer =
+        serde_json::from_slice(&body).context("decode deploy/current.json")?;
+    let mut first: Option<anyhow::Error> = None;
+    let mut components: BTreeMap<String, ComponentRef> = BTreeMap::new();
+    if let Some(generation) = &current.components {
+        components.clone_from(generation);
+    } else if let Some(primary) = current.script_name.clone() {
+        components.insert(
+            primary,
+            ComponentRef {
+                version: current.version.clone(),
+                prefix: current.prefix.clone(),
+            },
+        );
+    }
+    // Under a legacy pointer the attachments of every named script
+    // converge too, from the named version — the primary keeps its
+    // top-level truth, which wins over a stale named pointer.
+    let mut attachment_scripts = components.clone();
+    if current.components.is_none() {
+        match legacy_components(bucket).await {
+            Ok(named) => {
+                for (script, component) in named {
+                    attachment_scripts.entry(script).or_insert(component);
+                }
+            }
+            Err(error) => {
+                note!("warning: named pointers did not list for the heal: {error:#}");
+                first = Some(error);
+            }
+        }
+    }
+    if let Err(error) = converge_named_pointers(bucket, &components, command).await {
+        if first.is_none() {
+            first = Some(error);
+        }
+    }
+    for (script, component) in &attachment_scripts {
+        if let Err(error) = heal_script_queues(bucket, script, component, command).await {
+            note!("warning: queue attachments for script {script} did not heal: {error:#}");
+            if first.is_none() {
+                first = Some(error);
+            }
+        }
+    }
+    match first {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
+/// Converge one serving script's queue attachments from its committed
+/// manifest. An unreadable manifest warns and is skipped: the next
+/// writer retries, and adoption stays fail-closed in the meantime.
+async fn heal_script_queues(
+    bucket: &Bucket,
+    script: &str,
+    component: &ComponentRef,
+    command: &str,
+) -> anyhow::Result<()> {
+    let usable =
+        read_identified_manifest(bucket, script, &component.version, &component.prefix).await?;
+    let Some(manifest) = usable else {
+        note!(
+            "warning: serving script {script}={} has no readable manifest; its queue \
+             attachments cannot heal — re-run `celld {command}` once its version is restored",
+            component.version
+        );
+        return Ok(());
+    };
+    let states = prepare_queue_attachments(bucket, &manifest).await?;
+    publish_queue_attachments(bucket, &manifest, &component.prefix, states, command).await
+}
+
+/// Run [`heal_derivative_state`] after a writer error, returning the
+/// original error: the heal's own failure is reported beside it, never
+/// masking what failed.
+async fn heal_on_error(bucket: &Bucket, error: anyhow::Error, command: &str) -> anyhow::Error {
+    if let Err(heal) = heal_derivative_state(bucket, command).await {
+        note!("warning: healing toward the serving pointer failed: {heal:#}");
+        return error.context(format!(
+            "healing toward the serving pointer also failed: {heal:#}; re-run `celld {command}` \
+             to converge"
+        ));
+    }
+    error
+}
+
+/// The activated versions a legacy fleet-wide pointer (no components map)
+/// implies, from every named pointer in the bucket. Children of `deploy/`
+/// without a `current.json` — the image tars under `deploy/images/`, the
+/// queue attachments under `deploy/queues/` — are not scripts and are
+/// skipped; a named pointer that does not identify its own directory is
+/// corrupt and fails the activation rather than activating the wrong
+/// script's version under a script's name.
+async fn legacy_components(bucket: &Bucket) -> anyhow::Result<BTreeMap<String, ComponentRef>> {
+    let mut components = BTreeMap::new();
+    for child in bucket.common_prefixes("deploy/").await? {
+        let Some(script) = child
+            .strip_prefix("deploy/")
+            .filter(|name| !name.is_empty() && !name.contains('/'))
+        else {
+            continue;
+        };
+        let key = format!("deploy/{script}/current.json");
+        let Some((body, _)) = bucket.get(&key).await? else {
+            continue;
+        };
+        let pointer: DeployPointer =
+            serde_json::from_slice(&body).with_context(|| format!("decode {key}"))?;
+        // Older named pointers omit the script name; only a present name
+        // that disagrees is corruption.
+        if let Some(name) = pointer.script_name.as_deref() {
+            anyhow::ensure!(
+                name == script,
+                "named deployment pointer {key} identifies script {name:?}"
+            );
+        }
+        components.insert(
+            script.to_string(),
+            ComponentRef {
+                version: pointer.version,
+                prefix: pointer.prefix,
+            },
+        );
+    }
+    Ok(components)
+}
+
+/// What `celld discard` removed.
+#[derive(Debug)]
+pub struct Discarded {
+    pub removed: Vec<VersionRef>,
+    /// Version-dir objects deleted. Shared content-addressed objects —
+    /// asset bodies, image tars — are left: other versions reference them.
+    pub objects: usize,
+}
+
+/// Delete staged versions from the bucket.
+///
+/// A version any pointer names — the serving primary, a components entry,
+/// a named pointer, or a queue attachment — is refused: deleting
+/// activated code would break the next adoption. Anything else is inert
+/// (serving only reads pointers), so removing it is safe; that covers
+/// staged versions and superseded ones alike.
+///
+/// Deletion is scoped to the version directory, and the directory's own
+/// manifest must identify the script and version (when a manifest is
+/// present at all) before anything is deleted. The pointers are re-read
+/// after the delete under the same tokens: a concurrent activate or
+/// deploy that moved one mid-delete fails loudly instead of leaving a
+/// generation that points at missing code. No re-check can cover a
+/// commit landing after it — that interleaving names deleted code — but
+/// it fails loudly (adoption refuses a generation whose manifest is
+/// missing, never serving wrong code) and recovers by re-deploying from
+/// the same source, which reproduces the version byte-identically for a
+/// re-activate. Never run `celld discard` concurrently with `celld
+/// activate` or `celld deploy` — the re-check reports the race, it
+/// cannot undo the delete — and hold a superseded version until
+/// draining nodes have moved past it (past `CELLD_DEPLOY_MAX_AGE_S`,
+/// with the replacement's adoption verified) before discarding a
+/// rollback target.
+pub async fn discard(bucket: &Bucket, scripts: &[VersionRef]) -> anyhow::Result<Discarded> {
+    anyhow::ensure!(
+        !scripts.is_empty(),
+        "celld discard names at least one SCRIPT=VERSION"
+    );
+    let mut removed = Vec::with_capacity(scripts.len());
+    let mut objects = 0;
+    for reference in scripts {
+        let (fleet_token, named_token) = ensure_not_activated(bucket, reference).await?;
+        let prefix = format!("deploy/{}/{}", reference.script, reference.version);
+        let keys: Vec<String> = bucket
+            .list(&prefix)
+            .await?
+            .into_iter()
+            .map(|object| object.location.to_string())
+            .collect();
+        // An S3 listing is a byte prefix, so a listing that escapes the
+        // version directory — a sibling, a pointer key, an exact match —
+        // refuses the whole discard rather than deleting what it names.
+        let keys = discard_deletion_scope(&prefix, &keys, reference)?;
+        anyhow::ensure!(
+            !keys.is_empty(),
+            "no such version {:?} of script {:?}; nothing to discard",
+            reference.version,
+            reference.script
+        );
+        ensure_discard_manifest(bucket, reference, &prefix).await?;
+        let gone = bucket.delete_many(&keys).await;
+        anyhow::ensure!(
+            gone.len() == keys.len(),
+            "discard of {}={} deleted {}/{} objects; re-run `celld discard`",
+            reference.script,
+            reference.version,
+            gone.len(),
+            keys.len()
+        );
+        objects += gone.len();
+        if std::env::var("CELLD_TEST_DISCARD_RACE").as_deref() == Ok("1") {
+            // A concurrent writer that moved the fleet pointer after the
+            // pre-check: the re-check below must report it. Shaped as a
+            // valid pointer naming another version, so post-delete reads
+            // decode.
+            let rival = serde_json::json!({
+                "script_name": "staged-rival",
+                "version": "ffffffffffffffff",
+                "prefix": "deploy/staged-rival/ffffffffffffffff",
+                "rollout": { "percent": 100 },
+                "celld_test_rival": true,
+            });
+            bucket
+                .put(
+                    crate::fleet::CURRENT_POINTER_KEY,
+                    serde_json::to_vec_pretty(&rival)?,
+                )
+                .await
+                .context("write the injected rival pointer")?;
+        }
+        // A concurrent activate or deploy that moved a pointer after the
+        // first check: report it loudly. If the version is named now,
+        // serving code is already gone and the operator must re-deploy
+        // it before the next adoption needs it; if it is still named by
+        // nothing, the delete was safe but the race still says so.
+        let (fleet_moved, named_moved) = pointers_moved(
+            bucket,
+            reference,
+            fleet_token.as_deref(),
+            named_token.as_deref(),
+        )
+        .await?;
+        if ensure_not_activated(bucket, reference).await.is_err() {
+            bail!(
+                "a concurrent activate or deploy named {}={} while it was discarded; re-run \
+                 `celld deploy --no-activate` from the same source and `celld activate {}={}` \
+                 before any node adopts",
+                reference.script,
+                reference.version,
+                reference.script,
+                reference.version
+            );
+        }
+        if fleet_moved || named_moved {
+            bail!(
+                "a concurrent deploy or activate moved the {} pointer while {}={} was \
+                 discarded; the version is named by no pointer, so the delete was safe — \
+                 re-run `celld discard {}={}` to confirm",
+                if fleet_moved { "fleet" } else { "named" },
+                reference.script,
+                reference.version,
+                reference.script,
+                reference.version
+            );
+        }
+        removed.push(reference.clone());
+    }
+    Ok(Discarded { removed, objects })
+}
+
+/// Refuse a version any pointer names: the fleet pointer's primary and
+/// components, the script's named pointer, and every queue attachment.
+/// Returns the fleet and named pointer tokens, so the post-delete
+/// re-check runs against the same generation it verified.
+async fn ensure_not_activated(
+    bucket: &Bucket,
+    reference: &VersionRef,
+) -> anyhow::Result<(Option<String>, Option<String>)> {
+    let mut fleet_token = None;
+    if let Some((body, token)) = bucket.get(crate::fleet::CURRENT_POINTER_KEY).await? {
+        fleet_token = Some(token);
+        let pointer: DeployPointer =
+            serde_json::from_slice(&body).context("decode deploy/current.json")?;
+        anyhow::ensure!(
+            pointer.script_name.as_deref() != Some(reference.script.as_str())
+                || pointer.version != reference.version,
+            "version {:?} of script {:?} is the serving primary; activate a replacement first",
+            reference.version,
+            reference.script
+        );
+        if let Some(component) = pointer
+            .components
+            .as_ref()
+            .and_then(|generation| generation.get(&reference.script))
+        {
+            anyhow::ensure!(
+                component.version != reference.version,
+                "version {:?} of script {:?} is activated; activate a replacement first",
+                reference.version,
+                reference.script
+            );
+        }
+    }
+    let key = format!("deploy/{}/current.json", reference.script);
+    let mut named_token = None;
+    if let Some((body, token)) = bucket.get(&key).await? {
+        named_token = Some(token);
+        let pointer: DeployPointer =
+            serde_json::from_slice(&body).with_context(|| format!("decode {key}"))?;
+        anyhow::ensure!(
+            pointer.version != reference.version,
+            "version {:?} of script {:?} is the activated version of that script; \
+             activate a replacement first",
+            reference.version,
+            reference.script
+        );
+    }
+    let queues = attachments_naming(bucket, &reference.script, &reference.version).await?;
+    anyhow::ensure!(
+        queues.is_empty(),
+        "version {:?} of script {:?} is the attached consumer of queue {:?}; activate a \
+         replacement first",
+        reference.version,
+        reference.script,
+        queues.join(", ")
+    );
+    Ok((fleet_token, named_token))
+}
+
+/// The queues whose consumer attachment names one deployment. A version
+/// no pointer names can still be attached — skew from under a committed
+/// generation — and discarding it would break the next adoption that
+/// loads through that queue.
+async fn attachments_naming(
+    bucket: &Bucket,
+    script: &str,
+    version: &str,
+) -> anyhow::Result<Vec<String>> {
+    let mut naming = Vec::new();
+    for child in bucket.common_prefixes("deploy/queues/").await? {
+        let Some(queue) = child
+            .strip_prefix("deploy/queues/")
+            .filter(|name| !name.is_empty() && !name.contains('/'))
+        else {
+            continue;
+        };
+        let key = format!("deploy/queues/{queue}/consumer.json");
+        let Some((body, _)) = bucket.get(&key).await? else {
+            continue;
+        };
+        let attachment: QueueConsumerAttachment =
+            serde_json::from_slice(&body).with_context(|| format!("decode {key}"))?;
+        crate::protocol::validate_queue_consumer_attachment(queue, &attachment)?;
+        if attachment
+            .consumer
+            .as_ref()
+            .is_some_and(|consumer| consumer.script_name == script && consumer.version == version)
+        {
+            naming.push(queue.to_string());
+        }
+    }
+    naming.sort();
+    Ok(naming)
+}
+
+/// Whether the fleet and named pointers still carry the tokens the
+/// pre-delete check read. A changed token — including a pointer created
+/// or removed under us — is a concurrent writer.
+async fn pointers_moved(
+    bucket: &Bucket,
+    reference: &VersionRef,
+    fleet_token: Option<&str>,
+    named_token: Option<&str>,
+) -> anyhow::Result<(bool, bool)> {
+    let fleet_now = bucket
+        .head(crate::fleet::CURRENT_POINTER_KEY)
+        .await?
+        .map(|(_, token)| token);
+    let named_now = bucket
+        .head(&format!("deploy/{}/current.json", reference.script))
+        .await?
+        .map(|(_, token)| token);
+    Ok((
+        fleet_now.as_deref() != fleet_token,
+        named_now.as_deref() != named_token,
+    ))
+}
+
+/// The keys a discard may delete: exactly the version directory. Every
+/// listed key must sit under `prefix/`; anything else — a sibling
+/// version an S3 byte-prefix listing also matched, a pointer key, an
+/// object at the prefix itself — fails the discard, because deleting
+/// outside the version directory is never what was asked.
+fn discard_deletion_scope(
+    prefix: &str,
+    keys: &[String],
+    reference: &VersionRef,
+) -> anyhow::Result<Vec<String>> {
+    let directory = format!("{prefix}/");
+    for key in keys {
+        anyhow::ensure!(
+            key.starts_with(&directory),
+            "refusing to discard {}={}: listing returned {key:?}, which is outside the version \
+             directory — a byte-prefix match on a sibling or pointer key, not the version",
+            reference.script,
+            reference.version
+        );
+    }
+    Ok(keys.to_vec())
+}
+
+/// The version directory's own manifest must identify the script and
+/// version before anything is deleted — the same check `activate`
+/// applies. A directory with no manifest at all is inert (no manifest,
+/// no adoption) and discards, so a partial upload can still be cleaned.
+async fn ensure_discard_manifest(
+    bucket: &Bucket,
+    reference: &VersionRef,
+    prefix: &str,
+) -> anyhow::Result<()> {
+    let key = format!("{prefix}/manifest.json");
+    let Some((body, _)) = bucket.get(&key).await? else {
+        return Ok(());
+    };
+    let manifest: Manifest =
+        serde_json::from_slice(&body).with_context(|| format!("decode {key}"))?;
+    anyhow::ensure!(
+        manifest.script_name == reference.script && manifest.version == reference.version,
+        "version directory {prefix} holds manifest for {}={}, not {}={}; refusing to discard",
+        manifest.script_name,
+        manifest.version,
+        reference.script,
+        reference.version
+    );
+    Ok(())
+}
+
+/// The immutable half of [`write`]: everything under the version prefix
+/// plus the shared content-addressed objects it references.
+async fn upload_version(bucket: &Bucket, built: &Built) -> anyhow::Result<()> {
     // Images are fleet-wide and content-addressed like asset bodies, and
     // they are what a node loads before a container class can start.
     if built.upload_images {
@@ -1011,30 +2346,6 @@ pub async fn write(bucket: &Bucket, built: &Built) -> anyhow::Result<()> {
             serde_json::to_vec_pretty(&built.manifest)?,
         )
         .await?;
-
-    // An attachment names this exact immutable prefix. Publish it only after
-    // the prefix is complete, so a node can never resolve a consumer to a
-    // half-uploaded deployment. The named and fleet pointers can move later
-    // without tearing this queue-to-consumer relationship.
-    publish_queue_attachments(bucket, &built.manifest, &built.prefix, queue_attachments).await?;
-
-    let pointer = DeployPointer {
-        script_name: Some(built.script_name.clone()),
-        version: built.version.clone(),
-        prefix: built.prefix.clone(),
-        rollout: Rollout { percent: 100 },
-    };
-    let encoded = serde_json::to_vec_pretty(&pointer)?;
-    // The named pointer resolves service-binding components; the fleet-wide
-    // one is the sole application selector, so it moves last. A concurrent
-    // deploy must produce a loser, not a lost write.
-    put_pointer(
-        bucket,
-        &format!("deploy/{}/current.json", built.script_name),
-        encoded.clone(),
-    )
-    .await?;
-    put_pointer(bucket, "deploy/current.json", encoded).await?;
     Ok(())
 }
 
@@ -1135,6 +2446,7 @@ pub(crate) async fn publish_queue_attachments(
     manifest: &Manifest,
     prefix: &str,
     states: Vec<QueueAttachmentState>,
+    command: &str,
 ) -> anyhow::Result<()> {
     let consumer = QueueConsumerDeployment {
         script_name: manifest.script_name.clone(),
@@ -1162,26 +2474,33 @@ pub(crate) async fn publish_queue_attachments(
         if state.current.as_ref() == Some(&next) {
             continue;
         }
-        let body = serde_json::to_vec_pretty(&next)?;
-        match bucket
-            .put_cas(&state.key, body, state.token.as_deref())
-            .await
-        {
-            Ok(Some(_)) => {}
-            Ok(None) => {
-                bail!(
-                    "queue consumer attachment {} lost a race; another deploy may have landed first; re-run `celld deploy`",
-                    state.key
-                )
-            }
-            Err(error) => {
-                return Err(error.context(
-                    "a queue consumer attachment write may have committed; re-run `celld deploy`",
-                ));
-            }
-        }
+        publish_one_queue_attachment(bucket, &state.key, state.token.as_deref(), &next, command)
+            .await?;
     }
     Ok(())
+}
+
+/// One queue attachment's conditional write, against the token its
+/// prepare read. `command` names the re-run — `deploy` or `activate` —
+/// because the hint must repair the path that failed.
+async fn publish_one_queue_attachment(
+    bucket: &Bucket,
+    key: &str,
+    token: Option<&str>,
+    next: &QueueConsumerAttachment,
+    command: &str,
+) -> anyhow::Result<()> {
+    let body = serde_json::to_vec_pretty(next)?;
+    match bucket.put_cas(key, body, token).await {
+        Ok(Some(_)) => Ok(()),
+        Ok(None) => Err(anyhow!(
+            "queue consumer attachment {key} lost a race; another deploy or activate may have \
+             landed first; re-run `celld {command}`"
+        )),
+        Err(error) => Err(error.context(format!(
+            "a queue consumer attachment write may have committed; re-run `celld {command}`"
+        ))),
+    }
 }
 
 async fn ensure_asset_blob(bucket: &Bucket, sha256: &str, body: &[u8]) -> anyhow::Result<()> {
@@ -1197,20 +2516,70 @@ async fn ensure_asset_blob(bucket: &Bucket, sha256: &str, body: &[u8]) -> anyhow
 }
 
 /// Compare-and-swap on a pointer: create it if absent, otherwise replace
-/// exactly the value we read.
-async fn put_pointer(bucket: &Bucket, key: &str, body: Vec<u8>) -> anyhow::Result<()> {
+/// exactly the value we read. `command` names the re-run — `deploy` or
+/// `activate` — because the hint must repair the path that failed.
+async fn put_pointer(
+    bucket: &Bucket,
+    key: &str,
+    body: Vec<u8>,
+    command: &str,
+) -> anyhow::Result<()> {
     let etag = bucket.head(key).await.ok().flatten().map(|(_, etag)| etag);
     match bucket.put_cas(key, body, etag.as_deref()).await {
         Ok(Some(_)) => Ok(()),
         Ok(None) => Err(anyhow!(
             "write {}://{}/{key} lost a race\n\
-             Another deploy may have landed first; re-run `celld deploy`.",
+             Another deploy or activate may have landed first; re-run `celld {command}`.",
             bucket.scheme(),
             bucket.name
         )),
-        Err(error) => {
-            Err(error.context("Another deploy may have landed first; re-run `celld deploy`."))
-        }
+        Err(error) => Err(error.context(format!(
+            "Another deploy or activate may have landed first; re-run `celld {command}`."
+        ))),
+    }
+}
+
+/// The fleet-pointer commit: a compare-and-swap on `token`, the token of
+/// the opening pointer read — not a fresh head. A writer that landed
+/// between that read and this write changed the token, so the CAS
+/// rejects and the loser heals toward the winner and re-runs instead of
+/// silently overwriting it. `command` names the re-run, `deploy` or
+/// `activate`.
+async fn commit_pointer(
+    bucket: &Bucket,
+    key: &str,
+    body: Vec<u8>,
+    token: Option<&str>,
+    command: &str,
+) -> anyhow::Result<()> {
+    if std::env::var("CELLD_TEST_POINTER_RACE").as_deref() == Ok("1") {
+        // A concurrent writer that landed after the opening read: the
+        // commit must reject against its stale token and leave this
+        // rival generation in place. Shaped as a valid pointer naming
+        // another version, so post-write reads decode.
+        let rival = serde_json::json!({
+            "script_name": "staged-rival",
+            "version": "ffffffffffffffff",
+            "prefix": "deploy/staged-rival/ffffffffffffffff",
+            "rollout": { "percent": 100 },
+            "celld_test_rival": true,
+        });
+        bucket
+            .put(key, serde_json::to_vec_pretty(&rival)?)
+            .await
+            .context("write the injected rival pointer")?;
+    }
+    match bucket.put_cas(key, body, token).await {
+        Ok(Some(_)) => Ok(()),
+        Ok(None) => Err(anyhow!(
+            "write {}://{}/{key} lost a race\n\
+             Another deploy or activate landed first; re-run `celld {command}`.",
+            bucket.scheme(),
+            bucket.name
+        )),
+        Err(error) => Err(error.context(format!(
+            "Another deploy or activate may have landed first; re-run `celld {command}`."
+        ))),
     }
 }
 
@@ -3326,6 +4695,64 @@ fi
             "the conflict must stay visible: {message}"
         );
     }
+
+    #[test]
+    fn deployment_versions_have_the_minted_shape() {
+        assert!(crate::protocol::valid_deployment_version(
+            "0123456789abcdef"
+        ));
+        for version in [
+            "",
+            "abc",
+            "current.json",
+            "0123456789abcde",
+            "0123456789abcdef0",
+            "0123456789ABCDEF",
+            "zzzzzzzzzzzzzzzz",
+            "0123456789abcde/",
+        ] {
+            assert!(
+                !crate::protocol::valid_deployment_version(version),
+                "{version:?} is not a minted version"
+            );
+        }
+    }
+
+    #[test]
+    fn discard_scope_refuses_keys_outside_the_version_directory() {
+        let reference = VersionRef {
+            script: "app".to_string(),
+            version: "0123456789abcdef".to_string(),
+        };
+        let prefix = "deploy/app/0123456789abcdef";
+        // The version directory itself passes through.
+        let inside = [
+            format!("{prefix}/manifest.json"),
+            format!("{prefix}/index.js"),
+        ];
+        assert_eq!(
+            discard_deletion_scope(prefix, &inside, &reference).unwrap(),
+            inside
+        );
+        // Everything an S3 byte-prefix listing can also return is
+        // refused: a sibling version, the script's named pointer, the
+        // fleet pointer, and an object at the prefix itself.
+        for key in [
+            "deploy/app/0123456789abcdef0/manifest.json".to_string(),
+            "deploy/app/0123456789abcde/manifest.json".to_string(),
+            "deploy/app/current.json".to_string(),
+            "deploy/current.json".to_string(),
+            prefix.to_string(),
+        ] {
+            let keys = [inside[0].clone(), key.clone()];
+            let error = discard_deletion_scope(prefix, &keys, &reference)
+                .expect_err(&format!("{key:?} is outside the version directory"));
+            assert!(
+                format!("{error:#}").contains("outside the version directory"),
+                "unexpected error: {error:#}"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -3379,6 +4806,7 @@ mod sourcemap_tests {
             vars: VarOverrides::None,
             local_images: false,
             sourcemap,
+            no_activate: false,
         }
     }
 

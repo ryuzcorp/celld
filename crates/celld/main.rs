@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): cross-isolate RPC stubs and streams; operator token for the internal listener; D1 export operator-ingress marker; ported from meln1k/celld: report wake coverage after maintenance (e6cb9a3).
+// Modified by ryuzcorp (ryuzcorp/celld): cross-isolate RPC stubs and streams; operator token for the internal listener; D1 export operator-ingress marker; ported from meln1k/celld: report wake coverage after maintenance (e6cb9a3); staged activation.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 // The binary contains connection, startup, shutdown, and V8 shell code. The
@@ -869,7 +869,7 @@ async fn adopt_deployment(
         };
     };
     let current = runtime.generation();
-    if !force && pointer.version == current.version() && pointer.prefix == current.prefix() {
+    if !force && current.serving_identity().names(&pointer) {
         return ReloadOutcome::Unchanged {
             generation: current.id(),
             version: current.version().to_string(),
@@ -919,9 +919,10 @@ async fn adopt_deployment(
 /// It polls on a slow interval and adopts what the pointer names through
 /// `adopt_deployment`; a `POST /reload` or a managed notification only makes
 /// it look now. The pointer is the authority, so a missed nudge degrades to
-/// "adopts one interval later". A version that failed to build is remembered
-/// and not retried until the pointer names something else or a reload is
-/// forced: a broken bundle must not recompile every interval on every node.
+/// "adopts one interval later". A generation that failed to build is
+/// remembered by its full pointer identity and not retried until the
+/// pointer names something else or a reload is forced: a broken bundle
+/// must not recompile every interval on every node.
 fn start_pointer_watcher(
     app: AppHandle,
     bucket: Bucket,
@@ -933,7 +934,7 @@ fn start_pointer_watcher(
         let period = celld::generation::poll_interval();
         let mut tick = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        let mut failed: Option<ReloadOutcome> = None;
+        let mut failed: Option<(celld::generation::ServingIdentity, ReloadOutcome)> = None;
         loop {
             let request = celld::asyncrt::select! {
                 _ = tick.tick() => ReloadRequest { force: false, reply: None },
@@ -942,29 +943,33 @@ fn start_pointer_watcher(
                     None => return,
                 },
             };
-            let outcome = match fleet::read_current_pointer(&bucket).await {
+            let (outcome, identity) = match fleet::read_current_pointer(&bucket).await {
                 Err(error) => {
                     tracing::warn!(event = "deployment_pointer_unreadable", %error);
-                    ReloadOutcome::Failed {
-                        version: String::new(),
-                        prefix: String::new(),
-                        error: format!("{error:#}"),
-                    }
+                    (
+                        ReloadOutcome::Failed {
+                            version: String::new(),
+                            prefix: String::new(),
+                            error: format!("{error:#}"),
+                        },
+                        None,
+                    )
                 }
-                Ok(pointer) => match &failed {
-                    Some(ReloadOutcome::Failed {
-                        version, prefix, ..
-                    }) if !request.force
-                        && version == &pointer.version
-                        && prefix == &pointer.prefix =>
-                    {
-                        failed.clone().expect("matched above")
-                    }
-                    _ => {
-                        adopt_deployment(&app, &bucket, &node, &region, pointer, request.force)
-                            .await
-                    }
-                },
+                Ok(pointer) => {
+                    let identity = celld::generation::ServingIdentity::of_pointer(&pointer);
+                    let outcome = match &failed {
+                        Some((failed_for, outcome))
+                            if !request.force && failed_for == &identity =>
+                        {
+                            outcome.clone()
+                        }
+                        _ => {
+                            adopt_deployment(&app, &bucket, &node, &region, pointer, request.force)
+                                .await
+                        }
+                    };
+                    (outcome, Some(identity))
+                }
             };
             match &outcome {
                 ReloadOutcome::Adopted {
@@ -987,7 +992,10 @@ fn start_pointer_watcher(
                     prefix,
                     error,
                 } => {
-                    if failed.as_ref() != Some(&outcome) {
+                    let already = failed
+                        .as_ref()
+                        .is_some_and(|(_, previous)| previous == &outcome);
+                    if !already {
                         tracing::error!(
                             event = "deployment_adoption_failed",
                             version = %version,
@@ -997,7 +1005,9 @@ fn start_pointer_watcher(
                         );
                     }
                     if !version.is_empty() {
-                        failed = Some(outcome.clone());
+                        if let Some(identity) = identity {
+                            failed = Some((identity, outcome.clone()));
+                        }
                     }
                 }
             }
@@ -3841,6 +3851,8 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
     celld::memory::tune_allocator();
     let mut settings = match action {
         Action::Deploy(arguments) => return fleet::run_deploy(arguments).await,
+        Action::Activate(arguments) => return fleet::run_activate(arguments).await,
+        Action::Discard(arguments) => return fleet::run_discard(arguments).await,
         Action::Dev(arguments) => return celld::dev::run(arguments).await,
         Action::Cell(arguments) => return celld::cell_cli::run(arguments).await,
         Action::D1(arguments) => return celld::d1_cli::run(arguments).await,
