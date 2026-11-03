@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): ported from meln1k/celld: scripted core-bug reproductions (ea471ee, e46a685, 6d61462, 18d3bf9).
+// Modified by ryuzcorp (ryuzcorp/celld): ported from meln1k/celld: scripted core-bug reproductions (ea471ee, e46a685, 6d61462, 18d3bf9, 9d4c163).
 //! Scripted reproductions of core bugs the deterministic simulator
 //! (`crates/sim`) found. Each drives the core through a minimal shell that
 //! answers every effect at once, except the ones a test holds back to
@@ -12,7 +12,7 @@ use celld_logic::wake::{AlarmSnapshot, AlarmSource, PublicationId};
 use celld_logic::{
     on_event, pressure, CasOutcome, Channel, Config, Effect, Event, Failure, LeaseCasOutcome,
     LocalCell, NodeLeaseSpec, OwnerRecord, OwnershipOnEvict, ProofSource, RestoreOutcome, State,
-    Timer,
+    Timer, WakeHintScope,
 };
 use std::collections::{BTreeMap, VecDeque};
 
@@ -194,7 +194,8 @@ impl Shell {
             | Effect::Halt { .. }
             | Effect::ReconcileWakeEntry { .. }
             | Effect::EvictionAdmission { .. }
-            | Effect::EvictionFinished { .. } => return None,
+            | Effect::EvictionFinished { .. }
+            | Effect::CancelCellActivity { .. } => return None,
             other => panic!("unexpected effect {other:?}"),
         })
     }
@@ -407,5 +408,139 @@ fn a_full_node_sheds_a_cell_whose_alarm_is_near() {
     shell.serve(1, "a");
     shell.observe_alarm("a", NOW_MS as i64 + 600_000);
     shell.serve(2, "b");
+    shell.state.validate().expect("state invariant");
+}
+
+/// A drain holds a full batch of releases when a policy eviction arrives
+/// for a resident the pump has not reached. The eviction used to take a
+/// new handoff past `max_releases`: `validate` failed, and shutdown
+/// flooded the store. During a drain any non-quiescing eviction now
+/// finds no room and is refused.
+#[test]
+fn a_drain_refuses_a_policy_eviction_past_its_release_ceiling() {
+    let mut shell = Shell::new(3, |effect| matches!(effect, Effect::ReleaseOwner { .. }));
+    shell.start();
+    shell.serve(1, "a");
+    shell.serve(2, "b");
+    shell.serve(3, "c");
+    shell.send(Event::ReleaseAll);
+    assert_eq!(shell.held.len(), 2, "the drain holds a full batch");
+    assert_eq!(shell.state.handoffs_in_flight(), 2);
+
+    // One of the three is still resident; the other two refuse as
+    // transitioning. Only the resident can overrun the ceiling.
+    for cell in ["a", "b", "c"] {
+        let effects = shell.send(Event::Evict { cell: cell.into() });
+        assert!(
+            !effects.iter().any(|effect| matches!(
+                effect,
+                Effect::EnsureDurable { cell: c, .. } | Effect::StopRuntime { cell: c, .. }
+                if c == cell
+            )),
+            "policy eviction of {cell} starts no handoff past the ceiling: {effects:?}"
+        );
+    }
+    assert_eq!(shell.state.handoffs_in_flight(), 2);
+    shell.state.validate().expect("state invariant");
+}
+
+/// Shed a cell, then let a peer claim its record before the release
+/// lands: the release is rejected and the cell parks `Dormant` with no
+/// release in flight, ready for a balancing move.
+fn park_dormant(shell: &mut Shell) {
+    shell.serve(1, "a");
+    shell.serve(2, "b");
+    assert_eq!(shell.held.len(), 1, "admitting b sheds a");
+    let epoch = shell.owners["a"].epoch;
+    shell.owners.insert(
+        "a".into(),
+        OwnerRecord {
+            node: Some("n1".into()),
+            epoch,
+            etag: "peer".into(),
+        },
+    );
+    let held = std::mem::take(&mut shell.held);
+    for effect in held {
+        if let Some(reply) = shell.answer(&effect) {
+            shell.send(reply);
+        }
+    }
+}
+
+/// A wake hint arrives for a dormant cell while a balancing move is
+/// releasing it. The hint used to reactivate the cell mid-move, leaving
+/// the handoff mark set outside the pipeline: `validate` failed. Hints
+/// now wait for the release, as requests already do.
+#[test]
+fn a_wake_hint_waits_for_a_balancing_move() {
+    let mut shell = Shell::new(1, |effect| matches!(effect, Effect::ReleaseOwner { .. }));
+    shell.start();
+    park_dormant(&mut shell);
+    let effects = shell.send(Event::Rebalance { cells: 1 });
+    assert!(
+        effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::ReleaseOwner { cell, .. } if cell == "a")),
+        "the balancing move releases a: {effects:?}"
+    );
+
+    let effects = shell.send(Event::WakeHint {
+        cell: "a".into(),
+        entry_ms: NOW_MS as i64,
+        scope: WakeHintScope::Owned,
+    });
+    assert!(
+        effects.is_empty(),
+        "the hint waits for the move: {effects:?}"
+    );
+    shell.state.validate().expect("state invariant");
+}
+
+/// The node lease fences while a balancing move holds a dormant cell.
+/// The fence used to leave the handoff mark set on the fenced cell:
+/// `validate` failed. A fenced node moves nothing, so the fence now
+/// clears the mark.
+#[test]
+fn a_fence_clears_a_balancing_handoff() {
+    let mut shell = Shell::new(1, |effect| matches!(effect, Effect::ReleaseOwner { .. }));
+    shell.start();
+    park_dormant(&mut shell);
+    shell.send(Event::Rebalance { cells: 1 });
+
+    let fence = shell
+        .timers
+        .iter()
+        .find(|timer| matches!(timer, Timer::NodeLeaseFence { .. }))
+        .cloned()
+        .expect("the held lease arms its fence");
+    let effects = shell.send(Event::TimerFired {
+        timer: fence,
+        now_ms: NOW_MS + TTL_MS,
+        now_mono_ms: MONO_MS + TTL_MS,
+    });
+    assert!(effects
+        .iter()
+        .any(|effect| matches!(effect, Effect::Halt { .. })));
+    shell.state.validate().expect("state invariant");
+}
+
+/// A preserve retires a startup confirmation read that is still in
+/// flight. It used to retire the owner read but leave the cell in the
+/// confirmation set: `validate` failed. The preserve now settles the
+/// confirmation too.
+#[test]
+fn a_preserve_settles_a_confirming_read() {
+    let mut shell = Shell::new(4, |effect| matches!(effect, Effect::ReadOwner { .. }));
+    shell.local_cells = vec![LocalCell {
+        id: "c".into(),
+        epoch: 3,
+        live: false,
+    }];
+    shell.start();
+    assert_eq!(shell.held.len(), 1, "the confirmation read is in flight");
+
+    shell.send(Event::BeginPreserve);
+    assert!(shell.state.ownership_confirmed());
     shell.state.validate().expect("state invariant");
 }
