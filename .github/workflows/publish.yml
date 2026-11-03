@@ -5,7 +5,8 @@
 #
 #   `verify`   the tag names a `<version>`/`<n>` pair, the tree's
 #              Cargo.toml agrees on `<version>`, and the tagged commit
-#              is contained in the matching `ryuzcorp/v<version>` branch
+#              is the current tip of the matching `ryuzcorp/v<version>`
+#              branch (tags on old or bare-upstream commits are refused)
 #   `push`     per architecture: refuse an already-published tag (only
 #              a confirmed "not found" lets it publish), then run the
 #              Dockerfile's test stage and push the arch image
@@ -72,7 +73,15 @@ jobs:
             echo "refusing tag $GITHUB_REF_NAME: $sha is not on ryuzcorp/v$base" >&2
             exit 1
           fi
-          echo "tag $GITHUB_REF_NAME is $sha on ryuzcorp/v$base"
+          # The tagged commit must be the line tip at publish time, so a
+          # tag on an old or bare-upstream commit can never publish a
+          # stale image under this trusted name.
+          tip=$(git rev-parse FETCH_HEAD^{commit})
+          if [ "$sha" != "$tip" ]; then
+            echo "refusing tag $GITHUB_REF_NAME: $sha is not the tip of ryuzcorp/v$base ($tip); tag the line tip" >&2
+            exit 1
+          fi
+          echo "tag $GITHUB_REF_NAME is $sha, the tip of ryuzcorp/v$base"
 
   push:
     name: Test, build and push (${{ matrix.suffix }})
