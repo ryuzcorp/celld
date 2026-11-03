@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): exec-signal conformance fixture. Apache-2.0.
+// Modified by ryuzcorp (ryuzcorp/celld): exec-signal conformance fixture; exec kill delivery fixture. Apache-2.0.
 const J = (o, st = 200) => Response.json(o, { status: st });
 
 let nextScope = 0;
@@ -101,6 +101,24 @@ export default {
           const exitCode = await proc.exitCode;
           controller.abort();
           return { exitCode, kills: test.kills(id) };
+        }
+        // Fire-and-forget kill delivery: kill() returns void, so the
+        // handler answers in the same turn without awaiting anything.
+        // A fixed scope carries the exec across the two requests.
+        case 'kill-delivery': {
+          const fixed = 'kill-delivery';
+          test.attach(fixed);
+          const proc = await test.exec(fixed, ['sleep', '30']);
+          const [id] = test.ids(fixed);
+          // Fire and forget: the handler answers in this same turn,
+          // awaiting nothing after the kill.
+          proc.kill(9);
+          return { id };
+        }
+        case 'kill-delivery-status': {
+          const fixed = 'kill-delivery';
+          const [id] = test.ids(fixed);
+          return { completed: test.killsCompleted(id) };
         }
         default: return { error: `unknown ${t}` };
       }

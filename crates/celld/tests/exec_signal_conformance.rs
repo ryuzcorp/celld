@@ -1,7 +1,7 @@
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 //
 // Modified by ryuzcorp (ryuzcorp/celld): container exec AbortSignal
-// conformance. Apache-2.0.
+// conformance; container exec kill delivery conformance. Apache-2.0.
 
 // A black-box runner, not node code: it boots the binary, copies fixtures,
 // and polls TCP with wall-clock deadlines, so the execution boundary's
@@ -263,4 +263,31 @@ fn exec_signal_conformance() {
     assert_eq!(exited["ok"], true, "{exited}");
     assert_eq!(exited["result"]["exitCode"], 0, "{exited}");
     assert_eq!(exited["result"]["kills"], serde_json::json!([]), "{exited}");
+}
+
+/// A fire-and-forget `kill()` (sync, returns void) still runs its op:
+/// the fixture answers in the same turn without awaiting anything, and
+/// the kill completion must land anyway. An op the event drops never
+/// completes, so the suite observes delivery, not dispatch.
+#[test]
+fn exec_kill_delivery_conformance() {
+    let dir = tempfile::Builder::new()
+        .prefix("celld-exec-kill-delivery-")
+        .tempdir()
+        .expect("tempdir");
+    let app_project = dir.path().join("app");
+    copy_dir(&fixture_dir(), &app_project);
+    let node = TestNode::boot(&app_project);
+
+    let fired = get_json(&node, "/kill-delivery");
+    assert_eq!(fired["ok"], true, "{fired}");
+
+    // The completion lands once the driver polls the op; poll the
+    // observable condition with a deadline, like the boot poll.
+    let done = poll_until("kill completion", Duration::from_secs(30), || {
+        let status = get_json(&node, "/kill-delivery-status");
+        (status["ok"] == true && status["result"]["completed"] == serde_json::json!([9]))
+            .then(|| status.to_string())
+    });
+    assert!(done.contains("[9]"), "{done}");
 }
