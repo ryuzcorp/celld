@@ -46,6 +46,8 @@ jobs:
           fetch-depth: 0
           fetch-tags: true
       - name: Check the tag against its line branch
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           # The tag names the release: v<version>-ryuzcorp.<n>.
@@ -53,6 +55,14 @@ jobs:
             base="${BASH_REMATCH[1]}"
           else
             echo "refusing tag $GITHUB_REF_NAME: want v<version>-ryuzcorp.<n>" >&2
+            exit 1
+          fi
+          # A release is an annotated tag (tagger + message, FORK.md). Asked
+          # of the API rather than the checkout, whose tag refs may not keep
+          # the tag object.
+          kind=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$GITHUB_REF_NAME" --jq .object.type)
+          if [ "$kind" != "tag" ]; then
+            echo "refusing tag $GITHUB_REF_NAME: a release must be an annotated tag, got $kind" >&2
             exit 1
           fi
           sha=$(git rev-parse "refs/tags/$GITHUB_REF_NAME^{commit}")
