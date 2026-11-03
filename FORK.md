@@ -9,7 +9,7 @@ README below is kept intact; this file documents the fork.
 
 - `main` mirrors upstream `main` and carries no patches.
 - `ryuzcorp/v<version>` is a line branch: the upstream tag `v<version>`
-  plus our patches as commits, one commit per patch, in `0001`-`0023`
+  plus our patches as commits, one commit per patch, in `0001`-`0024`
   order. Each patch commit is self-contained and carries its own tests.
 
 Upstream's `.github/workflows/release.yml` targets `ghcr.io/denoland` and
@@ -283,11 +283,17 @@ push to `ghcr.io/denoland`, but still. Pushing a branch named
   generated columns, carries NUL and invalid-UTF-8 TEXT byte-exact,
   rebuilds fts5/fts5vocab/vec0 virtual tables without their shadows, and
   parses the virtual-table module instead of matching a DDL prefix.
-- `0023` (sha TBD at merge) `celld d1 execute --batch --json` reads a JSON
+- `0023` (`69114b9`) `celld d1 execute --batch --json` reads a JSON
   array of statements from stdin and runs it as one transactional batch:
   the cell runs the engine's own `batch()` behind a new fetch branch, so
   the CLI and the Worker binding share one implementation, and the CLI
   prints one JSON array shaped as the Worker's `batch()` shapes it.
+- `0024` (sha TBD at merge) `celld d1 export` scopes each
+  `sqlite_sequence` reset to its own counter: a filtered (`--table`) or
+  data-only (`--no-schema`) dump replayed into an existing database no
+  longer clears the AUTOINCREMENT counters of tables the dump does not
+  name, so those tables cannot reissue the ids of deleted rows. A full
+  dump still restores every counter exactly.
 
 ## Releases
 
