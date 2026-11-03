@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): cross-isolate RPC stubs and streams; D1 export operator-ingress marker.
+// Modified by ryuzcorp (ryuzcorp/celld): cross-isolate RPC stubs and streams; D1 export operator-ingress marker; ported from meln1k/celld: report wake coverage after maintenance (e6cb9a3).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 // RuntimeManager is the V8 cell-host arm, so its executor and observability
@@ -19,10 +19,10 @@ use crate::js::{self, CellJob, CellStorage, HttpResponse, Worker, WorkerConfig};
 pub use crate::clean_reload::take_clean_reload_generation;
 pub use crate::clean_reload::write_clean_reload_marker;
 pub use crate::engine_api::admission_wait;
-pub use crate::engine_api::AlarmObserver;
 pub use crate::engine_api::RuntimeFetch;
 pub use crate::engine_api::RuntimeOptions;
 pub use crate::engine_api::ServiceFetch;
+pub use crate::engine_api::{AlarmObserver, WakeCoverage};
 pub use crate::ltx_replication::Replication;
 use anyhow::{anyhow, Context};
 use futures_util::StreamExt as _;
@@ -603,7 +603,7 @@ fn alarm_reporter(cells: &Arc<Mutex<CellRegistry>>, observe: &AlarmObserver) -> 
                 // change. An ActivityFinished must use that source's snapshot.
                 handle.alarm = alarm;
                 if changed {
-                    observe_(scope, alarm);
+                    observe_(scope, alarm, WakeCoverage::Unconfirmed);
                 }
             }
         },
@@ -1334,7 +1334,7 @@ impl RuntimeManager {
                 return Err(error);
             }
         };
-        (self.alarm_observer)(cell.clone(), alarm);
+        (self.alarm_observer)(cell.clone(), alarm, WakeCoverage::Unconfirmed);
         let startup_us = startup_timing.emit("ready", "");
 
         {
@@ -1680,6 +1680,32 @@ impl RuntimeManager {
     /// reach the core after a fresher report (see `alarm_reporter`).
     pub fn with_alarm<T>(&self, cell: &str, f: impl FnOnce(Option<i64>) -> T) -> T {
         self.with_alarm_snapshot(cell, |alarm| f(alarm.at_ms()))
+    }
+
+    /// Tell the core that a wake entry now covers the alarm `maintained`
+    /// describes. Nothing else would: the reporter and the startup observer
+    /// send every new installation uncovered, and a restored alarm keeps the
+    /// core refusing eviction until some later activity finishes. This reads
+    /// and sends under the registry lock, like the reporter, so it cannot
+    /// overtake a newer installation. It says nothing once the cache moved on.
+    pub(crate) fn report_alarm_coverage(
+        &self,
+        cell: &str,
+        maintained: celld_logic::wake::AlarmSnapshot,
+    ) {
+        let cells = self.cells.lock().expect("cell registry poisoned");
+        let Some(handle) = cells
+            .published
+            .get(cell)
+            .or_else(|| cells.starting.get(cell))
+        else {
+            return;
+        };
+        let alarm = handle.alarm;
+        if alarm != maintained || alarm.at_ms().is_none() || !self.alarm_covered(cell, alarm) {
+            return;
+        }
+        (self.alarm_observer)(cell.to_string(), alarm, WakeCoverage::Confirmed);
     }
 
     pub(crate) fn with_alarm_snapshot<T>(

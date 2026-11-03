@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): cross-isolate RPC stubs and streams; operator token for the internal listener; Workers Cache pressure shedding.
+// Modified by ryuzcorp (ryuzcorp/celld): cross-isolate RPC stubs and streams; operator token for the internal listener; Workers Cache pressure shedding; ported from meln1k/celld: report wake coverage after maintenance (e6cb9a3).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! The serial lifecycle executor and its shell-side request drivers.
@@ -2338,6 +2338,10 @@ impl Actor {
                 Ok(Err(error)) => tracing::warn!(%cell, %error, "wake maintenance deferred"),
                 Err(_) => tracing::warn!(%cell, "wake maintenance timed out; a later scan retries"),
             }
+            // An entry this published lets the core evict the cell, and only
+            // the shell knows it exists. A later step can fail after the PUT,
+            // so ask the flusher rather than trusting the result.
+            host.report_alarm_coverage(&cell, alarm);
         })
         .detach();
     }
