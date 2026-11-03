@@ -1,3 +1,4 @@
+// Modified by ryuzcorp (ryuzcorp/celld): operator token for the internal listener.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! v0 of the in-fleet replicated log tier (`CELLD_DURABILITY=fleet`).
@@ -2499,6 +2500,7 @@ impl LogTransport for SignedPeerTransport {
                 builder = builder.timeout(deadline);
             }
             let request = self.auth.sign(builder, "POST", path, &body, node)?;
+            let request = crate::operator_token::authenticate(request)?;
             let response = request.body(body).send().await?;
             // Status before response-auth: an older peer can answer an
             // unsigned route error, and callers need that status to classify
@@ -2536,6 +2538,7 @@ impl LogTransport for SignedPeerTransport {
                 .header(hyper::header::CONNECTION, "upgrade")
                 .header(hyper::header::UPGRADE, "celld-log-stream");
             let request = self.auth.sign(builder, "POST", path, &[], node)?;
+            let request = crate::operator_token::authenticate(request)?;
             let response = request.send().await?;
             if response.status() != reqwest::StatusCode::SWITCHING_PROTOCOLS {
                 let status = response.status();

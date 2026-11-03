@@ -9,7 +9,7 @@ README below is kept intact; this file documents the fork.
 
 - `main` mirrors upstream `main` and carries no patches.
 - `ryuzcorp/v<version>` is a line branch: the upstream tag `v<version>`
-  plus our patches as commits, one commit per patch, in `0001`-`0012`
+  plus our patches as commits, one commit per patch, in `0001`-`0013`
   order. Each patch commit is self-contained and carries its own tests.
 
 Upstream's `.github/workflows/release.yml` targets `ghcr.io/denoland` and
@@ -185,7 +185,7 @@ push to `ghcr.io/denoland`, but still. Pushing a branch named
   sharing one container each shed against their own `memory.max` (which
   an unset `CELLD_MAX_RSS_MB` defaults to a share of); cgroup v1 and an
   unreadable leaf fall back to the root with a warning.
-- `0012` (sha TBD at merge) `celld deploy --sourcemap PATH` writes the
+- `0012` (`85d4886`) `celld deploy --sourcemap PATH` writes the
   bundled Worker's external source map to a local file: the esbuild run
   adds `--sourcemap=external`, so the deployed module bytes are
   byte-identical with or without the flag (a trailing
@@ -196,6 +196,15 @@ push to `ghcr.io/denoland`, but still. Pushing a branch named
   `no_bundle`, and Python projects warn and write nothing. The Docker
   test stage installs esbuild, pinned by sha512, so the bundling tests
   run in CI.
+- `0013` (sha TBD at merge) `CELLD_OPERATOR_TOKEN` guards the internal
+  listener: when set, every internal route requires
+  `Authorization: Bearer <token>` (constant-time compare, 401 without
+  it, no exempt routes — probes use the public health endpoint) and the
+  node refuses to start on an empty value or one with surrounding
+  whitespace; unset is today's open listener. Every in-tree internal
+  client (peer forwarding, handoff, abort, log tier, probe,
+  `d1`/`kv`/`queue` CLIs, `diagnose`, `dev` shutdown) sends the token
+  from its environment.
 
 ## Releases
 

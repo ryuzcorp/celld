@@ -1,3 +1,4 @@
+// Modified by ryuzcorp (ryuzcorp/celld): operator token for the internal listener.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 // Peer probing is a real-wire diagnostic outside the Actor execution domain.
@@ -134,6 +135,7 @@ pub(crate) async fn probe(
         &[],
         &node.node,
     )?;
+    let request = crate::operator_token::authenticate(request)?;
     let mut response = request
         .header("x-cells-probe-challenge", &challenge)
         .send()

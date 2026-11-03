@@ -1,3 +1,4 @@
+<!-- Modified by ryuzcorp (ryuzcorp/celld): operator token for the internal listener. -->
 # Security
 
 celld v0.6.3 is a beta release. It is not safe for hostile multi-tenant use.
@@ -40,7 +41,8 @@ path, so an operator request cannot become an application request.
 The internal listener has three request groups, and all three require the
 trusted private network:
 
-- Most operator routes have no request authentication.
+- Most operator routes have no request authentication, unless
+  `CELLD_OPERATOR_TOKEN` is set (see below).
 - `/peer/tunnel` opens a tunnel for cell fetch, RPC, and WebSocket calls. The
   establishment request carries the fleet HMAC, a clock limit, and replay
   protection. The calls inside the tunnel are plain, unsigned HTTP.
@@ -51,10 +53,44 @@ Every path to a runtime class therefore demands the fleet secret. The HMAC
 does not authenticate tunnel bytes after establishment and does not encrypt
 traffic, so it does not replace the private network.
 
+## Guard the internal listener with a token
+
+Set `CELLD_OPERATOR_TOKEN` to the same value on every node of the fleet,
+and every internal-listener route requires
+`Authorization: Bearer <token>`, compared in constant time, and answers
+401 without it. There are no exempt routes: unknown paths answer 401 too,
+and liveness and readiness probes use the public listener's
+`/.well-known/celld/health`, which the token does not guard. A node with
+the variable set but empty refuses to start; an unset variable is the
+open listener above.
+
+Every in-tree client of the internal listener reads the variable from its
+own environment and sends the token: node-to-node peer forwarding,
+handoff, abort, the log tier, and the signed probe, as well as
+`celld d1`, `celld kv`, `celld queue`, `celld diagnose`, and the `celld
+dev` supervisor's shutdown. A caller outside the fleet — a deployment
+script that posts `/reload`, a monitor that reads `/state` — must send
+the header itself. Roll the token out only after every node runs a celld
+that knows the variable: a node that never sends the header is refused
+by the nodes that require it, so a mixed fleet would split its peer
+traffic.
+
+A node holds one token and tunnels between nodes do not re-authenticate,
+so rotating the token means restarting the fleet with the new value:
+either every node at once, or node by node while accepting that nodes
+on different tokens refuse each other's peer traffic until the last one
+restarts.
+
+The token authenticates the caller; it does not encrypt the traffic.
+Without TLS on the internal listener the token travels in cleartext, so
+a network observer still sees it. Keep the trusted private network or
+the encrypted overlay: the token shrinks what that network must prove,
+it does not replace it.
+
 ## Use the internal operator API
 
 The operator API is an alpha interface. A release can change its paths or
-response formats. These routes do not authenticate the caller:
+response formats. Without the token, these routes do not authenticate the caller:
 
 - `/state` reports node state.
 - `/cell/<SCOPE>` resolves or activates a cell.

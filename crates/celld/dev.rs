@@ -1,3 +1,4 @@
+// Modified by ryuzcorp (ryuzcorp/celld): operator token for the internal listener.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 // Modified by ryuzcorp (ryuzcorp/celld): deploy --sourcemap writes the bundle's external map.
 
@@ -893,11 +894,21 @@ async fn stop_child(child: &mut Child, internal: Option<&str>) {
             .timeout(Duration::from_secs(2))
             .build()
         {
-            Ok(client) => client
-                .post(format!("{internal}/shutdown?handoff=preserve"))
-                .send()
-                .await
-                .is_ok_and(|response| response.status().is_success()),
+            Ok(client) => {
+                // The child inherits this supervisor's environment, so when
+                // the operator token is set the child guards /shutdown with
+                // it and this request must present it. An unreadable token
+                // falls through to the SIGTERM path below, as a refused
+                // shutdown does.
+                let post = client.post(format!("{internal}/shutdown?handoff=preserve"));
+                match crate::operator_token::authenticate(post) {
+                    Ok(signed) => signed
+                        .send()
+                        .await
+                        .is_ok_and(|response| response.status().is_success()),
+                    Err(_) => false,
+                }
+            }
             Err(_) => false,
         }
     } else {

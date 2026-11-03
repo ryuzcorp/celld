@@ -1,3 +1,4 @@
+// Modified by ryuzcorp (ryuzcorp/celld): operator token for the internal listener.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! Reaching a reserved-class cell from outside the fleet.
@@ -136,6 +137,7 @@ impl Reachable {
                     &entrance.node,
                 )
                 .with_context(|| format!("sign the request to {}", entrance.node))?;
+            let request = crate::operator_token::authenticate(request)?;
             let response = match request.send().await {
                 Ok(response) => response,
                 Err(error) if error.is_connect() && !last => {

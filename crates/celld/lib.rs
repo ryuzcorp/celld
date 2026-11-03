@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): cross-isolate RPC stubs and streams.
+// Modified by ryuzcorp (ryuzcorp/celld): cross-isolate RPC stubs and streams; operator token for the internal listener.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 #![warn(clippy::disallowed_methods, clippy::disallowed_types)]
@@ -79,6 +79,7 @@ pub mod machine;
 pub mod memory;
 pub mod node_log;
 pub(crate) mod operator_cell;
+pub mod operator_token;
 #[doc(hidden)]
 pub mod otlp;
 pub mod ownership_store;

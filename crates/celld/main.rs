@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): cross-isolate RPC stubs and streams.
+// Modified by ryuzcorp (ryuzcorp/celld): cross-isolate RPC stubs and streams; operator token for the internal listener.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 // The binary contains connection, startup, shutdown, and V8 shell code. The
@@ -321,6 +321,32 @@ fn peer_response(mut response: HttpReply) -> HttpReply {
         hyper::header::HeaderValue::from_static(peer_auth::PROTOCOL_VERSION_TEXT),
     );
     response
+}
+
+/// The operator-token gate for the internal listener. `None` is an open
+/// listener (the variable is unset) or a presented token; `Some` is the 401
+/// for a missing or wrong one. One gate in front of every internal route —
+/// including unknown paths and the recovery surface — so nothing answers
+/// without the token when one is configured. There are no exempt routes:
+/// liveness and readiness probes use the public listener's
+/// `/.well-known/celld/health`, which this token does not guard.
+fn operator_gate(app: &AppHandle, headers: &hyper::HeaderMap) -> Option<HttpReply> {
+    let token = app.operator_token.as_ref()?;
+    if token.verify(headers) {
+        return None;
+    }
+    let mut denied = response(
+        StatusCode::UNAUTHORIZED,
+        "{\"error\":\"operator authentication required\"}",
+    );
+    denied.headers_mut().insert(
+        hyper::header::WWW_AUTHENTICATE,
+        hyper::header::HeaderValue::from_static("Bearer"),
+    );
+    // The peer clients validate the response version before they read the
+    // status; without it a token mismatch would surface as "no protocol
+    // version" instead of the 401 it is.
+    Some(peer_response(denied))
 }
 
 /// Decides whether a Worker-set response header reaches the caller. The
@@ -737,6 +763,7 @@ async fn send_peer_abort(
         &[],
         &node,
     )?;
+    let request = celld::operator_token::authenticate(request)?;
     let response = request.body(Vec::new()).send().await?;
     peer_auth::validate_response(response.headers())?;
     anyhow::ensure!(
@@ -3145,6 +3172,9 @@ async fn handle_internal(
     app: AppHandle,
     shutdown: mpsc::UnboundedSender<ShutdownMode>,
 ) -> Result<HttpReply, Infallible> {
+    if let Some(denied) = operator_gate(&app, request.headers()) {
+        return Ok(denied);
+    }
     let path = request.uri().path().to_string();
     let draining = app.is_draining();
     let do_scope = path.strip_prefix("/do/");
@@ -3549,6 +3579,9 @@ fn serve_http_connection(
                         HttpSurface::Public => handle_public(request, app, service_requests).await,
                         HttpSurface::Internal => handle_internal(request, app, shutdown).await,
                         HttpSurface::Recovery => {
+                            if let Some(denied) = operator_gate(&app, request.headers()) {
+                                return Ok(denied);
+                            }
                             let path = request.uri().path().to_string();
                             Ok(match path.as_str() {
                                 "/peer/log/seal" | "/peer/log/tail" => {
@@ -3902,6 +3935,10 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
         }
         Action::Run(settings) => settings,
     };
+    // Before any listener binds: an empty or unshippable token refuses the
+    // boot instead of serving a node the operator believes is guarded.
+    // Absent is today's open internal listener.
+    let operator_token = celld::operator_token::from_env()?;
     // Operators need the applied worker count to verify CELLD_TOKIO_THREADS;
     // a count of process threads also includes unrelated, lazily started
     // thread pools, so it cannot stand in for this value.
@@ -4500,6 +4537,7 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
         max_request_body_bytes,
         operation_deadline_ms: celld::actor::operation_deadline_ms()?,
         follower: follower.clone(),
+        operator_token,
     };
 
     // The in-fleet log tier, v0. The takeover interlock is installed in
