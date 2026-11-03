@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): ctx.container.images; clone() of streaming and disturbed bodies; __celld$do on the service-binding RPC path; container exec pty/resize; cross-isolate RPC stubs and streams; container exec AbortSignal; test-only fake kill completion; exec reads survive their subscribing event; context end aborts finished uploads; tenant egress policy; D1 export; D1 export operator gate; D1 batch.
+// Modified by ryuzcorp (ryuzcorp/celld): ctx.container.images; clone() of streaming and disturbed bodies; __celld$do on the service-binding RPC path; container exec pty/resize; cross-isolate RPC stubs and streams; container exec AbortSignal; test-only fake kill completion; exec reads survive their subscribing event; context end aborts finished uploads; tenant egress policy; D1 export; D1 export operator gate; D1 batch; test-only fake close/signal completion.
 // The DO object model and the Cloudflare-compatible runtime surface, run
 // once per isolate by `js.rs::install_harness` after the Web-API prelude.
 // Lived as a 4,000-line raw string inside js.rs until 2026-07-29; it is a
@@ -6567,6 +6567,16 @@ if (__test_wait_enabled())
     exit(id, code) { __testexec_exit(id, code); },
     kills(id) { return JSON.parse(__testexec_kills(id)); },
     killsCompleted(id) { return JSON.parse(__testexec_kills_completed(id)); },
+    closes(id) { return JSON.parse(__testexec_closes(id)); },
+    closesCompleted(id) { return JSON.parse(__testexec_closes_completed(id)); },
+    signal(scope, signo) {
+      // The real signal on a scope-only Container, like exec above.
+      const self = Object.create(Container.prototype);
+      self._scope = scope;
+      return self.signal(signo);
+    },
+    signals(scope) { return JSON.parse(__testexec_signals(scope)); },
+    signalsCompleted(scope) { return JSON.parse(__testexec_signals_completed(scope)); },
     params(id) { return JSON.parse(__testexec_params(id)); },
   };
 // Test-only in-memory exec processes: `spawn` mints a real process-table

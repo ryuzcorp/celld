@@ -1,10 +1,27 @@
-// Modified by ryuzcorp (ryuzcorp/celld): exec-signal conformance fixture; exec kill delivery fixture. Apache-2.0.
+// Modified by ryuzcorp (ryuzcorp/celld): exec-signal conformance fixture; exec kill delivery fixture; close/signal delivery fixture; failed-event signal fixture. Apache-2.0.
+import { DurableObject } from 'cloudflare:workers';
+
 const J = (o, st = 200) => Response.json(o, { status: st });
 
 let nextScope = 0;
 
+// A cell fetch event that signals and then fails: the signal op is
+// already enqueued when the throw rejects the event, so only a
+// lifetime that survives failed cell events delivers it. (An RPC
+// method will not do: the RPC layer answers throws as error
+// envelopes, so the event succeeds.)
+export class SignalDO extends DurableObject {
+  async fetch() {
+    const test = globalThis.__celldTestExecForTestOnly;
+    const fixed = 'signal-fail';
+    test.attach(fixed);
+    test.signal(fixed, 15);
+    throw new Error('signal-fail boom');
+  }
+}
+
 export default {
-  async fetch(req) {
+  async fetch(req, env) {
     const t = new URL(req.url).pathname.slice(1);
     const run = async () => {
       if (t === 'health') return { ok: true };
@@ -119,6 +136,58 @@ export default {
           const fixed = 'kill-delivery';
           const [id] = test.ids(fixed);
           return { completed: test.killsCompleted(id) };
+        }
+        // Stdin-close delivery: the default stdin:none path fires
+        // __container_exec_close without awaiting it (there is no
+        // handle to await), and the handler answers in the same turn.
+        // A fixed scope carries the exec across the two requests.
+        case 'close-delivery': {
+          const fixed = 'close-delivery';
+          test.attach(fixed);
+          await test.exec(fixed, ['cat']);
+          const [id] = test.ids(fixed);
+          return { id, dispatched: test.closes(id) };
+        }
+        case 'close-delivery-status': {
+          const fixed = 'close-delivery';
+          const [id] = test.ids(fixed);
+          return {
+            dispatched: test.closes(id),
+            completed: test.closesCompleted(id),
+          };
+        }
+        // Container-signal delivery: signal() returns void, so the
+        // handler answers in the same turn without awaiting anything.
+        // A fixed scope carries the signals across the two requests.
+        case 'signal-delivery': {
+          const fixed = 'signal-delivery';
+          test.attach(fixed);
+          test.signal(fixed, 15);
+          return { dispatched: test.signals(fixed) };
+        }
+        case 'signal-delivery-status': {
+          const fixed = 'signal-delivery';
+          return {
+            dispatched: test.signals(fixed),
+            completed: test.signalsCompleted(fixed),
+          };
+        }
+        // Failed-event signal delivery: the DO fetch signals and then
+        // throws, so its cell event fails with the signal op pending.
+        // A fixed scope carries the signals across the two requests.
+        case 'signal-fail': {
+          const stub = env.SIGNAL_DO.get(env.SIGNAL_DO.idFromName('signal-fail'));
+          let threw = false;
+          try {
+            await stub.fetch('https://signal-fail.invalid/');
+          } catch { threw = true; }
+          return { threw, dispatched: test.signals('signal-fail') };
+        }
+        case 'signal-fail-status': {
+          return {
+            dispatched: test.signals('signal-fail'),
+            completed: test.signalsCompleted('signal-fail'),
+          };
         }
         default: return { error: `unknown ${t}` };
       }
