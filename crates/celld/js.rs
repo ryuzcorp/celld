@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): node:crypto scrypt; container exec resize op; cross-isolate RPC stubs and streams; test-only fake exec ops; fake kill completion op; exec reads survive their subscribing event; per-node Workers Cache API ops; tenant egress policy; D1 export operator-ingress marker.
+// Modified by ryuzcorp (ryuzcorp/celld): node:crypto scrypt; container exec resize op; cross-isolate RPC stubs and streams; test-only fake exec ops; fake kill completion op; exec reads survive their subscribing event; per-node Workers Cache API ops; tenant egress policy; D1 export operator-ingress marker; stateless attribution tokens; reaction-aware request resources.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 // The raw V8 adapter and its child modules remain outside the Actor execution
@@ -976,9 +976,19 @@ impl EgressGate {
 /// thread-local turn owner then names that other event. An effect raised by
 /// A's reaction would otherwise be gated against the wrong cell's position, or
 /// refused as belonging to the wrong cell. The turn owner remains the answer
-/// for a context that installs no continuation token.
-fn event_context(scope: &mut v8::PinScope) -> Arc<IoContext> {
-    current_reaction_io_context(scope).unwrap_or_else(current_context)
+/// for code that installs no continuation token — but a token that no longer
+/// resolves names a retired event, and must not borrow another event's
+/// ambient context: a stale continuation doing subrequest work would
+/// otherwise charge the ambient entry's budget.
+fn event_context(scope: &mut v8::PinScope) -> Option<Arc<IoContext>> {
+    current_reaction_or_untracked_io_context(scope)
+}
+
+/// Fail an op whose calling event already retired. Its token resolved to
+/// nothing, so there is no budget to charge and no gate to trail; borrowing
+/// the ambient entry's would charge a foreign request for work it never did.
+fn retired_event_throw(scope: &mut v8::PinScope) {
+    loader_throw(scope, "the event that issued this operation already ended");
 }
 
 /// What one cell event's outbound effects gate against.
@@ -2990,6 +3000,15 @@ fn take_execution_termination_in_context(
             } else if let Some(context) = context {
                 finish_terminated_actor_event(scope, context);
             } else {
+                // Ambient is the entry being unwound: the failing begin still
+                // holds its CurrentGuard at the begin-family call sites. The
+                // exceptions are the threw paths of turn_begin and
+                // turn_begin_cell, where the failed entry is already gone, and
+                // the worker-load module evaluation, which has no begin; in
+                // each, termination unwinds everything regardless. Resolving
+                // the running reaction instead would attribute teardown to
+                // whatever continuation ran last — or to nothing, when that
+                // entry already retired.
                 finish_terminated_actor_event(scope, &current_context());
             }
         }
@@ -4047,8 +4066,9 @@ impl InFlight {
 /// Telemetry once took the whole slot and exposed this collision.
 ///
 /// When all three riders are absent, the slot stays undefined and V8 can use
-/// its empty-state fast path. Stateless code can retain that path. A cell
-/// event intentionally installs the native token even when telemetry is off.
+/// its empty-state fast path. Every event installs the native token even
+/// when telemetry is off, so a shared promise's continuation attributes to
+/// its own entry when it runs during another entry's checkpoint.
 ///
 /// This reads one rider and leaves the other two unmaterialized. Reading a
 /// single rider is what every caller wants, so the layout rule lives here
@@ -4156,7 +4176,7 @@ fn restore_trace(scope: &mut v8::PinScope, previous: Option<v8::Local<v8::Value>
     }
 }
 
-/// Install the current cell event's native context in CPED. V8 restores this
+/// Install the current event's native context in CPED. V8 restores this
 /// token for each reaction, including a reaction that runs during another
 /// event's microtask checkpoint.
 fn install_io_context<'s>(
@@ -4251,10 +4271,11 @@ fn op_with_input_gate_context(
 /// Resolve the exact tracked reaction, or use the active context when this
 /// isolate does not track reactions at all.
 ///
-/// Cell events always install a token. A token that no longer resolves names
+/// Every event installs a token. A token that no longer resolves names
 /// a retired event and must not borrow another event's ambient context.
-/// Stateless requests install no token, so their current turn remains the
-/// only context that can own a synchronous operation such as `process.exit`.
+/// Code running outside any entry installs no token, so its current turn
+/// remains the only context that can own a synchronous operation such as
+/// `process.exit`.
 fn current_reaction_or_untracked_io_context(scope: &mut v8::PinScope) -> Option<Arc<IoContext>> {
     if cped_io_context(scope).is_undefined() {
         return Some(current_context());
@@ -4366,10 +4387,17 @@ impl Worker {
         let out = match begun {
             Begun::Running(mut entry) => {
                 entry.trace = trace;
+                // The first turn installs its token like every later turn, so
+                // a continuation registered while settling — the
+                // streaming-response bridge pump of a handler that settled
+                // before it ever suspended — carries this entry's id when it
+                // runs during another entry's checkpoint.
+                let previous_io_context = install_io_context(tc, &entry.context);
                 // A handler that returned an already-resolved promise is
                 // finished before it ever suspends, and must not wait for an
                 // op it will never start.
                 let ops = finish_turn(tc, &mut entry);
+                restore_io_context(tc, previous_io_context);
                 (Some(*entry), ops)
             }
             Begun::Threw(failure) => {
@@ -4718,14 +4746,19 @@ fn begin<'s>(
     // option also applies to RPC and cell events, but those events have no
     // report to consume retained logs, so enabling capture for them only
     // holds records until their IoContext retires.
-    let context = IoContext::with_options(
+    let context = IoContext::tracked_with_options(
         effective_resource_limits(runtime_state.resource_limits, invocation_limits),
         tail_reporting,
+        &runtime_state,
     );
     if let Some(stream_id) = body.stream_id() {
         context.own_body_stream(stream_id);
     }
     let guard = CurrentGuard::enter(context.clone());
+    // The first turn installs its token like every later turn, so a
+    // continuation registered here carries this entry's id when it runs
+    // during another entry's checkpoint.
+    let previous_io_context = install_io_context(tc, &context);
     context.begin_cpu_turn();
     let target = match entrypoint {
         Some(entrypoint) => FetchTarget::Entrypoint(entrypoint),
@@ -4751,6 +4784,7 @@ fn begin<'s>(
         Ok(Started::Threw) => {
             let cpu_error = context.finish_cpu_turn().err();
             drop(guard);
+            restore_io_context(tc, previous_io_context);
             return Begun::Threw(Box::new(BegunFailure {
                 answer: Answer::Fetch(reply),
                 cpu_error,
@@ -4784,6 +4818,7 @@ fn begin<'s>(
                 tail_report,
             };
             drop(guard);
+            restore_io_context(tc, previous_io_context);
             Begun::Running(Box::new(entry))
         }
         Err(error) => {
@@ -4796,6 +4831,7 @@ fn begin<'s>(
                 report.finish(&context);
             }
             drop(guard);
+            restore_io_context(tc, previous_io_context);
             let _ = reply.send(Err(error));
             Begun::Nothing
         }
@@ -4816,11 +4852,14 @@ fn begin_entrypoint_rpc(
     invocation_limits: Option<ResourceLimits>,
     reply: tokio::sync::oneshot::Sender<Result<Vec<u8>>>,
 ) -> Begun {
-    let context = IoContext::with_resource_limits(effective_resource_limits(
-        actor_runtime_state(tc).resource_limits,
-        invocation_limits,
-    ));
+    let runtime_state = actor_runtime_state(tc);
+    let context = IoContext::tracked_with_options(
+        effective_resource_limits(runtime_state.resource_limits, invocation_limits),
+        false,
+        &runtime_state,
+    );
     let guard = CurrentGuard::enter(context.clone());
+    let previous_io_context = install_io_context(tc, &context);
     context.begin_cpu_turn();
     let started = (|| {
         let f = internal_function(tc, "__dispatchEntrypointRpc")?;
@@ -4878,6 +4917,7 @@ fn begin_entrypoint_rpc(
                 tail_report: None,
             };
             drop(guard);
+            restore_io_context(tc, previous_io_context);
             Begun::Running(Box::new(entry))
         }
         Err(error) => {
@@ -4887,6 +4927,7 @@ fn begin_entrypoint_rpc(
                 .or(cpu_error)
                 .unwrap_or(error);
             drop(guard);
+            restore_io_context(tc, previous_io_context);
             let _ = reply.send(Err(error));
             Begun::Nothing
         }
@@ -5075,8 +5116,11 @@ fn begin_queue(
     batch: QueueBatch,
     reply: tokio::sync::oneshot::Sender<Result<QueueDispatchResult>>,
 ) -> Begun {
-    let context = IoContext::with_resource_limits(actor_runtime_state(tc).resource_limits);
+    let runtime_state = actor_runtime_state(tc);
+    let context =
+        IoContext::tracked_with_options(runtime_state.resource_limits, false, &runtime_state);
     let guard = CurrentGuard::enter(context.clone());
+    let previous_io_context = install_io_context(tc, &context);
     context.begin_cpu_turn();
     let started = (|| {
         let dispatch = internal_function(tc, "__dispatchEntrypointQueue")?;
@@ -5117,6 +5161,7 @@ fn begin_queue(
                 tail_report: None,
             };
             drop(guard);
+            restore_io_context(tc, previous_io_context);
             Begun::Running(Box::new(entry))
         }
         Err(error) => {
@@ -5126,6 +5171,7 @@ fn begin_queue(
                 .or(cpu_error)
                 .unwrap_or(error);
             drop(guard);
+            restore_io_context(tc, previous_io_context);
             let _ = reply.send(Err(error));
             Begun::Nothing
         }
@@ -7194,9 +7240,12 @@ fn op_kv_blob(
 ) {
     let request = args.get(0).to_rust_string_lossy(scope);
     let value = view_bytes(args.get(1));
+    let Some(event) = event_context(scope) else {
+        return retired_event_throw(scope);
+    };
     // Bucket I/O is egress, so it waits on the same gate a service call does
     // rather than escaping the shed the node applies under pressure.
-    let gate = egress_gate_request(&event_context(scope), celld_logic::Channel::Service);
+    let gate = egress_gate_request(&event, celld_logic::Channel::Service);
     // Blob authority follows the storage installed for this exact cell
     // activation. Capturing it before enqueue prevents a later ownership
     // lookup from lending a deposed collector the new owner's epoch.
@@ -7243,7 +7292,10 @@ fn op_queue_dispatch(
     let script = args.get(0).to_rust_string_lossy(scope);
     let queue = args.get(1).to_rust_string_lossy(scope);
     let envelope = args.get(2).to_rust_string_lossy(scope);
-    let gate = egress_gate_request(&event_context(scope), celld_logic::Channel::Queue);
+    let Some(event) = event_context(scope) else {
+        return retired_event_throw(scope);
+    };
+    let gate = egress_gate_request(&event, celld_logic::Channel::Queue);
     let cell = gate.cell_scope().map(str::to_string).unwrap_or_default();
     let request = match crate::queue_policy::dispatch_request(
         current_generation(scope),
@@ -7319,7 +7371,9 @@ fn op_svc_rpc(
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
-    let context = event_context(scope);
+    let Some(context) = event_context(scope) else {
+        return retired_event_throw(scope);
+    };
     if let Err(error) = context.charge_subrequest() {
         return loader_throw(scope, &error);
     }
@@ -7340,7 +7394,7 @@ fn op_svc_rpc(
     };
     let props = view_bytes(args.get(4)).unwrap_or_default();
     let (tx, rx) = tokio::sync::oneshot::channel();
-    let gate = egress_gate_request(&event_context(scope), celld_logic::Channel::Service);
+    let gate = egress_gate_request(&context, celld_logic::Channel::Service);
     let request = SvcRpcReq {
         generation: current_generation(scope),
         script,
@@ -7386,7 +7440,10 @@ fn op_svc_call_impl(
     rv: &mut v8::ReturnValue<v8::Value>,
     cancellable: bool,
 ) {
-    if let Err(error) = event_context(scope).charge_subrequest() {
+    let Some(event) = event_context(scope) else {
+        return retired_event_throw(scope);
+    };
+    if let Err(error) = event.charge_subrequest() {
         return loader_throw(scope, &error);
     }
     let script = args.get(0).to_rust_string_lossy(scope);
@@ -7425,7 +7482,7 @@ fn op_svc_call_impl(
             }
         };
     let body_guard = match body.stream_id() {
-        Some(stream_id) => match current_context().transfer_body_stream(stream_id) {
+        Some(stream_id) => match transfer_own_body_stream(scope, stream_id) {
             Some(guard) => guard,
             None => return loader_throw(scope, "service binding: the body stream is not owned"),
         },
@@ -7452,7 +7509,7 @@ fn op_svc_call_impl(
     } else {
         (None, None, None)
     };
-    let gate = egress_gate_request(&event_context(scope), celld_logic::Channel::Service);
+    let gate = egress_gate_request(&event, celld_logic::Channel::Service);
     let request = SvcCallReq {
         cancel,
         generation: current_generation(scope),
@@ -8041,7 +8098,7 @@ fn op_loader_fetch(
         (None, None)
     };
     let mut body_guard = match body.stream_id() {
-        Some(stream_id) => match current_context().transfer_body_stream(stream_id) {
+        Some(stream_id) => match transfer_own_body_stream(scope, stream_id) {
             Some(guard) => guard,
             None => return loader_throw(scope, "worker loader: the body stream is not owned"),
         },
@@ -8052,7 +8109,10 @@ fn op_loader_fetch(
         .unwrap()
         .get(&id)
         .map(|entry| entry.state.clone());
-    let gate = egress_gate_request(&event_context(scope), celld_logic::Channel::Service);
+    let Some(event) = event_context(scope) else {
+        return retired_event_throw(scope);
+    };
+    let gate = egress_gate_request(&event, celld_logic::Channel::Service);
     let stream_service = http_stream_service();
     let async_id = asyncrt::enqueue(async move {
         let mut cancel_guard = cancel_guard;
@@ -8155,7 +8215,10 @@ fn op_loader_rpc(
         .unwrap()
         .get(&id)
         .map(|entry| entry.state.clone());
-    let gate = egress_gate_request(&event_context(scope), celld_logic::Channel::Service);
+    let Some(event) = event_context(scope) else {
+        return retired_event_throw(scope);
+    };
+    let gate = egress_gate_request(&event, celld_logic::Channel::Service);
     let async_id = asyncrt::enqueue(async move {
         // The same rule as `op_loader_fetch`: the call carries cell state.
         await_egress_gate(gate).await?;
@@ -8729,7 +8792,7 @@ fn op_facet_fetch(
             Err(error) => return loader_throw(scope, &format!("facet headers: {error}")),
         };
     let mut body_guard = match body.stream_id() {
-        Some(stream_id) => match current_context().transfer_body_stream(stream_id) {
+        Some(stream_id) => match transfer_own_body_stream(scope, stream_id) {
             Some(guard) => guard,
             None => return loader_throw(scope, "facet: the body stream is not owned"),
         },
@@ -8997,7 +9060,7 @@ fn op_do_call_impl(
             }
         };
     let body_guard = match body.stream_id() {
-        Some(stream_id) => match current_context().transfer_body_stream(stream_id) {
+        Some(stream_id) => match transfer_own_body_stream(scope, stream_id) {
             Some(guard) => guard,
             None => return loader_throw(scope, "durable object: the body stream is not owned"),
         },
@@ -9005,8 +9068,11 @@ fn op_do_call_impl(
     };
     let (tx, rx) = tokio::sync::oneshot::channel();
     // Taken here and nowhere later: this is the last point that still runs
-    // in the order the script made the calls.
-    let order = Some(enter_call_order(current_context(), &cell));
+    // in the order the script made the calls. The chain belongs to the entry
+    // whose code is running, so a continuation resumed in a foreign
+    // checkpoint keeps its own caller's order rather than joining the turn
+    // owner's. A retired event has no chain to join and goes unordered.
+    let order = reaction_or_current_context(scope).map(|caller| enter_call_order(caller, &cell));
     // Every host op needs an internal cancellation channel. A caller without
     // an AbortSignal cannot cancel from JavaScript, but its enclosing Worker
     // can still disappear and drop this op before routing completes.
@@ -9017,7 +9083,10 @@ fn op_do_call_impl(
         .unwrap()
         .insert(request_id, cancel_sender);
     let mut cancel_guard = DoCallCancelGuard::new(request_id);
-    let gate = egress_gate_request(&event_context(scope), celld_logic::Channel::CellRpc);
+    let Some(event) = event_context(scope) else {
+        return retired_event_throw(scope);
+    };
+    let gate = egress_gate_request(&event, celld_logic::Channel::CellRpc);
     let request = DoCallReq {
         request_id: Some(request_id),
         cancel: Some(cancel),
@@ -9377,7 +9446,10 @@ fn op_rpc_call(
     let method = args.get(2).to_rust_string_lossy(scope);
     let args = RpcData::V8(view_bytes(args.get(3)).unwrap_or_default().into());
     let (tx, rx) = tokio::sync::oneshot::channel();
-    let gate = egress_gate_request(&event_context(scope), celld_logic::Channel::CellRpc);
+    let Some(event) = event_context(scope) else {
+        return retired_event_throw(scope);
+    };
+    let gate = egress_gate_request(&event, celld_logic::Channel::CellRpc);
     let request = RpcCallReq {
         scope: cell,
         name,
@@ -9429,7 +9501,10 @@ fn op_stub_call(
     let args = (!call_args.is_null())
         .then(|| RpcData::V8(view_bytes(call_args).unwrap_or_default().into()));
     let (tx, rx) = tokio::sync::oneshot::channel();
-    let gate = egress_gate_request(&event_context(scope), celld_logic::Channel::CellRpc);
+    let Some(event) = event_context(scope) else {
+        return retired_event_throw(scope);
+    };
+    let gate = egress_gate_request(&event, celld_logic::Channel::CellRpc);
     let caller = crate::pool::current_slot().map(|slot| slot.heap_id());
     let request = RpcStubReq {
         scope: cell,
@@ -9496,7 +9571,17 @@ fn op_stub_release(
         return;
     };
     let (tx, rx) = tokio::sync::oneshot::channel();
-    let gate = egress_gate_request(&event_context(scope), celld_logic::Channel::CellRpc);
+    // The hold above is already dropped; the routed dispose below frees the
+    // owner's entry once it drives. A retired event's dispose never drives —
+    // the spawn attributes to the retired token and the router drops it — so
+    // a stale release frees nothing further and the owner's entry waits for
+    // unpin or eviction. Fail-closed either way: the hold-drop is
+    // table-authoritative, and no other request's entry can be named here.
+    // Ungated when retired, as a finalizer's release already was — the
+    // ambient context of a turn running finalizers owns no cell frames either.
+    let gate = event_context(scope).map_or(EgressGate::NoCell, |event| {
+        egress_gate_request(&event, celld_logic::Channel::CellRpc)
+    });
     let request = RpcStubReq {
         scope: cell,
         stub_id,
@@ -9812,7 +9897,9 @@ fn op_fetch(
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
-    let context = event_context(scope);
+    let Some(context) = event_context(scope) else {
+        return retired_event_throw(scope);
+    };
     if let Err(error) = context.charge_subrequest() {
         return loader_throw(scope, &error);
     }
@@ -9867,7 +9954,7 @@ fn op_fetch(
     // request it asked for.
     let cancellable = args.get(6).boolean_value(scope);
     let mut body_guard = match body.as_ref().and_then(RequestBody::stream_id) {
-        Some(stream_id) => match current_context().transfer_body_stream(stream_id) {
+        Some(stream_id) => match transfer_own_body_stream(scope, stream_id) {
             Some(guard) => guard,
             None => return loader_throw(scope, "fetch: the body stream is not owned"),
         },
@@ -9897,7 +9984,7 @@ fn op_fetch(
             (None, None, None)
         };
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let gate = egress_gate_request(&event_context(scope), celld_logic::Channel::Fetch);
+        let gate = egress_gate_request(&context, celld_logic::Channel::Fetch);
         let request = SvcCallReq {
             cancel,
             generation: broker.generation,
@@ -9988,7 +10075,7 @@ fn op_fetch(
     // third party that has acted on a write celld then loses cannot be told to
     // un-act. That covers a write this handler made and a value it only read,
     // because the third party cannot tell the two apart.
-    let gate = egress_gate_request(&event_context(scope), celld_logic::Channel::Fetch);
+    let gate = egress_gate_request(&context, celld_logic::Channel::Fetch);
     // Shares the cancel registry, the id encoding and the `__do_call_cancel`
     // op that a Durable Object call and a service binding call already use.
     // Only a caller that supplied an AbortSignal registers: without one there
@@ -10236,6 +10323,16 @@ fn op_http_stream_tee(
 ) {
     let stream_id = args.get(0).integer_value(scope).unwrap_or(0).max(0) as u64;
     let service = http_stream_service();
+    // The owner is the running entry's request, as for every other body-stream
+    // transfer: a continuation resumed in a foreign checkpoint tees its own
+    // stream, and replacing on the turn owner would orphan the branches. A
+    // retired owner no longer has its stream.
+    let Some(owner) = reaction_or_current_context(scope) else {
+        let message = v8::String::new(scope, "response stream is no longer available").unwrap();
+        let exception = v8::Exception::type_error(scope, message);
+        scope.throw_exception(exception);
+        return;
+    };
     let source = service.checkout_transfer(stream_id, None).ok();
     let Some(source) = source else {
         let message = v8::String::new(scope, "response stream is no longer available").unwrap();
@@ -10252,7 +10349,7 @@ fn op_http_stream_tee(
             return;
         }
     };
-    current_context().replace_body_stream(stream_id, &service, ids);
+    owner.replace_body_stream(stream_id, &service, ids);
     let json = serde_json::to_string(&ids).unwrap();
     rv.set(v8::String::new(scope, &json).unwrap().into());
 }
@@ -10313,7 +10410,10 @@ fn op_response_stream_write(
     // expiry still runs during the wait, so a proof that never lands ends the
     // body with an error rather than releasing the chunk, which is the
     // direction this gate exists to fail in.
-    let gate = egress_gate_request(&event_context(scope), celld_logic::Channel::Response);
+    let Some(event) = event_context(scope) else {
+        return retired_event_throw(scope);
+    };
+    let gate = egress_gate_request(&event, celld_logic::Channel::Response);
     let service = http_stream_service();
     let id = asyncrt::enqueue(async move {
         await_egress_gate(gate).await?;
@@ -12016,6 +12116,14 @@ impl IoContext {
         Ok(())
     }
 
+    /// Start charging this turn's CPU to the entry that owns the turn.
+    ///
+    /// Known imprecision: a turn that runs another entry's continuations
+    /// during its microtask checkpoint charges their CPU here, to the turn
+    /// owner rather than the reaction owner. Totals are still counted, and a
+    /// reaction cannot choose whose turn runs it without spending that turn's
+    /// budget — so this is budget noise under shared-promise concurrency,
+    /// never a bypass. Per-reaction timers would cost more than they save.
     fn begin_cpu_turn(&self) {
         if self.cpu_limit_nanos.is_none() {
             return;
@@ -12131,9 +12239,56 @@ impl IoContext {
             cpu_used_nanos: AtomicU64::new(0),
             cpu_turn: Mutex::new(None),
             // Tracked contexts drive cell and RPC events. Dynamic Worker tail
-            // reports currently belong only to fetch jobs, whose untracked
-            // context is constructed from the report sender in `begin`.
+            // reports currently belong only to fetch jobs, whose context
+            // is constructed from the report sender in `begin`.
             tail_reporting: false,
+            tail_logs: Mutex::new(TailLogCapture::default()),
+        });
+        runtime_state
+            .io_contexts
+            .lock()
+            .unwrap()
+            .insert(id, Arc::downgrade(&context));
+        context
+    }
+
+    /// A tracked context for a stateless event: invocation limits and tail
+    /// reporting like [`Self::with_options`], plus a continuation id so an
+    /// op a shared promise's continuation enqueues during another entry's
+    /// turn attributes to this entry and hands over instead of dying with
+    /// the turn owner.
+    fn tracked_with_options(
+        limits: Option<ResourceLimits>,
+        tail_reporting: bool,
+        runtime_state: &Arc<ActorRuntimeState>,
+    ) -> Arc<Self> {
+        let id = allocate_io_context_id();
+        let context = Arc::new(Self {
+            continuation: Some((id, Arc::downgrade(runtime_state))),
+            call_chains: Mutex::new(CallChains::default()),
+            events: Mutex::new(IoEventState::default()),
+            vfs: OnceLock::new(),
+            sockets: Mutex::new(Vec::new()),
+            rewriters: Mutex::new(Vec::new()),
+            tcp_sockets: Mutex::new(Vec::new()),
+            input_gates: Mutex::new(InputGateClaims::default()),
+            cross_entry_gates: CrossEntryGateClaims::default(),
+            body_streams: Mutex::new(HashMap::new()),
+            ws_capture: Mutex::new(Vec::new()),
+            egress: Mutex::new(Vec::new()),
+            handed: Mutex::new(Some(Vec::new())),
+            handed_len: AtomicUsize::new(0),
+            handed_wake: tokio::sync::Notify::new(),
+            pending_events: Mutex::new(HashSet::new()),
+            subrequest_limit: limits.and_then(|limits| limits.sub_requests),
+            subrequests: AtomicUsize::new(0),
+            redirect_client: OnceLock::new(),
+            cpu_limit_nanos: limits
+                .and_then(|limits| limits.cpu_ms)
+                .map(|milliseconds| u64::from(milliseconds).saturating_mul(1_000_000)),
+            cpu_used_nanos: AtomicU64::new(0),
+            cpu_turn: Mutex::new(None),
+            tail_reporting,
             tail_logs: Mutex::new(TailLogCapture::default()),
         });
         runtime_state
@@ -12362,7 +12517,7 @@ impl IoContext {
     /// the request retires, and `drop` covers every earlier failure path.
     fn close_sockets(&self) {
         let opened = self.sockets.lock().unwrap().drain(..).collect();
-        ws_close_request_sockets(opened);
+        ws_close_request_sockets(self, opened);
         let rewriters: Vec<u64> = self.rewriters.lock().unwrap().drain(..).collect();
         for id in rewriters {
             html_rewriter::free(id);
@@ -12642,8 +12797,9 @@ fn op_event_begin(
     _args: v8::FunctionCallbackArguments,
     _rv: v8::ReturnValue<v8::Value>,
 ) {
-    let _ = scope;
-    current_context().begin_event();
+    if let Some(context) = reaction_or_current_context(scope) {
+        context.begin_event();
+    }
 }
 
 /// Pop the innermost event and return the aggregate of its `waitUntil`
@@ -12655,7 +12811,15 @@ fn op_event_end<'s>(
     _args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
-    let Some(frame) = current_context().end_event() else {
+    // The frame belongs to the entry whose code is running, exactly as its
+    // `waitUntil` does: ending a frame on the turn owner would pop a foreign
+    // request's frame when this continuation runs in its checkpoint, and the
+    // foreign request's `waitUntil` aggregate would drain into this one.
+    let Some(context) = reaction_or_current_context(scope) else {
+        rv.set_null();
+        return;
+    };
+    let Some(frame) = context.end_event() else {
         rv.set_null();
         return;
     };
@@ -12673,6 +12837,14 @@ fn reaction_or_current_context(scope: &mut v8::PinScope) -> Option<Arc<IoContext
         Some(id) => actor_runtime_state(scope).io_context(id),
         None => Some(current_context()),
     }
+}
+
+/// Move a request-owned body stream into its transfer guard. The owner is the
+/// running entry's request: a continuation resumed in a foreign checkpoint
+/// forwards its own stream, and resolving the turn owner instead would refuse
+/// a transfer the caller owns.
+fn transfer_own_body_stream(scope: &mut v8::PinScope, stream_id: u64) -> Option<RequestBodyGuard> {
+    reaction_or_current_context(scope).and_then(|context| context.transfer_body_stream(stream_id))
 }
 
 fn op_pending_event_begin(
@@ -12713,7 +12885,16 @@ fn op_vfs_mkdir(
 ) {
     let path = args.get(0).to_rust_string_lossy(scope);
     let recursive = args.get(1).boolean_value(scope);
-    let result = current_context()
+    // The tree belongs to the entry whose code is running: a continuation
+    // resumed in a foreign checkpoint must see its own request's `/tmp`,
+    // never the turn owner's. A retired entry's tree is gone, so creating
+    // a directory in it fails the way a missing parent does.
+    let Some(context) = reaction_or_current_context(scope) else {
+        let code = v8::String::new(scope, "ENOENT").unwrap();
+        rv.set(code.into());
+        return;
+    };
+    let result = context
         .vfs
         .get_or_init(|| Mutex::new(RequestVfs::default()))
         .lock()
@@ -12740,13 +12921,18 @@ fn op_vfs_stat(
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
     let path = args.get(0).to_rust_string_lossy(scope);
-    let (kind, size) = match current_context()
-        .vfs
-        .get_or_init(|| Mutex::new(RequestVfs::default()))
-        .lock()
-        .unwrap()
-        .stat(&path)
-    {
+    // As for `mkdir`: the request tree is the running entry's own. A retired
+    // entry simply claims nothing, so the lookup falls through to the bundle
+    // below, which is isolate-scoped and outlives every request.
+    let vfs = reaction_or_current_context(scope).and_then(|context| {
+        context
+            .vfs
+            .get_or_init(|| Mutex::new(RequestVfs::default()))
+            .lock()
+            .unwrap()
+            .stat(&path)
+    });
+    let (kind, size) = match vfs {
         Some(writable) => (if writable { 2 } else { 1 }, 0),
         // Only a path the writable tree does not claim can be a bundle path,
         // so the request tree stays authoritative for `/tmp`.
@@ -12830,13 +13016,13 @@ fn op_wait_until_active(
     rv.set(v8::Boolean::new(scope, active).into());
 }
 
-/// How many event frames are open on the current request.
+/// How many event frames are open on the running entry's request.
 fn op_event_depth(
     scope: &mut v8::PinScope,
     _args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
-    let depth = current_context().depth();
+    let depth = reaction_or_current_context(scope).map_or(0, |context| context.depth());
     rv.set(v8::Integer::new(scope, depth as i32).into());
 }
 
@@ -13540,7 +13726,7 @@ fn read_response(scope: &mut v8::PinScope, ret: v8::Local<v8::Value>) -> Result<
         None
     } else {
         Some(
-            websocket::transfer_worker_websocket_handoff(worker_id)
+            websocket::transfer_worker_websocket_handoff(scope, worker_id)
                 .ok_or_else(|| anyhow!("Worker WebSocket {worker_id} has no frame handoff"))?,
         )
     };

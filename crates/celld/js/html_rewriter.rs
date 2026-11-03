@@ -1,3 +1,4 @@
+// Modified by ryuzcorp (ryuzcorp/celld): reaction-aware request resources.
 //! HTMLRewriter host ops over the `lol_html` crate — the same parser
 //! Workerd embeds.
 //!
@@ -524,6 +525,13 @@ pub(super) fn op_hr_create(
             return loader_throw(scope, &parser_error(error));
         }
     }
+    // The owner is the running entry's request: a continuation resumed in a
+    // foreign checkpoint must account its rewriter to its own event, or the
+    // turn owner's retirement frees the parser thread mid-transform. Check
+    // before spawning: a retired owner throws with no thread and no push.
+    let Some(owner) = reaction_or_current_context(scope) else {
+        return retired_event_throw(scope);
+    };
 
     let (input_tx, input_rx) = mpsc::channel();
     let (cmd_tx, cmd_rx) = mpsc::channel();
@@ -546,7 +554,7 @@ pub(super) fn op_hr_create(
     let id = next_id();
     // Account the rewriter to the request, the way a Worker socket is:
     // request retirement frees an abandoned transform's parser thread.
-    current_context().rewriters.lock().unwrap().push(id);
+    owner.rewriters.lock().unwrap().push(id);
     registry().lock().unwrap().insert(
         id,
         Rewriter {

@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): re-export the shared list-request builder and the structured listing.
+// Modified by ryuzcorp (ryuzcorp/celld): re-export the shared list-request builder and the structured listing; reaction-aware request resources.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! The V8 surface over an `r2_buckets` binding.
@@ -136,7 +136,10 @@ pub(super) fn op_r2_delete(
     let bucket_name = args.get(0).to_rust_string_lossy(scope);
     let keys = serde_json::from_str::<Vec<String>>(&args.get(1).to_rust_string_lossy(scope))
         .map_err(|error| format!("invalid R2 delete key list: {error}"));
-    let gate = egress_gate_request(&event_context(scope), celld_logic::Channel::R2);
+    let Some(event) = event_context(scope) else {
+        return retired_event_throw(scope);
+    };
+    let gate = egress_gate_request(&event, celld_logic::Channel::R2);
     let id = asyncrt::enqueue(async move {
         let keys = keys?;
         await_egress_gate(gate).await?;
@@ -184,7 +187,10 @@ pub(super) fn op_r2_put(
     let body = view_bytes(args.get(2));
     let request = serde_json::from_str::<PutRequest>(&args.get(3).to_rust_string_lossy(scope))
         .map_err(|error| format!("invalid R2 put options: {error}"));
-    let gate = egress_gate_request(&event_context(scope), celld_logic::Channel::R2);
+    let Some(event) = event_context(scope) else {
+        return retired_event_throw(scope);
+    };
+    let gate = egress_gate_request(&event, celld_logic::Channel::R2);
     let id = asyncrt::enqueue(async move {
         let request = request?;
         let Some(body) = body else {
@@ -259,7 +265,10 @@ pub(super) fn op_r2_put_chunk(
 ) {
     let put_id = args.get(0).integer_value(scope).unwrap_or(0).max(0) as u64;
     let chunk = view_bytes(args.get(1));
-    let gate = egress_gate_request(&event_context(scope), celld_logic::Channel::R2);
+    let Some(event) = event_context(scope) else {
+        return retired_event_throw(scope);
+    };
+    let gate = egress_gate_request(&event, celld_logic::Channel::R2);
     let id = asyncrt::enqueue(async move {
         let Some(chunk) = chunk else {
             return Err("R2 put: a body chunk must be an ArrayBuffer view".to_string());
@@ -289,7 +298,10 @@ pub(super) fn op_r2_put_end(
 ) {
     let put_id = args.get(0).integer_value(scope).unwrap_or(0).max(0) as u64;
     let abort = args.get(1).boolean_value(scope);
-    let gate = egress_gate_request(&event_context(scope), celld_logic::Channel::R2);
+    let Some(event) = event_context(scope) else {
+        return retired_event_throw(scope);
+    };
+    let gate = egress_gate_request(&event, celld_logic::Channel::R2);
     let id = asyncrt::enqueue(async move {
         // Keep the entry registered until the proof succeeds. If the gate
         // refuses the effect, the normal cleanup path can abort a live multipart
@@ -410,7 +422,10 @@ pub(super) fn op_r2_mp_begin(
     let key = args.get(1).to_rust_string_lossy(scope);
     let request = serde_json::from_str::<PutRequest>(&args.get(2).to_rust_string_lossy(scope))
         .map_err(|error| format!("invalid R2 multipart options: {error}"));
-    let gate = egress_gate_request(&event_context(scope), celld_logic::Channel::R2);
+    let Some(event) = event_context(scope) else {
+        return retired_event_throw(scope);
+    };
+    let gate = egress_gate_request(&event, celld_logic::Channel::R2);
     let id = asyncrt::enqueue(async move {
         let request = request?;
         await_egress_gate(gate).await?;
@@ -498,7 +513,10 @@ pub(super) fn op_r2_mp_part(
     let upload_id = args.get(0).integer_value(scope).unwrap_or(0).max(0) as u64;
     let part_number = args.get(1).integer_value(scope).unwrap_or(0).max(0) as u32;
     let bytes = view_bytes(args.get(2));
-    let gate = egress_gate_request(&event_context(scope), celld_logic::Channel::R2);
+    let Some(event) = event_context(scope) else {
+        return retired_event_throw(scope);
+    };
+    let gate = egress_gate_request(&event, celld_logic::Channel::R2);
     let id = asyncrt::enqueue(async move {
         let Some(bytes) = bytes else {
             return Err(format!(
@@ -563,7 +581,10 @@ pub(super) fn op_r2_mp_complete(
     let upload_id = args.get(0).integer_value(scope).unwrap_or(0).max(0) as u64;
     let claimed = serde_json::from_str::<Vec<u32>>(&args.get(1).to_rust_string_lossy(scope))
         .map_err(|error| format!("invalid R2 multipart part list: {error}"));
-    let gate = egress_gate_request(&event_context(scope), celld_logic::Channel::R2);
+    let Some(event) = event_context(scope) else {
+        return retired_event_throw(scope);
+    };
+    let gate = egress_gate_request(&event, celld_logic::Channel::R2);
     let id = asyncrt::enqueue(async move {
         let claimed = claimed?;
         // Keep the upload reachable until the proof succeeds, so a refused
@@ -641,11 +662,18 @@ pub(super) fn op_r2_mp_abort(
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
     let upload_id = args.get(0).integer_value(scope).unwrap_or(0).max(0) as u64;
-    let gate = uploads()
-        .lock()
-        .unwrap()
-        .contains_key(&upload_id)
-        .then(|| egress_gate_request(&event_context(scope), celld_logic::Channel::R2));
+    // An abort is cleanup: it proceeds ungated when its event retired. But a
+    // retired event's abort never drives — the spawn attributes to the retired
+    // token and the router drops it — so a stale abort frees nothing and the
+    // upload's parts stay held: one entry per distinct upload a stale
+    // continuation abandons. Fail-closed: the abort names only the
+    // continuation's own captured upload id, so no other request's upload can
+    // be named here.
+    let gate = uploads().lock().unwrap().contains_key(&upload_id).then(|| {
+        event_context(scope).map_or(EgressGate::NoCell, |event| {
+            egress_gate_request(&event, celld_logic::Channel::R2)
+        })
+    });
     let id =
         asyncrt::enqueue(async move {
             // An absent upload changes nothing. A live upload stays in the

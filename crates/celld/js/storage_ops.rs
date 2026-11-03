@@ -1,3 +1,4 @@
+// Modified by ryuzcorp (ryuzcorp/celld): reaction-aware request resources.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! The V8 surface over `crate::storage`: key-value, SQL, and the value
@@ -265,7 +266,12 @@ pub(super) fn op_storage_sync(
         throw_storage_error(scope, "sync", "this process has no output-gate channel");
         return;
     }
-    let context = event_context(scope);
+    // A retired event has no running cell event either: its token names a
+    // context whose frames are gone, so the same refusal answers both.
+    let Some(context) = event_context(scope) else {
+        throw_storage_error(scope, "sync", format!("{cell} has no running cell event"));
+        return;
+    };
     let Some(frame) = current_cell_event(&context) else {
         throw_storage_error(scope, "sync", format!("{cell} has no running cell event"));
         return;

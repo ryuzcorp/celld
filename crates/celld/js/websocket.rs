@@ -1,3 +1,4 @@
+// Modified by ryuzcorp (ryuzcorp/celld): reaction-aware request resources.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! WebSockets inside the isolate: the registry, the ops JS calls, and the
@@ -19,25 +20,35 @@ pub(super) struct WsCapture {
     promise: Option<v8::Global<v8::Promise>>,
 }
 
-fn prepare_worker_websocket_handoff(id: u64) {
+fn prepare_worker_websocket_handoff(scope: &mut v8::PinScope, id: u64) -> Option<()> {
+    // The owner is the running entry's request — the responder — so its
+    // retirement frees an unanswered handoff. Resolve before registering:
+    // a retired owner throws with no queue and no push.
+    let owner = reaction_or_current_context(scope)?;
     let (inbound, receiver) = ws_pull_channel();
     ws_pull_register(id, receiver);
     ws_register_outbound(id, "", None);
-    ws_track_request_socket(id);
+    owner.sockets.lock().unwrap().push(id);
     let registry = ws_registry();
     let replaced = registry.lock().unwrap().worker_handoffs.insert(id, inbound);
     drop(replaced);
+    Some(())
 }
 
-pub(super) fn transfer_worker_websocket_handoff(id: u64) -> Option<WorkerWebSocket> {
+pub(super) fn transfer_worker_websocket_handoff(
+    scope: &mut v8::PinScope,
+    id: u64,
+) -> Option<WorkerWebSocket> {
     let inbound = ws_registry().lock().unwrap().worker_handoffs.remove(&id)?;
     // The response now owns cleanup. Transfer the frame channel and request
     // ownership together so request retirement cannot close a returned socket.
-    current_context()
-        .sockets
-        .lock()
-        .unwrap()
-        .retain(|opened| *opened != id);
+    // The owner is the responder the handoff was tracked to at prepare time,
+    // never the ambient turn owner. A retired owner is unreachable here — its
+    // retirement already drained the handoff above — so there is nothing to
+    // remove from.
+    if let Some(owner) = reaction_or_current_context(scope) {
+        owner.sockets.lock().unwrap().retain(|opened| *opened != id);
+    }
     Some(WorkerWebSocket { id, inbound })
 }
 
@@ -48,7 +59,7 @@ pub(super) fn transfer_worker_websocket_handoff(id: u64) -> Option<WorkerWebSock
 /// `WsPull` sender that this socket's `__ws_next` is waiting on. Unregistering
 /// first would strand the task instead — it detects a dead isolate by the
 /// send failing, and nothing else tells it to go.
-pub(super) fn ws_close_request_sockets(opened: Vec<u64>) {
+pub(super) fn ws_close_request_sockets(context: &IoContext, opened: Vec<u64>) {
     for id in opened {
         let registry = ws_registry();
         let handoff = registry.lock().unwrap().worker_handoffs.remove(&id);
@@ -58,21 +69,14 @@ pub(super) fn ws_close_request_sockets(opened: Vec<u64>) {
         // a dropped frame for an unknown id, so ask before sending.
         let open = ws_registry().lock().unwrap().outputs.contains_key(&id);
         if open {
-            // The event's own end, run by its turn: the owner is the context.
-            ws_emit(
-                &current_context(),
-                id,
-                WsOut::Close(1001, "request ended".into()),
-            );
+            // The retiring event's own end: gate the close against it, never
+            // the ambient turn owner — and bypass capture, whose turn-end
+            // flush the retired handler can no longer run.
+            ws_send_gated(context, id, WsOut::Close(1001, "request ended".into()));
         }
         ws_pull_unregister(id);
         ws_unregister(id);
     }
-}
-
-/// Account a Worker socket to the request that opened it.
-fn ws_track_request_socket(id: u64) {
-    current_context().sockets.lock().unwrap().push(id);
 }
 
 pub(super) fn ws_capture_begin() {
@@ -204,8 +208,15 @@ fn ws_emit(context: &Arc<IoContext>, id: u64, out: WsOut) {
         return;
     }
     drop(capture);
-    // A socket the isolate opened itself, which the capture above deliberately
-    // will not hold: releasing captured frames waits for the handler to
+    ws_send_gated(context, id, out);
+}
+
+/// Send one frame outside any capture, gated against the sending event.
+/// Request teardown uses this directly: the retired handler can no longer
+/// run a turn-end flush, so capturing its close would strand the frame.
+fn ws_send_gated(context: &IoContext, id: u64, out: WsOut) {
+    // A socket the isolate opened itself, which a capture deliberately will
+    // not hold: releasing captured frames waits for the handler to
     // return, and this handler may be awaiting a reply to the very frame being
     // held. Waiting on the DURABILITY ticket instead has no such cycle -- it
     // is resolved by the replicator, which does not need this event loop -- so
@@ -252,7 +263,10 @@ pub(super) fn op_ws_send(
         .map(|n| n.value() as u64)
         .unwrap_or(0);
     let data = args.get(1).to_rust_string_lossy(scope);
-    ws_emit(&event_context(scope), id, WsOut::Text(data));
+    let Some(event) = event_context(scope) else {
+        return retired_event_throw(scope);
+    };
+    ws_emit(&event, id, WsOut::Text(data));
 }
 pub(super) fn op_ws_send_binary(
     scope: &mut v8::PinScope,
@@ -265,7 +279,10 @@ pub(super) fn op_ws_send_binary(
         .map(|n| n.value() as u64)
         .unwrap_or(0);
     let data = view_bytes(args.get(1)).unwrap_or_default();
-    ws_emit(&event_context(scope), id, WsOut::Binary(data));
+    let Some(event) = event_context(scope) else {
+        return retired_event_throw(scope);
+    };
+    ws_emit(&event, id, WsOut::Binary(data));
 }
 pub(super) fn op_ws_close(
     scope: &mut v8::PinScope,
@@ -279,7 +296,10 @@ pub(super) fn op_ws_close(
         .unwrap_or(0);
     let code = args.get(1).uint32_value(scope).unwrap_or(1000) as u16;
     let reason = args.get(2).to_rust_string_lossy(scope);
-    ws_emit(&event_context(scope), id, WsOut::Close(code, reason));
+    let Some(event) = event_context(scope) else {
+        return retired_event_throw(scope);
+    };
+    ws_emit(&event, id, WsOut::Close(code, reason));
 }
 pub(super) fn op_ws_alloc(
     scope: &mut v8::PinScope,
@@ -299,7 +319,9 @@ pub(super) fn op_ws_prepare_worker_handoff(
         .to_integer(scope)
         .map(|n| n.value() as u64)
         .unwrap_or(0);
-    prepare_worker_websocket_handoff(id);
+    if prepare_worker_websocket_handoff(scope, id).is_none() {
+        retired_event_throw(scope);
+    }
 }
 /// The facet record of an outbound socket that `cell` opens, when the running
 /// event belongs to a Durable Object facet.
@@ -318,7 +340,7 @@ fn dialing_facet(scope: &mut v8::PinScope, cell: &str) -> Result<Option<FacetSoc
         storage,
         root: Some(root),
         ..
-    }) = current_cell_event(&event_context(scope))
+    }) = event_context(scope).and_then(|event| current_cell_event(&event))
     else {
         return Ok(None);
     };
@@ -389,10 +411,17 @@ pub(super) fn op_ws_upgrade(
         .find(|(name, _)| name.eq_ignore_ascii_case("sec-websocket-protocol"))
         .map(|(_, value)| value.split(',').map(|p| p.trim().to_string()).collect())
         .unwrap_or_default();
+    // The owner is the running entry's request: a continuation resumed in a
+    // foreign checkpoint must account its socket to its own event, or the
+    // turn owner's retirement closes a live socket. Check before registering:
+    // a retired owner throws with no queue and no push.
+    let Some(owner) = reaction_or_current_context(scope) else {
+        return retired_event_throw(scope);
+    };
     let pull = cell.is_empty().then(|| {
         let (pull_tx, pull_rx) = ws_pull_channel();
         ws_pull_register(id, pull_rx);
-        ws_track_request_socket(id);
+        owner.sockets.lock().unwrap().push(id);
         pull_tx
     });
     let (tx, rx) = tokio::sync::oneshot::channel();
@@ -508,12 +537,17 @@ pub(super) fn op_ws_connect(
                 )
             }
         };
+    // The owner is the running entry's request, as for `op_ws_upgrade`:
+    // check before registering, so a retired owner throws with nothing owned.
+    let Some(owner) = reaction_or_current_context(scope) else {
+        return retired_event_throw(scope);
+    };
     // No cell means a Worker socket: the isolate polls it, so register the
     // queue here on the JS thread and track it against the running request.
     let pull = cell.is_empty().then(|| {
         let (pull_tx, pull_rx) = ws_pull_channel();
         ws_pull_register(id, pull_rx);
-        ws_track_request_socket(id);
+        owner.sockets.lock().unwrap().push(id);
         pull_tx
     });
     let (tx, rx) = tokio::sync::oneshot::channel();
@@ -581,10 +615,15 @@ pub(super) fn op_ws_bind_target(
         Ok(facet) => facet,
         Err(error) => return loader_throw(scope, &error),
     };
+    // The owner is the running entry's request, as for `op_ws_upgrade`:
+    // check before registering, so a retired owner throws with nothing owned.
+    let Some(owner) = reaction_or_current_context(scope) else {
+        return retired_event_throw(scope);
+    };
     let (pull_tx, pull_rx) = ws_pull_channel();
     ws_pull_register(id, pull_rx);
     if cell.is_empty() {
-        ws_track_request_socket(id);
+        owner.sockets.lock().unwrap().push(id);
     }
     // Registered here, on the JS thread, so a frame sent between this op and
     // the pipe task buffers as a pending frame instead of being dropped for
