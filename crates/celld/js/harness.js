@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): ctx.container.images; clone() of streaming and disturbed bodies; __celld$do on the service-binding RPC path; container exec pty/resize; cross-isolate RPC stubs and streams; container exec AbortSignal; test-only fake kill completion; exec reads survive their subscribing event; context end aborts finished uploads; tenant egress policy; D1 export; D1 export operator gate.
+// Modified by ryuzcorp (ryuzcorp/celld): ctx.container.images; clone() of streaming and disturbed bodies; __celld$do on the service-binding RPC path; container exec pty/resize; cross-isolate RPC stubs and streams; container exec AbortSignal; test-only fake kill completion; exec reads survive their subscribing event; context end aborts finished uploads; tenant egress policy; D1 export; D1 export operator gate; D1 batch.
 // The DO object model and the Cloudflare-compatible runtime surface, run
 // once per isolate by `js.rs::install_harness` after the Web-API prelude.
 // Lived as a 4,000-line raw string inside js.rs until 2026-07-29; it is a
@@ -8927,6 +8927,10 @@ class __D1DatabaseCell {
       } else if (body.export !== undefined) {
         if (!operator) return refuse("export", "celld d1 export");
         result = this.__d1Export(body.export || {});
+      } else if (body.batch !== undefined) {
+        // The CLI's batch path rides the Worker's own __d1Batch, so the two
+        // share one transactional implementation rather than two.
+        result = this.__d1Batch((body.batch || {}).statements || []);
       } else {
         result = this.__d1Query(body.statements || []);
       }
