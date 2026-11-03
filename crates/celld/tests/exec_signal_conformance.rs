@@ -1,7 +1,9 @@
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 //
 // Modified by ryuzcorp (ryuzcorp/celld): container exec AbortSignal
-// conformance; container exec kill delivery conformance. Apache-2.0.
+// conformance; container exec kill delivery conformance; stdin-close and
+// container-signal delivery conformance; failed-event signal delivery
+// conformance. Apache-2.0.
 
 // A black-box runner, not node code: it boots the binary, copies fixtures,
 // and polls TCP with wall-clock deadlines, so the execution boundary's
@@ -290,4 +292,93 @@ fn exec_kill_delivery_conformance() {
             .then(|| status.to_string())
     });
     assert!(done.contains("[9]"), "{done}");
+}
+
+/// The stdin:none close is fired without awaiting it (there is no handle
+/// to await), and the handler answers in the same turn: the close op must
+/// still run, or a process reading stdin to EOF hangs forever. An op the
+/// event drops never completes, so the suite observes delivery.
+#[test]
+fn exec_close_delivery_conformance() {
+    let dir = tempfile::Builder::new()
+        .prefix("celld-exec-close-delivery-")
+        .tempdir()
+        .expect("tempdir");
+    let app_project = dir.path().join("app");
+    copy_dir(&fixture_dir(), &app_project);
+    let node = TestNode::boot(&app_project);
+
+    let fired = get_json(&node, "/close-delivery");
+    assert_eq!(fired["ok"], true, "{fired}");
+    // The close dispatched synchronously with the exec; only its
+    // completion proves the op ran.
+    assert_eq!(fired["result"]["dispatched"], 1, "{fired}");
+
+    let done = poll_until("close completion", Duration::from_secs(30), || {
+        let status = get_json(&node, "/close-delivery-status");
+        (status["ok"] == true && status["result"]["completed"] == 1).then(|| status.to_string())
+    });
+    assert!(done.contains("\"completed\":1"), "{done}");
+}
+
+/// A fire-and-forget `signal()` (sync, returns void) still runs its op:
+/// the fixture answers in the same turn without awaiting anything, and
+/// the signal completion must land anyway. An op the event drops never
+/// completes, so the suite observes delivery, not dispatch.
+#[test]
+fn container_signal_delivery_conformance() {
+    let dir = tempfile::Builder::new()
+        .prefix("celld-signal-delivery-")
+        .tempdir()
+        .expect("tempdir");
+    let app_project = dir.path().join("app");
+    copy_dir(&fixture_dir(), &app_project);
+    let node = TestNode::boot(&app_project);
+
+    let fired = get_json(&node, "/signal-delivery");
+    assert_eq!(fired["ok"], true, "{fired}");
+    assert_eq!(
+        fired["result"]["dispatched"],
+        serde_json::json!([15]),
+        "{fired}"
+    );
+
+    let done = poll_until("signal completion", Duration::from_secs(30), || {
+        let status = get_json(&node, "/signal-delivery-status");
+        (status["ok"] == true && status["result"]["completed"] == serde_json::json!([15]))
+            .then(|| status.to_string())
+    });
+    assert!(done.contains("[15]"), "{done}");
+}
+
+/// A cell event that calls `signal()` and then throws still delivers
+/// the signal: the op is pending when the event fails, so a Handler
+/// lifetime drops it and only IoContext lands the completion. The
+/// stateless suite above cannot show this — Handler dies on every
+/// stateless event, while a successful cell event keeps it.
+#[test]
+fn container_signal_failed_event_delivery_conformance() {
+    let dir = tempfile::Builder::new()
+        .prefix("celld-signal-fail-")
+        .tempdir()
+        .expect("tempdir");
+    let app_project = dir.path().join("app");
+    copy_dir(&fixture_dir(), &app_project);
+    let node = TestNode::boot(&app_project);
+
+    let fired = get_json(&node, "/signal-fail");
+    assert_eq!(fired["ok"], true, "{fired}");
+    assert_eq!(fired["result"]["threw"], true, "{fired}");
+    assert_eq!(
+        fired["result"]["dispatched"],
+        serde_json::json!([15]),
+        "{fired}"
+    );
+
+    let done = poll_until("signal completion", Duration::from_secs(30), || {
+        let status = get_json(&node, "/signal-fail-status");
+        (status["ok"] == true && status["result"]["completed"] == serde_json::json!([15]))
+            .then(|| status.to_string())
+    });
+    assert!(done.contains("[15]"), "{done}");
 }

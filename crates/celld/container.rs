@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): exec() waits for start(); exec pty/resize; fence node-netns exception; process-granularity exec kill; kill conformance tests; exec reads survive their subscribing event; worker container endpoints for the tenant egress policy; exec-kill tests share the common test runtime.
+// Modified by ryuzcorp (ryuzcorp/celld): exec() waits for start(); exec pty/resize; fence node-netns exception; process-granularity exec kill; kill conformance tests; exec reads survive their subscribing event; worker container endpoints for the tenant egress policy; exec-kill tests share the common test runtime; bounded engine control calls; tiered lifecycle bound; orphan cleanup on failed start and exec; capped retry loops.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! Containers attached to Durable Objects: the engine side of
@@ -25,7 +25,7 @@
 //! never talks to a registry.
 
 use crate::asyncrt;
-use crate::docker::{frame_header, Docker, Stream};
+use crate::docker::{frame_header, Docker, Stream, LIFECYCLE_TIMEOUT};
 use anyhow::{anyhow, Context};
 use bytes::Bytes;
 use serde_json::{json, Value};
@@ -864,7 +864,7 @@ impl ContainerEngine {
         let filters = json!({ "label": [format!("celld.node={}", self.node)] }).to_string();
         let reply = self
             .docker
-            .expect(
+            .expect_control(
                 "GET",
                 &format!(
                     "/containers/json?all=true&filters={}",
@@ -882,7 +882,12 @@ impl ContainerEngine {
             if let Some(id) = entry.get("Id").and_then(Value::as_str) {
                 let _ = self
                     .docker
-                    .call("DELETE", &format!("/containers/{id}?force=true"), None)
+                    .call_control(
+                        "DELETE",
+                        &format!("/containers/{id}?force=true"),
+                        None,
+                        "remove container",
+                    )
                     .await;
             }
         }
@@ -905,7 +910,12 @@ impl ContainerEngine {
         }
         let reply = self
             .docker
-            .call("GET", &format!("/images/{image}/json"), None)
+            .call_control(
+                "GET",
+                &format!("/images/{image}/json"),
+                None,
+                "inspect image",
+            )
             .await?;
         if reply.status.is_success() {
             tracing::info!(image, "container image present in the engine");
@@ -921,6 +931,8 @@ impl ContainerEngine {
             anyhow!("image {image} is not in the bucket at {key}; run `celld deploy`")
         })?;
         let bytes = tar.len();
+        // An image transfer, not a control call: sized by the image,
+        // unbounded.
         let reply = self
             .docker
             .post_octets("/images/load?quiet=true", tar, "load image")
@@ -952,7 +964,7 @@ impl ContainerEngine {
             // bridge and says so rather than refusing every container.
             let current = self
                 .docker
-                .call("GET", &format!("/networks/{name}"), None)
+                .call_control("GET", &format!("/networks/{name}"), None, "inspect network")
                 .await?;
             if current.status.is_success() {
                 let bridge = if internal {
@@ -972,7 +984,12 @@ impl ContainerEngine {
                 }
                 let removed = self
                     .docker
-                    .call("DELETE", &format!("/networks/{name}"), None)
+                    .call_control(
+                        "DELETE",
+                        &format!("/networks/{name}"),
+                        None,
+                        "remove network",
+                    )
                     .await?;
                 if !removed.status.is_success() {
                     tracing::warn!(
@@ -986,7 +1003,7 @@ impl ContainerEngine {
             }
             let reply = self
                 .docker
-                .call(
+                .call_control(
                     "POST",
                     "/networks/create",
                     Some(json!({
@@ -998,6 +1015,7 @@ impl ContainerEngine {
                             BRIDGE_NAME_OPTION: if internal { INTERNAL_BRIDGE } else { OPEN_BRIDGE },
                         },
                     })),
+                    "create network",
                 )
                 .await?;
             // 409: it exists, which is the steady state.
@@ -1041,9 +1059,15 @@ impl ContainerEngine {
             "Labels": { "celld.node": self.node, "celld.fence": "1" },
             "HostConfig": { "NetworkMode": "host", "CapAdd": ["NET_ADMIN"] },
         });
+        // A timed-out create may leave a stopped fence container whose
+        // id this call never learned; it carries the celld.node label,
+        // so the next restart's reap removes it. Accepted as-is: eager
+        // cleanup by label is not worth the extra calls for a stopped,
+        // tiny orphan, and `fenced` stays false so the next start
+        // retries.
         let created = self
             .docker
-            .expect(
+            .expect_lifecycle(
                 "POST",
                 "/containers/create",
                 Some(body),
@@ -1058,13 +1082,14 @@ impl ContainerEngine {
             .to_string();
         let outcome = async {
             self.docker
-                .expect(
+                .expect_lifecycle(
                     "POST",
                     &format!("/containers/{id}/start"),
                     None,
                     "start fence container",
                 )
                 .await?;
+            // A wait, not a control call: inherently long-polled, unbounded.
             let waited = self
                 .docker
                 .expect(
@@ -1091,7 +1116,12 @@ impl ContainerEngine {
         .await;
         let _ = self
             .docker
-            .call("DELETE", &format!("/containers/{id}?force=true"), None)
+            .call_lifecycle(
+                "DELETE",
+                &format!("/containers/{id}?force=true"),
+                None,
+                "remove fence container",
+            )
             .await;
         outcome.context("fence the container bridges")?;
         tracing::info!(
@@ -1104,15 +1134,13 @@ impl ContainerEngine {
     }
 
     /// Both output streams of a stopped container, for an error message.
+    /// The sole caller is the fence error path, reading bytes of nft
+    /// output; `tail` bounds the body structurally so the control bound
+    /// stays safe whatever the caller reads.
     async fn logs(&self, id: &str) -> anyhow::Result<String> {
         let reply = self
             .docker
-            .expect(
-                "GET",
-                &format!("/containers/{id}/logs?stdout=true&stderr=true"),
-                None,
-                "container logs",
-            )
+            .expect_control("GET", &container_logs_path(id), None, "container logs")
             .await?;
         let mut text = Vec::new();
         let mut rest: &[u8] = &reply.body;
@@ -1286,7 +1314,12 @@ impl ContainerEngine {
     async fn inspect_running(&self, cell: &CellContainer) -> anyhow::Result<Option<Address>> {
         let reply = self
             .docker
-            .call("GET", &format!("/containers/{}/json", cell.name), None)
+            .call_control(
+                "GET",
+                &format!("/containers/{}/json", cell.name),
+                None,
+                "inspect container",
+            )
             .await?;
         if reply.status.as_u16() == 404 {
             return Ok(None);
@@ -1357,6 +1390,7 @@ impl ContainerEngine {
         let docker = self.docker.clone();
         let cell_ = cell.clone();
         asyncrt::spawn(async move {
+            // A wait, not a control call: the container runs indefinitely.
             let result = docker
                 .call("POST", &format!("/containers/{}/wait", cell_.name), None)
                 .await
@@ -1400,10 +1434,11 @@ impl ContainerEngine {
         // stopped one. The name is the cell's, so it is ours to remove.
         let _ = self
             .docker
-            .call(
+            .call_lifecycle(
                 "DELETE",
                 &format!("/containers/{}?force=true", cell.name),
                 None,
+                "remove container",
             )
             .await;
         let mut env: Vec<String> = DEFAULT_ENV.iter().map(|entry| entry.to_string()).collect();
@@ -1499,68 +1534,111 @@ impl ContainerEngine {
         if let Some(entrypoint) = params.entrypoint {
             body["Cmd"] = json!(entrypoint);
         }
-        // The daemon can answer 409 for a name whose previous container is
-        // still being removed, so a fresh start after `destroy()` retries
-        // briefly, as workerd's engine does.
-        let mut reply = self
-            .docker
-            .call(
-                "POST",
-                &format!("/containers/create?name={}", cell.name),
-                Some(body.clone()),
-            )
-            .await?;
-        for _ in 0..20 {
-            if reply.status.as_u16() != 409 {
-                break;
-            }
-            asyncrt::sleep(Duration::from_millis(100)).await;
-            let _ = self
+        // Everything from the first create on may leave a container
+        // behind: a timed-out start or post-start inspect still lands
+        // late on the daemon, RUNNING, with no watcher armed and state
+        // saying stopped. Any error at or after the create therefore
+        // force-removes the name before returning, best-effort and
+        // idempotent (a 404 is fine); only a double failure leaves an
+        // orphan, for the next start, eviction, or restart to reap.
+        // The pre-create path above (fence, ceiling, image, networks)
+        // created nothing and stays outside.
+        let started = async {
+            // The daemon can answer 409 for a name whose previous container is
+            // still being removed, so a fresh start after `destroy()` retries
+            // briefly, as workerd's engine does.
+            let mut reply = self
                 .docker
-                .call(
-                    "DELETE",
-                    &format!("/containers/{}?force=true", cell.name),
-                    None,
-                )
-                .await;
-            reply = self
-                .docker
-                .call(
+                .call_lifecycle(
                     "POST",
                     &format!("/containers/create?name={}", cell.name),
                     Some(body.clone()),
+                    "create container",
                 )
                 .await?;
+            let loop_started = asyncrt::mono_us();
+            for _ in 0..20 {
+                if reply.status.as_u16() != 409 {
+                    break;
+                }
+                // Aggregate cap: each iteration makes two lifecycle
+                // calls, and a start runs inside the IoContext
+                // lifetime, so the loop must not spin for minutes.
+                if aggregate_budget_spent(loop_started, asyncrt::mono_us()) {
+                    break;
+                }
+                asyncrt::sleep(Duration::from_millis(100)).await;
+                let _ = self
+                    .docker
+                    .call_lifecycle(
+                        "DELETE",
+                        &format!("/containers/{}?force=true", cell.name),
+                        None,
+                        "remove container",
+                    )
+                    .await;
+                reply = self
+                    .docker
+                    .call_lifecycle(
+                        "POST",
+                        &format!("/containers/create?name={}", cell.name),
+                        Some(body.clone()),
+                        "create container",
+                    )
+                    .await?;
+            }
+            if reply.status.as_u16() == 404 {
+                return Err(anyhow!("No such image available named {}", cell.spec.image));
+            }
+            if !reply.status.is_success() {
+                return Err(anyhow!(
+                    "Create container failed with [{}] {}",
+                    reply.status.as_u16(),
+                    reply.message()
+                ));
+            }
+            self.docker
+                .expect_lifecycle(
+                    "POST",
+                    &format!("/containers/{}/start", cell.name),
+                    None,
+                    "start container",
+                )
+                .await?;
+            let info = self
+                .docker
+                .expect_control(
+                    "GET",
+                    &format!("/containers/{}/json", cell.name),
+                    None,
+                    "inspect container",
+                )
+                .await?
+                .json()?;
+            Ok::<_, anyhow::Error>(address_of(&info))
         }
-        if reply.status.as_u16() == 404 {
-            return Err(anyhow!("No such image available named {}", cell.spec.image));
+        .await;
+        if started.is_err() {
+            // Best-effort: the start error is what the caller sees.
+            if let Err(cleanup) = self
+                .docker
+                .call_lifecycle(
+                    "DELETE",
+                    &format!("/containers/{}?force=true", cell.name),
+                    None,
+                    "remove container",
+                )
+                .await
+            {
+                tracing::warn!(
+                    event = "container_orphan_cleanup_failed",
+                    cell = %cell.scope,
+                    error = %format!("{cleanup:#}"),
+                    "a failed start could not remove its container; the next start, eviction, or restart reaps it"
+                );
+            }
         }
-        if !reply.status.is_success() {
-            return Err(anyhow!(
-                "Create container failed with [{}] {}",
-                reply.status.as_u16(),
-                reply.message()
-            ));
-        }
-        self.docker
-            .expect(
-                "POST",
-                &format!("/containers/{}/start", cell.name),
-                None,
-                "start container",
-            )
-            .await?;
-        let info = self
-            .docker
-            .expect(
-                "GET",
-                &format!("/containers/{}/json", cell.name),
-                None,
-                "inspect container",
-            )
-            .await?
-            .json()?;
-        Ok(address_of(&info))
+        started
     }
 
     /// Wait for the current run to end. `Ok(code)` is the root process's
@@ -1584,18 +1662,20 @@ impl ContainerEngine {
         // the name disappear under it.
         let _ = self
             .docker
-            .call(
+            .call_control(
                 "POST",
                 &format!("/containers/{}/kill?signal=SIGKILL", cell.name),
                 None,
+                "kill container",
             )
             .await;
         let _ = self
             .docker
-            .call(
+            .call_control(
                 "DELETE",
                 &format!("/containers/{}?force=true", cell.name),
                 None,
+                "remove container",
             )
             .await;
         let mut state = cell.state.lock().unwrap();
@@ -1606,7 +1686,7 @@ impl ContainerEngine {
 
     pub async fn signal(&self, cell: &Arc<CellContainer>, signal: u32) -> anyhow::Result<()> {
         self.docker
-            .expect(
+            .expect_control(
                 "POST",
                 &format!("/containers/{}/kill?signal={signal}", cell.name),
                 None,
@@ -1691,7 +1771,7 @@ impl ContainerEngine {
         params.env.push((EXEC_ID_ENV.to_string(), format!("{id};")));
         let created = self
             .docker
-            .expect(
+            .expect_control(
                 "POST",
                 &format!("/containers/{}/exec", cell.name),
                 Some(exec_create_body(&params)),
@@ -1704,6 +1784,8 @@ impl ContainerEngine {
             .and_then(Value::as_str)
             .ok_or_else(|| anyhow!("exec create answered without an id"))?
             .to_string();
+        // The stream attach, not a control call: the connection outlives
+        // the call by design and stays unbounded.
         let stream = self
             .docker
             .hijack(
@@ -1716,29 +1798,51 @@ impl ContainerEngine {
         // is the one answer that means "not yet": retry it briefly, as
         // workerd does. Breaking on `Running: false` here lost the pid of a
         // short command whenever the inspect landed in that window.
-        let mut pid = 0;
-        for _ in 0..20 {
-            let info = self
-                .docker
-                .expect(
-                    "GET",
-                    &format!("/exec/{exec_id}/json"),
-                    None,
-                    "inspect exec",
-                )
-                .await?
-                .json()?;
-            pid = info.get("Pid").and_then(Value::as_i64).unwrap_or(0);
-            if pid != 0 {
-                break;
+        let polled = async {
+            let mut pid = 0;
+            let loop_started = asyncrt::mono_us();
+            for _ in 0..20 {
+                // Aggregate cap, as in the create 409 loop.
+                if aggregate_budget_spent(loop_started, asyncrt::mono_us()) {
+                    break;
+                }
+                let info = self
+                    .docker
+                    .expect_control(
+                        "GET",
+                        &format!("/exec/{exec_id}/json"),
+                        None,
+                        "inspect exec",
+                    )
+                    .await?
+                    .json()?;
+                pid = info.get("Pid").and_then(Value::as_i64).unwrap_or(0);
+                if pid != 0 {
+                    break;
+                }
+                asyncrt::sleep(Duration::from_millis(50)).await;
             }
-            asyncrt::sleep(Duration::from_millis(50)).await;
+            Ok::<_, anyhow::Error>(pid)
         }
+        .await;
+        let pid = match polled {
+            Ok(pid) => pid,
+            Err(error) => {
+                // The daemon-side process is already running, and no
+                // handle is ever registered on this path; kill it so a
+                // failed inspect doesn't orphan a process, mirroring the
+                // resize cleanup below. Best-effort: the inspect error
+                // is what the caller sees.
+                let _ =
+                    kill_via_exec(&self.docker, &cell.name, id, 9, params.user.as_deref()).await;
+                return Err(error);
+            }
+        };
         if params.pty {
             if let (Some(cols), Some(rows)) = (params.cols, params.rows) {
                 if let Err(resize_err) = self
                     .docker
-                    .expect(
+                    .expect_control(
                         "POST",
                         &exec_resize_path(&exec_id, cols, rows),
                         None,
@@ -1896,7 +2000,7 @@ async fn kill_via_exec(
     user: Option<&str>,
 ) -> anyhow::Result<()> {
     let created = docker
-        .expect(
+        .expect_control(
             "POST",
             &format!("/containers/{container}/exec"),
             Some(kill_exec_body(id, signal, user)),
@@ -1909,7 +2013,7 @@ async fn kill_via_exec(
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow!("exec create answered without an id"))?;
     docker
-        .expect(
+        .expect_control(
             "POST",
             &format!("/exec/{exec}/start"),
             Some(json!({ "Detach": true })),
@@ -2139,10 +2243,16 @@ impl ExecProcess {
         // The stream closes when the process exits, but the daemon records
         // the exit code a moment later.
         let mut code = None;
+        let loop_started = asyncrt::mono_us();
         for _ in 0..40 {
+            // Aggregate cap, as in the create 409 loop. Falling out
+            // without a code keeps the existing error below.
+            if aggregate_budget_spent(loop_started, asyncrt::mono_us()) {
+                break;
+            }
             let info = self
                 .docker
-                .expect(
+                .expect_control(
                     "GET",
                     &format!("/exec/{}/json", self.exec_id),
                     None,
@@ -2190,7 +2300,7 @@ impl ExecProcess {
             anyhow::bail!("resize() dimensions must be positive");
         }
         self.docker
-            .expect(
+            .expect_control(
                 "POST",
                 &exec_resize_path(&self.exec_id, cols, rows),
                 None,
@@ -2288,6 +2398,23 @@ fn address_of(info: &Value) -> Address {
         }
     }
     Address::Published(ports)
+}
+
+/// Whether a retry loop has spent its aggregate wall-clock budget.
+/// The per-call bounds cap one call; without this, the 409 loop (20
+/// iterations of two lifecycle calls) could pin a start inside the
+/// IoContext lifetime for minutes against a slow-but-answering
+/// daemon. The loops share `LIFECYCLE_TIMEOUT` as their total, read
+/// off the execution-domain monotonic clock; pure over its two stamps
+/// so tests pin both branches without a domain.
+fn aggregate_budget_spent(start_us: u64, now_us: u64) -> bool {
+    Duration::from_micros(now_us.saturating_sub(start_us)) >= LIFECYCLE_TIMEOUT
+}
+
+/// The stopped-container logs query: `tail` bounds the body
+/// structurally, pure so tests pin the bound without an engine.
+fn container_logs_path(id: &str) -> String {
+    format!("/containers/{id}/logs?stdout=true&stderr=true&tail=50")
 }
 
 /// A Docker name from a node and a cell scope: the scope's characters are
@@ -2891,6 +3018,9 @@ mod kill_tests {
         destructive: Vec<String>,
         sleep_running: bool,
         sleep_closer: Option<std::sync::mpsc::Sender<()>>,
+        /// Fail the exec inspect, so `exec()` errors after the daemon
+        /// started the process.
+        fail_exec_inspect: bool,
     }
 
     impl MockDaemon {
@@ -2906,6 +3036,7 @@ mod kill_tests {
                 destructive: Vec::new(),
                 sleep_running: true,
                 sleep_closer: None,
+                fail_exec_inspect: false,
             }));
             let serving = state.clone();
             std::thread::spawn(move || {
@@ -2923,7 +3054,9 @@ mod kill_tests {
         }
     }
 
-    fn read_request(stream: &UnixStream) -> (String, String, Vec<(String, String)>, Vec<u8>) {
+    pub(super) fn read_request(
+        stream: &UnixStream,
+    ) -> (String, String, Vec<(String, String)>, Vec<u8>) {
         let mut reader = BufReader::new(stream);
         let mut line = String::new();
         reader.read_line(&mut line).expect("request line");
@@ -2956,7 +3089,7 @@ mod kill_tests {
         (method, path, headers, body)
     }
 
-    fn respond(stream: &mut UnixStream, status: &str, body: &[u8]) {
+    pub(super) fn respond(stream: &mut UnixStream, status: &str, body: &[u8]) {
         write!(
             stream,
             "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -3050,6 +3183,14 @@ mod kill_tests {
             return;
         }
         if method == "GET" && path == "/exec/sleep-exec/json" {
+            if state.lock().unwrap().fail_exec_inspect {
+                respond(
+                    &mut stream,
+                    "500 Internal Server Error",
+                    json!({ "message": "boom" }).to_string().as_bytes(),
+                );
+                return;
+            }
             let running = state.lock().unwrap().sleep_running;
             let code = (!running).then_some(137);
             respond(
@@ -3104,7 +3245,7 @@ mod kill_tests {
     /// it once for the test binary; installing a second handle here
     /// would trip `set_host_handle`'s exactly-once assert now that
     /// other lib tests share the same installer.
-    fn ensure_domain() {
+    pub(super) fn ensure_domain() {
         let _ = asyncrt::shared_test_runtime();
     }
 
@@ -3193,6 +3334,74 @@ mod kill_tests {
             mock.state.lock().unwrap().destructive.is_empty(),
             "the kill must not touch the container"
         );
+    }
+
+    /// N2: an exec whose post-hijack inspect fails kills the started
+    /// process, mirroring the resize cleanup: the daemon side is
+    /// already running and no handle is ever registered, so without
+    /// the kill it is orphaned. The fast 500 exercises the same error
+    /// path as a timed-out inspect.
+    #[tokio::test]
+    async fn a_failed_exec_inspect_kills_the_started_process() {
+        ensure_domain();
+        let mock = MockDaemon::start();
+        mock.state.lock().unwrap().fail_exec_inspect = true;
+        let engine = ContainerEngine {
+            runtime: None,
+            dns: Vec::new(),
+            resolv_conf: None,
+            docker: Docker::new(&mock.socket),
+            node: "test".to_string(),
+            bucket: None,
+            images: Mutex::new(HashMap::new()),
+            cells: Mutex::new(HashMap::new()),
+            networks: tokio::sync::Mutex::new(None),
+            fenced: tokio::sync::Mutex::new(false),
+        };
+        let cell = Arc::new(kill_cell());
+        let run = cell.begin_run();
+        cell.finish_start(run);
+        let error = engine
+            .exec(
+                &cell,
+                ExecParams {
+                    cmd: vec!["sleep".to_string(), "60".to_string()],
+                    env: Vec::new(),
+                    cwd: None,
+                    user: None,
+                    combined: false,
+                    pty: false,
+                    cols: None,
+                    rows: None,
+                },
+            )
+            .await
+            .err()
+            .expect("exec must fail");
+        assert!(error.to_string().contains("boom"), "{error:#}");
+        // The cleanup is a marker scan for the sleep, not a container kill.
+        let state = mock.state.lock().unwrap();
+        assert_eq!(state.exec_creates.len(), 2);
+        let marker = state.exec_creates[0]["Env"]
+            .as_array()
+            .and_then(|env| {
+                env.iter().find_map(|entry| {
+                    entry
+                        .as_str()?
+                        .strip_prefix("CELLD_EXEC_ID=")
+                        .map(str::to_string)
+                })
+            })
+            .expect("the sleep carries its marker");
+        let script = state.exec_creates[1]["Cmd"][2]
+            .as_str()
+            .expect("kill scan script");
+        assert!(
+            script.contains(&format!("CELLD_EXEC_ID={marker}")),
+            "{script}"
+        );
+        assert!(script.contains("-9"), "{script}");
+        assert!(state.destructive.is_empty(), "no container-scope kill");
     }
 
     /// The same kill against a real daemon: ignored by default (CI has
@@ -3411,5 +3620,262 @@ mod retained_read_tests {
         assert!(end.is_empty());
         let again = read_bytes(poll_read(&process, 8, 0, 2));
         assert!(again.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod control_timeout_tests {
+    use super::kill_tests::ensure_domain;
+    use super::*;
+    use std::os::unix::net::UnixListener;
+
+    /// A daemon that accepts and never answers: holds every
+    /// connection, reads nothing, answers nothing. Dropping a
+    /// connection would fail the call with EOF instead of hanging it.
+    fn silent_daemon() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::Builder::new()
+            .prefix("celld-control-timeout-")
+            .tempdir()
+            .expect("silent daemon tempdir");
+        let socket = dir.path().join("d.sock");
+        let listener = UnixListener::bind(&socket).expect("silent daemon bind");
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { break };
+                std::thread::spawn(move || {
+                    let _held = stream;
+                    std::thread::park();
+                });
+            }
+        });
+        (dir, socket)
+    }
+
+    /// A control call against a daemon that accepts and never answers
+    /// fails with the control error instead of hanging: the bound, not
+    /// the daemon, ends the call. The injected bound is milliseconds,
+    /// so the test never waits out the production one.
+    #[tokio::test]
+    async fn control_call_times_out_on_a_silent_daemon() {
+        ensure_domain();
+        let (_dir, socket) = silent_daemon();
+        let docker = Docker::new(&socket);
+        let Err(error) = docker
+            .call_control_with_timeout(
+                "POST",
+                "/containers/n/kill?signal=15",
+                None,
+                "signal container",
+                Duration::from_millis(50),
+            )
+            .await
+        else {
+            panic!("a silent daemon must fail the control call");
+        };
+        assert_eq!(
+            error.to_string(),
+            "container engine did not answer signal container within 50ms"
+        );
+    }
+
+    /// N3: a lifecycle call against the silent daemon fails the same
+    /// way through its own entry point: the tier routes through the
+    /// shared timeout, not around it.
+    #[tokio::test]
+    async fn lifecycle_call_times_out_on_a_silent_daemon() {
+        ensure_domain();
+        let (_dir, socket) = silent_daemon();
+        let docker = Docker::new(&socket);
+        let Err(error) = docker
+            .call_lifecycle_with_timeout(
+                "POST",
+                "/containers/n/start",
+                None,
+                "start container",
+                Duration::from_millis(50),
+            )
+            .await
+        else {
+            panic!("a silent daemon must fail the lifecycle call");
+        };
+        assert_eq!(
+            error.to_string(),
+            "container engine did not answer start container within 50ms"
+        );
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::kill_tests::{ensure_domain, read_request, respond};
+    use super::*;
+    use std::os::unix::net::{UnixListener, UnixStream};
+
+    /// A scripted Engine API over a unix socket: answers the create,
+    /// then fails the start, and records every call in order.
+    /// Synchronous std threads only (no second runtime): the engine
+    /// under test is the only async party.
+    struct StartFailingDaemon {
+        _dir: tempfile::TempDir,
+        socket: PathBuf,
+        calls: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl StartFailingDaemon {
+        fn start(name: &str) -> Self {
+            let dir = tempfile::Builder::new()
+                .prefix("celld-start-failing-")
+                .tempdir()
+                .expect("mock daemon tempdir");
+            let socket = dir.path().join("d.sock");
+            let listener = UnixListener::bind(&socket).expect("mock daemon bind");
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let serving = calls.clone();
+            let name = name.to_string();
+            std::thread::spawn(move || {
+                for stream in listener.incoming() {
+                    let Ok(stream) = stream else { break };
+                    let calls = serving.clone();
+                    let name = name.clone();
+                    std::thread::spawn(move || serve(stream, calls, &name));
+                }
+            });
+            Self {
+                _dir: dir,
+                socket,
+                calls,
+            }
+        }
+    }
+
+    fn serve(stream: UnixStream, calls: Arc<Mutex<Vec<String>>>, name: &str) {
+        let (method, path, _, _) = read_request(&stream);
+        calls.lock().unwrap().push(format!("{method} {path}"));
+        let mut stream = stream;
+        if method == "POST" && path == format!("/containers/create?name={name}") {
+            respond(
+                &mut stream,
+                "201 Created",
+                json!({ "Id": "n1deadbeef", "Warnings": [] })
+                    .to_string()
+                    .as_bytes(),
+            );
+            return;
+        }
+        if method == "POST" && path == format!("/containers/{name}/start") {
+            respond(
+                &mut stream,
+                "500 Internal Server Error",
+                json!({ "message": "boom" }).to_string().as_bytes(),
+            );
+            return;
+        }
+        if method == "DELETE" && path == format!("/containers/{name}?force=true") {
+            respond(&mut stream, "204 No Content", b"");
+            return;
+        }
+        respond(
+            &mut stream,
+            "404 Not Found",
+            json!({ "message": format!("mock daemon: no such call {method} {path}") })
+                .to_string()
+                .as_bytes(),
+        );
+    }
+
+    fn start_cell(name: &str) -> CellContainer {
+        CellContainer {
+            scope: "s".into(),
+            name: name.to_string(),
+            spec: Arc::new(ContainerSpec {
+                class_name: "C".into(),
+                image: "celld-image:x".into(),
+                instance_type: None,
+                max_instances: None,
+                runtime: None,
+            }),
+            state: Mutex::new(CellState::default()),
+            processes: Mutex::new(Vec::new()),
+            exit: watch::channel(None).0,
+            started: watch::channel(0).0,
+        }
+    }
+
+    /// N1: a start that fails after its create force-removes the
+    /// container by name, so no untracked container is left while
+    /// state says stopped. The fast 500 exercises the same error path
+    /// as a timed-out start; the test asserts the exact call order,
+    /// ending in the cleanup DELETE.
+    #[tokio::test]
+    async fn a_start_failed_after_create_removes_the_container() {
+        ensure_domain();
+        let name = "n1-cell";
+        let mock = StartFailingDaemon::start(name);
+        let mut images = HashMap::new();
+        images.insert(
+            "celld-image:x".to_string(),
+            Arc::new(tokio::sync::Mutex::new(true)),
+        );
+        let engine = ContainerEngine {
+            runtime: None,
+            dns: Vec::new(),
+            resolv_conf: None,
+            docker: Docker::new(&mock.socket),
+            node: "test".to_string(),
+            bucket: None,
+            images: Mutex::new(images),
+            cells: Mutex::new(HashMap::new()),
+            networks: tokio::sync::Mutex::new(Some((
+                "celld".to_string(),
+                "celld-internal".to_string(),
+            ))),
+            fenced: tokio::sync::Mutex::new(true),
+        };
+        let cell = start_cell(name);
+        let error = engine
+            .create_and_start(
+                &cell,
+                StartParams {
+                    entrypoint: None,
+                    env: Vec::new(),
+                    enable_internet: true,
+                    labels: Vec::new(),
+                },
+            )
+            .await
+            .expect_err("the start must fail");
+        assert!(error.to_string().contains("boom"), "{error:#}");
+        assert_eq!(
+            *mock.calls.lock().unwrap(),
+            vec![
+                format!("DELETE /containers/{name}?force=true"),
+                format!("POST /containers/create?name={name}"),
+                format!("POST /containers/{name}/start"),
+                format!("DELETE /containers/{name}?force=true"),
+            ]
+        );
+    }
+
+    /// N4: the retry loops share the lifecycle bound as their
+    /// aggregate budget, so a slow-but-answering daemon cannot spin
+    /// them for minutes. Both branches, with no waiting and no
+    /// domain: the budget is a pure function of two clock stamps.
+    #[test]
+    fn retry_loops_share_the_lifecycle_bound_as_their_budget() {
+        let bound = LIFECYCLE_TIMEOUT.as_micros() as u64;
+        assert!(!aggregate_budget_spent(1_000, 1_000));
+        assert!(!aggregate_budget_spent(1_000, 1_000 + bound - 1));
+        assert!(aggregate_budget_spent(1_000, 1_000 + bound));
+        assert!(!aggregate_budget_spent(2_000, 1_000));
+    }
+
+    /// N4: the stopped-container logs query tails, so its size bound
+    /// is structural rather than coupled to the fence caller.
+    #[test]
+    fn stopped_container_logs_query_tails() {
+        assert_eq!(
+            container_logs_path("abc"),
+            "/containers/abc/logs?stdout=true&stderr=true&tail=50"
+        );
     }
 }

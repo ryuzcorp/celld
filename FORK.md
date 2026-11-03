@@ -9,7 +9,7 @@ README below is kept intact; this file documents the fork.
 
 - `main` mirrors upstream `main` and carries no patches.
 - `ryuzcorp/v<version>` is a line branch: the upstream tag `v<version>`
-  plus our patches as commits, one commit per patch, in `0001`-`0037`
+  plus our patches as commits, one commit per patch, in `0001`-`0038`
   order. Each patch commit is self-contained and carries its own tests.
 
 Upstream's `.github/workflows/release.yml` targets `ghcr.io/denoland` and
@@ -366,7 +366,7 @@ push to `ghcr.io/denoland`, but still. Pushing a branch named
   sockets, WebSockets, HTMLRewriters and stream tees are accounted to
   the owning request, and a retired owner throws with nothing
   registered.
-- `0037` (sha TBD at merge) shared runtime cells run in a dedicated
+- `0037` (`8978fe4`) shared runtime cells run in a dedicated
   runtime isolate pool: cells of `__D1Database`, `__KvNamespace`, and
   `__Queue` build their isolates from the harness plus a fixed inert
   entry module, with no tenant bundle loaded — previously they ran in
@@ -384,6 +384,21 @@ push to `ghcr.io/denoland`, but still. Pushing a branch named
   Per-cell placement and ownership are unchanged — state stays in the
   cells' SQLite, so a rolling upgrade moves cells on restart with no
   migration — and `/state` reports the pool under its reserved name.
+- `0038` (sha TBD at merge) container stdin close and signal reach the
+  engine: both ops run under the start's lifetime (a fire-and-forget
+  close no longer dies with its event; a signal lands even on failed
+  cell events and stateless entries, the cases that dropped Handler
+  work), so an exec with the default stdin reaches EOF instead of
+  hanging. Single-shot engine control calls fail after 10 s instead of
+  pinning their event on a wedged daemon, with a 60 s tier for container
+  create/start/remove (large-layer unlinks and sandboxed starts
+  legitimately take seconds); waits, streams, and image transfers stay
+  unbounded. A start that fails after its create best-effort removes the
+  container by name, and a failed post-start exec inspect kills the
+  started process, so neither leaves an untracked orphan; the
+  create/exec/wait retry loops share the 60 s aggregate cap. The
+  websocket bind wait is unrefed: its reply is unobserved, so it no
+  longer pins successful cell events.
 
 Patches `0025`–`0034` are ported fixes from
 [meln1k/celld](https://github.com/meln1k/celld) by Nikita

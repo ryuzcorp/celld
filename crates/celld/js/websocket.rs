@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): reaction-aware request resources.
+// Modified by ryuzcorp (ryuzcorp/celld): reaction-aware request resources; unrefed websocket bind wait.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! WebSockets inside the isolate: the registry, the ops JS calls, and the
@@ -651,8 +651,11 @@ pub(super) fn op_ws_bind_target(
     // Nothing observes the outcome: the socket is already open, so there is
     // no handshake for JS to await. The task keeps the reply receiver alive
     // until the connector answers. A bind failure drops the pull sender, so
-    // `op_ws_next` reports the caller socket as abnormally closed.
-    asyncrt::enqueue(async move {
+    // `op_ws_next` reports the caller socket as abnormally closed. Unrefed:
+    // the bind request is already sent, so dropping this wait loses no
+    // effect, and a referenced wait would pin a successful cell event on
+    // the connector's reply for nothing.
+    asyncrt::enqueue_unrefed(async move {
         if !sent {
             return Err::<String, String>("no outbound WebSocket channel".into());
         }

@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): node:crypto scrypt; container exec resize op; cross-isolate RPC stubs and streams; test-only fake exec ops; fake kill completion op; exec reads survive their subscribing event; per-node Workers Cache API ops; tenant egress policy; D1 export operator-ingress marker; stateless attribution tokens; reaction-aware request resources.
+// Modified by ryuzcorp (ryuzcorp/celld): node:crypto scrypt; container exec resize op; cross-isolate RPC stubs and streams; test-only fake exec ops; fake kill completion op; exec reads survive their subscribing event; per-node Workers Cache API ops; tenant egress policy; D1 export operator-ingress marker; stateless attribution tokens; reaction-aware request resources; fake close/signal completion ops.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 // The raw V8 adapter and its child modules remain outside the Actor execution
@@ -7114,6 +7114,10 @@ ops! { OP_NAMES, install_op_functions,
         "__testexec_exit" => container::op_testexec_exit,
         "__testexec_kills" => container::op_testexec_kills,
         "__testexec_kills_completed" => container::op_testexec_kills_completed,
+        "__testexec_closes" => container::op_testexec_closes,
+        "__testexec_closes_completed" => container::op_testexec_closes_completed,
+        "__testexec_signals" => container::op_testexec_signals,
+        "__testexec_signals_completed" => container::op_testexec_signals_completed,
         "__testexec_params" => container::op_testexec_params,
         "__upload_new" => op_upload_new,
         "__upload_push" => op_upload_push,
