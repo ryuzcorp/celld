@@ -1,3 +1,4 @@
+// Modified by ryuzcorp (ryuzcorp/celld): re-export the shared list-request builder and the structured listing.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! The V8 surface over an `r2_buckets` binding.
@@ -29,6 +30,8 @@ pub(crate) use crate::r2_store::blob_key;
 pub(crate) use crate::r2_store::delete;
 pub(crate) use crate::r2_store::head;
 pub(crate) use crate::r2_store::list;
+pub(crate) use crate::r2_store::list_entries;
+pub(crate) use crate::r2_store::list_request;
 pub(crate) use crate::r2_store::object_json;
 pub(crate) use crate::r2_store::open_put;
 pub(crate) use crate::r2_store::put_once;

@@ -1,3 +1,4 @@
+// Modified by ryuzcorp (ryuzcorp/celld): R2 startAfter compares decoded keys; listing pages carry walk-ordered rows.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! The engine's single object-store client: the `object_store` crate
@@ -502,6 +503,7 @@ pub enum BlobRead {
 }
 
 /// One object in a listing page.
+#[derive(Clone, Debug)]
 pub struct BlobEntry {
     pub key: String,
     pub size: u64,
@@ -510,16 +512,78 @@ pub struct BlobEntry {
     pub uploaded_ms: i64,
 }
 
+/// One prefix a delimiter rolled up, with the last key that rolled into
+/// it. The prefix string itself is not a valid listing offset — `a/`
+/// encodes to `a/%`, ahead of the keys it stands for — so the row
+/// continues past the last rolled key instead.
+#[derive(Clone, Debug)]
+pub struct BlobPrefix {
+    pub prefix: String,
+    pub cursor: String,
+}
+
+/// One row of a listing page, in the store's walk order: an object, or a
+/// prefix at its first key. Each row carries the key a reader resumes
+/// after it with — the object itself, or the last key that rolled into
+/// the prefix. A reader that prints rows in this order and resumes past
+/// the last printed row re-walks exactly the rest.
+#[derive(Clone, Debug)]
+pub enum BlobRow {
+    Object { entry: BlobEntry, cursor: String },
+    Prefix(BlobPrefix),
+}
+
 /// One page of a listing.
 pub struct BlobPage {
     pub objects: Vec<BlobEntry>,
     /// The keys a delimiter rolled up, in key order and deduplicated.
     pub prefixes: Vec<String>,
+    /// Every row of the page in walk order, mirroring `objects` and
+    /// `prefixes`: each object once, each prefix once with its last
+    /// rolled key.
+    pub entries: Vec<BlobRow>,
     pub truncated: bool,
     /// The last key this page consumed, whether it was listed or rolled
     /// up. The next page resumes strictly after it, which is what R2's
     /// opaque cursor does.
     pub cursor: Option<String>,
+}
+
+/// Where a [`Bucket::list_page`] resumes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ListAfter<'a> {
+    /// The last key a previous page consumed. Its stored form is a valid
+    /// offset in the store's own order, so the walk continues past it.
+    Cursor(&'a str),
+    /// Any decoded key, in R2's UTF-8 byte order. The store sorts by the
+    /// encoded form, where `a%7E` precedes `aa`, so this bound cannot be
+    /// an offset: the walk starts at the prefix and skips what sorts at
+    /// or before it.
+    StartAfter(&'a str),
+    /// A cursor with the filter of the listing it came from: the walk
+    /// resumes past the consumed key and still skips what sorts at or
+    /// before the bound. A seeded walk's continuations carry both,
+    /// because the offset alone would re-admit keys the first page
+    /// filtered out where the two orders disagree.
+    BoundedCursor { cursor: &'a str, bound: &'a str },
+}
+
+impl<'a> ListAfter<'a> {
+    /// The store offset the walk resumes past, if it resumes from one.
+    fn offset(&self) -> Option<&'a str> {
+        match self {
+            Self::Cursor(cursor) | Self::BoundedCursor { cursor, .. } => Some(cursor),
+            Self::StartAfter(_) => None,
+        }
+    }
+
+    /// The decoded bound the walk filters past, if it filters at all.
+    fn bound(&self) -> Option<&'a str> {
+        match self {
+            Self::StartAfter(bound) | Self::BoundedCursor { bound, .. } => Some(bound),
+            Self::Cursor(_) => None,
+        }
+    }
 }
 
 /// The user metadata on a response, as name/value pairs. `object_store`
@@ -1462,9 +1526,9 @@ impl Bucket {
     }
 
     /// One listing page: every object whose full key starts with `prefix`,
-    /// in key order, resuming strictly after `after`. `limit` bounds the
-    /// page, counting a rolled-up prefix as R2 counts one — against the
-    /// same limit as an object.
+    /// in key order, resuming after `after`. `limit` bounds the page,
+    /// counting a rolled-up prefix as R2 counts one — against the same
+    /// limit as an object.
     ///
     /// `prefix` is a raw string prefix, as R2's is, not the directory
     /// prefix the rest of this module lists by: the store is asked for the
@@ -1476,37 +1540,45 @@ impl Bucket {
     pub async fn list_page(
         &self,
         prefix: &str,
-        after: Option<&str>,
+        after: Option<ListAfter<'_>>,
         limit: usize,
         delimiter: Option<&str>,
     ) -> anyhow::Result<BlobPage> {
         let directory = prefix.rsplit_once('/').map_or("", |(head, _)| head);
         let path = self.blob_path(directory);
-        let mut stream = match after {
-            Some(after) => self
+        let start_after = after.and_then(|after| after.bound());
+        let mut stream = match after.and_then(|after| after.offset()) {
+            Some(cursor) => self
                 .store
-                .list_with_offset(Some(&path), &self.blob_path(after)),
+                .list_with_offset(Some(&path), &self.blob_path(cursor)),
             None => self.store.list(Some(&path)),
         };
         let delimiter = delimiter.filter(|delimiter| !delimiter.is_empty());
         let mut page = BlobPage {
             objects: Vec::with_capacity(limit.min(1024)),
             prefixes: Vec::new(),
+            entries: Vec::with_capacity(limit.min(1024)),
             truncated: false,
             cursor: None,
         };
-        // The rolled-up prefixes seen so far. A listing is in key order, so
-        // a run of keys under one prefix is contiguous and only the newest
-        // prefix can repeat — but a delimiter is any string, not only `/`,
-        // so `prefix` can be re-entered later and the set is kept whole.
-        // Ordered, because nothing in the engine may hold state a replay
-        // would walk in a different order.
-        let mut rolled = std::collections::BTreeSet::new();
+        // The rolled-up prefixes seen so far, each with its row. A listing
+        // is in key order, so a run of keys under one prefix is contiguous
+        // and only the newest prefix can repeat — but a delimiter is any
+        // string, not only `/`, so `prefix` can be re-entered later and
+        // the map is kept whole. Ordered, because nothing in the engine
+        // may hold state a replay would walk in a different order.
+        let mut prefix_at = std::collections::BTreeMap::new();
         while let Some(meta) = stream.next().await {
             let meta =
                 meta.with_context(|| format!("list {}://{}/{path}", self.scheme(), self.name))?;
             let key = self.listed_key(&meta.location)?;
             let key = key.as_str();
+            // `startAfter` compares decoded keys in byte order. The walk
+            // started at the prefix rather than at an encoded offset, so
+            // nothing sorts past this test unseen.
+            if start_after.is_some_and(|bound| key <= bound) {
+                continue;
+            }
             let Some(remainder) = key.strip_prefix(prefix) else {
                 continue;
             };
@@ -1517,9 +1589,17 @@ impl Bucket {
             });
             // A prefix already rolled up costs nothing and does not end the
             // page: it is the same entry the caller has already been given.
+            // Its row still advances past this key, so resuming after the
+            // row continues past exactly what this page consumed.
             if let Some(group) = &group {
-                if rolled.contains(group) {
+                if let Some(&at) = prefix_at.get(group) {
                     page.cursor = Some(key.to_string());
+                    match &mut page.entries[at] {
+                        BlobRow::Prefix(rolled) => rolled.cursor = key.to_string(),
+                        BlobRow::Object { .. } => {
+                            unreachable!("a rolled prefix points at its own row")
+                        }
+                    }
                     continue;
                 }
             }
@@ -1529,16 +1609,27 @@ impl Bucket {
             }
             match group {
                 Some(group) => {
-                    rolled.insert(group.clone());
-                    page.prefixes.push(group);
+                    prefix_at.insert(group.clone(), page.entries.len());
+                    page.prefixes.push(group.clone());
+                    page.entries.push(BlobRow::Prefix(BlobPrefix {
+                        prefix: group,
+                        cursor: key.to_string(),
+                    }));
                 }
-                None => page.objects.push(BlobEntry {
-                    key: key.to_string(),
-                    size: meta.size,
-                    etag: meta.e_tag,
-                    version: meta.version,
-                    uploaded_ms: meta.last_modified.timestamp_millis(),
-                }),
+                None => {
+                    let entry = BlobEntry {
+                        key: key.to_string(),
+                        size: meta.size,
+                        etag: meta.e_tag,
+                        version: meta.version,
+                        uploaded_ms: meta.last_modified.timestamp_millis(),
+                    };
+                    page.entries.push(BlobRow::Object {
+                        entry: entry.clone(),
+                        cursor: key.to_string(),
+                    });
+                    page.objects.push(entry);
+                }
             }
             page.cursor = Some(key.to_string());
         }
@@ -2147,4 +2238,299 @@ pub fn is_unauthorized(error: &anyhow::Error) -> bool {
             || text.contains("status code: 403 Forbidden")
             || text.contains("status code: 401 Unauthorized")
     })
+}
+
+/// The paginated store serves operator cell walks, never blob listings,
+/// so the listing tests stub it out.
+#[cfg(test)]
+#[derive(Debug)]
+struct TestUnpaginated;
+
+#[cfg(test)]
+#[async_trait::async_trait]
+impl PaginatedListStore for TestUnpaginated {
+    async fn list_paginated(
+        &self,
+        _prefix: Option<&str>,
+        _options: PaginatedListOptions,
+    ) -> object_store::Result<object_store::list::PaginatedListResult> {
+        Err(object_store::Error::NotSupported {
+            source: "a listing test serves no paginated listing".into(),
+        })
+    }
+}
+
+#[cfg(test)]
+impl Bucket {
+    /// An in-memory bucket for listing tests. `r2_store` shares it, so the
+    /// binding path and the operator path test against one store shape.
+    pub(crate) fn for_test() -> Self {
+        let store = Arc::new(object_store::memory::InMemory::new());
+        Self {
+            store: store.clone(),
+            paginated: Arc::new(TestUnpaginated),
+            cas_store: store,
+            backend: StorageBackend::S3,
+            name: "list-test".to_string(),
+            prefix: String::new(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod r2_list_tests {
+    use super::*;
+
+    async fn put(bucket: &Bucket, key: &str) {
+        bucket
+            .put_blob(
+                key,
+                b"body".to_vec().into(),
+                &BlobAttributes::default(),
+                &BlobConditions::default(),
+            )
+            .await
+            .expect("put the test object")
+            .expect("an unconditional write applies");
+    }
+
+    /// `startAfter` names a decoded R2 key: `a~` sorts after `aa` in UTF-8
+    /// bytes, so it must be listed. The encoded form `a%7E` sorts before
+    /// `aa`, and comparing against it skips the key.
+    #[tokio::test]
+    async fn start_after_compares_decoded_keys() {
+        let bucket = Bucket::for_test();
+        put(&bucket, "r2/b/aa").await;
+        put(&bucket, "r2/b/a~").await;
+        let page = bucket
+            .list_page("r2/b/", Some(ListAfter::StartAfter("r2/b/aa")), 10, None)
+            .await
+            .expect("list the page");
+        let keys: Vec<&str> = page
+            .objects
+            .iter()
+            .map(|entry| entry.key.as_str())
+            .collect();
+        assert_eq!(keys, ["r2/b/a~"]);
+    }
+
+    /// A delimiter rolls the keys below it into prefixes and lists what
+    /// stays above it. The limit counts both, as R2 counts them.
+    #[tokio::test]
+    async fn delimiter_groups_keys_into_prefixes() {
+        let bucket = Bucket::for_test();
+        for key in ["r2/b/a/1", "r2/b/a/2", "r2/b/top.txt"] {
+            put(&bucket, key).await;
+        }
+        let page = bucket
+            .list_page("r2/b/", None, 10, Some("/"))
+            .await
+            .expect("list the page");
+        let keys: Vec<&str> = page
+            .objects
+            .iter()
+            .map(|entry| entry.key.as_str())
+            .collect();
+        assert_eq!(keys, ["r2/b/top.txt"]);
+        assert_eq!(page.prefixes, ["r2/b/a/"]);
+        assert!(!page.truncated);
+    }
+
+    /// Keys the store percent-encodes come back decoded: empty segments,
+    /// escapables, and non-ASCII bytes all round-trip.
+    #[tokio::test]
+    async fn encoded_keys_list_decoded() {
+        let bucket = Bucket::for_test();
+        let keys = [
+            "r2/b/a//b",
+            "r2/b/photos/",
+            "r2/b/accent-é",
+            "r2/b/pic name+café (1).png",
+            "r2/b/q?mark",
+            "r2/b/sp ace.txt",
+        ];
+        for key in keys {
+            put(&bucket, key).await;
+        }
+        let page = bucket
+            .list_page("r2/b/", None, 100, None)
+            .await
+            .expect("list the page");
+        let mut listed: Vec<&str> = page
+            .objects
+            .iter()
+            .map(|entry| entry.key.as_str())
+            .collect();
+        listed.sort_unstable();
+        let mut expected = keys.to_vec();
+        expected.sort_unstable();
+        assert_eq!(listed, expected);
+    }
+
+    /// A cursor walks every page of a delimiter listing: each object is
+    /// listed exactly once, and each folder is reported.
+    #[tokio::test]
+    async fn cursor_pages_across_a_delimiter() {
+        let bucket = Bucket::for_test();
+        for key in ["r2/b/a/1", "r2/b/a/2", "r2/b/c/1", "r2/b/top.txt"] {
+            put(&bucket, key).await;
+        }
+        let mut objects = Vec::new();
+        let mut prefixes = Vec::new();
+        let mut after = None;
+        loop {
+            let page = bucket
+                .list_page(
+                    "r2/b/",
+                    after.as_deref().map(ListAfter::Cursor),
+                    2,
+                    Some("/"),
+                )
+                .await
+                .expect("list the page");
+            objects.extend(page.objects.iter().map(|entry| entry.key.clone()));
+            prefixes.extend(page.prefixes.iter().cloned());
+            if !page.truncated {
+                break;
+            }
+            after = page.cursor.clone();
+            assert!(after.is_some(), "a truncated page names its cursor");
+        }
+        objects.sort_unstable();
+        assert_eq!(objects, ["r2/b/top.txt"]);
+        prefixes.sort_unstable();
+        prefixes.dedup();
+        assert_eq!(prefixes, ["r2/b/a/", "r2/b/c/"]);
+    }
+
+    /// Rows mirror the page in walk order: each object once, each prefix
+    /// once at its first key. A prefix row carries the last key that
+    /// rolled into it — the offset a reader resumes after the row with —
+    /// and a reported prefix is fully consumed in its page, so it never
+    /// answers twice.
+    #[tokio::test]
+    async fn entries_mirror_the_page_in_walk_order() {
+        let bucket = Bucket::for_test();
+        for key in ["r2/b/a/1", "r2/b/a/2", "r2/b/c/1", "r2/b/top.txt"] {
+            put(&bucket, key).await;
+        }
+        let page = bucket
+            .list_page("r2/b/", None, 10, Some("/"))
+            .await
+            .expect("list the page");
+        assert_eq!(page.entries.len(), page.objects.len() + page.prefixes.len());
+        let mut objects = Vec::new();
+        let mut prefixes = Vec::new();
+        let mut cursors = Vec::new();
+        for row in &page.entries {
+            match row {
+                BlobRow::Object { entry, cursor } => {
+                    objects.push(entry.key.as_str());
+                    assert_eq!(cursor, &entry.key);
+                }
+                BlobRow::Prefix(prefix) => {
+                    prefixes.push(prefix.prefix.as_str());
+                    cursors.push(prefix.cursor.as_str());
+                }
+            }
+        }
+        assert_eq!(objects, ["r2/b/top.txt"]);
+        assert_eq!(prefixes, ["r2/b/a/", "r2/b/c/"]);
+        assert_eq!(cursors, ["r2/b/a/2", "r2/b/c/1"]);
+        // The rows interleave in walk order: the folders at their first
+        // keys, the object where the walk reached it.
+        let order: Vec<&str> = page
+            .entries
+            .iter()
+            .map(|row| match row {
+                BlobRow::Object { entry, .. } => entry.key.as_str(),
+                BlobRow::Prefix(prefix) => prefix.prefix.as_str(),
+            })
+            .collect();
+        assert_eq!(order, ["r2/b/a/", "r2/b/c/", "r2/b/top.txt"]);
+
+        // A truncated page ends mid-walk with its rows' cursors exact: the
+        // next page continues past the last consumed key, and the reported
+        // folder is complete, so it does not answer again.
+        let page = bucket
+            .list_page("r2/b/", None, 1, Some("/"))
+            .await
+            .expect("list the page");
+        assert!(page.truncated);
+        let [BlobRow::Prefix(prefix)] = page.entries.as_slice() else {
+            panic!("one entry answers: {:?}", page.entries);
+        };
+        assert_eq!(prefix.prefix, "r2/b/a/");
+        assert_eq!(prefix.cursor, "r2/b/a/2");
+        let page = bucket
+            .list_page(
+                "r2/b/",
+                page.cursor.as_deref().map(ListAfter::Cursor),
+                10,
+                Some("/"),
+            )
+            .await
+            .expect("list the next page");
+        assert!(!page.truncated);
+        assert_eq!(page.prefixes, ["r2/b/c/"]);
+    }
+
+    /// A bounded cursor resumes past its offset and still filters past
+    /// its bound: keys the first page filtered out stay out. The bare
+    /// offset re-admits them, which is the case for carrying the bound.
+    #[tokio::test]
+    async fn bounded_cursor_keeps_its_filter() {
+        let bucket = Bucket::for_test();
+        put(&bucket, "r2/b/aa").await;
+        put(&bucket, "r2/b/a~").await;
+        put(&bucket, "r2/b/m").await;
+        // The walk opens with `a~` (encoded first), past the `aa` bound.
+        let page = bucket
+            .list_page("r2/b/", Some(ListAfter::StartAfter("r2/b/aa")), 1, None)
+            .await
+            .expect("list the page");
+        let keys: Vec<&str> = page
+            .objects
+            .iter()
+            .map(|entry| entry.key.as_str())
+            .collect();
+        assert_eq!(keys, ["r2/b/a~"]);
+        assert!(page.truncated);
+        let cursor = page
+            .cursor
+            .clone()
+            .expect("a truncated page names its cursor");
+        assert_eq!(cursor, "r2/b/a~");
+        // The bounded continuation filters past the seed: only `m`.
+        let page = bucket
+            .list_page(
+                "r2/b/",
+                Some(ListAfter::BoundedCursor {
+                    cursor: &cursor,
+                    bound: "r2/b/aa",
+                }),
+                10,
+                None,
+            )
+            .await
+            .expect("list the next page");
+        let keys: Vec<&str> = page
+            .objects
+            .iter()
+            .map(|entry| entry.key.as_str())
+            .collect();
+        assert_eq!(keys, ["r2/b/m"]);
+        // The bare offset re-admits `aa`: without the bound, the second
+        // page answers a key the first page's filter excluded.
+        let page = bucket
+            .list_page("r2/b/", Some(ListAfter::Cursor(&cursor)), 10, None)
+            .await
+            .expect("list the next page");
+        let keys: Vec<&str> = page
+            .objects
+            .iter()
+            .map(|entry| entry.key.as_str())
+            .collect();
+        assert_eq!(keys, ["r2/b/aa", "r2/b/m"]);
+    }
 }

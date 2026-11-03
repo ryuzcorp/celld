@@ -1,4 +1,4 @@
-<!-- Modified by ryuzcorp (ryuzcorp/celld): CELLD_MEMORY_SCOPE; deploy --sourcemap writes the bundle's external map; operator token for the internal listener. -->
+<!-- Modified by ryuzcorp (ryuzcorp/celld): CELLD_MEMORY_SCOPE; deploy --sourcemap writes the bundle's external map; operator token for the internal listener; r2 list --delimiter, the --page shape, and --cursor continuation. -->
 # celld
 
 celld is a stateful distributed system. It runs server-side JavaScript on
@@ -350,9 +350,13 @@ object that another tool writes into the prefix is also readable, without
 `celld r2 head` prints the stored record; with `--json`, the
 `http` and `custom` fields hold `httpMetadata` and `customMetadata`.
 
-`celld kv list` and `celld r2 list` print at most 1000 keys and print the
-`--after KEY` that continues the listing on stderr. Pass `--all` for every
-key and `--json` for one JSON object per key.
+`celld kv list` and `celld r2 list` print at most 1000 keys and, on stderr,
+the flag that continues the listing: `--after KEY` for kv, `--cursor CURSOR`
+for r2. Pass `--all` for every key. `celld kv list --json` prints one JSON
+object per key. `celld r2 list` takes `--prefix` and `--delimiter`; with
+`--page` it prints one page object — objects with `httpMetadata` and
+`customMetadata`, plus `delimitedPrefixes`, `truncated` and `cursor` — a
+Worker's `list()` page without `version`, `checksums` and `storageClass`.
 
 Every celld command writes data to stdout and messages to stderr. A closed
 stdout pipe is a successful stop.

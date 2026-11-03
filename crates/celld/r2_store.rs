@@ -1,3 +1,4 @@
+// Modified by ryuzcorp (ryuzcorp/celld): list() separates cursor from startAfter; shared list-request builder; structured entries for the CLI; cursors carry their bound.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! The object-store side of an `r2_buckets` binding: the R2 object record,
@@ -10,10 +11,15 @@ use crate::asyncrt;
 use crate::bucket::BlobAttributes;
 use crate::bucket::BlobConditions;
 use crate::bucket::BlobMeta;
+use crate::bucket::BlobPage;
+use crate::bucket::BlobPrefix;
 use crate::bucket::BlobRange;
 use crate::bucket::BlobRead;
+use crate::bucket::BlobRow;
 use crate::bucket::Bucket;
+use crate::bucket::ListAfter;
 use crate::host_channels::R2_STORE;
+use base64::Engine;
 use futures_util::StreamExt as _;
 use object_store::MultipartUpload;
 use serde::Deserialize;
@@ -280,6 +286,28 @@ struct ListRequest {
     include: bool,
 }
 
+/// A `list()` request in the shape `__makeR2Bucket` sends it. `celld r2
+/// list` builds the same JSON the binding does, so an operator's listing
+/// and a Worker's listing are one code path with one set of semantics.
+pub(crate) fn list_request(
+    prefix: &str,
+    cursor: Option<&str>,
+    start_after: Option<&str>,
+    limit: usize,
+    delimiter: Option<&str>,
+    include: bool,
+) -> String {
+    serde_json::json!({
+        "prefix": prefix,
+        "cursor": cursor,
+        "startAfter": start_after,
+        "limit": limit,
+        "delimiter": delimiter,
+        "include": include,
+    })
+    .to_string()
+}
+
 // ---- checksums -----------------------------------------------------------
 
 /// The digests an R2 write computes over its own bytes. R2 always records
@@ -431,50 +459,177 @@ pub(crate) async fn delete(bucket_name: &str, keys: &[String]) -> Result<(), Str
     Ok(())
 }
 
+/// A listing request parsed, normalized and scoped to the fleet
+/// bucket: the page bound, the cursor rule, and the reserved prefix.
+/// Shared by the binding's JSON projection and the CLI's structured one,
+/// so the two cannot drift in scoping, resumption, or page size.
+struct ScopedList {
+    store: &'static Bucket,
+    scoped: String,
+    cursor: Option<String>,
+    start_after: Option<String>,
+    /// The listing's decoded bound in the caller's key space, for
+    /// wrapping the cursors the page answers with.
+    out_bound: Option<String>,
+    limit: usize,
+    delimiter: Option<String>,
+    include: bool,
+}
+
+impl ScopedList {
+    fn parse(bucket_name: &str, request_json: &str) -> Result<Self, String> {
+        let request = serde_json::from_str::<ListRequest>(request_json)
+            .map_err(|error| format!("invalid R2 list options: {error}"))?;
+        let store = store()?;
+        let limit = match request.limit.unwrap_or(0) {
+            limit if limit > 0 => (limit as usize).min(LIST_LIMIT),
+            _ => LIST_LIMIT,
+        };
+        let (offset, token_bound) = match request.cursor.filter(|cursor| !cursor.is_empty()) {
+            Some(raw) => {
+                let (pos, bound) = decode_cursor(&raw)?;
+                (Some(blob_key(bucket_name, &pos)), bound)
+            }
+            None => (None, None),
+        };
+        // A cursor carries its own bound, or none at all; only a boundless
+        // first page reads `startAfter`. R2 ignores `startAfter` beside a
+        // cursor, and so does this.
+        let (start_after, out_bound) = match (offset.is_some(), token_bound) {
+            (_, Some(bound)) => (Some(blob_key(bucket_name, &bound)), Some(bound)),
+            (true, None) => (None, None),
+            (false, None) => match request.start_after.filter(|after| !after.is_empty()) {
+                Some(bound) => (Some(blob_key(bucket_name, &bound)), Some(bound)),
+                None => (None, None),
+            },
+        };
+        Ok(Self {
+            store,
+            scoped: blob_key(bucket_name, &request.prefix),
+            cursor: offset,
+            start_after,
+            out_bound,
+            limit,
+            delimiter: request.delimiter,
+            include: request.include,
+        })
+    }
+
+    /// Where the walk resumes. A cursor names a key the store returned,
+    /// so it resumes as an offset; a `startAfter` names any decoded key
+    /// and compares in UTF-8 byte order, past the encoded form the store
+    /// sorts by. A seeded walk's continuations carry both.
+    fn after(&self) -> Option<ListAfter<'_>> {
+        match (self.cursor.as_deref(), self.start_after.as_deref()) {
+            (Some(cursor), Some(bound)) => Some(ListAfter::BoundedCursor { cursor, bound }),
+            (Some(cursor), None) => Some(ListAfter::Cursor(cursor)),
+            (None, Some(bound)) => Some(ListAfter::StartAfter(bound)),
+            (None, None) => None,
+        }
+    }
+
+    async fn walk(&self) -> Result<BlobPage, String> {
+        self.store
+            .list_page(
+                &self.scoped,
+                self.after(),
+                self.limit,
+                self.delimiter.as_deref(),
+            )
+            .await
+            .map_err(|error| error.to_string())
+    }
+}
+
+/// The caller's key space: strip the reserved prefix back off, so a
+/// listed key is one the caller can `get`.
+fn unscope_key(strip: &str, key: &str) -> String {
+    key.strip_prefix(strip).unwrap_or(key).to_string()
+}
+
+/// The cursor family a seeded listing answers with. An unseeded listing's
+/// cursor stays the plain key it always was, so a cursor an operator holds
+/// keeps working; a seeded listing's cursor carries its bound, because the
+/// offset alone would re-admit keys the first page filtered out where
+/// encoded and decoded orders disagree. The token is shell-safe base64url
+/// over JSON, so the CLI prints it back unchanged.
+const CURSOR_FAMILY: &str = "celld-r2-cursor-";
+const CURSOR_V1: &str = "celld-r2-cursor-v1.";
+
+/// A seeded listing's cursor: the consumed position plus the decoded
+/// bound of the listing it came from, both in the caller's key space.
+#[derive(Deserialize, Serialize)]
+struct CursorToken {
+    pos: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    bound: Option<String>,
+}
+
+/// Wrap a consumed position, with its listing's bound when it has one.
+fn encode_cursor(pos: &str, bound: Option<&str>) -> String {
+    let json = serde_json::to_string(&CursorToken {
+        pos: pos.to_string(),
+        bound: bound.map(str::to_string),
+    })
+    .expect("a cursor token serializes");
+    format!(
+        "{CURSOR_V1}{}",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json)
+    )
+}
+
+/// Split a cursor into its consumed position and its listing's bound. A
+/// plain key is an offset with no bound; anything in the token family
+/// must parse, so a corrupt token fails loudly instead of resuming
+/// somewhere surprising.
+fn decode_cursor(cursor: &str) -> Result<(String, Option<String>), String> {
+    if !cursor.starts_with(CURSOR_FAMILY) {
+        return Ok((cursor.to_string(), None));
+    }
+    let payload = cursor
+        .strip_prefix(CURSOR_V1)
+        .ok_or_else(|| format!("unsupported R2 cursor version: {cursor:?}"))?;
+    let json = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload)
+        .map_err(|_| format!("invalid R2 cursor: {cursor:?}"))?;
+    let token: CursorToken =
+        serde_json::from_slice(&json).map_err(|_| format!("invalid R2 cursor: {cursor:?}"))?;
+    Ok((token.pos, token.bound))
+}
+
+/// The cursor a page answers a position with: the key itself, wrapped
+/// with the listing's bound when the walk is seeded. A key that itself
+/// starts like a token is wrapped too, without a bound, so it can never
+/// be read back as a token.
+fn wrap_cursor(strip: &str, bound: Option<&str>, key: &str) -> String {
+    let pos = unscope_key(strip, key);
+    if bound.is_some() || pos.starts_with(CURSOR_FAMILY) {
+        encode_cursor(&pos, bound)
+    } else {
+        pos
+    }
+}
+
 /// One listing page, in the shape `__makeR2Bucket` turns into an
 /// `R2Objects`. `request_json` is R2's `R2ListOptions`, normalized by the
 /// harness.
 ///
-/// Shared with `celld r2 list`, so an operator's listing applies the same
-/// prefix scoping, the same cursor rule, and the same page bound as a
-/// Worker's.
+/// Shared with `celld r2 list --page`, so an operator's page applies the
+/// same prefix scoping, the same cursor rule, and the same page bound as
+/// a Worker's.
 pub(crate) async fn list(
     bucket_name: &str,
     request_json: &str,
 ) -> Result<serde_json::Value, String> {
-    let request = serde_json::from_str::<ListRequest>(request_json)
-        .map_err(|error| format!("invalid R2 list options: {error}"))?;
-    let store = store()?;
-    let limit = match request.limit.unwrap_or(0) {
-        limit if limit > 0 => (limit as usize).min(LIST_LIMIT),
-        _ => LIST_LIMIT,
-    };
-    let scoped = blob_key(bucket_name, &request.prefix);
-    // R2 resumes from the cursor when it has one and ignores
-    // `startAfter`, which is the same knob for a first page.
-    let after = request
-        .cursor
-        .filter(|cursor| !cursor.is_empty())
-        .or(request.start_after)
-        .filter(|after| !after.is_empty())
-        .map(|after| blob_key(bucket_name, &after));
-    let page = store
-        .list_page(
-            &scoped,
-            after.as_deref(),
-            limit,
-            request.delimiter.as_deref(),
-        )
-        .await
-        .map_err(|error| error.to_string())?;
-    // The binding's key space is the caller's: strip the reserved
-    // prefix back off, so a listed key is one the caller can `get`.
+    let scoped = ScopedList::parse(bucket_name, request_json)?;
+    let page = scoped.walk().await?;
     let strip = blob_key(bucket_name, "");
-    let unscope = |key: &str| key.strip_prefix(&strip).unwrap_or(key).to_string();
+    let unscope = |key: &str| unscope_key(&strip, key);
     // A listing carries no metadata on any object store; `include` is
     // R2 saying it is worth one head per object to have it, and those
     // heads go out together rather than one after another.
-    let objects = match request.include {
+    let store = scoped.store;
+    let objects = match scoped.include {
         false => page
             .objects
             .iter()
@@ -517,12 +672,62 @@ pub(crate) async fn list(
             objects
         }
     };
+    let bound = scoped.out_bound.as_deref();
     Ok(serde_json::json!({
         "objects": objects,
         "prefixes": page.prefixes.iter().map(|prefix| unscope(prefix)).collect::<Vec<_>>(),
         "truncated": page.truncated,
-        "cursor": page.cursor.as_deref().map(unscope),
+        "cursor": page.cursor.as_deref().map(|last| wrap_cursor(&strip, bound, last)),
     }))
+}
+
+/// One listing page with its rows in walk order, in the caller's key
+/// space. `celld r2 list` prints these rows and resumes past the last
+/// printed one, so it needs the order and the per-prefix continuations
+/// the binding's JSON shape does not carry. Same request, same scoping,
+/// same walk as [`list`]; only the projection differs.
+pub(crate) async fn list_entries(
+    bucket_name: &str,
+    request_json: &str,
+) -> Result<BlobPage, String> {
+    let scoped = ScopedList::parse(bucket_name, request_json)?;
+    let page = scoped.walk().await?;
+    let strip = blob_key(bucket_name, "");
+    let unscope = |key: &str| unscope_key(&strip, key);
+    let bound = scoped.out_bound.as_deref();
+    Ok(BlobPage {
+        objects: page
+            .objects
+            .into_iter()
+            .map(|mut entry| {
+                entry.key = unscope(&entry.key);
+                entry
+            })
+            .collect(),
+        prefixes: page.prefixes.iter().map(|prefix| unscope(prefix)).collect(),
+        entries: page
+            .entries
+            .into_iter()
+            .map(|row| match row {
+                BlobRow::Object { mut entry, cursor } => {
+                    entry.key = unscope(&entry.key);
+                    BlobRow::Object {
+                        entry,
+                        cursor: wrap_cursor(&strip, bound, &cursor),
+                    }
+                }
+                BlobRow::Prefix(prefix) => BlobRow::Prefix(BlobPrefix {
+                    prefix: unscope(&prefix.prefix),
+                    cursor: wrap_cursor(&strip, bound, &prefix.cursor),
+                }),
+            })
+            .collect(),
+        truncated: page.truncated,
+        cursor: page
+            .cursor
+            .as_deref()
+            .map(|last| wrap_cursor(&strip, bound, last)),
+    })
 }
 
 /// Write `body` under `key`, honoring the request's conditions and
@@ -747,4 +952,200 @@ static PUTS: OnceLock<Open<PutStream>> = OnceLock::new();
 
 pub(crate) fn puts() -> &'static Open<PutStream> {
     PUTS.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::Value;
+
+    static STORE: OnceLock<()> = OnceLock::new();
+
+    /// The bindings' store, installed once: unit tests share one process,
+    /// so they share one store and isolate by bucket name.
+    fn install_store() {
+        STORE.get_or_init(|| {
+            crate::host_channels::set_r2_store(crate::bucket::Bucket::for_test());
+        });
+    }
+
+    async fn put(bucket: &str, key: &str, content_type: Option<&str>) {
+        install_store();
+        let request: PutRequest =
+            serde_json::from_value(serde_json::json!({"http": {"contentType": content_type}}))
+                .expect("parse the put options");
+        let answer = put_once(
+            bucket.to_string(),
+            key.to_string(),
+            b"body".to_vec(),
+            request,
+        )
+        .await
+        .expect("put the test object");
+        let answer: Value = serde_json::from_str(&answer).expect("parse the answer");
+        assert_eq!(answer.get("stored"), Some(&Value::Bool(true)));
+    }
+
+    /// `include` fetches the record one head per object: with it the page
+    /// carries `httpMetadata`, without it the map is empty.
+    #[tokio::test]
+    async fn list_returns_http_metadata_when_included() {
+        put("httpmeta", "photos/sun.png", Some("image/png")).await;
+        put("httpmeta", "notes.txt", None).await;
+        let page = list("httpmeta", &list_request("", None, None, 100, None, true))
+            .await
+            .expect("list with include");
+        let objects = page
+            .get("objects")
+            .and_then(Value::as_array)
+            .expect("the listing carries objects");
+        assert_eq!(objects.len(), 2);
+        let sun = objects
+            .iter()
+            .find(|object| object.get("key").and_then(Value::as_str) == Some("photos/sun.png"))
+            .expect("the png is listed");
+        assert_eq!(
+            sun.pointer("/http/contentType").and_then(Value::as_str),
+            Some("image/png")
+        );
+        let page = list("httpmeta", &list_request("", None, None, 100, None, false))
+            .await
+            .expect("list without include");
+        for object in page
+            .get("objects")
+            .and_then(Value::as_array)
+            .expect("the listing carries objects")
+        {
+            assert_eq!(object.get("http"), Some(&serde_json::json!({})));
+        }
+    }
+
+    /// The CLI builds the request the binding builds: this is the
+    /// harness's normalization in `__makeR2Bucket.list`, transcribed by
+    /// hand, and the two must stay one shape over one bucket.
+    #[tokio::test]
+    async fn cli_builds_the_binding_request() {
+        put("parity", "a/1", None).await;
+        put("parity", "top.txt", Some("text/plain")).await;
+        // `__makeR2Bucket.list({ delimiter: "/", include: ["httpMetadata"] })`.
+        let binding = r#"{"prefix":"","cursor":null,"startAfter":null,"limit":0,"delimiter":"/","include":true}"#;
+        let cli = list_request("", None, None, 0, Some("/"), true);
+        assert_eq!(
+            serde_json::from_str::<Value>(&cli).expect("parse the CLI request"),
+            serde_json::from_str::<Value>(binding).expect("parse the binding request"),
+        );
+        let from_binding = list("parity", binding).await.expect("list as the binding");
+        let from_cli = list("parity", &cli).await.expect("list as the CLI");
+        assert_eq!(from_binding, from_cli);
+        let objects = from_cli
+            .get("objects")
+            .and_then(Value::as_array)
+            .expect("the listing carries objects");
+        assert_eq!(objects.len(), 1);
+        assert_eq!(
+            objects[0].get("key").and_then(Value::as_str),
+            Some("top.txt")
+        );
+        assert_eq!(
+            objects[0]
+                .pointer("/http/contentType")
+                .and_then(Value::as_str),
+            Some("text/plain")
+        );
+        assert_eq!(from_cli.get("prefixes"), Some(&serde_json::json!(["a/"])));
+    }
+
+    /// A cursor token round-trips its position and bound, even when both
+    /// look adversarial: magic-looking keys, unicode, and empty positions
+    /// all survive the wrap. A plain key stays an offset with no bound.
+    #[test]
+    fn cursor_tokens_round_trip() {
+        for (pos, bound) in [
+            ("a/1", "a"),
+            ("a~", "aa"),
+            ("celld-r2-cursor-v1.plain", ""),
+            ("é/x", "p~/"),
+            ("", "m"),
+        ] {
+            let token = encode_cursor(pos, Some(bound));
+            assert!(token.starts_with(CURSOR_FAMILY));
+            assert_eq!(
+                decode_cursor(&token).expect("a written token parses"),
+                (pos.to_string(), Some(bound.to_string()))
+            );
+        }
+        assert_eq!(decode_cursor("a/2"), Ok(("a/2".to_string(), None)));
+    }
+
+    /// An unseeded walk answers a plain key, except one that starts like a
+    /// token: that one is wrapped without a bound, so a planted key named
+    /// like a cursor still resumes after itself instead of failing.
+    #[test]
+    fn keys_named_like_tokens_resume() {
+        let strip = blob_key("b", "");
+        let plain = wrap_cursor(&strip, None, &format!("{strip}a/1"));
+        assert_eq!(plain, "a/1");
+        let planted = format!("{CURSOR_FAMILY}x");
+        let cursor = wrap_cursor(&strip, None, &format!("{strip}{planted}"));
+        assert_ne!(cursor, planted);
+        assert_eq!(decode_cursor(&cursor), Ok((planted, None)));
+    }
+
+    /// Anything in the token family must parse: a corrupt token fails
+    /// loudly instead of resuming somewhere surprising.
+    #[test]
+    fn corrupt_cursors_fail_loudly() {
+        assert!(decode_cursor("celld-r2-cursor-v1.not-base64!!!").is_err());
+        assert!(decode_cursor("celld-r2-cursor-v1.aGk").is_err());
+        assert!(decode_cursor("celld-r2-cursor-v9.whatever").is_err());
+    }
+
+    /// A token beside a `startAfter` keeps its own bound: R2 ignores
+    /// `startAfter` beside a cursor, and so does the token.
+    #[tokio::test]
+    async fn token_keeps_its_bound_beside_start_after() {
+        for key in ["a", "b", "c", "d"] {
+            put("tokenbound", key, None).await;
+        }
+        let page = list(
+            "tokenbound",
+            &list_request("", None, Some("a"), 1, None, false),
+        )
+        .await
+        .expect("list the first page");
+        let objects = page
+            .get("objects")
+            .and_then(Value::as_array)
+            .expect("the page carries objects");
+        assert_eq!(objects.len(), 1);
+        assert_eq!(objects[0].get("key").and_then(Value::as_str), Some("b"));
+        let token = page
+            .get("cursor")
+            .and_then(Value::as_str)
+            .expect("a truncated page names its cursor");
+        assert!(token.starts_with(CURSOR_FAMILY));
+        // A narrowing companion bound is ignored: the token answers what
+        // it answers alone, and the walk stays past the seed.
+        let with = list(
+            "tokenbound",
+            &list_request("", Some(token), Some("c"), 10, None, false),
+        )
+        .await
+        .expect("list with the token");
+        let without = list(
+            "tokenbound",
+            &list_request("", Some(token), None, 10, None, false),
+        )
+        .await
+        .expect("list with the token");
+        assert_eq!(with, without);
+        let keys: Vec<&str> = with
+            .get("objects")
+            .and_then(Value::as_array)
+            .expect("the page carries objects")
+            .iter()
+            .filter_map(|object| object.get("key").and_then(Value::as_str))
+            .collect();
+        assert_eq!(keys, ["c", "d"]);
+    }
 }
