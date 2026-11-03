@@ -2374,7 +2374,13 @@ class ContainerExecProcess {
   }
   get exitCode() {
     if (this._exitCode === null) {
-      this._exitCode = __container_exec_wait(this.#id).then(Number);
+      // Retained across native-event retirements: the backing wait is
+      // unrefed (it dies with its subscribing event), so the stable
+      // promise re-subscribes in each later event instead of hanging
+      // on the first event's dropped op.
+      const id = this.#id;
+      this._exitCode =
+        __retainedWait(() => __container_exec_wait(id).then(Number));
     }
     return this._exitCode;
   }
@@ -2965,6 +2971,7 @@ const __currentActorEvent = () => {
 const __currentActorScope = () => __currentActorEvent()?.scope ?? "";
 const __beginActorEvent = (scope) => {
   __rpcSignalRefresh();
+  __refreshRetainedWaits();
   const event = { scope, context: String(__io_context_id()) };
   __actorEventStack.push(event);
   return event;
@@ -4612,6 +4619,74 @@ const __rpcSignalRefresh = () => {
       __rpcSignalReceivers.delete(id);
     else
       __rpcSignalReceivers.set(id, live);
+  }
+};
+// ---- retained waits --------------------------------------------
+// A stable promise across native-event retirements for a value a
+// host-side waiter produces (a container exec's exit code). The backing
+// subscription is unrefed: it belongs to the subscribing event and
+// dies with it, so a promise held across events needs a fresh
+// subscription in each later event -- the same rule retained RPC
+// signals follow above. A waiter that kept its first subscription
+// would hang every later await: the op's resolver is purged with its
+// event and the promise never settles. Each refresh subscribes at
+// most once per native event; the first settlement wins and
+// unregisters, and a collected promise unregisters through the
+// finalizer, so an un-awaited waiter retains only its record.
+const __retainedWaits = new Map();
+let __nextRetainedWaitId = 1;
+const __retainedWaitFinalizer = new FinalizationRegistry((record) => {
+  if (__retainedWaits.get(record.id) === record)
+    __retainedWaits.delete(record.id);
+});
+const __settleRetainedWait = (record, ok, value) => {
+  if (record.settled) return;
+  record.settled = true;
+  if (__retainedWaits.get(record.id) === record)
+    __retainedWaits.delete(record.id);
+  __retainedWaitFinalizer.unregister(record);
+  if (ok) record.resolve(value);
+  else record.reject(value);
+};
+const __subscribeRetainedWait = (record) => {
+  let sub;
+  try {
+    sub = record.subscribe();
+  } catch (error) {
+    __settleRetainedWait(record, false, error);
+    return;
+  }
+  sub.then(
+    (value) => __settleRetainedWait(record, true, value),
+    (error) => __settleRetainedWait(record, false, error),
+  );
+};
+// `subscribe` issues one backing wait for the current event and answers
+// its promise. Subscribes eagerly: the creating event is live, so an
+// await in the same event resolves through its own subscription.
+const __retainedWait = (subscribe) => {
+  const record = {
+    id: __nextRetainedWaitId++,
+    subscribe,
+    settled: false,
+    ctx: String(__io_context_id()),
+  };
+  const promise = new Promise((resolve, reject) => {
+    record.resolve = resolve;
+    record.reject = reject;
+  });
+  __retainedWaits.set(record.id, record);
+  __retainedWaitFinalizer.register(promise, record, record);
+  __subscribeRetainedWait(record);
+  return promise;
+};
+const __refreshRetainedWaits = () => {
+  if (__retainedWaits.size === 0) return;
+  const ctx = String(__io_context_id());
+  for (const record of __retainedWaits.values()) {
+    if (record.settled || record.ctx === ctx) continue;
+    record.ctx = ctx;
+    __subscribeRetainedWait(record);
   }
 };
 // Replace stub-able values with wire markers. Runs only after a
@@ -6354,6 +6429,18 @@ __celld.__stubStats = () => {
 };
 if (__test_stub_stats_enabled())
   globalThis.__celldStubStatsForTestOnly = __celld.__stubStats;
+// Test-only retained waits: `makeWait` holds one native unrefed wait
+// across native-event retirements (standing in for a container exec
+// wait, which needs an engine the test environment has not got), and
+// `fire` resolves it. Defined only on nodes booted with
+// CELLD_TEST_WAIT=1 (the cross-event wait conformance suite).
+if (__test_wait_enabled())
+  globalThis.__celldTestWaitForTestOnly = {
+    makeWait(id) {
+      return { promise: __retainedWait(() => __testwait_await(id)), id };
+    },
+    fire(id, value) { __testwait_fire(id, value); },
+  };
 const __entrypointClass = (name) => {
   const cls = __cell.entrypoints[name];
   if (typeof cls !== "function") {
@@ -12011,6 +12098,7 @@ const __entrypointContext = (props = __defaultProps) => ({
 });
 const __beginEvent = __celld.__beginEvent = (props = __defaultProps) => {
   __rpcSignalRefresh();
+  __refreshRetainedWaits();
   __event_begin();
   return __entrypointContext(props);
 };
