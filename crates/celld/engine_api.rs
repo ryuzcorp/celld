@@ -1,4 +1,5 @@
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
+// Modified by ryuzcorp (ryuzcorp/celld): D1 export operator-ingress marker.
 
 //! Engine-neutral types and helpers that the cell runtimes and the host
 //! share. Nothing here touches V8; `crate::js`, `crate::runtime` and
@@ -742,6 +743,10 @@ pub struct RuntimeFetch {
     /// The dispatching Worker's trace context, so the cell's span joins
     /// the caller's trace instead of rooting a disconnected one.
     pub parent: Option<crate::telemetry::TraceContext>,
+    /// Whether the call entered over the authenticated operator route.
+    /// Set by the host at ingress, carried across the owner-forwarding
+    /// hop, and handed to the isolate with the request.
+    pub operator_ingress: bool,
 }
 
 /// What a Durable Object RPC method returned, plus the position its writes

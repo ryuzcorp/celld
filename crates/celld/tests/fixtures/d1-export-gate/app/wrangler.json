@@ -1,0 +1,7 @@
+{
+  "name": "d1-export-gate",
+  "main": "worker.js",
+  "compatibility_date": "2026-02-12",
+  "no_bundle": true,
+  "d1_databases": [{ "binding": "DB", "database_name": "gate-db" }]
+}

@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): cross-isolate RPC stubs and streams; operator token for the internal listener.
+// Modified by ryuzcorp (ryuzcorp/celld): cross-isolate RPC stubs and streams; operator token for the internal listener; D1 export operator-ingress marker.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 // The binary contains connection, startup, shutdown, and V8 shell code. The
@@ -796,6 +796,7 @@ async fn arm_cron_schedule(app: AppHandle, cell: String) -> anyhow::Result<()> {
             reply,
             order: None,
             parent: None,
+            operator_ingress: false,
         },
     )
     .await;
@@ -1217,6 +1218,7 @@ async fn dispatch_do_call(app: AppHandle, call: DoCallReq) {
                         name: name.clone(),
                         request_id,
                         capacity_handoff: epoch == 0,
+                        operator_ingress: call.operator_ingress,
                     };
                     let attempt_body = match body {
                         celld::js::RequestBody::Bytes(bytes) => {
@@ -2218,6 +2220,7 @@ fn request_url(parts: &hyper::http::request::Parts, trust_forwarded_headers: boo
 /// the cancellation channel, so a client that hangs up reaches the owner
 /// rather than only the node it connected to. `/do/` and `/runtime/` share this:
 /// they differ in what they authenticate, not in how they reach a cell.
+#[allow(clippy::too_many_arguments)]
 async fn dispatch_cell_fetch(
     app: &AppHandle,
     cell: String,
@@ -2226,6 +2229,7 @@ async fn dispatch_cell_fetch(
     method: String,
     body: celld::js::RequestBody,
     headers: Vec<(String, String)>,
+    operator_ingress: bool,
 ) -> HttpReply {
     let preserve_representation_length = method.eq_ignore_ascii_case("HEAD");
     let (reply, receive) = oneshot::channel();
@@ -2250,6 +2254,9 @@ async fn dispatch_cell_fetch(
         // Cross-node trace propagation is not available here, so a direct-DO
         // ingress starts without a remote parent.
         parent: None,
+        // Set by the route that received the call: true only on the
+        // authenticated `/runtime/` path below.
+        operator_ingress,
     });
     if !accepted {
         return response(
@@ -2291,6 +2298,7 @@ pub(crate) struct ForwardedFetch {
     pub(crate) headers: Vec<(String, String)>,
     pub(crate) request_id: Option<celld::js::RequestId>,
     pub(crate) capacity_handoff: bool,
+    pub(crate) operator_ingress: bool,
 }
 
 pub(crate) enum ForwardedFetchOutcome {
@@ -2317,6 +2325,7 @@ pub(crate) async fn dispatch_forwarded_fetch(
         headers,
         request_id,
         capacity_handoff,
+        operator_ingress,
     } = fetch;
     let _request_body_guard = celld::js::RequestBodyGuard::of(&request_body);
     let preserve_representation_length = method.eq_ignore_ascii_case("HEAD");
@@ -2369,6 +2378,7 @@ pub(crate) async fn dispatch_forwarded_fetch(
                                 // peer protocol does not carry trace context.
                                 order: None,
                                 parent: None,
+                                operator_ingress,
                             },
                             None,
                         )
@@ -2826,6 +2836,7 @@ async fn dispatch_queue_batch(app: AppHandle, call: QueueDispatchReq) {
             reply,
             order: None,
             parent: None,
+            operator_ingress: false,
         },
     )
     .await;
@@ -3295,6 +3306,8 @@ async fn handle_internal(
             // A Queue needs its name before its constructor chooses a
             // consumer. The runtime also proves that this name hashes to the
             // requested scope before it exposes the identity to JavaScript.
+            // The fleet HMAC above already passed, so this call carries the
+            // operator-ingress marker its cell's operator branches demand.
             dispatch_cell_fetch(
                 &app,
                 scope,
@@ -3303,6 +3316,7 @@ async fn handle_internal(
                 "POST".to_string(),
                 celld::js::RequestBody::Bytes(body),
                 vec![("content-type".to_string(), "application/json".to_string())],
+                true,
             )
             .await
         }
@@ -3346,7 +3360,7 @@ async fn handle_internal(
                 Ok(payload) => payload,
                 Err(response) => return Ok(*response),
             };
-            dispatch_cell_fetch(&app, cell, None, url, method, body, headers).await
+            dispatch_cell_fetch(&app, cell, None, url, method, body, headers, false).await
         }
         _ if cell_scope.is_some() => {
             let cell = cell_scope.expect("checked prefix");

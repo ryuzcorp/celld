@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): cross-isolate RPC stubs and streams.
+// Modified by ryuzcorp (ryuzcorp/celld): cross-isolate RPC stubs and streams; D1 export operator-ingress marker.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 // RuntimeManager is the V8 cell-host arm, so its executor and observability
@@ -960,6 +960,8 @@ impl RuntimeManager {
             // traceparent is honored by the drive, from the headers.
             order: _,
             parent: _,
+            // A Worker entrypoint never serves an operator protocol.
+            operator_ingress: _,
         } = request;
         let request_id = request_id.context("resident Worker fetch requires a request id")?;
         let isolate = self
@@ -1553,6 +1555,7 @@ impl RuntimeManager {
             request_id,
             order,
             parent,
+            operator_ingress,
         } = request;
         let admitted = match self.admit_cell_request(&cell)? {
             Some(admitted) => admitted,
@@ -1586,6 +1589,7 @@ impl RuntimeManager {
             headers,
             reply,
             order,
+            operator_ingress,
         };
         let cancellation = if let Some(request_id) = request_id {
             let mut requests = self
