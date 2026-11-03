@@ -123,17 +123,23 @@ impl TestNode {
             let _ = stderr.read_to_end(&mut sink);
         });
         let public = format!("127.0.0.1:{port}");
+        // The kill-on-drop guard exists before the readiness poll, so a
+        // boot timeout or an early child exit cannot leak the server.
+        let mut node = Self {
+            child,
+            public: public.clone(),
+        };
         // Readiness is the public port answering with the app loaded.
         poll_until("boot", Duration::from_secs(120), || {
             if !probe(&public, "/health") {
                 return None;
             }
-            if let Some(status) = child.try_wait().expect("poll child") {
+            if let Some(status) = node.child.try_wait().expect("poll child") {
                 panic!("celld dev exited during boot: {status}");
             }
             Some(public.clone())
         });
-        Self { child, public }
+        node
     }
 }
 
