@@ -1,4 +1,4 @@
-<!-- Modified by ryuzcorp (ryuzcorp/celld): CELLD_MEMORY_SCOPE; deploy --sourcemap writes the bundle's external map. -->
+<!-- Modified by ryuzcorp (ryuzcorp/celld): CELLD_MEMORY_SCOPE; deploy --sourcemap writes the bundle's external map; operator token for the internal listener. -->
 # celld
 
 celld is a stateful distributed system. It runs server-side JavaScript on
@@ -391,10 +391,11 @@ Start each node with the same bucket settings and its own reachable
 bucket; there is no join command.
 
 Peer traffic has no TLS and cell fetch and RPC traffic is not signed, and
-the internal listener has an unauthenticated operator API. Put the
-advertised addresses on a trusted private network or an encrypted overlay
-such as WireGuard or Tailscale, and never expose the internal listener to
-the internet. See [security](security.md).
+without `CELLD_OPERATOR_TOKEN` the internal listener has an
+unauthenticated operator API. Put the advertised addresses on a trusted
+private network or an encrypted overlay such as WireGuard or Tailscale,
+and never expose the internal listener to the internet. See
+[security](security.md).
 
 The node that receives a request activates a new cell, so a load balancer
 must include a new node in its rotation. A node at its residency cap or
@@ -653,6 +654,7 @@ unset variable selects its default. A Boolean variable accepts only `0` or
 | `CELLD_INTERNAL_ADDR` | The peer and operator listener. The same as `--internal-listen` |
 | `CELLD_ADVERTISE` | The internal address that peers can reach. The same as `--advertise` |
 | `CELLD_UNSAFE_PUBLIC_ADVERTISE` | Set to `1` to permit a literal public IP in `CELLD_ADVERTISE`. It does not resolve a DNS name or restrict the internal listener |
+| `CELLD_OPERATOR_TOKEN` | A bearer token the whole fleet shares. When set, every internal-listener route requires `Authorization: Bearer <token>` (compared in constant time) and answers 401 without it; `celld d1`, `celld kv`, `celld queue`, and `celld diagnose` read it from the environment and send it. Unset: the internal listener stays open. Set but empty: the node refuses to start. See [security](security.md) |
 | `CELLD_NODE` | An explicit node-session ID: 1 to 128 ASCII letters, numbers, dots, dashes, or underscores, but not `.` or `..` |
 | `CELLD_WATCH` | The local work directory for SQLite and replication |
 | `CELLD_ESBUILD` | The path of the esbuild executable |

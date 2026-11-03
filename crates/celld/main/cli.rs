@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): CELLD_MEMORY_SCOPE help.
+// Modified by ryuzcorp (ryuzcorp/celld): CELLD_MEMORY_SCOPE help; operator token for the internal listener.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! The command line: what the process was asked to do, and the help text
@@ -332,6 +332,9 @@ ENVIRONMENT:
   CELLD_UNSAFE_PUBLIC_ADVERTISE   `1` permits a literal public IP in
                                   CELLD_ADVERTISE; it does not resolve hostnames
                                   or restrict CELLD_INTERNAL_ADDR
+  CELLD_OPERATOR_TOKEN            Bearer token for every internal-listener
+                                  route; unset leaves the listener open, empty
+                                  refuses to start
   CELLD_TRUST_FORWARDED_HEADERS   `1` trusts X-Forwarded-Host and
                                   X-Forwarded-Proto
   CELLD_NODE                      Node-session ID (default: generated)

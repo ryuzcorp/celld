@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): cross-isolate RPC stubs and streams.
+// Modified by ryuzcorp (ryuzcorp/celld): cross-isolate RPC stubs and streams; operator token for the internal listener.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! The serial lifecycle executor and its shell-side request drivers.
@@ -1344,6 +1344,10 @@ pub struct AppHandle {
     /// generation. This is the same operation deadline that bounds the
     /// decision core, so a shell retry cannot outlive its core operation.
     pub operation_deadline_ms: u64,
+    /// The fleet's operator token, when `CELLD_OPERATOR_TOKEN` is set. The
+    /// internal listener's gate compares it in constant time; `None` is
+    /// today's open listener. Cloned per connection, never logged.
+    pub operator_token: Option<crate::operator_token::OperatorToken>,
 }
 
 impl AppHandle {
@@ -2238,6 +2242,7 @@ async fn request_peer_handoff(
         &body,
         &peer.node,
     )?;
+    let outbound = crate::operator_token::authenticate(outbound)?;
     let request = outbound.body(body).build()?;
     // Keep response decoding after transport selection so a test transport
     // cannot bypass the donor contract with an invented typed acceptance.

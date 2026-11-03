@@ -1,3 +1,4 @@
+// Modified by ryuzcorp (ryuzcorp/celld): operator token for the internal listener.
 // Copyright 2026 Deno Land Inc. All rights reserved.
 
 //! The peer tunnel: an upgraded stream per peer, plain HTTP inside.
@@ -368,11 +369,10 @@ async fn establish(peer: &Peer<'_>, kind: &'static str) -> anyhow::Result<Tunnel
             peer_auth::RESPONSE_VERSION_HEADER,
             peer_auth::PROTOCOL_VERSION_TEXT,
         );
-    let response = peer
+    let signed = peer
         .auth
-        .sign(request, "GET", "/peer/tunnel", b"", peer.node)?
-        .send()
-        .await?;
+        .sign(request, "GET", "/peer/tunnel", b"", peer.node)?;
+    let response = celld::operator_token::authenticate(signed)?.send().await?;
     peer_auth::validate_response(response.headers())?;
     if response
         .headers()
