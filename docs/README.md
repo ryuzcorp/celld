@@ -1,3 +1,4 @@
+<!-- Modified by ryuzcorp (ryuzcorp/celld): CELLD_MEMORY_SCOPE. -->
 # celld
 
 celld is a stateful distributed system. It runs server-side JavaScript on
@@ -663,6 +664,7 @@ unset variable selects its default. A Boolean variable accepts only `0` or
 | `CELLD_PLACEMENT_WEIGHT` | The ownership share of this node, relative to the other nodes (default: the CPU count) |
 | `CELLD_REBALANCE_INTERVAL_MS` | The fleet sample interval and maximum age (default: 5000; 0 disables balancing) |
 | `CELLD_MAX_RSS_MB` | The memory threshold for pressure shedding, on the greater of the allocator-adjusted RSS and the active cgroup working set (default: 80% of the available memory; 0 disables the threshold and the absolute cap) |
+| `CELLD_MEMORY_SCOPE` | Which cgroup the pressure sample and limit read: `container` (default) measures the cgroupfs root, `self` the process's own cgroup v2 leaf, falling back to the root with a warning on cgroup v1 or where the leaf is unreadable. With `self` and an unset `CELLD_MAX_RSS_MB`, the threshold defaults to 80% of the leaf's `memory.max` |
 | `CELLD_DURABILITY` | `fleet` (default): the node sends each write to one or two other nodes and answers when they hold it on disk or the bucket upload finishes. A single node has no peer, so every write waits for the bucket. `bucket`: always wait for the bucket |
 | `CELLD_LOG_PIPELINE` | Fleet log rounds in flight (default: 4) |
 | `CELLD_LOG_HEDGE_MS` | The wait before a second copy of a slow log append. The default is adaptive: 4 times the slowest recent append, at least 250 ms. `0` disables the copy |

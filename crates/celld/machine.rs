@@ -1,3 +1,4 @@
+// Modified by ryuzcorp (ryuzcorp/celld): validate CELLD_MEMORY_SCOPE.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! What the process can learn about where it is running.
@@ -116,7 +117,8 @@ pub fn ownership_on_evict_from_environment() -> anyhow::Result<OwnershipOnEvict>
 }
 
 /// Total memory this process may use: the cgroup limit when one applies
-/// (containers), the machine otherwise.
+/// (containers; the process leaf's under `CELLD_MEMORY_SCOPE=self`), the
+/// machine otherwise.
 #[cfg(target_os = "linux")]
 #[allow(clippy::disallowed_methods)] // cgroup and `/proc` files describe the host.
 fn total_memory_bytes() -> Option<u64> {
@@ -161,6 +163,10 @@ pub fn pressure_config_from_environment() -> anyhow::Result<celld_logic::pressur
     // Memory shedding is on by default: a node that runs into its memory ceiling
     // must give cells back, not be killed. The arithmetic lives in the core;
     // the shell supplies only the two facts it can read.
+    // Reject a misspelled memory scope here too: startup validation runs
+    // first, but the config build must not depend on that ordering, and the
+    // sampler itself can only warn and measure the container.
+    crate::memory::MemoryScope::from_environment()?;
     let config = celld_logic::pressure::PressureConfig::from_limits(
         total_memory_bytes(),
         crate::env_vars::optional::<u64>("CELLD_MAX_RSS_MB")?,

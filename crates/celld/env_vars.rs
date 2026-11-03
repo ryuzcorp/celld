@@ -1,3 +1,4 @@
+// Modified by ryuzcorp (ryuzcorp/celld): validate CELLD_MEMORY_SCOPE.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! Strict runtime environment parsing.
@@ -312,6 +313,11 @@ pub fn validate() -> anyhow::Result<()> {
     if let Some(value) = value("CELLD_PRESSURE_OWNERSHIP")? {
         if !matches!(value.as_str(), "release" | "sticky") {
             bail!("CELLD_PRESSURE_OWNERSHIP must be release or sticky, not {value:?}");
+        }
+    }
+    if let Some(value) = value("CELLD_MEMORY_SCOPE")? {
+        if !matches!(value.as_str(), "container" | "self") {
+            bail!("CELLD_MEMORY_SCOPE must be container or self, not {value:?}");
         }
     }
     if let Some(node) = value("CELLD_NODE")? {
