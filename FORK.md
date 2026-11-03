@@ -9,7 +9,7 @@ README below is kept intact; this file documents the fork.
 
 - `main` mirrors upstream `main` and carries no patches.
 - `ryuzcorp/v<version>` is a line branch: the upstream tag `v<version>`
-  plus our patches as commits, one commit per patch, in `0001`-`0017`
+  plus our patches as commits, one commit per patch, in `0001`-`0018`
   order. Each patch commit is self-contained and carries its own tests.
 
 Upstream's `.github/workflows/release.yml` targets `ghcr.io/denoland` and
@@ -230,7 +230,7 @@ push to `ghcr.io/denoland`, but still. Pushing a branch named
   re-subscription and the lease slot turns a late pile-up aside, so
   bytes arrive exactly once. Test-only in-memory exec processes
   stand in for the daemon where no engine exists.
-- `0017` (sha TBD at merge) `celld r2 list` takes `--delimiter` and,
+- `0017` (`9aae151`) `celld r2 list` takes `--delimiter` and,
   with `--page`, prints one page — decoded keys with `httpMetadata`
   and `customMetadata`, plus `delimitedPrefixes`, `truncated` and
   `cursor` — through the same listing the R2 binding calls; a truncated
@@ -238,6 +238,15 @@ push to `ghcr.io/denoland`, but still. Pushing a branch named
   decoded keys in UTF-8 byte order while the store walks the encoded
   form, so continuing by `--after` can omit keys. `--json` keeps
   upstream's one-record-per-line output.
+- `0018` (sha TBD at merge) per-node Workers Cache API: `caches.default` and
+  `caches.open(name)` over a process-local store keyed by the script name
+  the host read from isolate state, so all isolates of a script on the
+  node share entries and no script can name another's. Cloudflare
+  freshness (`s-maxage`/`max-age`/`Expires`, edge-TTL defaults),
+  `no-store`/`private`/`Set-Cookie` never cached, `Vary` ignored,
+  conditional and range answers, `CF-Cache-Status: HIT` on hits,
+  `CELLD_CACHE_MAX_BYTES` cap (64 MiB default) with LRU eviction.
+  Release note: default 64 MiB per node of new memory; set CELLD_CACHE_MAX_BYTES=0 to disable.
 
 ## Releases
 

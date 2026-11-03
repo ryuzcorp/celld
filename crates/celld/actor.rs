@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): cross-isolate RPC stubs and streams; operator token for the internal listener.
+// Modified by ryuzcorp (ryuzcorp/celld): cross-isolate RPC stubs and streams; operator token for the internal listener; Workers Cache pressure shedding.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! The serial lifecycle executor and its shell-side request drivers.
@@ -2692,6 +2692,12 @@ impl Actor {
         // `memory.current` crossed the absolute cap.
         let reason = self.state.shed_reason();
         if reason != self.logged_shed_reason {
+            // Best-effort bytes go before billable cells: entering
+            // pressure drops the Workers cache instead of shedding
+            // cells to hold it.
+            if reason.is_some() && self.logged_shed_reason.is_none() {
+                crate::worker_cache::shed_cache();
+            }
             self.logged_shed_reason = reason;
             // How many V8 heaps the resident cells hold open. Most of
             // what a cell costs is its heap, and a heap comes back

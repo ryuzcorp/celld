@@ -1,4 +1,4 @@
-<!-- Modified by ryuzcorp (ryuzcorp/celld): CELLD_MEMORY_SCOPE; deploy --sourcemap writes the bundle's external map; operator token for the internal listener; r2 list --delimiter, the --page shape, and --cursor continuation. -->
+<!-- Modified by ryuzcorp (ryuzcorp/celld): CELLD_MEMORY_SCOPE; deploy --sourcemap writes the bundle's external map; operator token for the internal listener; r2 list --delimiter, the --page shape, and --cursor continuation; Workers Cache API page. -->
 # celld
 
 celld is a stateful distributed system. It runs server-side JavaScript on
@@ -129,6 +129,7 @@ Each service page contains a runnable example and the known differences from
 the Cloudflare service.
 
 - [Workers](services/workers.md)
+- [Cache](services/cache.md)
 - [Durable Objects / Cells](services/durable-objects.md)
 - [Durable Object Facets](services/durable-object-facets.md)
 - [KV](services/kv.md)

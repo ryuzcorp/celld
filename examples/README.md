@@ -1,9 +1,11 @@
+<!-- Modified by ryuzcorp (ryuzcorp/celld): Workers Cache API example. -->
 # Examples
 
 These small Wrangler projects demonstrate the Workers platform that `celld`
 supports, one service or API at a time:
 
 - `hello/` — a stateless Worker `fetch` handler
+- `cache/` — a response cached for a minute with the Cache API
 - `webapi/` — common Web Platform APIs
 - `static-assets/` — an asset-only website with headers and redirects
 - `counter/` — a SQLite-backed Durable Object
