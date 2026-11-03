@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): cross-isolate RPC stubs and streams; operator token for the internal listener; per-node Workers Cache API.
+// Modified by ryuzcorp (ryuzcorp/celld): cross-isolate RPC stubs and streams; operator token for the internal listener; per-node Workers Cache API; tenant egress policy.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 #![warn(clippy::disallowed_methods, clippy::disallowed_types)]
@@ -55,6 +55,7 @@ pub mod deploy;
 pub mod dev;
 pub mod docker;
 pub mod drain_token;
+pub mod egress;
 pub mod engine_api;
 pub mod env_vars;
 #[cfg(celld_internal_tests)]

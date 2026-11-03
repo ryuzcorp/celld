@@ -1,4 +1,4 @@
-<!-- Modified by ryuzcorp (ryuzcorp/celld): operator token for the internal listener. -->
+<!-- Modified by ryuzcorp (ryuzcorp/celld): operator token for the internal listener; tenant egress policy. -->
 # Security
 
 celld v0.6.3 is a beta release. It is not safe for hostile multi-tenant use.
@@ -179,6 +179,56 @@ the limit.
 
 For a method other than `GET` or `HEAD`, `/do/<ID>` streams a body of unknown
 length or of at least 1 MiB. It collects a smaller body before dispatch.
+
+## Restrict Worker egress
+
+By default (`CELLD_EGRESS=open`) Worker code may dial any address with
+`fetch()`, `connect()` sockets, and outbound WebSockets.
+`CELLD_EGRESS=public` refuses dials to every non-public address:
+loopback, private (RFC 1918), link-local, carrier-grade NAT (RFC 6598),
+IPv6 unique-local, unspecified, multicast, reserved (`240.0.0.0/4`),
+the IPv4-mapped and transition-embedded (NAT64, 6to4, Teredo,
+IPv4-compatible) forms of those, and the cloud metadata address
+(`169.254.169.254`).
+
+`CELLD_EGRESS_ALLOW` lists exceptions as comma-separated CIDRs (any
+port) or `host:port` pairs (that host on that port only), for example
+an object store endpoint on a private address:
+
+```sh
+CELLD_EGRESS=public CELLD_EGRESS_ALLOW=10.89.0.7:9000,10.89.0.0/24
+```
+
+A hostname entry resolves on every check, so a moved endpoint is
+re-allowed without a restart. A `host:port` entry is port-scoped on
+every hop: the initial request and each redirect hop match the entry
+only on its port, against the hop's full URL. A redirect to a bare IP
+literal matches only IP, CIDR, and IP:port entries — never a hostname
+entry, which cannot be resolved in that path — so allowlist redirect
+targets in one of those forms. The node refuses to boot when either
+variable is invalid.
+
+Enforcement happens on the resolved address at connect time: hostnames
+are resolved and filtered before the dial, every address is judged, and
+redirects re-check on every hop, so DNS rebinding and redirects cannot
+bypass the policy. In `public` mode tenant clients never use a proxy
+(`HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` are ignored): through a proxy
+the target would resolve with the proxy's DNS and redirect hops would
+expose only the proxy's address, so a proxied fetch cannot be policed.
+celld's own traffic — the object store, peers, control, telemetry, and
+container-engine clients — never goes through these checks and keeps
+its proxy handling. Dials to container endpoints this node published
+via `getTcpPort()` are exempt, and that exemption is node-global: any
+Worker on the node may dial a published container endpoint by its
+address and port, the same reachability the nft gateway granted. A
+refused `fetch()` rejects with a `TypeError` whose message starts
+`fetch failed: egress policy refused ...`; a refused `connect()`
+rejects the socket's `opened`/`closed` promises, and a refused
+WebSocket fires `error` and closes with 1006, each naming the refused
+address and reason. Every refusal also logs an `egress_refused`
+warning with the target's scheme, host, and port, the refused address,
+and the reason — never the full URL, whose userinfo or query may carry
+secrets.
 
 ## Protect the fleet bucket
 

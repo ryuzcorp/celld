@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): validate CELLD_MEMORY_SCOPE; CELLD_CACHE_MAX_BYTES validation.
+// Modified by ryuzcorp (ryuzcorp/celld): validate CELLD_MEMORY_SCOPE; CELLD_CACHE_MAX_BYTES validation; tenant egress policy.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! Strict runtime environment parsing.
@@ -309,6 +309,13 @@ pub fn validate() -> anyhow::Result<()> {
         if !matches!(value.as_str(), "http" | "stream") {
             bail!("CELLD_LOG_TRANSPORT must be http or stream, not {value:?}");
         }
+    }
+
+    // The tenant egress policy refuses to boot on invalid values: an
+    // operator who misspells CELLD_EGRESS opted into a policy, and
+    // silently running open (or closed) would betray that intent.
+    if let Err(error) = crate::egress::EgressPolicy::from_env() {
+        bail!("{error}");
     }
 
     if let Some(value) = value("CELLD_PRESSURE_OWNERSHIP")? {

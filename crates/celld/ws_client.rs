@@ -1,3 +1,4 @@
+// Modified by ryuzcorp (ryuzcorp/celld): tenant egress policy.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 // The real peer WebSocket transport is outside the Actor execution domain.
@@ -36,6 +37,7 @@ use hyper::StatusCode;
 use hyper_util::rt::TokioIo;
 use sha1::Digest;
 use sha1::Sha1;
+use std::sync::Arc;
 use std::sync::OnceLock;
 use tokio::io::AsyncRead;
 use tokio::io::AsyncWrite;
@@ -106,9 +108,24 @@ fn accept_key(key: &str) -> String {
 
 /// Open a WebSocket to `url`, sending `extra` alongside the handshake headers.
 ///
+/// The tenant egress policy judges the resolved address before the dial.
 /// The caller owns the timeout: nothing here bounds how long a server may take
 /// to answer.
 pub async fn connect(url: &str, extra: HeaderMap) -> Result<Connection, Error> {
+    connect_with_policy(url, extra, Some(crate::egress::EgressPolicy::global())).await
+}
+
+/// Open a WebSocket for celld's own control traffic. Never subject to
+/// the tenant policy: the node must always reach its control plane.
+pub async fn connect_internal(url: &str, extra: HeaderMap) -> Result<Connection, Error> {
+    connect_with_policy(url, extra, None).await
+}
+
+async fn connect_with_policy(
+    url: &str,
+    extra: HeaderMap,
+    policy: Option<Arc<crate::egress::EgressPolicy>>,
+) -> Result<Connection, Error> {
     let url = url::Url::parse(url).context("parse WebSocket URL")?;
     // `fetch("http://…", { headers: { Upgrade: "websocket" } })` is the
     // Workers idiom for an outbound socket, and the only form a container
@@ -132,9 +149,23 @@ pub async fn connect(url: &str, extra: HeaderMap) -> Result<Connection, Error> {
         None => url.path().to_string(),
     };
 
-    let tcp = tokio::net::TcpStream::connect((host.as_str(), port))
-        .await
-        .with_context(|| format!("connect {authority}"))?;
+    let tcp = match policy.as_ref().filter(|policy| !policy.is_open()) {
+        None => tokio::net::TcpStream::connect((host.as_str(), port))
+            .await
+            .with_context(|| format!("connect {authority}"))?,
+        Some(policy) => match crate::egress::policed_tcp_connect(policy, &host, port).await {
+            Ok(stream) => stream,
+            Err(crate::egress::DialError::Refused(refusal)) => {
+                return Err(Error::Failed(anyhow::Error::new(refusal)));
+            }
+            Err(crate::egress::DialError::Resolve(error)) => {
+                return Err(Error::Failed(anyhow!("connect {authority}: {error}")));
+            }
+            Err(crate::egress::DialError::Tcp(error)) => {
+                return Err(Error::Failed(anyhow!("connect {authority}: {error}")));
+            }
+        },
+    };
     let stream: Box<dyn Stream> = if tls {
         let name = rustls::pki_types::ServerName::try_from(host.clone())
             .map_err(|_| anyhow!("invalid TLS server name: {host}"))?;

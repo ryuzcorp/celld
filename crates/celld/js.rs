@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): node:crypto scrypt; container exec resize op; cross-isolate RPC stubs and streams; test-only fake exec ops; fake kill completion op; exec reads survive their subscribing event; per-node Workers Cache API ops.
+// Modified by ryuzcorp (ryuzcorp/celld): node:crypto scrypt; container exec resize op; cross-isolate RPC stubs and streams; test-only fake exec ops; fake kill completion op; exec reads survive their subscribing event; per-node Workers Cache API ops; tenant egress policy.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 // The raw V8 adapter and its child modules remain outside the Actor execution
@@ -766,23 +766,110 @@ impl CellJob {
     }
 }
 
+/// The tenant `fetch()` client for `redirect: "follow"`: the default
+/// client in open mode, and the policy-enforcing client (filtering
+/// resolver plus a redirect policy that refuses refused literals) in
+/// public mode. Shared across requests, so only for policies without
+/// port-scoped entries; anything port-scoped takes a pinned client.
+fn tenant_follow_client() -> reqwest::Client {
+    let policy = crate::egress::EgressPolicy::global();
+    if policy.is_open() {
+        return reqwest::Client::new();
+    }
+    debug_assert!(
+        !policy.has_port_scoped_entries(),
+        "port-scoped policies take pinned per-request clients"
+    );
+    crate::egress::apply_tenant_policy(
+        reqwest::Client::builder().redirect(crate::egress::follow_redirect_policy(policy.clone())),
+        &policy,
+        crate::egress::HopPort::unpinned(),
+    )
+    .build()
+    .expect("build the tenant fetch client")
+}
+
+fn tenant_manual_client() -> reqwest::Client {
+    let policy = crate::egress::EgressPolicy::global();
+    debug_assert!(
+        policy.is_open() || !policy.has_port_scoped_entries(),
+        "port-scoped policies take pinned per-request clients"
+    );
+    crate::egress::apply_tenant_policy(
+        reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()),
+        &policy,
+        crate::egress::HopPort::unpinned(),
+    )
+    .build()
+    .expect("build the tenant manual-redirect fetch client")
+}
+
+fn tenant_error_client() -> reqwest::Client {
+    let policy = crate::egress::EgressPolicy::global();
+    debug_assert!(
+        policy.is_open() || !policy.has_port_scoped_entries(),
+        "port-scoped policies take pinned per-request clients"
+    );
+    crate::egress::apply_tenant_policy(
+        reqwest::Client::builder().redirect(reqwest::redirect::Policy::custom(|attempt| {
+            attempt.error("fetch redirect mode is error")
+        })),
+        &policy,
+        crate::egress::HopPort::unpinned(),
+    )
+    .build()
+    .expect("build the tenant error-redirect fetch client")
+}
+
+/// The tenant `fetch()` client for one request under a port-scoped
+/// policy: the filtering resolver and the redirect policy share a pin
+/// starting at the initial request's port, so `host:port` entries match
+/// exactly on the initial hop and every redirect hop. Built per request
+/// because only the request knows its port; single-use, never shared.
+fn tenant_pinned_client(
+    policy: &Arc<crate::egress::EgressPolicy>,
+    redirect: &str,
+    initial_port: u16,
+    charge_subrequest: Option<crate::egress::SubrequestCharge>,
+) -> reqwest::Client {
+    let pin = crate::egress::HopPort::new(initial_port);
+    let redirect_policy = match redirect {
+        "follow" => match charge_subrequest {
+            Some(charge) => crate::egress::follow_redirect_policy_pinned_counted(
+                Arc::clone(policy),
+                pin.clone(),
+                charge,
+            ),
+            None => crate::egress::follow_redirect_policy_pinned(Arc::clone(policy), pin.clone()),
+        },
+        "manual" => reqwest::redirect::Policy::none(),
+        "error" => reqwest::redirect::Policy::custom(|attempt| {
+            attempt.error("fetch redirect mode is error")
+        }),
+        _ => unreachable!("the redirect mode was validated above"),
+    };
+    crate::egress::apply_tenant_policy(
+        reqwest::Client::builder().redirect(redirect_policy),
+        policy,
+        pin,
+    )
+    .build()
+    .expect("build the pinned tenant fetch client")
+}
+
 thread_local! {
     // One outbound HTTP client per JS thread — building it per fetch rebuilds
     // the TLS stack every call (async-op-hazards.md).
-    static HTTP: reqwest::Client = reqwest::Client::new();
-    static HTTP_MANUAL: reqwest::Client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none()).build().unwrap();
+    static HTTP: reqwest::Client = tenant_follow_client();
+    static HTTP_MANUAL: reqwest::Client = tenant_manual_client();
     // A separate policy stops an `error` request before reqwest can replay it
     // at the destination. Inspecting the final response would be too late:
     // the method, body, and credentials could already have left the process.
-    static HTTP_ERROR: reqwest::Client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::custom(|attempt| {
-            attempt.error("fetch redirect mode is error")
-        })).build().unwrap();
+    static HTTP_ERROR: reqwest::Client = tenant_error_client();
 }
 
 #[derive(Debug)]
-struct RedirectSubrequestLimit(String);
+pub(crate) struct RedirectSubrequestLimit(pub(crate) String);
 
 impl std::fmt::Display for RedirectSubrequestLimit {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -797,6 +884,11 @@ fn fetch_request_error(error: &reqwest::Error) -> String {
     loop {
         if let Some(limit) = source.downcast_ref::<RedirectSubrequestLimit>() {
             return limit.0.clone();
+        }
+        // A policy refusal carries the marker the harness translates to
+        // `TypeError`; it must survive reqwest's top-level message.
+        if let Some(refused) = source.downcast_ref::<crate::egress::FetchRefused>() {
+            return refused.to_string();
         }
         let Some(next) = source.source() else {
             return format!("fetch: {error}");
@@ -9823,14 +9915,40 @@ fn op_fetch(
         rv.set(promise);
         return;
     }
+    // The tenant egress policy, judged before anything is sent. A
+    // brokered call never reaches here: it stays in the fleet.
+    let egress_policy = crate::egress::EgressPolicy::global();
     // Select the client only for direct egress: a broker must not initialize
     // an unused network client and its TLS stack.
-    let client = match redirect.as_str() {
-        "follow" if context.subrequest_limit.is_some() => context.redirect_counting_client(),
-        "follow" => HTTP.with(|client| client.clone()),
-        "manual" => HTTP_MANUAL.with(|client| client.clone()),
-        "error" => HTTP_ERROR.with(|client| client.clone()),
-        _ => unreachable!("the redirect mode was validated above"),
+    let client = if !egress_policy.is_open() && egress_policy.has_port_scoped_entries() {
+        // Port-scoped entries match exactly only against the request's
+        // own hop port, which no shared client knows, so the request
+        // builds its own pinned client.
+        let charge =
+            (redirect.as_str() == "follow" && context.subrequest_limit.is_some()).then(|| {
+                let context = Arc::downgrade(&context);
+                let charge: crate::egress::SubrequestCharge = Arc::new(move || {
+                    context
+                        .upgrade()
+                        .map(|context| context.charge_subrequest())
+                        .unwrap_or(Ok(()))
+                });
+                charge
+            });
+        tenant_pinned_client(
+            &egress_policy,
+            redirect.as_str(),
+            crate::egress::initial_hop_port(&url),
+            charge,
+        )
+    } else {
+        match redirect.as_str() {
+            "follow" if context.subrequest_limit.is_some() => context.redirect_counting_client(),
+            "follow" => HTTP.with(|client| client.clone()),
+            "manual" => HTTP_MANUAL.with(|client| client.clone()),
+            "error" => HTTP_ERROR.with(|client| client.clone()),
+            _ => unreachable!("the redirect mode was validated above"),
+        }
     };
     // The creating context, read here while JS is still running: the op
     // future resolves on whatever worker polls it, far from any CPED.
@@ -9903,6 +10021,28 @@ fn op_fetch(
         await_egress_gate(gate).await.inspect_err(|error| {
             finish(false, None, Some(error.clone()));
         })?;
+        // The tenant egress policy judges the destination on its
+        // resolved address before anything leaves the process. Redirect
+        // hops re-check through the client's filtering resolver and
+        // redirect policy.
+        if let Err(refusal) = crate::egress::check_fetch_url(&egress_policy, &url).await {
+            // The log names the target's scheme, host, and port — never
+            // the full URL, whose userinfo or query may carry secrets.
+            let (scheme, host, port) = crate::egress::log_target_parts(&url)
+                .unwrap_or_else(|| ("?".to_string(), refusal.host.clone(), 0));
+            tracing::warn!(
+                event = "egress_refused",
+                scheme = %scheme,
+                host = %host,
+                port = port,
+                ip = %refusal.ip,
+                reason = refusal.reason,
+                "worker egress refused"
+            );
+            let error = crate::egress::fetch_refusal_message(&refusal);
+            finish(false, None, Some(error.clone()));
+            return Err(error);
+        }
         let m = reqwest::Method::from_bytes(method.as_bytes()).unwrap_or(reqwest::Method::GET);
         // a timeout bounds a black-hole host: the future settles (Err) instead
         // of parking run_loop forever — the hang the Drop guard can't catch.
@@ -11801,14 +11941,31 @@ impl IoContext {
             .and_then(|limit| u32::try_from(limit / 1_000_000).ok())
     }
 
+    /// The counting client for a context whose policy has no
+    /// port-scoped entries; anything port-scoped takes a pinned
+    /// per-request counting client from the fetch op instead.
     fn redirect_counting_client(self: &Arc<Self>) -> reqwest::Client {
         self.redirect_client
             .get_or_init(|| {
                 let context = Arc::downgrade(self);
-                reqwest::Client::builder()
-                    .redirect(reqwest::redirect::Policy::custom(move |attempt| {
+                let policy = crate::egress::EgressPolicy::global();
+                debug_assert!(
+                    policy.is_open() || !policy.has_port_scoped_entries(),
+                    "port-scoped policies take pinned per-request clients"
+                );
+                let redirect_policy = policy.clone();
+                let builder = reqwest::Client::builder().redirect(
+                    reqwest::redirect::Policy::custom(move |attempt| {
                         if attempt.previous().len() >= 10 {
                             return attempt.error("too many redirects");
+                        }
+                        // A refused literal never reaches the resolver,
+                        // so the redirect policy refuses it here, where
+                        // the hop's port is known.
+                        if let Err(refusal) =
+                            crate::egress::check_redirect_target(&redirect_policy, attempt.url())
+                        {
+                            return attempt.error(crate::egress::FetchRefused(refusal));
                         }
                         if let Some(context) = context.upgrade() {
                             if let Err(error) = context.charge_subrequest() {
@@ -11816,9 +11973,15 @@ impl IoContext {
                             }
                         }
                         attempt.follow()
-                    }))
-                    .build()
-                    .expect("build the redirect-counting HTTP client")
+                    }),
+                );
+                crate::egress::apply_tenant_policy(
+                    builder,
+                    &policy,
+                    crate::egress::HopPort::unpinned(),
+                )
+                .build()
+                .expect("build the redirect-counting HTTP client")
             })
             .clone()
     }

@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): exec() waits for start(); exec pty/resize; fence node-netns exception; process-granularity exec kill; kill conformance tests; exec reads survive their subscribing event.
+// Modified by ryuzcorp (ryuzcorp/celld): exec() waits for start(); exec pty/resize; fence node-netns exception; process-granularity exec kill; kill conformance tests; exec reads survive their subscribing event; worker container endpoints for the tenant egress policy.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! Containers attached to Durable Objects: the engine side of
@@ -1168,6 +1168,59 @@ impl ContainerEngine {
     /// The cell's handle, if the cell started on this node.
     pub fn cell(&self, scope: &str) -> Option<Arc<CellContainer>> {
         self.cells.lock().unwrap().get(scope).cloned()
+    }
+
+    /// Whether the node published `(ip, port)` to Workers as a container
+    /// endpoint: a bridge address on Linux (every port reaches the same
+    /// container), or exactly `127.0.0.1` plus a mapped host port where
+    /// ports are published. Only running containers count, so a stale
+    /// address stops matching when its container stops. The tenant
+    /// egress policy exempts these endpoints, because the `getTcpPort()`
+    /// path dials them by design.
+    pub fn is_worker_container_endpoint(&self, ip: std::net::IpAddr, port: u16) -> bool {
+        use std::net::IpAddr;
+        for cell in self.cells.lock().unwrap().values() {
+            let state = cell.state.lock().unwrap();
+            if !state.running {
+                continue;
+            }
+            match &state.address {
+                Address::Ip(addr) => {
+                    if addr.parse::<IpAddr>().is_ok_and(|known| known == ip) {
+                        return true;
+                    }
+                }
+                Address::Published(ports) => {
+                    if ip == IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+                        && ports.values().any(|mapped| *mapped == port)
+                    {
+                        return true;
+                    }
+                }
+                Address::None => {}
+            }
+        }
+        false
+    }
+
+    /// Whether `ip` is one of this node's container bridge addresses,
+    /// without regard to port. Only the Linux form qualifies: a bridge
+    /// IP names its container on every port, while a published loopback
+    /// port cannot be verified without the port.
+    pub fn is_worker_container_ip(&self, ip: std::net::IpAddr) -> bool {
+        use std::net::IpAddr;
+        for cell in self.cells.lock().unwrap().values() {
+            let state = cell.state.lock().unwrap();
+            if !state.running {
+                continue;
+            }
+            if let Address::Ip(addr) = &state.address {
+                if addr.parse::<IpAddr>().is_ok_and(|known| known == ip) {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     /// The memory the node's running containers reserve, summed over their
@@ -2401,6 +2454,48 @@ mod pty_tests {
             networks: tokio::sync::Mutex::new(None),
             fenced: tokio::sync::Mutex::new(false),
         }
+    }
+
+    /// The tenant egress policy exempts exactly the endpoints the node
+    /// published: a bridge IP on any port, a published loopback port on
+    /// its mapped port only, and nothing once the container stops.
+    #[test]
+    fn worker_container_endpoints_match_published_addresses() {
+        use std::net::{IpAddr, Ipv4Addr};
+        let engine = test_engine();
+        let cell = Arc::new(test_cell());
+        {
+            let mut state = cell.state.lock().unwrap();
+            state.running = true;
+            state.address = Address::Ip("172.18.0.5".to_string());
+        }
+        engine
+            .cells
+            .lock()
+            .unwrap()
+            .insert("s".to_string(), cell.clone());
+        let bridge: IpAddr = "172.18.0.5".parse().unwrap();
+        assert!(engine.is_worker_container_endpoint(bridge, 80));
+        assert!(engine.is_worker_container_endpoint(bridge, 5432));
+        assert!(engine.is_worker_container_ip(bridge));
+        assert!(!engine.is_worker_container_endpoint("172.18.0.6".parse().unwrap(), 80));
+        assert!(!engine.is_worker_container_ip("172.18.0.6".parse().unwrap()));
+        // A published port matches only 127.0.0.1 with its mapped port,
+        // and never the port-less check.
+        {
+            let mut state = cell.state.lock().unwrap();
+            state.address = Address::Published(HashMap::from([(8080, 49152)]));
+        }
+        let loopback = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        assert!(engine.is_worker_container_endpoint(loopback, 49152));
+        assert!(!engine.is_worker_container_endpoint(loopback, 8080));
+        assert!(!engine.is_worker_container_endpoint("127.0.0.2".parse().unwrap(), 49152));
+        assert!(!engine.is_worker_container_ip(loopback));
+        // A stopped container exempts nothing.
+        cell.state.lock().unwrap().running = false;
+        assert!(!engine.is_worker_container_endpoint(loopback, 49152));
+        assert!(!engine.is_worker_container_endpoint(bridge, 80));
+        assert!(!engine.is_worker_container_ip(bridge));
     }
 
     /// P4: a PTY size that the daemon would refuse fails before the daemon

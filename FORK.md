@@ -9,7 +9,7 @@ README below is kept intact; this file documents the fork.
 
 - `main` mirrors upstream `main` and carries no patches.
 - `ryuzcorp/v<version>` is a line branch: the upstream tag `v<version>`
-  plus our patches as commits, one commit per patch, in `0001`-`0020`
+  plus our patches as commits, one commit per patch, in `0001`-`0021`
   order. Each patch commit is self-contained and carries its own tests.
 
 Upstream's `.github/workflows/release.yml` targets `ghcr.io/denoland` and
@@ -247,7 +247,7 @@ push to `ghcr.io/denoland`, but still. Pushing a branch named
   conditional and range answers, `CF-Cache-Status: HIT` on hits,
   `CELLD_CACHE_MAX_BYTES` cap (64 MiB default) with LRU eviction.
   Release note: default 64 MiB per node of new memory; set CELLD_CACHE_MAX_BYTES=0 to disable.
-- `0019` (sha TBD at merge) context end aborts finished uploads: the
+- `0019` (`856dba1`) context end aborts finished uploads: the
   caller runtime used to abort only pumps still registered at context
   end, so an upload whose pump already finished lingered sender-alive
   until isolate retirement; context end now aborts every upload id the
@@ -256,12 +256,21 @@ push to `ghcr.io/denoland`, but still. Pushing a branch named
   fixture stores on tmpfs (a loud disk fallback where it is missing), so
   parallel suites on a loaded disk no longer stall lease commits into a
   node self-fence.
-- `0020` (sha TBD at merge) `celld dev --port 0` assigns an ephemeral
+- `0020` (`72256ac`) `celld dev --port 0` assigns an ephemeral
   port: the node binds it and the supervisor learns the assigned address
   from the node's announce line, so parallel boots never race on a
   probed-free port; the conformance suites boot with port zero and
   discover the worker (200 on `/scope` or `/health`) and operator
   listeners via `/proc`.
+- `0021` (sha TBD at merge) tenant egress policy: `CELLD_EGRESS=public`
+  refuses Worker `fetch()`/`connect()`/outbound-WebSocket dials to
+  non-public addresses (loopback, private, link-local, CGNAT, ULA,
+  unspecified, multicast, reserved, IPv4-mapped and transition-embedded
+  forms, the metadata address), with `CELLD_EGRESS_ALLOW` CIDR/`host:port`
+  exceptions matched exactly on every hop, enforced on the resolved
+  address; tenant clients ignore proxies, celld's own traffic and
+  published container endpoints are exempt, and refused fetches reject
+  with `TypeError`.
 
 ## Releases
 
