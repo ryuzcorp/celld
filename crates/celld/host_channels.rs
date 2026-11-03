@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): cross-isolate RPC stubs and streams.
+// Modified by ryuzcorp (ryuzcorp/celld): cross-isolate RPC stubs and streams; trusted cell RPC.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! The channels a cell runtime uses to hand work to the host: one request
@@ -189,6 +189,10 @@ pub struct RpcCallReq {
     pub name: Option<String>,
     pub method: String,
     pub args: RpcData,
+    /// True only for a call a harness host op built itself, never for a
+    /// stub call: the target resolves the method without the tenant RPC
+    /// allowlist. Only the Queue DLQ forward sets it.
+    pub trusted: bool,
     pub reply: tokio::sync::oneshot::Sender<Result<RpcData>>,
 }
 pub(crate) static RPC_CALL_TX: OnceLock<tokio::sync::mpsc::UnboundedSender<RpcCallReq>> =

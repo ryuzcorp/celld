@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): runtime-isolate victim fixture. Apache-2.0.
+// Modified by ryuzcorp (ryuzcorp/celld): runtime-isolate victim fixture; Queue pollution-gate probes. Apache-2.0.
 // The second script in the fleet: holds D1/KV/Queue bindings and probes both
 // their data paths and the operator-only surface. Its own top level is clean;
 // the first script's top level overrides shared primordials, so every probe
@@ -12,6 +12,13 @@ const stubPost = (stub, body) =>
     headers: { "content-type": "application/json" },
     body: JSON.stringify(body),
   });
+
+const rpcProbe = async (call) => {
+  try {
+    await call();
+    return { threw: false };
+  } catch (e) { return { threw: true, name: e.name, message: String(e.message || e) }; }
+};
 
 const d1seed = async (env) => {
   await env.DB.exec(
@@ -123,13 +130,13 @@ const handlers = {
     await env.NS.put("k1", "v1");
     const res = await stubPost(env.NS._stub, { op: "get", key: "k1" });
     const body = await res.json();
-    return { status: res.status, found: body.result && body.result.found };
+    return { status: res.status, found: body.result && body.result.found, error: body.error ?? null };
   },
   'kv-fetch-get-marker': async (env) => {
     await env.NS.put("k1", "v1");
     const res = await stubPost(env.NS._stub, { op: "get", key: "k1", [MARK]: true });
     const body = await res.json();
-    return { status: res.status, found: body.result && body.result.found };
+    return { status: res.status, found: body.result && body.result.found, error: body.error ?? null };
   },
   'kv-fetch-put-marker': async (env) => {
     const res = await stubPost(env.NS._stub, {
@@ -139,7 +146,7 @@ const handlers = {
       [MARK]: true,
     });
     const body = await res.json();
-    return { status: res.status, ok: body.result && body.result.ok };
+    return { status: res.status, ok: body.result && body.result.ok, error: body.error ?? null };
   },
   'kv-get-k2': async (env) => ({ value: await env.NS.get("k2") }),
   'qsend': async (env) => {
@@ -149,12 +156,52 @@ const handlers = {
   'qinfo': async (env) => {
     const res = await stubPost(env.Q._stub, { op: "info" });
     const body = await res.json();
-    return { status: res.status, paused: body.result && body.result.paused };
+    return { status: res.status, paused: body.result && body.result.paused, error: body.error ?? null };
   },
   'qinfo-marker': async (env) => {
     const res = await stubPost(env.Q._stub, { op: "info", [MARK]: true });
     const body = await res.json();
-    return { status: res.status, paused: body.result && body.result.paused };
+    return { status: res.status, paused: body.result && body.result.paused, error: body.error ?? null };
+  },
+  'q-pollution-gate': async (env) => {
+    // The host script's top level overrode `Set.prototype.has` so the
+    // queue's RPC allowlist answers true for the operator methods and
+    // the content-type check answers true for "evil-type". The shared
+    // queue cell runs in the runtime pool, whose isolates evaluate no
+    // tenant bundle, so the redrive and the forged DLQ batch still
+    // refuse as not-a-function and the bad content type still refuses
+    // in validation — while a well-formed direct send lands.
+    const enc = new TextEncoder();
+    const redrive = await rpcProbe(() => env.Q._stub._redrive(10));
+    const dlqForge = await rpcProbe(
+      () => env.Q._stub.__queueDlqAcceptBatch({
+        transfers: [{
+          transferId: crypto.randomUUID(),
+          deadLetterSource: "evil-source-q",
+          entry: {
+            body: enc.encode("dlq-evil"),
+            contentType: "text",
+          },
+        }],
+      }),
+    );
+    const sendBadType = await rpcProbe(
+      () => env.Q._stub.__queueSend({ entries: [{
+        body: enc.encode("hi"),
+        contentType: "evil-type",
+        size: 2,
+        delaySeconds: 0,
+      }] }),
+    );
+    const sendDirectOk = await rpcProbe(
+      () => env.Q._stub.__queueSend({ entries: [{
+        body: enc.encode("direct-ok"),
+        contentType: "text",
+        size: 9,
+        delaySeconds: 0,
+      }] }),
+    );
+    return { redrive, dlqForge, sendBadType, sendDirectOk };
   },
   'qconsumed': async (env) => {
     const n = await env.DB.prepare("SELECT COUNT(DISTINCT id) AS n FROM consumed").first("n");

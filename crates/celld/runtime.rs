@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): cross-isolate RPC stubs and streams; D1 export operator-ingress marker; ported from meln1k/celld: report wake coverage after maintenance (e6cb9a3); wake coverage follow-ups: startup observation ordering, installation comparison.
+// Modified by ryuzcorp (ryuzcorp/celld): cross-isolate RPC stubs and streams; D1 export operator-ingress marker; ported from meln1k/celld: report wake coverage after maintenance (e6cb9a3); wake coverage follow-ups: startup observation ordering, installation comparison; trusted cell RPC.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 // RuntimeManager is the V8 cell-host arm, so its executor and observability
@@ -1886,6 +1886,7 @@ impl RuntimeManager {
         method: String,
         args: js::RpcData,
         request_id: Option<js::RequestId>,
+        trusted: bool,
     ) -> anyhow::Result<js::RpcOutcome> {
         let (reply, receive) = tokio::sync::oneshot::channel();
         let job = CellJob::Rpc {
@@ -1894,6 +1895,7 @@ impl RuntimeManager {
             name,
             method,
             args,
+            trusted,
             reply,
         };
         self.cell_event(&cell, job, receive, "cell isolate dropped RPC result")

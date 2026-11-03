@@ -1,3 +1,4 @@
+// Modified by ryuzcorp (ryuzcorp/celld): KV operator fetch gate; prototype-safe operator lookup. Apache-2.0.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 // The KV service, shared by both engines: the namespace cell (the server) and
@@ -677,6 +678,37 @@ function kvService(host) {
         body = await request.json();
       } catch {
         return Response.json({ error: "KV_ERROR: invalid request body" }, { status: 400 });
+      }
+      // A JSON `null` (or any other non-object) parses without throwing, so
+      // it needs its own refusal: `body.op` below would throw outside the
+      // switch's try and answer 500 instead of 400.
+      if (body === null || typeof body !== "object") {
+        return Response.json({ error: "KV_ERROR: invalid request body" }, { status: 400 });
+      }
+      // The whole fetch surface below is the operator's: the KV binding
+      // reaches the cell over RPC, never fetch, so any fetch without the
+      // host-set operator-ingress marker is refused. This is what makes the
+      // "reached only over `/runtime/`" comment above true against a Worker's
+      // own stub.fetch() too.
+      const operatorCommands = {
+        get: "celld kv get",
+        put: "celld kv put",
+        "put-base64": "celld kv put",
+        delete: "celld kv delete",
+        list: "celld kv list",
+        info: "celld kv info",
+      };
+      // An own-property lookup: `body.op` is tenant input, and a plain
+      // index would resolve inherited names (`constructor`, `toString`)
+      // and interpolate a native function into the 403 below.
+      const operatorCommand = Object.hasOwn(operatorCommands, body.op)
+        ? operatorCommands[body.op]
+        : undefined;
+      if (operatorCommand !== undefined && !__operatorIngressRequests.has(request)) {
+        return Response.json(
+          { error: `KV_ERROR: ${body.op} is an operator operation; use \`${operatorCommand}\`` },
+          { status: 403 },
+        );
       }
       const now = Date.now();
       try {

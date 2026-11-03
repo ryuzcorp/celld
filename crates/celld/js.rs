@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): node:crypto scrypt; container exec resize op; cross-isolate RPC stubs and streams; test-only fake exec ops; fake kill completion op; exec reads survive their subscribing event; per-node Workers Cache API ops; tenant egress policy; D1 export operator-ingress marker; stateless attribution tokens; reaction-aware request resources; fake close/signal completion ops; binding-forgery enforcement.
+// Modified by ryuzcorp (ryuzcorp/celld): node:crypto scrypt; container exec resize op; cross-isolate RPC stubs and streams; test-only fake exec ops; fake kill completion op; exec reads survive their subscribing event; per-node Workers Cache API ops; tenant egress policy; D1 export operator-ingress marker; stateless attribution tokens; reaction-aware request resources; fake close/signal completion ops; binding-forgery enforcement; trusted cell RPC; Queue DLQ forward host op; DLQ forward caller identity.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 // The raw V8 adapter and its child modules remain outside the Actor execution
@@ -646,6 +646,9 @@ pub enum CellJob {
         name: Option<String>,
         method: String,
         args: RpcData,
+        /// A harness host op built this call: `__dispatchRpc` resolves the
+        /// method without the tenant allowlist. A stub call never sets it.
+        trusted: bool,
         reply: tokio::sync::oneshot::Sender<Result<RpcOutcome>>,
     },
     /// One operation on a cross-isolate RPC stub owned by `scope`: a
@@ -5526,6 +5529,7 @@ fn begin_cell(tc: &mut v8::PinScope, job: CellJob, event_time: i64) -> Begun {
             name,
             method,
             args,
+            trusted,
             reply,
         } => {
             if let Err(error) = register_actor_name(tc, &scope, name.as_deref()) {
@@ -5545,6 +5549,7 @@ fn begin_cell(tc: &mut v8::PinScope, job: CellJob, event_time: i64) -> Begun {
                         v8::String::new(tc, &scope).unwrap().into(),
                         v8::String::new(tc, &method).unwrap().into(),
                         rpc_data_value(tc, args),
+                        v8::Boolean::new(tc, trusted).into(),
                     ];
                     let recv = v8::undefined(tc).into();
                     f.call(tc, recv, &arguments)
@@ -7119,6 +7124,7 @@ ops! { OP_NAMES, install_op_functions,
         "__svc_rpc" => op_svc_rpc,
         "__queue_dispatch" => op_queue_dispatch,
         "__queue_policy" => op_queue_policy,
+        "__queue_dlq_forward" => op_queue_dlq_forward,
         "__do_call_cancellable" => op_do_call_cancellable,
         "__do_call_cancel" => op_do_call_cancel,
         "__rpc_signal_new" => op_rpc_signal_new,
@@ -8797,6 +8803,7 @@ fn op_facet_rpc(
             name: None,
             method,
             args: RpcData::V8(call_args.into()),
+            trusted: false,
             reply,
         };
         let driving = tokio::spawn(crate::runtime::drive_cell(
@@ -9520,7 +9527,7 @@ fn op_testwait_fire(
 fn op_rpc_call(
     scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
-    mut rv: v8::ReturnValue<v8::Value>,
+    rv: v8::ReturnValue<v8::Value>,
 ) {
     let cell = args.get(0).to_rust_string_lossy(scope);
     let name_value = args.get(1);
@@ -9530,6 +9537,69 @@ fn op_rpc_call(
     }
     let method = args.get(2).to_rust_string_lossy(scope);
     let args = RpcData::V8(view_bytes(args.get(3)).unwrap_or_default().into());
+    enqueue_cell_rpc(scope, rv, cell, name, method, args, false);
+}
+
+/// `__queue_dlq_forward(scope, name, argsSc)` -> Promise<Uint8Array>; the
+/// Queue cell's dead-letter/redrive forward to another Queue cell. It
+/// routes exactly like `__rpc_call`, but trusted: the target resolves
+/// `__queueDlqAcceptBatch` without the tenant RPC allowlist, so that
+/// method stays off the allowlist and no stub holder can forge a
+/// transfer. Only a Queue cell event may call it, and only to a Queue
+/// scope. Like every op it is a harness parameter, never a worker
+/// global, so a bundle cannot name it.
+fn op_queue_dlq_forward(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    rv: v8::ReturnValue<v8::Value>,
+) {
+    let cell = args.get(0).to_rust_string_lossy(scope);
+    let name_value = args.get(1);
+    let name = (!name_value.is_null_or_undefined()).then(|| name_value.to_rust_string_lossy(scope));
+    if !cell.starts_with("__Queue:") || !celld_logic::cell::valid_cell_scope(&cell) {
+        return loader_throw(scope, "queue DLQ forward needs a Queue target scope");
+    }
+    // Identity comes from the running event's frame, not from the egress
+    // gate's durability verdict: the gate answers `NoCell` for a read-only
+    // event in a process with no output gate, which would spuriously refuse
+    // a future read-only trusted caller. The gate still verdicts the send
+    // itself in `enqueue_cell_rpc`.
+    let Some(context) = event_context(scope) else {
+        return retired_event_throw(scope);
+    };
+    let caller = current_cell_event(&context)
+        .map(|frame| frame.root.map(|root| root.cell).unwrap_or(frame.storage));
+    if !caller.is_some_and(|caller| caller.starts_with("__Queue:")) {
+        return loader_throw(scope, "Queue DLQ forward requires a queue cell event");
+    }
+    // Defence in depth: the same grant/declaration check `__rpc_call`
+    // applies. The forward pins its target's grant before resolving it, so
+    // this passes for that target; it refuses a scope nothing pinned or
+    // declared, should another trusted caller ever reach this op.
+    if let Err(error) = binding_policy::check_cell_call(scope, &cell, name.as_deref()) {
+        return loader_throw(scope, &error);
+    }
+    let args = RpcData::V8(view_bytes(args.get(2)).unwrap_or_default().into());
+    enqueue_cell_rpc(
+        scope,
+        rv,
+        cell,
+        name,
+        "__queueDlqAcceptBatch".to_string(),
+        args,
+        true,
+    );
+}
+
+fn enqueue_cell_rpc(
+    scope: &mut v8::PinScope,
+    mut rv: v8::ReturnValue<v8::Value>,
+    cell: String,
+    name: Option<String>,
+    method: String,
+    args: RpcData,
+    trusted: bool,
+) {
     let (tx, rx) = tokio::sync::oneshot::channel();
     let Some(event) = event_context(scope) else {
         return retired_event_throw(scope);
@@ -9540,6 +9610,7 @@ fn op_rpc_call(
         name,
         method,
         args,
+        trusted,
         reply: tx,
     };
     let id = asyncrt::enqueue(async move {

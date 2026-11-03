@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): cross-isolate RPC stubs and streams; operator token for the internal listener; D1 export operator-ingress marker; ported from meln1k/celld: report wake coverage after maintenance (e6cb9a3); staged activation.
+// Modified by ryuzcorp (ryuzcorp/celld): cross-isolate RPC stubs and streams; operator token for the internal listener; D1 export operator-ingress marker; ported from meln1k/celld: report wake coverage after maintenance (e6cb9a3); staged activation; trusted cell RPC.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 // The binary contains connection, startup, shutdown, and V8 shell code. The
@@ -1451,6 +1451,7 @@ async fn dispatch_rpc_call(app: AppHandle, call: RpcCallReq) {
         name,
         method,
         args,
+        trusted,
         reply,
     } = call;
     let result = async {
@@ -1473,7 +1474,7 @@ async fn dispatch_rpc_call(app: AppHandle, call: RpcCallReq) {
                             app.runtime
                                 .as_ref()
                                 .context("no cell runtime")?
-                                .rpc(scope, name, method, args, local_request_id)
+                                .rpc(scope, name, method, args, local_request_id, trusted)
                                 .await
                         })
                         .await;
@@ -1515,6 +1516,7 @@ async fn dispatch_rpc_call(app: AppHandle, call: RpcCallReq) {
                     name.as_deref(),
                     &method,
                     &args,
+                    trusted,
                 )
                 .await;
                 // Classify failures before response decoding. An explicit stale
@@ -2574,6 +2576,7 @@ pub(crate) async fn dispatch_forwarded_rpc(
     name: Option<String>,
     rpc_method: String,
     args: celld::js::RpcData,
+    trusted: bool,
 ) -> HttpReply {
     let result = match app.request(scope.clone()).await {
         Ok(Routed {
@@ -2586,7 +2589,7 @@ pub(crate) async fn dispatch_forwarded_rpc(
                 return peer_response(response(StatusCode::SERVICE_UNAVAILABLE, "no cell runtime"));
             };
             let completed = local
-                .run(runtime.rpc(scope, name, rpc_method, args, local_request_id))
+                .run(runtime.rpc(scope, name, rpc_method, args, local_request_id, trusted))
                 .await;
             match completed.result {
                 Ok(outcome) => Ok(outcome.data),

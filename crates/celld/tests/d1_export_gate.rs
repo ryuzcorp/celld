@@ -1,3 +1,4 @@
+// Modified by ryuzcorp (ryuzcorp/celld): Queue/KV operator fetch gate; Queue/KV stub-RPC allowlists; Queue DLQ RPC refusal; Queue send cell-side validation; KV prototype-safe operator lookup. Apache-2.0.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 //
 // Modified by ryuzcorp (ryuzcorp/celld): D1 export is operator-only.
@@ -266,4 +267,154 @@ fn d1_export_is_operator_only() {
     let exec_rows = get_json(&node, "/fetch-exec-rows");
     assert_eq!(exec_rows["ok"], true, "{exec_rows}");
     assert_eq!(exec_rows["result"]["status"], 403, "{exec_rows}");
+
+    // The KV binding keeps working over RPC while every fetch op refuses:
+    // the fetch surface is the operator's alone.
+    let kv_ok = get_json(&node, "/kv-binding-ok");
+    assert_eq!(kv_ok["ok"], true, "{kv_ok}");
+    assert_eq!(kv_ok["result"]["value"], "gate-value", "{kv_ok}");
+    assert_eq!(kv_ok["result"]["metaValue"], "gate-value", "{kv_ok}");
+    assert!(kv_ok["result"]["gone"].is_null(), "{kv_ok}");
+    assert_eq!(
+        kv_ok["result"]["names"],
+        serde_json::json!(["gate-key"]),
+        "{kv_ok}"
+    );
+    assert_eq!(kv_ok["result"]["complete"], true, "{kv_ok}");
+
+    let kv = get_json(&node, "/kv-gate");
+    assert_eq!(kv["ok"], true, "{kv}");
+    for op in ["put", "get", "info", "delete", "list", "put-base64"] {
+        assert_eq!(kv["result"][op]["status"], 403, "{kv} {op}");
+        assert!(
+            kv["result"][op]["body"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("operator"),
+            "{kv} {op}"
+        );
+    }
+
+    // Inherited op names must not resolve through the operator lookup:
+    // they fall through to "unknown operation" instead of 403ing with a
+    // leaked native function in the message. A JSON null body parses
+    // without throwing and answers 400, not 500.
+    let proto = get_json(&node, "/kv-gate-proto");
+    assert_eq!(proto["ok"], true, "{proto}");
+    for op in ["constructorOp", "toStringOp", "protoOp"] {
+        assert_eq!(proto["result"][op]["status"], 400, "{proto} {op}");
+        let body = proto["result"][op]["body"].as_str().unwrap_or_default();
+        assert!(body.contains("unknown operation"), "{proto} {op}");
+        assert!(
+            !body.contains("native code") && !body.contains("function Object"),
+            "{proto} {op}"
+        );
+    }
+    assert_eq!(proto["result"]["nullBody"]["status"], 400, "{proto}");
+    assert!(
+        proto["result"]["nullBody"]["body"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("invalid request body"),
+        "{proto}"
+    );
+
+    // The Queue fetch has no lookup table, but a JSON null body still
+    // reaches past the parse: it answers 400 from inside the handler.
+    let queue_null = get_json(&node, "/queue-gate-null");
+    assert_eq!(queue_null["ok"], true, "{queue_null}");
+    assert_eq!(queue_null["result"]["status"], 400, "{queue_null}");
+
+    // Stub RPC on the KV scope refuses the internal cell methods the D1
+    // allowlist shape refuses: sweep and metrics run as direct calls
+    // inside the cell, never over RPC.
+    let kv_rpc = get_json(&node, "/kv-rpc-gate");
+    assert_eq!(kv_rpc["ok"], true, "{kv_rpc}");
+    for method in ["sweep", "metrics"] {
+        assert_eq!(kv_rpc["result"][method]["threw"], true, "{kv_rpc} {method}");
+        assert!(
+            kv_rpc["result"][method]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("is not a function"),
+            "{kv_rpc} {method}"
+        );
+    }
+
+    // The Queue binding sends while every operator fetch op refuses.
+    let queue_ok = get_json(&node, "/queue-binding-ok");
+    assert_eq!(queue_ok["ok"], true, "{queue_ok}");
+    assert_eq!(queue_ok["result"]["sent"], true, "{queue_ok}");
+    assert_eq!(queue_ok["result"]["backlog"], 3, "{queue_ok}");
+
+    let queue = get_json(&node, "/queue-gate");
+    assert_eq!(queue["ok"], true, "{queue}");
+    for op in ["info", "purge", "pause", "resume", "peek", "redrive"] {
+        assert_eq!(queue["result"][op]["status"], 403, "{queue} {op}");
+        assert!(
+            queue["result"][op]["body"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("operator"),
+            "{queue} {op}"
+        );
+    }
+
+    // Stub RPC on the Queue scope refuses the operator cell methods and
+    // the DLQ accept alike: the accept rides the `__queue_dlq_forward`
+    // host op, never stub RPC, so even the reviewer's forged batch
+    // (forged id, forged dead-letter source, lying size) refuses before
+    // validation. Direct `__queueSend` validates every entry cell-side.
+    let queue_rpc = get_json(&node, "/queue-rpc-gate");
+    assert_eq!(queue_rpc["ok"], true, "{queue_rpc}");
+    for method in [
+        "purge",
+        "peek",
+        "setPaused",
+        "redrive",
+        "dlqAccept",
+        "dlqForge",
+    ] {
+        assert_eq!(
+            queue_rpc["result"][method]["threw"], true,
+            "{queue_rpc} {method}"
+        );
+        assert!(
+            queue_rpc["result"][method]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("is not a function"),
+            "{queue_rpc} {method}"
+        );
+    }
+    for (method, fragment) in [
+        ("sendSizeLie", "byte length"),
+        ("sendBadType", "contentType"),
+        ("sendOversize", "at most"),
+        ("sendBadDelay", "delaySeconds"),
+    ] {
+        assert_eq!(
+            queue_rpc["result"][method]["threw"], true,
+            "{queue_rpc} {method}"
+        );
+        assert!(
+            queue_rpc["result"][method]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains(fragment),
+            "{queue_rpc} {method}"
+        );
+    }
+    // A well-formed direct send still lands: the cell validates entries,
+    // it does not block the method.
+    assert_eq!(
+        queue_rpc["result"]["sendDirectOk"]["threw"], false,
+        "{queue_rpc}"
+    );
+
+    // Host-driven settlement stays open: a body with no lease 409s instead
+    // of 403ing.
+    let settle = get_json(&node, "/queue-settle-open");
+    assert_eq!(settle["ok"], true, "{settle}");
+    assert_eq!(settle["result"]["status"], 409, "{settle}");
 }

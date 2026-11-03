@@ -9,7 +9,7 @@ README below is kept intact; this file documents the fork.
 
 - `main` mirrors upstream `main` and carries no patches.
 - `ryuzcorp/v<version>` is a line branch: the upstream tag `v<version>`
-  plus our patches as commits, one commit per patch, in `0001`-`0040`
+  plus our patches as commits, one commit per patch, in `0001`-`0041`
   order. Each patch commit is self-contained and carries its own tests.
 
 Upstream's `.github/workflows/release.yml` targets `ghcr.io/denoland` and
@@ -405,7 +405,7 @@ push to `ghcr.io/denoland`, but still. Pushing a branch named
   atomic fleet-pointer write (service bindings resolve from the
   pointer's component map, queue attachments publish at activate time);
   `celld discard` removes versions no pointer names.
-- `0040` (sha TBD at merge) bindings resolve from the script's
+- `0040` (`f0fda85`) bindings resolve from the script's
   declared resources: cell dispatch and id derivation refuse names
   the calling script never bound (D1, KV, queues, workflows,
   Durable Object namespaces, reserved cells), runtime cells answer
@@ -418,6 +418,30 @@ push to `ghcr.io/denoland`, but still. Pushing a branch named
   that host-written table. Stored-stub rows written before this
   patch decode as plain data on first read; storing them again
   writes the new envelope.
+- `0041` (sha TBD at merge) the operator-only KV and Queue fetch
+  branches demand the same host-set operator-ingress marker 0022
+  introduced: every KV fetch op and the Queue info/purge/pause/
+  resume/peek/redrive ops refuse stub.fetch() without it, while the
+  bindings (RPC/send) keep working and host-driven queue settlement
+  stays open. Stub RPC on the Queue and KV scopes answers the same
+  per-class allowlist shape as D1: only the binding's
+  `__queueSend`/`__queueMetrics`/`__kvGet`/`__kvPut`/`__kvDelete`/
+  `__kvList` stay callable, and operator/internal methods refuse as
+  not a function. The Queue purge/pause/resume/peek/redrive methods
+  re-check the marker on the server-side request internally, so
+  reaching them over stub RPC still refuses. The cell's own Queue
+  DLQ forward rides the `__queue_dlq_forward` host op instead of
+  stub RPC, and both `__queueSend` and the DLQ accept validate
+  entries cell-side: the size must equal the body byte length, the
+  content type must be known, bodies stay within bounds, and ids are
+  host-minted. The tunnel markers are protocol-negotiated — a peer
+  that sends no marker flag has its markers ignored, so a Worker on
+  an older node cannot forge them — and the KV operator lookup is
+  prototype-safe, with a null body refused as 400. DLQ and redrive
+  need the fleet on this patch: mixed versions fail closed both
+  ways (an old forward refuses against the new allowlist, a new
+  forward errors against an old accept) and the alarm retries after
+  convergence.
 
 Patches `0025`–`0034` are ported fixes from
 [meln1k/celld](https://github.com/meln1k/celld) by Nikita
