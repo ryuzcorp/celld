@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): node:crypto scrypt; container exec resize op; cross-isolate RPC stubs and streams; test-only fake exec ops; fake kill completion op; exec reads survive their subscribing event; per-node Workers Cache API ops; tenant egress policy; D1 export operator-ingress marker; stateless attribution tokens; reaction-aware request resources; fake close/signal completion ops.
+// Modified by ryuzcorp (ryuzcorp/celld): node:crypto scrypt; container exec resize op; cross-isolate RPC stubs and streams; test-only fake exec ops; fake kill completion op; exec reads survive their subscribing event; per-node Workers Cache API ops; tenant egress policy; D1 export operator-ingress marker; stateless attribution tokens; reaction-aware request resources; fake close/signal completion ops; binding-forgery enforcement.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 // The raw V8 adapter and its child modules remain outside the Actor execution
@@ -2597,11 +2597,27 @@ enum EgressPolicy {
     Broker(OutboundBroker),
 }
 
+/// One host-checked Durable Object stub scope recorded during a lift, with
+/// the absolute path where its placeholder sits in the envelope tree.
+struct DoLiftEntry {
+    path: Vec<String>,
+    class: String,
+    value: String,
+    name: Option<String>,
+}
+
 #[derive(Default)]
 struct ActorRuntimeState {
     promises: std::sync::Mutex<PromiseMap>,
     termination: std::sync::Mutex<Option<ExecutionTermination>>,
     pending_puts: std::sync::Mutex<PendingPuts>,
+    /// In-progress stub lifts: token -> host-checked table. The check and
+    /// the table both live here, so tenant JS can neither append entries
+    /// (H1) nor split the check from the record (H2); the envelope tag is
+    /// written host-side at finish (H3). Synchronous only: begin/record/
+    /// finish share one JS thread with no await between them.
+    do_lift_tables: Mutex<HashMap<u64, Vec<DoLiftEntry>>>,
+    do_lift_next: AtomicU64,
     io_contexts: std::sync::Mutex<HashMap<u64, Weak<IoContext>>>,
     /// WebSocket captures that received a frame in the current isolate turn.
     /// Weak references record every continuation context without extending
@@ -2610,6 +2626,16 @@ struct ActorRuntimeState {
     egress: EgressPolicy,
     resource_limits: Option<ResourceLimits>,
     tail_reporting: bool,
+    /// Cell scopes this isolate may address through received stubs. A
+    /// stub that arrives over RPC or comes back from storage names a
+    /// cell the script never declared; revive records it here so dispatch
+    /// honors the transfer, and nothing else can add to the set. See
+    /// [`binding_policy`]. Each live revived stub holds one reference;
+    /// the grant drops when the last stub for the scope is released.
+    /// Deployment-declared edges (the queue DLQ forward) pin scopes that
+    /// are not tied to a live stub object and are therefore never
+    /// released. One lock for both, so no lock ordering can deadlock.
+    do_grants: Mutex<binding_policy::GrantSet>,
     script_name: String,
     event_hooks: OnceLock<EventHooks>,
     /// See [`internals`].
@@ -7035,6 +7061,7 @@ ops! { OP_NAMES, install_op_functions,
         "__sql_cursor_start" => storage_ops::op_sql_cursor_start,
         "__sql_cursor_next" => storage_ops::op_sql_cursor_next,
         "__sql_cursor_close" => storage_ops::op_sql_cursor_close,
+        "__sql_cursor_close_finalizer" => storage_ops::op_sql_cursor_close_finalizer,
         "__sql_database_size" => storage_ops::op_sql_database_size,
         "__d1_run" => storage_ops::op_d1_run,
         "__storage_transaction_control" => storage_ops::op_storage_transaction_control,
@@ -7048,6 +7075,9 @@ ops! { OP_NAMES, install_op_functions,
         "__storage_flush_pending_puts" => storage_ops::op_storage_flush_pending_puts,
         "__storage_sync" => storage_ops::op_storage_sync,
         "__storage_cancel_pending_puts" => storage_ops::op_storage_cancel_pending_puts,
+        "__storage_drop_pending_puts" => storage_ops::op_storage_drop_pending_puts,
+        "__storage_drop_pending_puts_own" => storage_ops::op_storage_drop_pending_puts_own,
+        "__storage_drop_pending_puts_reset" => storage_ops::op_storage_drop_pending_puts_reset,
         "__actor_abort" => op_actor_abort,
         "__cron_plan" => op_cron_plan,
         "__kv_blob" => op_kv_blob,
@@ -7098,6 +7128,20 @@ ops! { OP_NAMES, install_op_functions,
         "__rpc_signal_wait" => op_rpc_signal_wait,
         "__rpc_signal_unsubscribe" => op_rpc_signal_unsubscribe,
         "__do_id" => op_do_id,
+        "__do_grant" => op_do_grant,
+        "__do_grant_name" => op_do_grant_name,
+        "__do_release" => op_do_release,
+        "__do_check_lift" => op_do_check_lift,
+        "__do_brand_stub" => storage_ops::op_do_brand_stub,
+        "__do_is_stub" => storage_ops::op_do_is_stub,
+        "__do_lift_begin" => storage_ops::op_do_lift_begin,
+        "__do_lift_record" => storage_ops::op_do_lift_record,
+        "__do_lift_abort" => storage_ops::op_do_lift_abort,
+        "__do_lift_finish_rpc" => storage_ops::op_do_lift_finish_rpc,
+        "__do_lift_finish_stored" => storage_ops::op_do_lift_finish_stored,
+        "__rpc_encode_bare" => storage_ops::op_rpc_encode_bare,
+        "__rpc_decode_bytes" => storage_ops::op_rpc_decode_bytes,
+        "__bytes_tagged" => storage_ops::op_bytes_tagged,
         "__rpc_call" => op_rpc_call,
         "__stub_call" => op_stub_call,
         "__stub_release" => op_stub_release,
@@ -7692,6 +7736,32 @@ fn admit_loaded_worker(
     Ok(id)
 }
 
+/// The loader state for `id`, only when the calling isolate loaded it:
+/// ids are sequential registry keys, so a lookup without the owner check
+/// would let one script drive another's loaded worker.
+fn owned_loader_state(
+    scope: &mut v8::PinScope,
+    id: u64,
+) -> Option<tokio::sync::watch::Receiver<LoaderState>> {
+    let owner = scope.get_slot::<LoaderOwner>()?;
+    loader_registry()
+        .lock()
+        .unwrap()
+        .get(&id)
+        .filter(|entry| entry.owner == *owner)
+        .map(|entry| entry.state.clone())
+}
+
+/// Remove the registry entry for `id`, only when `owner` loaded it.
+fn take_owned_loader(id: u64, owner: &LoaderOwner) -> Option<LoaderEntry> {
+    let mut registry = loader_registry().lock().unwrap();
+    if registry.get(&id).is_some_and(|entry| entry.owner == *owner) {
+        registry.remove(&id)
+    } else {
+        None
+    }
+}
+
 fn loader_throw(scope: &mut v8::PinScope, message: &str) {
     let message = v8::String::new(scope, message).unwrap();
     let exception = v8::Exception::error(scope, message);
@@ -8108,11 +8178,7 @@ fn op_loader_fetch(
         },
         None => RequestBodyGuard::of(&body),
     };
-    let loaded = loader_registry()
-        .lock()
-        .unwrap()
-        .get(&id)
-        .map(|entry| entry.state.clone());
+    let loaded = owned_loader_state(scope, id);
     let Some(event) = event_context(scope) else {
         return retired_event_throw(scope);
     };
@@ -8214,11 +8280,7 @@ fn op_loader_rpc(
     // value is an unbounded per-call allocation in the host. The harness checks
     // nothing here: it runs in the calling worker's isolate beside the
     // application's code, so only this op can bound the value.
-    let loaded = loader_registry()
-        .lock()
-        .unwrap()
-        .get(&id)
-        .map(|entry| entry.state.clone());
+    let loaded = owned_loader_state(scope, id);
     let Some(event) = event_context(scope) else {
         return retired_event_throw(scope);
     };
@@ -8386,18 +8448,18 @@ enum FacetHost {
 }
 
 impl FacetHost {
-    /// Resolved in the op, while the root's turn names its slot.
-    fn of(loader: u64) -> Result<Self, String> {
+    /// Resolved in the op, while the root's turn names its slot. A foreign
+    /// loader id answers exactly as an unknown one: ids are sequential
+    /// registry keys, so resolving without the owner check would let one
+    /// script drive another's loaded worker.
+    fn of(scope: &mut v8::PinScope, loader: u64) -> Result<Self, String> {
         if loader == OWN_SCRIPT_LOADER {
             return crate::pool::current_slot()
                 .map(Self::Own)
                 .ok_or_else(|| "facet: no isolate runs this turn".to_string());
         }
-        loader_registry()
-            .lock()
-            .unwrap()
-            .get(&loader)
-            .map(|entry| Self::Loaded(entry.state.clone()))
+        owned_loader_state(scope, loader)
+            .map(Self::Loaded)
             .ok_or_else(|| "worker loader: unknown worker".to_string())
     }
 
@@ -8699,6 +8761,9 @@ fn op_facet_rpc(
     };
     let method = args.get(7).to_rust_string_lossy(scope);
     let call_args = view_bytes(args.get(8)).unwrap_or_default();
+    if let Err(error) = binding_policy::require_executing_cell(scope, &parent_scope) {
+        return loader_throw(scope, &error);
+    }
     let parent = match storage::storage_identity(&parent_scope) {
         Ok(Some(parent)) => parent,
         Ok(None) => {
@@ -8709,7 +8774,7 @@ fn op_facet_rpc(
         }
         Err(error) => return loader_throw(scope, &error.to_string()),
     };
-    let host = FacetHost::of(loader);
+    let host = FacetHost::of(scope, loader);
     let trace = current_trace_context(scope);
     let async_id = asyncrt::enqueue(async move {
         let facet = prepare_facet(
@@ -8781,6 +8846,9 @@ fn op_facet_fetch(
     };
     let url = args.get(7).to_rust_string_lossy(scope);
     let method = args.get(8).to_rust_string_lossy(scope);
+    if let Err(error) = binding_policy::require_executing_cell(scope, &parent_scope) {
+        return loader_throw(scope, &error);
+    }
     let stream_arg = args.get(11);
     let body = if stream_arg.is_number() {
         RequestBody::Stream(stream_arg.number_value(scope).unwrap_or(0.0) as u64)
@@ -8812,7 +8880,7 @@ fn op_facet_fetch(
         }
         Err(error) => return loader_throw(scope, &error.to_string()),
     };
-    let host = FacetHost::of(loader);
+    let host = FacetHost::of(scope, loader);
     let trace = current_trace_context(scope);
     let stream_service = http_stream_service();
     let async_id = asyncrt::enqueue(async move {
@@ -8883,7 +8951,10 @@ fn op_facet_abort(
     let parent_scope = args.get(2).to_rust_string_lossy(scope);
     let owner = args.get(3).to_rust_string_lossy(scope);
     let name = args.get(4).to_rust_string_lossy(scope);
-    let host = FacetHost::of(loader);
+    let host = FacetHost::of(scope, loader);
+    if let Err(error) = binding_policy::require_executing_cell(scope, &parent_scope) {
+        return loader_throw(scope, &error);
+    }
     let facet_scope = facet_scope(&class_name, &parent_scope, &owner, &name);
     // The root that recorded the facet, and the facet's place below it. A
     // parent without storage has no record to drop and no facet below.
@@ -8946,6 +9017,9 @@ fn op_facet_delete(
 ) {
     let parent_scope = args.get(0).to_rust_string_lossy(scope);
     let name = args.get(1).to_rust_string_lossy(scope);
+    if let Err(error) = binding_policy::require_executing_cell(scope, &parent_scope) {
+        return loader_throw(scope, &error);
+    }
     let parent = match storage::storage_identity(&parent_scope) {
         Ok(Some(parent)) => parent,
         Ok(None) => {
@@ -8999,7 +9073,8 @@ fn op_loader_drop(
     _rv: v8::ReturnValue<v8::Value>,
 ) {
     let id = args.get(0).integer_value(scope).unwrap_or(0).max(0) as u64;
-    if let Some(entry) = loader_registry().lock().unwrap().remove(&id) {
+    let owner = scope.get_slot::<LoaderOwner>().cloned();
+    if let Some(entry) = owner.and_then(|owner| take_owned_loader(id, &owner)) {
         // This op runs while the parent isolate is entered. The load state can
         // own the loaded isolate, and V8 forbids dropping one isolate while a
         // different isolate is entered on the same thread. Hand the final
@@ -9034,6 +9109,9 @@ fn op_do_call_impl(
     let cell = args.get(0).to_rust_string_lossy(scope);
     let name_value = args.get(1);
     let name = (!name_value.is_null_or_undefined()).then(|| name_value.to_rust_string_lossy(scope));
+    if let Err(error) = binding_policy::check_cell_call(scope, &cell, name.as_deref()) {
+        return loader_throw(scope, &error);
+    }
     let url = args.get(2).to_rust_string_lossy(scope);
     let method = args.get(3).to_rust_string_lossy(scope);
     // arg 4 is the held bytes; arg 6, when a number, is a host stream id for a
@@ -9447,6 +9525,9 @@ fn op_rpc_call(
     let cell = args.get(0).to_rust_string_lossy(scope);
     let name_value = args.get(1);
     let name = (!name_value.is_null_or_undefined()).then(|| name_value.to_rust_string_lossy(scope));
+    if let Err(error) = binding_policy::check_cell_call(scope, &cell, name.as_deref()) {
+        return loader_throw(scope, &error);
+    }
     let method = args.get(2).to_rust_string_lossy(scope);
     let args = RpcData::V8(view_bytes(args.get(3)).unwrap_or_default().into());
     let (tx, rx) = tokio::sync::oneshot::channel();
@@ -10830,6 +10911,70 @@ fn register_actor_name(
     Ok(())
 }
 
+/// `__do_grant(scope)`: record a received stub's cell scope in this
+/// isolate's grant set. Only the harness calls this, from stub revive
+/// and from the queue cell's DLQ forward; user code cannot name the op.
+/// See [`binding_policy`].
+fn op_do_grant(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue<v8::Value>,
+) {
+    let cell = args.get(0).to_rust_string_lossy(scope);
+    if let Err(error) = binding_policy::grant_cell_scope(scope, &cell) {
+        loader_throw(scope, &error);
+    }
+}
+
+/// `__do_grant_name(namespaceKey, name)`: grant the cell scope that name
+/// resolves to, for a deployment-declared edge the harness addresses by
+/// name (the queue cell's DLQ forward). Only the harness calls this;
+/// user code cannot name the op. See [`binding_policy`].
+fn op_do_grant_name(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue<v8::Value>,
+) {
+    let namespace_key = args.get(0).to_rust_string_lossy(scope);
+    let name = args.get(1).to_rust_string_lossy(scope);
+    if let Err(error) = binding_policy::grant_cell_name(scope, &namespace_key, &name) {
+        loader_throw(scope, &error);
+    }
+}
+
+/// `__do_release(scope)`: drop one revived-stub reference. Only the
+/// harness calls this, from the grant finalizer when a revived stub is
+/// collected. Never throws: unknown scopes are a silent no-op. See
+/// [`binding_policy`].
+fn op_do_release(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue<v8::Value>,
+) {
+    let cell = args.get(0).to_rust_string_lossy(scope);
+    binding_policy::release_cell_scope(scope, &cell);
+}
+
+/// `__do_check_lift(scope, name?)`: refuse a stub lift the sender could
+/// not dispatch, synchronously, before the harness mints a transfer
+/// marker. The same predicate dispatch answers, minus the grant write:
+/// only a stub its holder could already use may cross RPC or storage, so
+/// a forged stub object can never mint a grant at revive. Only the
+/// harness calls this, from the two lift sites; user code cannot name the
+/// op. See [`binding_policy`].
+fn op_do_check_lift(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue<v8::Value>,
+) {
+    let cell = args.get(0).to_rust_string_lossy(scope);
+    let name_value = args.get(1);
+    let name = (!name_value.is_null_or_undefined()).then(|| name_value.to_rust_string_lossy(scope));
+    if let Err(error) = binding_policy::check_lift(scope, &cell, name.as_deref()) {
+        loader_throw(scope, &error);
+    }
+}
+
 fn op_do_id(
     scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
@@ -10840,6 +10985,12 @@ fn op_do_id(
     let namespace_key = args.get(0).to_rust_string_lossy(scope);
     let operation = args.get(1).to_rust_string_lossy(scope);
     let input = args.get(2).to_rust_string_lossy(scope);
+    if let Err(error) =
+        binding_policy::check_do_namespace(scope, &namespace_key, &operation, &input)
+    {
+        throw_durable_object_id_error(scope, &error);
+        return;
+    }
     let key = durable_object_id_key(&namespace_key);
     let mut id = [0_u8; 32];
 
@@ -10925,6 +11076,7 @@ fn webcrypto_return_bytes(
     rv.set(view.into());
 }
 
+mod binding_policy;
 mod container;
 mod crypto;
 mod html_rewriter;
@@ -10941,7 +11093,15 @@ fn op_actor_abort(
     let Some(context) = current_reaction_io_context(scope) else {
         return;
     };
-    let cell = args.get(0).to_rust_string_lossy(scope);
+    // The aborting cell is the executing cell, never a JS-passed scope: a
+    // mutated `ctx._scope` must not break another cell (H6).
+    let Some(event) = event_context(scope) else {
+        return;
+    };
+    let Some(frame) = current_cell_event(&event) else {
+        return;
+    };
+    let cell = frame.storage;
     let reason = args.get(1).to_rust_string_lossy(scope);
     let state = actor_runtime_state(scope);
     state
@@ -10977,8 +11137,10 @@ fn op_process_exit(
         );
         return;
     }
-    let actor_scope = args.get(1).to_rust_string_lossy(scope);
-    let actor_scope = (!actor_scope.is_empty()).then_some(actor_scope);
+    // The exiting actor is the executing cell, never a JS-passed scope.
+    let actor_scope = event_context(scope)
+        .and_then(|event| current_cell_event(&event))
+        .map(|frame| frame.storage);
     let state = actor_runtime_state(scope);
     if let Some(actor_scope) = actor_scope.as_deref() {
         state
@@ -13181,6 +13343,10 @@ fn op_alarm_set(
     _rv: v8::ReturnValue<v8::Value>,
 ) {
     let s = args.get(0).to_rust_string_lossy(scope);
+    if let Err(error) = binding_policy::require_executing_cell(scope, &s) {
+        throw_storage_error(scope, "setAlarm", error);
+        return;
+    }
     let at = args.get(1).number_value(scope).unwrap_or(0.0) as i64;
     let timing_started = (tracing::enabled!(target: "queue_timing", tracing::Level::DEBUG)
         && s.split_once(':')
@@ -13220,6 +13386,10 @@ fn op_queue_alarm_set_wait(
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
     let cell = args.get(0).to_rust_string_lossy(scope);
+    if let Err(error) = binding_policy::require_executing_cell(scope, &cell) {
+        throw_storage_error(scope, "Queue setAlarm", error);
+        return;
+    }
     let at_ms = args.get(1).number_value(scope).unwrap_or(0.0) as i64;
     let committed = match storage::set_alarm(&cell, at_ms) {
         Ok(committed) => committed,
@@ -13249,6 +13419,10 @@ fn op_alarm_get(
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
     let s = args.get(0).to_rust_string_lossy(scope);
+    if let Err(error) = binding_policy::require_executing_cell(scope, &s) {
+        throw_storage_error(scope, "getAlarm", error);
+        return;
+    }
     match storage::get_alarm(&s) {
         Some(at) => rv.set(v8::Number::new(scope, at as f64).into()),
         None => rv.set(v8::null(scope).into()),
@@ -13260,6 +13434,10 @@ fn op_alarm_delete(
     _rv: v8::ReturnValue<v8::Value>,
 ) {
     let s = args.get(0).to_rust_string_lossy(scope);
+    if let Err(error) = binding_policy::require_executing_cell(scope, &s) {
+        throw_storage_error(scope, "deleteAlarm", error);
+        return;
+    }
     if let Err(error) = storage::delete_alarm(&s) {
         throw_storage_error(scope, "deleteAlarm", error);
     }

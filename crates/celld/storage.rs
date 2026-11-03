@@ -1,5 +1,5 @@
+// Modified by ryuzcorp (ryuzcorp/celld): D1 export; D1 export hardening; D1 batch tests; D1 export sequence scoping; binding-forgery enforcement.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
-// Modified by ryuzcorp (ryuzcorp/celld): D1 export; D1 export hardening; D1 batch tests; D1 export sequence scoping.
 
 // This is V8-thread SQLite plumbing outside the Actor execution domain.
 #![allow(clippy::disallowed_methods)]
@@ -2157,6 +2157,29 @@ pub fn sql_cursor_close(cursor_id: u64) {
     sql_cursors(|cursors| {
         cursors.borrow_mut().remove(&cursor_id);
     });
+}
+
+/// The scope that opened a SQL cursor, if it is still active. The op
+/// layer refuses a cursor another cell opened, so a sequential id cannot
+/// be retargeted across cells.
+pub fn sql_cursor_scope(cursor_id: u64) -> Option<String> {
+    sql_cursors(|cursors| {
+        cursors
+            .borrow()
+            .get(&cursor_id)
+            .map(|cursor| cursor.scope.clone())
+    })
+}
+
+/// The scope that opened a sync-list cursor, if it is still active. See
+/// [`sql_cursor_scope`].
+pub fn sync_list_cursor_scope(cursor_id: u64) -> Option<String> {
+    sync_list_cursors(|cursors| {
+        cursors
+            .borrow()
+            .get(&cursor_id)
+            .map(|cursor| cursor.scope.clone())
+    })
 }
 
 /// `(last_insert_rowid, changes)` for the cell's connection. D1 reports both in

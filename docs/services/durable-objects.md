@@ -1,3 +1,4 @@
+<!-- Modified by ryuzcorp (ryuzcorp/celld): stored-stub upgrade note. -->
 # Durable Objects / Cells
 
 A Durable Object is a single-threaded actor with its own SQLite database, and
@@ -99,6 +100,11 @@ celld does not answer a successful `setAlarm()` until a durable wake entry in
 the bucket covers the alarm. A hibernated cell fires its alarm on its owner
 node. One node holds the waker role, and it wakes only a cell whose owner
 stopped.
+
+Stubs kept in storage (`ctx.storage.put()` of a Durable Object stub) use a
+versioned envelope. Rows written before the binding-hardening release read
+back as plain data once; storing the stub again writes the current envelope
+and restores the live stub.
 
 ## Differences from Cloudflare
 

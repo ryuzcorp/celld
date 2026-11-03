@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): exec() waits for start(); exec pty/resize; test-only fake exec engine; fake kill completion; exec reads survive their subscribing event; close/signal IoContext lifetime with fake completion.
+// Modified by ryuzcorp (ryuzcorp/celld): exec() waits for start(); exec pty/resize; test-only fake exec engine; fake kill completion; exec reads survive their subscribing event; close/signal IoContext lifetime with fake completion; binding-forgery enforcement.
 //! Host ops behind `ctx.container`.
 //!
 //! JavaScript owns the surface and every validation message, copied from
@@ -35,12 +35,35 @@ fn number_arg(scope: &mut v8::PinScope, args: &v8::FunctionCallbackArguments, in
     args.get(index).integer_value(scope).unwrap_or(0).max(0) as u64
 }
 
+/// The scope this container op may address: the executing cell's own, or
+/// a throw. A `Container` forged with another cell's scope reaches this
+/// boundary and no further. Scopes the test fake serves
+/// (`CELLD_TEST_WAIT=1` only) bypass the check, because the conformance
+/// suite drives them from stateless events with no executing cell.
+fn own_cell_container(
+    scope: &mut v8::PinScope,
+    operation: &str,
+    cell: String,
+) -> Result<String, ()> {
+    if test_wait_enabled() && test_execs().lock().unwrap().scopes.contains(&cell) {
+        return Ok(cell);
+    }
+    if let Err(error) = super::binding_policy::require_executing_cell(scope, &cell) {
+        loader_throw(scope, &format!("{operation}: {error}"));
+        return Err(());
+    }
+    Ok(cell)
+}
+
 pub(super) fn op_container_running(
     scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
     let cell = string_arg(scope, &args, 0);
+    let Ok(cell) = own_cell_container(scope, "running", cell) else {
+        return;
+    };
     if test_wait_enabled() && test_execs().lock().unwrap().scopes.contains(&cell) {
         rv.set(v8::Boolean::new(scope, true).into());
         return;
@@ -58,6 +81,9 @@ pub(super) fn op_container_address(
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
     let cell = string_arg(scope, &args, 0);
+    let Ok(cell) = own_cell_container(scope, "getTcpPort", cell) else {
+        return;
+    };
     let port = number_arg(scope, &args, 1) as u16;
     let address = container::engine_if_ready()
         .and_then(|engine| engine.cell(&cell))
@@ -87,6 +113,9 @@ pub(super) fn op_container_start(
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
     let cell = string_arg(scope, &args, 0);
+    let Ok(cell) = own_cell_container(scope, "start()", cell) else {
+        return;
+    };
     let raw = string_arg(scope, &args, 1);
     let request: StartArgs = match serde_json::from_str(&raw) {
         Ok(request) => request,
@@ -147,6 +176,9 @@ pub(super) fn op_container_monitor(
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
     let cell = string_arg(scope, &args, 0);
+    let Ok(cell) = own_cell_container(scope, "monitor()", cell) else {
+        return;
+    };
     let run = container::engine_if_ready()
         .and_then(|engine| engine.cell(&cell))
         .map_or(0, |cell| cell.current_run());
@@ -164,6 +196,9 @@ pub(super) fn op_container_destroy(
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
     let cell = string_arg(scope, &args, 0);
+    let Ok(cell) = own_cell_container(scope, "destroy()", cell) else {
+        return;
+    };
     let async_id = asyncrt::enqueue(async move {
         let (engine, cell) = cell_for(&cell).await?;
         engine
@@ -181,6 +216,9 @@ pub(super) fn op_container_signal(
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
     let cell = string_arg(scope, &args, 0);
+    let Ok(cell) = own_cell_container(scope, "signal()", cell) else {
+        return;
+    };
     let signal = number_arg(scope, &args, 1) as u32;
     if test_wait_enabled() && test_execs().lock().unwrap().scopes.contains(&cell) {
         // Recorded synchronously, like the kill dispatch; the completion
@@ -231,6 +269,9 @@ pub(super) fn op_container_inactivity(
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
     let cell = string_arg(scope, &args, 0);
+    let Ok(cell) = own_cell_container(scope, "setInactivityTimeout()", cell) else {
+        return;
+    };
     let duration = number_arg(scope, &args, 1);
     let async_id = asyncrt::enqueue(async move {
         let (_, cell) = cell_for(&cell).await?;
@@ -261,6 +302,9 @@ pub(super) fn op_container_exec(
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
     let cell = string_arg(scope, &args, 0);
+    let Ok(cell) = own_cell_container(scope, "exec()", cell) else {
+        return;
+    };
     let raw = string_arg(scope, &args, 1);
     let request: ExecArgs = match serde_json::from_str(&raw) {
         Ok(request) => request,
@@ -359,7 +403,13 @@ fn process_arg(
     args: &v8::FunctionCallbackArguments,
 ) -> Result<Arc<container::ExecProcess>, String> {
     let id = number_arg(scope, args, 0);
-    container::process(id).ok_or_else(|| "the process is closed".to_string())
+    let process = container::process(id).ok_or_else(|| "the process is closed".to_string())?;
+    // Another cell's process answers as a closed one: a distinct refusal
+    // would turn a sequential id into a liveness oracle.
+    if super::binding_policy::require_executing_cell(scope, process.owner_scope()).is_err() {
+        return Err("the process is closed".to_string());
+    }
+    Ok(process)
 }
 
 /// One chunk of stdout (1) or stderr (2); an empty chunk is the end.
@@ -604,6 +654,13 @@ pub(super) fn op_container_exec_drop(
     if test_exec_hit(id) {
         test_execs().lock().unwrap().processes.remove(&id);
         return;
+    }
+    // Dropping another cell's process would be a cross-cell effect;
+    // silently keep what is not ours, as for an unknown id.
+    if let Some(process) = container::process(id) {
+        if super::binding_policy::require_executing_cell(scope, process.owner_scope()).is_err() {
+            return;
+        }
     }
     container::drop_process(id);
 }
@@ -917,7 +974,16 @@ pub(super) fn op_testproc_spawn(
     if !test_wait_enabled() {
         return loader_throw(scope, "test procs are disabled on this node");
     }
-    rv.set(v8::Number::new(scope, container::test_proc_spawn() as f64).into());
+    // The fake joins the real process table, so it records its owner like
+    // a real exec: the read and drop ops answer only the spawning cell.
+    let Some(context) = event_context(scope) else {
+        return loader_throw(scope, "test procs need a running event");
+    };
+    let Some(frame) = current_cell_event(&context) else {
+        return loader_throw(scope, "test procs need a running cell event");
+    };
+    let id = container::test_proc_spawn(&frame.storage);
+    rv.set(v8::Number::new(scope, id as f64).into());
 }
 
 /// `__testproc_emit(id, which, bytes)`; push one chunk into a test-only
