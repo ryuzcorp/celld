@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): ctx.container.images; clone() of streaming and disturbed bodies; __celld$do on the service-binding RPC path; container exec pty/resize; cross-isolate RPC stubs and streams; container exec AbortSignal; test-only fake kill completion; exec reads survive their subscribing event.
+// Modified by ryuzcorp (ryuzcorp/celld): ctx.container.images; clone() of streaming and disturbed bodies; __celld$do on the service-binding RPC path; container exec pty/resize; cross-isolate RPC stubs and streams; container exec AbortSignal; test-only fake kill completion; exec reads survive their subscribing event; context end aborts finished uploads.
 // The DO object model and the Cloudflare-compatible runtime surface, run
 // once per isolate by `js.rs::install_harness` after the Web-API prelude.
 // Lived as a 4,000-line raw string inside js.rs until 2026-07-29; it is a
@@ -4084,16 +4084,28 @@ const __fetchCtxs = new WeakMap();
 // sees it) and the channel aborts (the receiver observes the disconnect),
 // so an upload never outlives its sender's invocation.
 const __ctxUploads = new Map();
+// ctx id -> Set of every upload id the context created. A pump that
+// already finished unregisters from __ctxUploads, but its host entry
+// still needs the sender-gone terminal at context end: without this,
+// the entry lingers with sender_alive until isolate retirement, and
+// the channels do not drain with the request.
+const __ctxUploadIds = new Map();
 const __ctxEndUploads = (id) => {
   const pumps = __ctxUploads.get(id);
-  if (pumps === undefined) return;
-  __ctxUploads.delete(id);
-  for (const pump of pumps) {
+  if (pumps !== undefined) {
+    __ctxUploads.delete(id);
+    for (const pump of pumps) {
+      try {
+        pump.reader.cancel().catch(() => {});
+      } catch {}
+    }
+  }
+  const ids = __ctxUploadIds.get(id);
+  if (ids === undefined) return;
+  __ctxUploadIds.delete(id);
+  for (const uid of ids) {
     try {
-      pump.reader.cancel().catch(() => {});
-    } catch {}
-    try {
-      __upload_abort(pump.id);
+      __upload_abort(uid);
     } catch {}
   }
 };
@@ -4519,6 +4531,9 @@ const __exportUpload = (v) => {
   if (pumps === undefined) __ctxUploads.set(ctx, pumps = new Set());
   const pump = { id, reader };
   pumps.add(pump);
+  let ids = __ctxUploadIds.get(ctx);
+  if (ids === undefined) __ctxUploadIds.set(ctx, ids = new Set());
+  ids.add(id);
   // The pump is floating work: each push awaits buffer room (the receiver
   // pulls), so a fast producer cannot outrun a slow consumer. Context end
   // cancels the reader and aborts the channel, which rejects a parked
