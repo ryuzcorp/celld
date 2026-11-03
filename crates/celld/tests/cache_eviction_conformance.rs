@@ -88,6 +88,7 @@ fn preseed_probe(app_project: &Path, probe_src: &Path) {
             vars: celld::deploy::VarOverrides::None,
             local_images: true,
             sourcemap: None,
+            no_activate: false,
         })
         .expect("build probe");
         celld::deploy::write(&bucket, &built)

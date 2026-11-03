@@ -1,3 +1,4 @@
+// Modified by ryuzcorp (ryuzcorp/celld): staged activation.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 // Modified by ryuzcorp (ryuzcorp/celld): deploy --sourcemap writes the bundle's external map.
 
@@ -32,6 +33,7 @@ pub(crate) struct Deployed {
     version: String,
     location: String,
     dry_run: bool,
+    staged: bool,
 }
 
 impl Record for Deployed {
@@ -41,6 +43,7 @@ impl Record for Deployed {
             "version": self.version,
             "location": self.location,
             "dry_run": self.dry_run,
+            "staged": self.staged,
         })
     }
 
@@ -50,9 +53,98 @@ impl Record for Deployed {
                 "Current Version ID: {} (dry run; nothing written)",
                 self.version
             )
+        } else if self.staged {
+            format!(
+                "Staged Version ID: {} (not serving; `celld activate {}={}` to serve it)",
+                self.version, self.worker, self.version
+            )
         } else {
             format!("Current Version ID: {}", self.version)
         })
+    }
+}
+
+/// What an activation named: the primary and every component.
+pub(crate) struct Activated {
+    primary: String,
+    version: String,
+    prefix: String,
+    components: Vec<(String, String)>,
+    unchanged: bool,
+}
+
+impl Record for Activated {
+    fn json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "primary": self.primary,
+            "version": self.version,
+            "prefix": self.prefix,
+            "components": self
+                .components
+                .iter()
+                .map(|(script, version)| serde_json::json!({
+                    "script": script,
+                    "version": version,
+                }))
+                .collect::<Vec<_>>(),
+            "unchanged": self.unchanged,
+        })
+    }
+
+    fn text(&self) -> Cow<'_, str> {
+        let mut components: Vec<String> = self
+            .components
+            .iter()
+            .map(|(script, version)| format!("{script}={version}"))
+            .collect();
+        components.sort();
+        Cow::Owned(format!(
+            "Activated generation: {} (primary {}; {})",
+            components.join(" "),
+            self.primary,
+            if self.unchanged {
+                "already serving"
+            } else {
+                "adopted at the next pointer poll"
+            }
+        ))
+    }
+}
+
+/// What a discard removed.
+pub(crate) struct Discarded {
+    removed: Vec<(String, String)>,
+    objects: usize,
+}
+
+impl Record for Discarded {
+    fn json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "removed": self
+                .removed
+                .iter()
+                .map(|(script, version)| serde_json::json!({
+                    "script": script,
+                    "version": version,
+                }))
+                .collect::<Vec<_>>(),
+            "objects": self.objects,
+        })
+    }
+
+    fn text(&self) -> Cow<'_, str> {
+        let mut removed: Vec<String> = self
+            .removed
+            .iter()
+            .map(|(script, version)| format!("{script}={version}"))
+            .collect();
+        removed.sort();
+        Cow::Owned(format!(
+            "Discarded {} ({} object{})",
+            removed.join(" "),
+            self.objects,
+            if self.objects == 1 { "" } else { "s" }
+        ))
     }
 }
 
@@ -600,6 +692,7 @@ pub async fn run_deploy(arguments: Vec<String>) -> anyhow::Result<()> {
             version: built.version.clone(),
             location: String::new(),
             dry_run: true,
+            staged: false,
         })?;
         return out.finish();
     }
@@ -609,7 +702,11 @@ pub async fn run_deploy(arguments: Vec<String>) -> anyhow::Result<()> {
     validate_bucket(&store).await?;
     crate::wake_format::ensure_ready(&store).await?;
     let started = std::time::Instant::now();
-    deploy::write(&store, &built).await?;
+    if options.no_activate {
+        deploy::write_staged(&store, &built).await?;
+    } else {
+        deploy::write(&store, &built).await?;
+    }
     let location = format!(
         "{}://{}/{}{}",
         store.scheme(),
@@ -628,8 +725,97 @@ pub async fn run_deploy(arguments: Vec<String>) -> anyhow::Result<()> {
         version: built.version.clone(),
         location,
         dry_run: false,
+        staged: options.no_activate,
     })?;
-    note!("Nodes adopt this version at their next pointer poll, without a restart.");
+    if options.no_activate {
+        note!(
+            "Staged, not serving: `celld activate {}={}` to serve this version.",
+            built.script_name,
+            built.version
+        );
+    } else {
+        note!("Nodes adopt this version at their next pointer poll, without a restart.");
+    }
+    out.finish()
+}
+
+pub async fn run_activate(arguments: Vec<String>) -> anyhow::Result<()> {
+    let Some(mut options) = deploy::activate_options_from_arguments(arguments)? else {
+        deploy::print_activate_help();
+        return Ok(());
+    };
+    let region = resolve_storage_location(
+        &mut options.bucket,
+        &mut options.endpoint,
+        options.region.as_deref(),
+    );
+    if options.bucket.is_none() {
+        bail!(
+            "celld activate requires --bucket s3://NAME, gs://NAME or az://CONTAINER \
+             (or CELLD_BUCKET)"
+        );
+    }
+    let bucket = options.bucket.expect("validated activation bucket");
+    let store = bucket_client(&bucket, options.endpoint.as_deref(), &region)?;
+    validate_bucket(&store).await?;
+    let activated = deploy::activate(&store, &options.scripts, options.primary.as_deref()).await?;
+    let mut out = Output::new(if options.json {
+        Format::Json
+    } else {
+        Format::Text
+    });
+    out.row(&Activated {
+        primary: activated.primary.clone(),
+        version: activated.version.clone(),
+        prefix: activated.prefix.clone(),
+        components: activated
+            .components
+            .iter()
+            .map(|(script, component)| (script.clone(), component.version.clone()))
+            .collect(),
+        unchanged: activated.unchanged,
+    })?;
+    if activated.unchanged {
+        note!("This generation is already serving; nothing moved.");
+    } else {
+        note!("Nodes adopt this generation at their next pointer poll, without a restart.");
+    }
+    out.finish()
+}
+
+pub async fn run_discard(arguments: Vec<String>) -> anyhow::Result<()> {
+    let Some(mut options) = deploy::discard_options_from_arguments(arguments)? else {
+        deploy::print_discard_help();
+        return Ok(());
+    };
+    let region = resolve_storage_location(
+        &mut options.bucket,
+        &mut options.endpoint,
+        options.region.as_deref(),
+    );
+    if options.bucket.is_none() {
+        bail!(
+            "celld discard requires --bucket s3://NAME, gs://NAME or az://CONTAINER \
+             (or CELLD_BUCKET)"
+        );
+    }
+    let bucket = options.bucket.expect("validated discard bucket");
+    let store = bucket_client(&bucket, options.endpoint.as_deref(), &region)?;
+    validate_bucket(&store).await?;
+    let discarded = deploy::discard(&store, &options.scripts).await?;
+    let mut out = Output::new(if options.json {
+        Format::Json
+    } else {
+        Format::Text
+    });
+    out.row(&Discarded {
+        removed: discarded
+            .removed
+            .iter()
+            .map(|reference| (reference.script.clone(), reference.version.clone()))
+            .collect(),
+        objects: discarded.objects,
+    })?;
     out.finish()
 }
 
@@ -730,6 +916,7 @@ pub async fn load_queue_consumer_worker(
         version: consumer.version.clone(),
         prefix: consumer.prefix.clone(),
         rollout: Rollout { percent: 100 },
+        components: None,
     };
     let pointer_key = format!("deploy/{}/current.json", consumer.script_name);
     let loaded = load_worker_at_pointer(bucket, pointer, &pointer_key, node).await?;
@@ -754,6 +941,20 @@ async fn load_worker_from_pointer(
     let pointer: DeployPointer = serde_json::from_str(&get_string(bucket, pointer_key).await?)
         .with_context(|| format!("decode {pointer_key}"))?;
     load_worker_at_pointer(bucket, pointer, pointer_key, node).await
+}
+
+/// Load the exact deployment a pointer names, for a caller that already
+/// holds the pointer rather than its key. The generation walk uses this
+/// for components pinned by the fleet-wide pointer: the manifest checks
+/// below still verify the version and script name, so a corrupt map
+/// entry fails the adoption instead of serving the wrong code.
+pub async fn load_pinned_worker(
+    bucket: &Bucket,
+    pointer: &DeployPointer,
+    pointer_key: &str,
+    node: String,
+) -> anyhow::Result<LoadedDeployment> {
+    load_worker_at_pointer(bucket, pointer.clone(), pointer_key, node).await
 }
 
 async fn load_worker_at_pointer(

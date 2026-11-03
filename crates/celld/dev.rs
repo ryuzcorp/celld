@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): operator token for the internal listener; `celld dev --port 0` assigns an ephemeral port.
+// Modified by ryuzcorp (ryuzcorp/celld): operator token for the internal listener; `celld dev --port 0` assigns an ephemeral port; staged activation.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 // Modified by ryuzcorp (ryuzcorp/celld): deploy --sourcemap writes the bundle's external map.
 
@@ -598,6 +598,7 @@ async fn deploy_project(config: &Path, store: &Store, logs: bool) -> anyhow::Res
         local_images: true,
         // `celld dev` serves locally; deployment source maps are a deploy concern.
         sourcemap: None,
+        no_activate: false,
     })?;
     if logs {
         built.report();

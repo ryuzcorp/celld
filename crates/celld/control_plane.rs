@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): tenant egress policy.
+// Modified by ryuzcorp (ryuzcorp/celld): tenant egress policy; staged activation.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 // Managed control-plane sessions execute outside the Actor execution domain.
@@ -1922,6 +1922,7 @@ pub async fn apply_deployment(
         &deployment.manifest,
         &deployment.pointer.prefix,
         queue_attachments,
+        "deploy",
     )
     .await?;
     bucket

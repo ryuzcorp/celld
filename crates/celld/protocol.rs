@@ -1,3 +1,4 @@
+// Modified by ryuzcorp (ryuzcorp/celld): staged activation.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! Durable types on the bucket contract between deployment tools and celld.
@@ -463,11 +464,39 @@ pub struct DeployPointer {
     pub version: String,
     pub prefix: String,
     pub rollout: Rollout,
+    /// The activated generation: every script's version, by script name.
+    /// Present only on fleet-wide pointers written by `celld activate`; a
+    /// plain `celld deploy` moves the top-level fields and leaves this
+    /// absent, and nodes then resolve service bindings through the named
+    /// pointers as before. Old nodes ignore the field and resolve the same
+    /// versions through the named pointers `activate` moves beside it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub components: Option<BTreeMap<String, ComponentRef>>,
+}
+
+/// One script's activated version inside a [`DeployPointer`]'s generation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ComponentRef {
+    pub version: String,
+    pub prefix: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Rollout {
     pub percent: u8,
+}
+
+/// Whether `version` has the shape [`deployment_version`] mints: 16
+/// lowercase hex characters. `celld activate` and `celld discard` name
+/// versions `celld deploy` printed, so anything else is a usage error —
+/// and for `discard` a safety gate, because an S3 listing is a byte
+/// prefix: a short or non-hex version would match sibling versions or
+/// the script's named pointer instead of one version directory.
+pub fn valid_deployment_version(version: &str) -> bool {
+    version.len() == 16
+        && version
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 /// Deployment identity: sorted module contents plus the serialized metadata,

@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): shared runtime cells run in a dedicated runtime isolate pool; runtime compat is the union over declaring scripts.
+// Modified by ryuzcorp (ryuzcorp/celld): shared runtime cells run in a dedicated runtime isolate pool; runtime compat is the union over declaring scripts; staged activation.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! One application deployment as the running process holds it.
@@ -26,6 +26,7 @@ use crate::assets::AssetResolver;
 use crate::bucket::Bucket;
 use crate::fleet::{self, LoadedDeployment};
 use crate::js::{Compat, WorkerConfig, WorkerConfigOptions};
+use crate::protocol::{ComponentRef, DeployPointer, Rollout};
 
 /// Which generation, within this process. Monotonic from one at boot; never
 /// reused, never persisted, and never compared across nodes — the fleet-wide
@@ -112,8 +113,45 @@ pub fn max_age() -> std::time::Duration {
 /// [`DeploymentGraph::load`] is the only bucket walk, so the boot path and
 /// the reload path cannot resolve a deployment's dependencies differently.
 pub struct DeploymentGraph {
+    /// The pointer identity this graph was loaded from. A generation
+    /// records it at build, and the pointer watcher compares it, so a
+    /// component-only activation — same primary version and prefix, new
+    /// map — is adopted instead of mistaken for the serving generation.
+    pub identity: ServingIdentity,
     pub primary: LoadedDeployment,
     pub cohosted: Vec<LoadedDeployment>,
+}
+
+/// Everything about a fleet pointer an adoption decision reads: the
+/// primary it names and the whole activated generation, not just the
+/// primary's version and prefix. Comparing less pins a node to a stale
+/// generation forever: the pointer never moves again, so a skipped
+/// component-only change is never retried.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ServingIdentity {
+    pub script_name: Option<String>,
+    pub version: String,
+    pub prefix: String,
+    pub components: Option<BTreeMap<String, ComponentRef>>,
+}
+
+impl ServingIdentity {
+    pub fn of_pointer(pointer: &DeployPointer) -> Self {
+        Self {
+            script_name: pointer.script_name.clone(),
+            version: pointer.version.clone(),
+            prefix: pointer.prefix.clone(),
+            components: pointer.components.clone(),
+        }
+    }
+
+    /// Whether `pointer` names this same serving generation: the same
+    /// primary and the same component map. The watcher adopts on any
+    /// difference; rebuilding on a pointer that names identical content
+    /// is the safe direction, skipping on one that differs is not.
+    pub fn names(&self, pointer: &DeployPointer) -> bool {
+        *self == Self::of_pointer(pointer)
+    }
 }
 
 impl DeploymentGraph {
@@ -121,7 +159,14 @@ impl DeploymentGraph {
     /// starts from a file, which declares no services and has no bucket to
     /// resolve them from.
     pub fn single(primary: LoadedDeployment) -> Self {
+        let identity = ServingIdentity {
+            script_name: Some(primary.script_name.clone()),
+            version: primary.version.clone(),
+            prefix: primary.prefix.clone(),
+            components: None,
+        };
         Self {
+            identity,
             primary,
             cohosted: Vec::new(),
         }
@@ -130,14 +175,40 @@ impl DeploymentGraph {
     /// Resolve the fleet-wide pointer and every script it depends on.
     ///
     /// A service binding names a script, and that script's own pointer names
-    /// its deployment. A queue dependency names a queue, and the queue's
-    /// consumer attachment names an exact deployment. The walk refuses a
-    /// script that resolves twice and a queue attached to a deployment other
-    /// than the one already loaded, because either would give one script two
-    /// bodies in one process.
+    /// its deployment — unless the fleet-wide pointer carries an activated
+    /// generation (`celld activate`), in which case every script resolves
+    /// from that one pointer read and the adoption is atomic across
+    /// scripts. A queue dependency names a queue, and the queue's consumer
+    /// attachment names an exact deployment. The walk refuses a script that
+    /// resolves twice and a queue attached to a deployment other than the
+    /// one already loaded, because either would give one script two bodies
+    /// in one process. Under an activated generation it also refuses an
+    /// attachment the components map does not name, so crash residue (or
+    /// the normal pre-commit window) fails the adoption instead of serving
+    /// one generation's primary beside another's consumer.
     pub async fn load(bucket: &Bucket, node: String) -> anyhow::Result<Self> {
-        let primary = fleet::load_current_worker(bucket, node.clone()).await?;
+        let pointer = fleet::read_current_pointer(bucket).await?;
+        let primary =
+            fleet::load_pinned_worker(bucket, &pointer, fleet::CURRENT_POINTER_KEY, node.clone())
+                .await?;
         let primary_script = primary.script_name.clone();
+        let components = pointer.components.clone();
+        // The map claims to name every script's version. A primary it
+        // omits or disagrees with is a corrupt pointer: fail the adoption
+        // rather than serve a generation the pointer does not describe.
+        if let Some(generation) = &components {
+            let pinned = generation.get(&primary_script).with_context(|| {
+                format!(
+                    "fleet pointer names primary script {primary_script:?} but no version for it"
+                )
+            })?;
+            anyhow::ensure!(
+                pinned.version == pointer.version && pinned.prefix == pointer.prefix,
+                "fleet pointer primary {} disagrees with its activated generation entry {}",
+                pointer.version,
+                pinned.version
+            );
+        }
         let mut loaded_scripts = BTreeMap::from([(primary_script.clone(), primary.prefix.clone())]);
         let mut loaded_consumers =
             BTreeMap::from([(primary_script.clone(), consumed_queues(&primary.options))]);
@@ -150,9 +221,32 @@ impl DeploymentGraph {
                     if target == primary_script || loaded_scripts.contains_key(&target) {
                         continue;
                     }
-                    let loaded = fleet::load_named_worker(bucket, &target, node.clone())
+                    let pinned = components.as_ref().and_then(|generation| {
+                        generation.get(&target).map(|component| DeployPointer {
+                            script_name: Some(target.clone()),
+                            version: component.version.clone(),
+                            prefix: component.prefix.clone(),
+                            rollout: Rollout { percent: 100 },
+                            components: None,
+                        })
+                    });
+                    let loaded = match (pinned, components.is_some()) {
+                        (Some(pinned), _) => fleet::load_pinned_worker(
+                            bucket,
+                            &pinned,
+                            &format!("deploy/{target}/current.json"),
+                            node.clone(),
+                        )
                         .await
-                        .with_context(|| format!("load service binding target {target}"))?;
+                        .with_context(|| format!("load service binding target {target}"))?,
+                        (None, true) => anyhow::bail!(
+                            "service binding target {target} is not in the activated generation; \
+                             activate a generation that names every script"
+                        ),
+                        (None, false) => fleet::load_named_worker(bucket, &target, node.clone())
+                            .await
+                            .with_context(|| format!("load service binding target {target}"))?,
+                    };
                     if loaded.script_name != target {
                         anyhow::bail!(
                             "service pointer {target} resolved script {}",
@@ -173,7 +267,7 @@ impl DeploymentGraph {
                     else {
                         if let Some(script) = declared_by {
                             anyhow::bail!(
-                                "script {script:?} consumes queue {queue:?}, but the queue has no active consumer attachment; re-run `celld deploy`"
+                                "script {script:?} consumes queue {queue:?}, but the queue has no active consumer attachment; re-run `celld activate` (or `celld deploy` for a single script) to converge the queue attachments"
                             );
                         }
                         continue;
@@ -188,7 +282,7 @@ impl DeploymentGraph {
                     if let Some(prefix) = loaded_scripts.get(&consumer.script_name) {
                         anyhow::ensure!(
                             prefix == &consumer.prefix,
-                            "queue {queue:?} is attached to deployment {} of script {:?}, but deployment {prefix} is already loaded; re-run `celld deploy`",
+                            "queue {queue:?} is attached to deployment {} of script {:?}, but deployment {prefix} is already loaded; re-run `celld activate` (or `celld deploy` for a single script) to converge the queue attachments",
                             consumer.version,
                             consumer.script_name
                         );
@@ -200,6 +294,27 @@ impl DeploymentGraph {
                             consumer.script_name
                         );
                         continue;
+                    }
+                    // The components map pins every script's version: an
+                    // attachment naming a consumer the map omits or versions
+                    // differently is crash residue (or the normal pre-commit
+                    // window), and loading it would serve one generation's
+                    // primary beside another's consumer. Fail closed exactly
+                    // like the service branch above.
+                    if let Some(generation) = components.as_ref() {
+                        let pinned = generation.get(&consumer.script_name).with_context(|| {
+                            format!(
+                                "queue {queue:?} is attached to script {:?}, which is not in the activated generation; activate a generation that names every script",
+                                consumer.script_name
+                            )
+                        })?;
+                        anyhow::ensure!(
+                            pinned.version == consumer.version && pinned.prefix == consumer.prefix,
+                            "queue {queue:?} is attached to deployment {} of script {:?}, but the activated generation names {}; re-run `celld activate` to converge the queue attachments",
+                            consumer.version,
+                            consumer.script_name,
+                            pinned.version
+                        );
                     }
                     fleet::load_queue_consumer_worker(bucket, &queue, &consumer, node.clone())
                         .await
@@ -232,7 +347,11 @@ impl DeploymentGraph {
             }
             cohosted.push(loaded);
         }
-        Ok(Self { primary, cohosted })
+        Ok(Self {
+            identity: ServingIdentity::of_pointer(&pointer),
+            primary,
+            cohosted,
+        })
     }
 }
 
@@ -284,6 +403,7 @@ pub struct Generation {
     pub(crate) version: String,
     pub(crate) prefix: String,
     pub(crate) script_name: String,
+    pub(crate) serving: ServingIdentity,
     pub(crate) stateless: crate::runtime::StatelessRuntime,
     pub(crate) services: HashMap<String, crate::runtime::StatelessRuntime>,
     pub(crate) cell_configs: HashMap<String, Arc<WorkerConfig>>,
@@ -320,6 +440,12 @@ impl Generation {
     /// consults before running the Worker.
     pub fn script_name(&self) -> &str {
         &self.script_name
+    }
+
+    /// The pointer identity this generation was adopted from, for the
+    /// pointer watcher's unchanged check.
+    pub fn serving_identity(&self) -> &ServingIdentity {
+        &self.serving
     }
 
     /// The asset resolver of the named script, if that script deployed
@@ -491,7 +617,11 @@ impl Generation {
         options: GenerationOptions,
     ) -> anyhow::Result<Self> {
         let GenerationOptions { node, region } = options;
-        let DeploymentGraph { primary, cohosted } = graph;
+        let DeploymentGraph {
+            identity,
+            primary,
+            cohosted,
+        } = graph;
         crate::runtime::init_engine();
 
         // A Queue class is shared by every co-hosted script, but its broker
@@ -713,6 +843,7 @@ impl Generation {
             version,
             prefix,
             script_name: primary_script,
+            serving: identity,
             stateless,
             services: service_pools,
             cell_configs,

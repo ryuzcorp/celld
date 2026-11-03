@@ -9,7 +9,7 @@ README below is kept intact; this file documents the fork.
 
 - `main` mirrors upstream `main` and carries no patches.
 - `ryuzcorp/v<version>` is a line branch: the upstream tag `v<version>`
-  plus our patches as commits, one commit per patch, in `0001`-`0038`
+  plus our patches as commits, one commit per patch, in `0001`-`0039`
   order. Each patch commit is self-contained and carries its own tests.
 
 Upstream's `.github/workflows/release.yml` targets `ghcr.io/denoland` and
@@ -384,7 +384,7 @@ push to `ghcr.io/denoland`, but still. Pushing a branch named
   Per-cell placement and ownership are unchanged — state stays in the
   cells' SQLite, so a rolling upgrade moves cells on restart with no
   migration — and `/state` reports the pool under its reserved name.
-- `0038` (sha TBD at merge) container stdin close and signal reach the
+- `0038` (`14fab72`) container stdin close and signal reach the
   engine: both ops run under the start's lifetime (a fire-and-forget
   close no longer dies with its event; a signal lands even on failed
   cell events and stateless entries, the cases that dropped Handler
@@ -399,6 +399,12 @@ push to `ghcr.io/denoland`, but still. Pushing a branch named
   create/exec/wait retry loops share the 60 s aggregate cap. The
   websocket bind wait is unrefed: its reply is unobserved, so it no
   longer pins successful cell events.
+- `0039` (sha TBD at merge) staged activation: `celld deploy
+  --no-activate` uploads a version without moving any pointer; `celld
+  activate SCRIPT=VERSION...` serves a multi-script generation with one
+  atomic fleet-pointer write (service bindings resolve from the
+  pointer's component map, queue attachments publish at activate time);
+  `celld discard` removes versions no pointer names.
 
 Patches `0025`–`0034` are ported fixes from
 [meln1k/celld](https://github.com/meln1k/celld) by Nikita
