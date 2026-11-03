@@ -42,9 +42,77 @@ fn fixture_dir() -> PathBuf {
         .expect("fixture exists")
 }
 
-fn free_port() -> u16 {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("probe bind");
-    listener.local_addr().expect("probe addr").port()
+/// Direct children of a process, via `/proc/<pid>/task/*/children`.
+fn child_pids(pid: u32) -> Vec<u32> {
+    let mut children = Vec::new();
+    let Ok(tasks) = std::fs::read_dir(format!("/proc/{pid}/task")) else {
+        return children;
+    };
+    for task in tasks.map_while(Result::ok) {
+        let Ok(list) = std::fs::read_to_string(task.path().join("children")) else {
+            continue;
+        };
+        children.extend(
+            list.split_whitespace()
+                .filter_map(|id| id.parse::<u32>().ok()),
+        );
+    }
+    children.sort_unstable();
+    children.dedup();
+    children
+}
+
+/// Loopback TCP ports one process listens on, matching its socket inodes
+/// against `/proc/net/tcp` LISTEN entries.
+fn listening_loopback_ports(pid: u32) -> Vec<u16> {
+    let mut inodes = std::collections::HashSet::new();
+    if let Ok(fds) = std::fs::read_dir(format!("/proc/{pid}/fd")) {
+        for fd in fds.map_while(Result::ok) {
+            let Ok(link) = std::fs::read_link(fd.path()) else {
+                continue;
+            };
+            if let Some(name) = link.to_str() {
+                if let Some(inode) = name
+                    .strip_prefix("socket:[")
+                    .and_then(|inode| inode.strip_suffix(']'))
+                {
+                    inodes.insert(inode.to_string());
+                }
+            }
+        }
+    }
+    let Ok(tcp) = std::fs::read_to_string("/proc/net/tcp") else {
+        return Vec::new();
+    };
+    let mut ports = Vec::new();
+    for line in tcp.lines().skip(1) {
+        let mut fields = line.split_whitespace();
+        let (Some(local), Some(state)) = (fields.nth(1), fields.nth(1)) else {
+            continue;
+        };
+        if state != "0A" {
+            continue;
+        }
+        // Fields past `st`: tx_queue, tr, retransmit, uid, timeout, then
+        // the inode.
+        let Some(inode) = fields.nth(5) else { continue };
+        if !inodes.contains(inode) {
+            continue;
+        }
+        let mut addr = local.split(':');
+        if addr.next() != Some("0100007F") {
+            continue;
+        }
+        if let Some(port) = addr
+            .next()
+            .and_then(|port| u16::from_str_radix(port, 16).ok())
+        {
+            ports.push(port);
+        }
+    }
+    ports.sort_unstable();
+    ports.dedup();
+    ports
 }
 
 fn copy_dir(src: &Path, dst: &Path) {
@@ -128,12 +196,13 @@ struct TestNode {
 
 impl TestNode {
     fn boot(app_project: &Path) -> Self {
-        let port = free_port();
+        // Port zero: the OS assigns the worker port, so parallel boots
+        // can never claim the same one; discovery below learns it.
         let mut child = Command::new(celld_binary())
             .arg("dev")
             .arg(app_project)
             .arg("--port")
-            .arg(port.to_string())
+            .arg("0")
             .arg("--no-watch")
             .arg("--logs")
             .env("CELLD_TEST_WAIT", "1")
@@ -152,22 +221,32 @@ impl TestNode {
             let mut sink = Vec::new();
             let _ = stderr.read_to_end(&mut sink);
         });
-        let public = format!("127.0.0.1:{port}");
-        // The kill-on-drop guard exists before the readiness poll, so a
-        // boot timeout or an early child exit cannot leak the server.
+        // The kill-on-drop guard exists before discovery, so a boot
+        // timeout or an early child exit cannot leak the server; the
+        // address is a placeholder until discovery fills it.
         let mut node = Self {
             child,
-            public: public.clone(),
+            public: String::new(),
         };
-        // Readiness is the public port answering with the app loaded.
-        poll_until("boot", Duration::from_secs(120), || {
-            if !probe(&public, "/health") {
-                return None;
-            }
+        // Discovery doubles as readiness: the node child's listener
+        // answering /health with 200 is the worker listener (the
+        // operator listener 404s it). Neither answers before the app
+        // loads.
+        node.public = poll_until("boot", Duration::from_secs(120), || {
+            // Liveness first: a dead child must fail fast, not burn
+            // the deadline on refused probes.
             if let Some(status) = node.child.try_wait().expect("poll child") {
                 panic!("celld dev exited during boot: {status}");
             }
-            Some(public.clone())
+            for pid in child_pids(node.child.id()) {
+                for found in listening_loopback_ports(pid) {
+                    let addr = format!("127.0.0.1:{found}");
+                    if probe(&addr, "/health") {
+                        return Some(addr);
+                    }
+                }
+            }
+            None
         });
         node
     }

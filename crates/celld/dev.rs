@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): operator token for the internal listener.
+// Modified by ryuzcorp (ryuzcorp/celld): operator token for the internal listener; `celld dev --port 0` assigns an ephemeral port.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 // Modified by ryuzcorp (ryuzcorp/celld): deploy --sourcemap writes the bundle's external map.
 
@@ -345,7 +345,7 @@ A .dev.vars file beside the config supplies Worker variables in dotenv form,\n\
 as for wrangler dev. Without one, .env and then .env.local supply them, and\n\
 an entry of these files that cannot be a binding is skipped with a warning.\n\
 The entries override the vars of the config.\n\n\
-OPTIONS:\n  --host IP              Worker listener host (default: 127.0.0.1)\n  --port PORT            Worker listener port (default: {DEFAULT_PORT})\n  --clean                Delete PROJECT/.celld/dev before the server starts\n  --logs                 Show the node warning and information logs\n  --no-watch             Do not rebuild when a project file changes\n  --watch-ignore PATTERN Ignore a project-relative glob; repeat as needed\n  -h, --help             Show this help"
+OPTIONS:\n  --host IP              Worker listener host (default: 127.0.0.1)\n  --port PORT            Worker listener port (default: {DEFAULT_PORT}; 0 assigns an ephemeral port)\n  --clean                Delete PROJECT/.celld/dev before the server starts\n  --logs                 Show the node warning and information logs\n  --no-watch             Do not rebuild when a project file changes\n  --watch-ignore PATTERN Ignore a project-relative glob; repeat as needed\n  -h, --help             Show this help"
         ),
     )
 }
@@ -382,12 +382,13 @@ fn options_from_arguments(arguments: Vec<String>) -> anyhow::Result<Option<Optio
             }
             "--port" => {
                 let value = arguments.next().context("--port requires a value")?;
+                // Zero is an ephemeral port: the node binds it and the
+                // supervisor learns the assigned address from the node's
+                // announce line, so parallel `celld dev` instances never
+                // race on a probed-free port.
                 port = value
                     .parse::<u16>()
                     .with_context(|| format!("invalid --port value {value:?}"))?;
-                if port == 0 {
-                    bail!("--port must be between 1 and 65535");
-                }
             }
             other if other.starts_with('-') => bail!("unknown argument for `celld dev`: {other}"),
             value if project.is_none() => project = Some(PathBuf::from(value)),
@@ -776,14 +777,21 @@ async fn start_node(
         .take()
         .expect("the local node was configured with piped output");
     let (internal_tx, internal_rx) = oneshot::channel();
+    let (public_tx, public_rx) = oneshot::channel();
     let output_console = *console;
     let output = tokio::spawn(async move {
         let mut lines = BufReader::new(stdout).lines();
         let mut internal_tx = Some(internal_tx);
+        let mut public_tx = Some(public_tx);
         while let Ok(Some(line)) = lines.next_line().await {
             if let Some(origin) = internal_origin(&line) {
                 if let Some(sender) = internal_tx.take() {
                     let _ = sender.send(origin);
+                }
+            }
+            if let Some(address) = public_origin(&line) {
+                if let Some(sender) = public_tx.take() {
+                    let _ = sender.send(address);
                 }
             }
             if logs || line.contains(" ERROR ") {
@@ -805,6 +813,30 @@ async fn start_node(
             }
         }
     };
+    // The node prints its worker announce before its operator announce,
+    // so this is already in hand; the timeout only guards a node that
+    // never prints it.
+    let public = match tokio::time::timeout(Duration::from_secs(30), public_rx).await {
+        Ok(Ok(public)) => public,
+        result => {
+            stop_child(&mut child, Some(&internal)).await;
+            let _ = output.await;
+            match result {
+                Err(_) => bail!("the local node did not announce its worker listener"),
+                Ok(Err(_)) => {
+                    bail!("the local node exited before it announced its worker listener")
+                }
+                Ok(Ok(_)) => unreachable!(),
+            }
+        }
+    };
+    // A requested port of zero means the node assigned one; readiness
+    // and the ready URL use the announced address in that case.
+    let listener = if listener.port() == 0 {
+        public
+    } else {
+        listener
+    };
 
     if let Err(error) = wait_for_node(&mut child, listener).await {
         stop_child(&mut child, Some(&internal)).await;
@@ -825,6 +857,11 @@ fn internal_origin(line: &str) -> Option<String> {
         .split_once(' ')?
         .0;
     Some(format!("http://{address}"))
+}
+
+fn public_origin(line: &str) -> Option<SocketAddr> {
+    let address = line.strip_prefix("celld listening on ")?.split_once(' ')?.0;
+    address.parse().ok()
 }
 
 #[allow(clippy::disallowed_methods)] // Readiness waits on a real child and wall-clock deadline.
@@ -928,5 +965,44 @@ async fn stop_child(child: &mut Child, internal: Option<&str>) {
     let waited = tokio::time::timeout(Duration::from_secs(35), child.wait()).await;
     if waited.is_err() {
         let _ = child.kill().await;
+    }
+}
+
+#[cfg(test)]
+mod dev_tests {
+    use super::*;
+
+    fn options_of(args: &[&str]) -> Options {
+        options_from_arguments(args.iter().map(|arg| arg.to_string()).collect())
+            .expect("parse")
+            .expect("options")
+    }
+
+    #[test]
+    fn port_zero_means_ephemeral() {
+        let options = options_of(&["--port", "0"]);
+        assert_eq!(options.stack.listener.port(), 0);
+        let options = options_of(&["--port", "8484"]);
+        assert_eq!(options.stack.listener.port(), 8484);
+    }
+
+    #[test]
+    fn announce_parsers_split_worker_and_operator_lines() {
+        let worker = "celld listening on 127.0.0.1:40349 (ownership=dev-abc)";
+        let operator = "celld internal listening on 127.0.0.1:51234 (advertise=none)";
+        assert_eq!(
+            public_origin(worker),
+            Some("127.0.0.1:40349".parse().expect("addr"))
+        );
+        assert_eq!(public_origin(operator), None);
+        assert_eq!(
+            internal_origin(operator).as_deref(),
+            Some("http://127.0.0.1:51234")
+        );
+        assert_eq!(internal_origin(worker), None);
+        assert_eq!(
+            public_origin("celld listening on bogus (ownership=x)"),
+            None
+        );
     }
 }
