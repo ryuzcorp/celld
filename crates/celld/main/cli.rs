@@ -1,3 +1,4 @@
+// Modified by ryuzcorp (ryuzcorp/celld): CELLD_MEMORY_SCOPE help.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! The command line: what the process was asked to do, and the help text
@@ -362,6 +363,9 @@ TUNING:
   CELLD_MAX_DYNAMIC_WORKER_CODE_BYTES  Loaded module total (default: 64 MiB)
   CELLD_PRESSURE_OWNERSHIP        release to rebalance, sticky to cache locally
   CELLD_MAX_RSS_MB                Active-memory shed threshold (default: 80%; 0 disables)
+  CELLD_MEMORY_SCOPE              Which cgroup memory pressure reads: the
+                                  container root (container, the default) or
+                                  the process's own cgroup leaf (self)
   CELLD_ALARM_RESIDENT_MS         Near-alarm residency window
   CELLD_WAKER_TICK_MS             Orphan-alarm scan interval
   CELLD_V8_HEAP_LIMIT_MB          Per-isolate V8 heap limit

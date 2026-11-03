@@ -1,3 +1,4 @@
+// Modified by ryuzcorp (ryuzcorp/celld): per-process cgroup memory scope.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! What the process holds, and how much of that a cell actually holds.
@@ -18,6 +19,42 @@ pub struct Sample {
     pub cgroup_current_bytes: Option<u64>,
 }
 
+/// Which cgroup the memory sample and limit describe.
+///
+/// `container` (the default) reads the cgroupfs root: the whole container.
+/// That is right for one node per container. When several nodes share one
+/// container, each in its own cgroup leaf with its own `memory.max`, the
+/// root charge trips every node's pressure gate at once; `self` reads the
+/// process's own cgroup v2 leaf instead, so each node sheds against its own
+/// cap. Set with `CELLD_MEMORY_SCOPE`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MemoryScope {
+    /// Measure the container-root cgroup.
+    #[default]
+    Container,
+    /// Measure the process's own cgroup v2 leaf, falling back to the
+    /// container root where the leaf is not readable.
+    OwnLeaf,
+}
+
+impl MemoryScope {
+    /// Read `CELLD_MEMORY_SCOPE`: `container` (the default) or `self`.
+    /// Anything else is an operator typo and fails, so a misspelled scope
+    /// cannot silently measure the wrong cgroup.
+    pub fn from_environment() -> anyhow::Result<Self> {
+        match std::env::var("CELLD_MEMORY_SCOPE") {
+            Err(_) => Ok(Self::Container),
+            Ok(value) => match value.trim() {
+                "container" => Ok(Self::Container),
+                "self" => Ok(Self::OwnLeaf),
+                other => Err(anyhow::anyhow!(
+                    "CELLD_MEMORY_SCOPE must be `container` or `self`, not `{other}`"
+                )),
+            },
+        }
+    }
+}
+
 /// The resident set size and the memory a cell holds, together.
 pub fn sample() -> Sample {
     let rss_bytes = resident_bytes();
@@ -30,37 +67,158 @@ pub fn sample() -> Sample {
     }
 }
 
+/// [`sample`] with explicit filesystem roots, so tests can point it at a
+/// fake cgroup tree.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn sample_with_roots(
+    cgroup_root: &std::path::Path,
+    proc_self_cgroup: &std::path::Path,
+    scope: MemoryScope,
+) -> Sample {
+    let rss_bytes = resident_bytes();
+    let cgroup = cgroup_memory_with_roots(cgroup_root, proc_self_cgroup, scope);
+    Sample {
+        rss_bytes,
+        in_use_bytes: rss_bytes.saturating_sub(allocator_slack_bytes()),
+        cgroup_working_set_bytes: cgroup.map(|memory| memory.working_set_bytes),
+        cgroup_current_bytes: cgroup.map(|memory| memory.current_bytes),
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct CgroupMemory {
+pub(crate) struct CgroupMemory {
     current_bytes: u64,
     working_set_bytes: u64,
 }
 
+/// The configured scope, read once: the sampler calls this on every turn
+/// and the environment does not change under a running node. Startup
+/// validation rejects a misspelled scope before the first sample, so the
+/// warning here only fires where that pass did not run.
+#[cfg(target_os = "linux")]
+fn scope() -> MemoryScope {
+    static SCOPE: std::sync::OnceLock<MemoryScope> = std::sync::OnceLock::new();
+    *SCOPE.get_or_init(|| {
+        MemoryScope::from_environment().unwrap_or_else(|error| {
+            tracing::warn!(
+                %error,
+                "measuring the container cgroup until the operator fixes CELLD_MEMORY_SCOPE"
+            );
+            MemoryScope::Container
+        })
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn cgroup_memory() -> Option<CgroupMemory> {
+    cgroup_memory_with_roots(
+        std::path::Path::new("/sys/fs/cgroup"),
+        std::path::Path::new("/proc/self/cgroup"),
+        scope(),
+    )
+}
+
+/// The cgroup charge under `scope`, read below `cgroup_root`, with the
+/// process's own membership read from `proc_self_cgroup`. The roots are
+/// parameters so tests can point them at a fake tree; production passes
+/// the real `/sys/fs/cgroup` and `/proc/self/cgroup`.
+#[cfg(target_os = "linux")]
+pub(crate) fn cgroup_memory_with_roots(
+    cgroup_root: &std::path::Path,
+    proc_self_cgroup: &std::path::Path,
+    scope: MemoryScope,
+) -> Option<CgroupMemory> {
+    match scope {
+        MemoryScope::Container => cgroup_memory_at(cgroup_root),
+        MemoryScope::OwnLeaf => match own_leaf_memory(cgroup_root, proc_self_cgroup) {
+            Ok(memory) => Some(memory),
+            Err(reason) => {
+                warn_self_scope_fallback(reason);
+                cgroup_memory_at(cgroup_root)
+            }
+        },
+    }
+}
+
 #[cfg(target_os = "linux")]
 #[allow(clippy::disallowed_methods)] // cgroup files are kernel telemetry.
-fn cgroup_memory() -> Option<CgroupMemory> {
-    for (current_path, stat_path, inactive_key) in [
+fn cgroup_memory_at(dir: &std::path::Path) -> Option<CgroupMemory> {
+    for (current_name, stat_name, inactive_key) in [
+        ("memory.current", "memory.stat", "inactive_file"),
         (
-            "/sys/fs/cgroup/memory.current",
-            "/sys/fs/cgroup/memory.stat",
-            "inactive_file",
-        ),
-        (
-            "/sys/fs/cgroup/memory/memory.usage_in_bytes",
-            "/sys/fs/cgroup/memory/memory.stat",
+            "memory/memory.usage_in_bytes",
+            "memory/memory.stat",
             "total_inactive_file",
         ),
     ] {
-        let Ok(current) = std::fs::read_to_string(current_path) else {
+        let Ok(current) = std::fs::read_to_string(dir.join(current_name)) else {
             continue;
         };
         let Some(current_bytes) = current.trim().parse::<u64>().ok() else {
             continue;
         };
-        let stat = std::fs::read_to_string(stat_path).unwrap_or_default();
+        let stat = std::fs::read_to_string(dir.join(stat_name)).unwrap_or_default();
         return Some(cgroup_memory_from_stat(current_bytes, &stat, inactive_key));
     }
     None
+}
+
+/// The process's own cgroup v2 directory below `cgroup_root`. `Err` names
+/// why the caller must fall back to the container root.
+///
+/// The membership is resolved on every sample, not cached: an orchestrator
+/// moves a freshly spawned node into its leaf after the spawn, so the leaf
+/// of the first sample need not be the leaf of the rest. Under a cgroup
+/// namespace `/proc/self/cgroup` shows the path relative to the namespace
+/// root, which is what the cgroupfs mount shows too, so the join is right
+/// with and without one.
+#[cfg(target_os = "linux")]
+#[allow(clippy::disallowed_methods)] // cgroup files are kernel telemetry.
+fn own_leaf_dir(
+    cgroup_root: &std::path::Path,
+    proc_self_cgroup: &std::path::Path,
+) -> Result<std::path::PathBuf, &'static str> {
+    let membership = std::fs::read_to_string(proc_self_cgroup)
+        .map_err(|_| "the process cgroup membership is not readable")?;
+    // cgroup v2 reports one `0::/path` line; cgroup v1 reports
+    // `id:subsystems:/path` lines and no unified entry.
+    let relative = membership
+        .lines()
+        .find_map(|line| line.strip_prefix("0::"))
+        .map(|path| path.trim_start_matches('/'))
+        .ok_or("the hierarchy is cgroup v1, which has no unified leaf")?;
+    if relative.split('/').any(|component| component == "..") {
+        return Err("the process cgroup path escapes the cgroup root");
+    }
+    Ok(if relative.is_empty() {
+        cgroup_root.to_path_buf()
+    } else {
+        cgroup_root.join(relative)
+    })
+}
+
+/// The charge of the process's own cgroup v2 leaf. `Err` names why the
+/// caller must fall back to the container root.
+#[cfg(target_os = "linux")]
+fn own_leaf_memory(
+    cgroup_root: &std::path::Path,
+    proc_self_cgroup: &std::path::Path,
+) -> Result<CgroupMemory, &'static str> {
+    let leaf = own_leaf_dir(cgroup_root, proc_self_cgroup)?;
+    cgroup_memory_at(&leaf).ok_or("the process cgroup has no readable memory files")
+}
+
+/// Report a `self`-scope fallback once: the sampler retries the leaf on
+/// every turn, but the operator needs one line, not one per sample.
+#[cfg(target_os = "linux")]
+fn warn_self_scope_fallback(reason: &str) {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        tracing::warn!(
+            reason,
+            "CELLD_MEMORY_SCOPE=self falls back to the container cgroup"
+        );
+    }
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -99,15 +257,46 @@ fn cgroup_memory_from_stat(current_bytes: u64, stat: &str, inactive_key: &str) -
 }
 
 /// The active memory-cgroup limit. `None` means that no finite cgroup limit is
-/// readable, so the caller must use the host memory size.
+/// readable, so the caller must use the host memory size. Under
+/// `CELLD_MEMORY_SCOPE=self` this is the process leaf's `memory.max`, so an
+/// unset `CELLD_MAX_RSS_MB` defaults the shed threshold to a share of the
+/// leaf instead of the container.
+#[cfg(target_os = "linux")]
+pub(crate) fn cgroup_limit_bytes() -> Option<u64> {
+    cgroup_limit_bytes_with_roots(
+        std::path::Path::new("/sys/fs/cgroup"),
+        std::path::Path::new("/proc/self/cgroup"),
+        scope(),
+    )
+}
+
+/// [`cgroup_limit_bytes`] under an explicit `scope` and explicit filesystem
+/// roots, so tests can point it at a fake tree. In `self` scope the leaf's
+/// `memory.max` wins; an unlimited leaf (`max`) or an unreadable one falls
+/// through to the container root, whose limit still constrains the process.
+#[cfg(target_os = "linux")]
+pub(crate) fn cgroup_limit_bytes_with_roots(
+    cgroup_root: &std::path::Path,
+    proc_self_cgroup: &std::path::Path,
+    scope: MemoryScope,
+) -> Option<u64> {
+    match scope {
+        MemoryScope::Container => cgroup_limit_at(cgroup_root),
+        MemoryScope::OwnLeaf => match own_leaf_dir(cgroup_root, proc_self_cgroup) {
+            Ok(leaf) => cgroup_limit_at(&leaf).or_else(|| cgroup_limit_at(cgroup_root)),
+            Err(reason) => {
+                warn_self_scope_fallback(reason);
+                cgroup_limit_at(cgroup_root)
+            }
+        },
+    }
+}
+
 #[cfg(target_os = "linux")]
 #[allow(clippy::disallowed_methods)] // cgroup files are kernel telemetry.
-pub(crate) fn cgroup_limit_bytes() -> Option<u64> {
-    for path in [
-        "/sys/fs/cgroup/memory.max",
-        "/sys/fs/cgroup/memory/memory.limit_in_bytes",
-    ] {
-        if let Ok(raw) = std::fs::read_to_string(path) {
+fn cgroup_limit_at(dir: &std::path::Path) -> Option<u64> {
+    for name in ["memory.max", "memory/memory.limit_in_bytes"] {
+        if let Ok(raw) = std::fs::read_to_string(dir.join(name)) {
             if let Ok(limit) = raw.trim().parse::<u64>() {
                 // cgroup v1 reports "no limit" as a huge page-rounded value.
                 if limit < (1 << 50) {
@@ -338,4 +527,186 @@ pub fn tune_allocator() {
 #[cfg(all(test, celld_internal_tests))]
 mod internal_tests {
     include!(env!("CELLD_INTERNAL_MEMORY_TESTS"));
+}
+
+#[cfg(all(test, target_os = "linux"))]
+#[allow(clippy::disallowed_methods)] // Tests build their own fake cgroup tree.
+mod scope_tests {
+    use super::{cgroup_limit_bytes_with_roots, sample_with_roots, MemoryScope};
+    use std::path::{Path, PathBuf};
+
+    struct FakeCgroup {
+        dir: tempfile::TempDir,
+    }
+
+    impl FakeCgroup {
+        fn build() -> Self {
+            let dir = tempfile::Builder::new()
+                .prefix("celld-memory-scope-test-")
+                .tempdir()
+                .expect("tempdir");
+            // The container root carries one charge and limit, the fleet leaf
+            // another; the two must never be confused.
+            write_tree(
+                dir.path(),
+                &[
+                    ("memory.current", "1000000"),
+                    ("memory.stat", "inactive_file 100000\n"),
+                    ("memory.max", "8000000"),
+                    ("fleet-a/memory.current", "500000"),
+                    ("fleet-a/memory.stat", "inactive_file 50000\n"),
+                    ("fleet-a/memory.max", "2000000"),
+                    ("proc-self-cgroup", "0::/fleet-a\n"),
+                    (
+                        "proc-self-cgroup-v1",
+                        "8:memory:/fleet-a\n2:cpu,cpuacct:/\n",
+                    ),
+                    ("proc-self-cgroup-root", "0::/\n"),
+                ],
+            );
+            Self { dir }
+        }
+
+        fn root(&self) -> &Path {
+            self.dir.path()
+        }
+
+        fn path(&self, name: &str) -> PathBuf {
+            self.dir.path().join(name)
+        }
+
+        fn proc_self_cgroup(&self) -> PathBuf {
+            self.path("proc-self-cgroup")
+        }
+    }
+
+    fn write_tree(root: &Path, files: &[(&str, &str)]) {
+        for (name, contents) in files {
+            let path = root.join(name);
+            std::fs::create_dir_all(path.parent().expect("file has a parent"))
+                .expect("create fake cgroup dir");
+            std::fs::write(&path, contents).expect("write fake cgroup file");
+        }
+    }
+
+    #[test]
+    fn scope_parses_known_values() {
+        // The only test that touches the process environment, so no other
+        // test can observe the values it sets.
+        let previous = std::env::var_os("CELLD_MEMORY_SCOPE");
+        let restore = || {
+            if let Some(value) = previous.as_deref() {
+                std::env::set_var("CELLD_MEMORY_SCOPE", value);
+            } else {
+                std::env::remove_var("CELLD_MEMORY_SCOPE");
+            }
+        };
+        std::env::remove_var("CELLD_MEMORY_SCOPE");
+        assert_eq!(
+            MemoryScope::from_environment().expect("unset means container"),
+            MemoryScope::Container
+        );
+        std::env::set_var("CELLD_MEMORY_SCOPE", "container");
+        assert_eq!(
+            MemoryScope::from_environment().expect("container parses"),
+            MemoryScope::Container
+        );
+        std::env::set_var("CELLD_MEMORY_SCOPE", "self");
+        assert_eq!(
+            MemoryScope::from_environment().expect("self parses"),
+            MemoryScope::OwnLeaf
+        );
+        std::env::set_var("CELLD_MEMORY_SCOPE", "leaf");
+        assert!(
+            MemoryScope::from_environment().is_err(),
+            "an unknown scope must fail, not silently measure the container"
+        );
+        restore();
+    }
+
+    #[test]
+    fn container_scope_reads_the_cgroup_root() {
+        let fake = FakeCgroup::build();
+        let sample = sample_with_roots(
+            fake.root(),
+            &fake.proc_self_cgroup(),
+            MemoryScope::Container,
+        );
+        assert_eq!(sample.cgroup_current_bytes, Some(1_000_000));
+        assert_eq!(sample.cgroup_working_set_bytes, Some(900_000));
+        assert_eq!(
+            cgroup_limit_bytes_with_roots(
+                fake.root(),
+                &fake.proc_self_cgroup(),
+                MemoryScope::Container
+            ),
+            Some(8_000_000)
+        );
+    }
+
+    #[test]
+    fn self_scope_reads_the_process_leaf() {
+        let fake = FakeCgroup::build();
+        let sample = sample_with_roots(fake.root(), &fake.proc_self_cgroup(), MemoryScope::OwnLeaf);
+        assert_eq!(sample.cgroup_current_bytes, Some(500_000));
+        assert_eq!(sample.cgroup_working_set_bytes, Some(450_000));
+        assert_eq!(
+            cgroup_limit_bytes_with_roots(
+                fake.root(),
+                &fake.proc_self_cgroup(),
+                MemoryScope::OwnLeaf
+            ),
+            Some(2_000_000)
+        );
+    }
+
+    #[test]
+    fn self_scope_at_the_root_reads_the_root() {
+        let fake = FakeCgroup::build();
+        let proc = fake.path("proc-self-cgroup-root");
+        let sample = sample_with_roots(fake.root(), &proc, MemoryScope::OwnLeaf);
+        assert_eq!(sample.cgroup_current_bytes, Some(1_000_000));
+        assert_eq!(sample.cgroup_working_set_bytes, Some(900_000));
+    }
+
+    #[test]
+    fn self_scope_falls_back_on_cgroup_v1() {
+        let fake = FakeCgroup::build();
+        let proc = fake.path("proc-self-cgroup-v1");
+        let sample = sample_with_roots(fake.root(), &proc, MemoryScope::OwnLeaf);
+        assert_eq!(sample.cgroup_current_bytes, Some(1_000_000));
+        assert_eq!(sample.cgroup_working_set_bytes, Some(900_000));
+        assert_eq!(
+            cgroup_limit_bytes_with_roots(fake.root(), &proc, MemoryScope::OwnLeaf),
+            Some(8_000_000)
+        );
+    }
+
+    #[test]
+    fn self_scope_falls_back_when_the_leaf_is_unreadable() {
+        let fake = FakeCgroup::build();
+        // No such member file: the membership entry is missing entirely.
+        let missing = fake.path("proc-self-cgroup-missing");
+        let sample = sample_with_roots(fake.root(), &missing, MemoryScope::OwnLeaf);
+        assert_eq!(sample.cgroup_current_bytes, Some(1_000_000));
+        // The membership names a leaf with no memory files.
+        let dangling = fake.path("proc-self-cgroup-dangling");
+        std::fs::write(&dangling, "0::/no-such-leaf\n").expect("write dangling entry");
+        let sample = sample_with_roots(fake.root(), &dangling, MemoryScope::OwnLeaf);
+        assert_eq!(sample.cgroup_current_bytes, Some(1_000_000));
+    }
+
+    #[test]
+    fn self_scope_unlimited_leaf_uses_the_container_limit() {
+        let fake = FakeCgroup::build();
+        std::fs::write(fake.path("fleet-a/memory.max"), "max").expect("unlimit the leaf");
+        assert_eq!(
+            cgroup_limit_bytes_with_roots(
+                fake.root(),
+                &fake.proc_self_cgroup(),
+                MemoryScope::OwnLeaf
+            ),
+            Some(8_000_000)
+        );
+    }
 }

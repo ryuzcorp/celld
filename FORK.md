@@ -9,7 +9,7 @@ README below is kept intact; this file documents the fork.
 
 - `main` mirrors upstream `main` and carries no patches.
 - `ryuzcorp/v<version>` is a line branch: the upstream tag `v<version>`
-  plus our patches as commits, one commit per patch, in `0001`-`0010`
+  plus our patches as commits, one commit per patch, in `0001`-`0011`
   order. Each patch commit is self-contained and carries its own tests.
 
 Upstream's `.github/workflows/release.yml` targets `ghcr.io/denoland` and
@@ -169,8 +169,8 @@ push to `ghcr.io/denoland`, but still. Pushing a branch named
   a retained wait re-subscribes in each later event instead of hanging
   on the first event's dropped op; awaiting in its own event still
   resolves through its own subscription.
-- `0009` (`d4215ef`, test fix-ups `145d8e9` and the ETXTBSY fix that
-  runs the fake engine through `sh`) `celld deploy` treats a
+- `0009` (`d4215ef`, test fix-ups `145d8e9` and `56bfc42`, the latter
+  running the fake engine through `sh`) `celld deploy` treats a
   lost content-tag race as success: when tagging the built image fails
   with `AlreadyExists`, the tag is re-inspected and the deploy continues
   if it names the same content; a different image under the tag still
@@ -180,6 +180,11 @@ push to `ghcr.io/denoland`, but still. Pushing a branch named
   before spawning, aborting later sends SIGKILL through the existing
   exec kill path, and the abort listener is removed when the process
   exits.
+- `0011` (sha TBD at merge) `CELLD_MEMORY_SCOPE=self` measures the
+  process's own cgroup v2 leaf instead of the container root, so nodes
+  sharing one container each shed against their own `memory.max` (which
+  an unset `CELLD_MAX_RSS_MB` defaults to a share of); cgroup v1 and an
+  unreadable leaf fall back to the root with a warning.
 
 ## Releases
 
