@@ -1,3 +1,4 @@
+// Modified by ryuzcorp (ryuzcorp/celld): idempotent content-tagged image create.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 // Deployment is an operator control-plane path outside the Actor execution
@@ -837,8 +838,37 @@ fn resolve_image(root: &Path, image: &str, platform: Option<&str>) -> anyhow::Re
         ],
         "inspect container image",
     )?;
-    let reference = crate::container::image_reference(&format!("{:x}", Sha256::digest(&content)));
-    run_engine(&["tag", &id, &reference], "tag container image")?;
+    let key = format!("{:x}", Sha256::digest(&content));
+    let reference = crate::container::image_reference(&key);
+    if let Err(tag_error) = run_engine(&["tag", &id, &reference], "tag container image") {
+        // Two deploys of one image tag the same content reference at once.
+        // The engine replaces a tag by deleting then creating it, so the
+        // loser can fail with AlreadyExists after the winner recreates the
+        // tag. The tag names the content, so re-inspect it: when it holds
+        // the content just built, the concurrent deploy won and this one
+        // continues; a different image under the tag still fails.
+        if !format!("{tag_error:?}").contains("AlreadyExists") {
+            return Err(tag_error);
+        }
+        let existing = match run_engine(
+            &[
+                "image",
+                "inspect",
+                "--format",
+                "{{json .RootFS.Layers}}{{json .Config}}",
+                &reference,
+            ],
+            "inspect container image",
+        ) {
+            Ok(existing) => existing,
+            Err(_) => return Err(tag_error),
+        };
+        if format!("{:x}", Sha256::digest(&existing)) != key {
+            return Err(tag_error).with_context(|| {
+                format!("the container image tag {reference} names a different image")
+            });
+        }
+    }
     Ok(reference)
 }
 
@@ -3040,4 +3070,117 @@ fn strip_jsonc(source: &str) -> String {
 #[cfg(all(test, celld_internal_tests))]
 mod deploy_contract {
     include!(env!("CELLD_INTERNAL_DEPLOY_TESTS"));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::{Mutex, OnceLock};
+
+    /// `resolve_image` reaches the engine through the `CELLD_DOCKER` CLI,
+    /// which is process-global, so the fake-engine tests serialize here.
+    fn engine_cli_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    /// Point `CELLD_DOCKER` at `cli` until the guard drops.
+    struct EngineCliGuard {
+        previous: Option<String>,
+    }
+
+    impl EngineCliGuard {
+        fn install(cli: &Path) -> Self {
+            let previous = std::env::var("CELLD_DOCKER").ok();
+            std::env::set_var("CELLD_DOCKER", cli);
+            Self { previous }
+        }
+    }
+
+    impl Drop for EngineCliGuard {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(previous) => std::env::set_var("CELLD_DOCKER", previous),
+                None => std::env::remove_var("CELLD_DOCKER"),
+            }
+        }
+    }
+
+    /// A fake engine CLI: builds answer with `built_id`, inspects of that
+    /// id answer with `built_content`, inspects of anything else (the
+    /// content tag under contention) answer with `tagged_content`, and
+    /// every tag fails the way the engine fails a lost tag race.
+    fn fake_engine(
+        dir: &Path,
+        built_id: &str,
+        built_content: &str,
+        tagged_content: &str,
+    ) -> PathBuf {
+        let cli = dir.join("fake-engine");
+        let script = r#"#!/bin/sh
+if [ "$1" = "build" ]; then
+  echo 'CELLD_TEST_BUILT_ID'
+elif [ "$1" = "image" ]; then
+  if [ "$5" = 'CELLD_TEST_BUILT_ID' ]; then
+    echo 'CELLD_TEST_BUILT_CONTENT'
+  else
+    echo 'CELLD_TEST_TAGGED_CONTENT'
+  fi
+elif [ "$1" = "tag" ]; then
+  echo "failed to create an image $3 after deleting the existing one: AlreadyExists" >&2
+  exit 1
+else
+  echo "unexpected engine call: $*" >&2
+  exit 99
+fi
+"#
+        .replace("CELLD_TEST_BUILT_ID", built_id)
+        .replace("CELLD_TEST_BUILT_CONTENT", built_content)
+        .replace("CELLD_TEST_TAGGED_CONTENT", tagged_content);
+        std::fs::write(&cli, script).unwrap();
+        std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
+        cli
+    }
+
+    fn dockerfile_project(dir: &Path) {
+        std::fs::write(dir.join("Dockerfile"), "FROM scratch\n").unwrap();
+    }
+
+    #[test]
+    fn tag_race_against_identical_image_succeeds() {
+        let _guard = engine_cli_lock().lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        dockerfile_project(dir.path());
+        let content = "[layer-a]{config-a}";
+        let cli = fake_engine(dir.path(), "fake-built-id", content, content);
+        let _env = EngineCliGuard::install(&cli);
+        let reference = resolve_image(dir.path(), "Dockerfile", None)
+            .expect("an identical image under the tag is the lost race's winner");
+        assert_eq!(
+            reference,
+            crate::container::image_reference(&format!("{:x}", Sha256::digest(content)))
+        );
+    }
+
+    #[test]
+    fn tag_race_against_different_image_fails() {
+        let _guard = engine_cli_lock().lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        dockerfile_project(dir.path());
+        let cli = fake_engine(
+            dir.path(),
+            "fake-built-id",
+            "[layer-a]{config-a}",
+            "[layer-b]{config-b}",
+        );
+        let _env = EngineCliGuard::install(&cli);
+        let error = resolve_image(dir.path(), "Dockerfile", None)
+            .expect_err("a different image under the tag must still fail");
+        let message = format!("{error:?}");
+        assert!(
+            message.contains("AlreadyExists"),
+            "the conflict must stay visible: {message}"
+        );
+    }
 }
