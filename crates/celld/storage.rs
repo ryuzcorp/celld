@@ -1,5 +1,5 @@
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
-// Modified by ryuzcorp (ryuzcorp/celld): D1 export; D1 export hardening; D1 batch tests.
+// Modified by ryuzcorp (ryuzcorp/celld): D1 export; D1 export hardening; D1 batch tests; D1 export sequence scoping.
 
 // This is V8-thread SQLite plumbing outside the Actor execution domain.
 #![allow(clippy::disallowed_methods)]
@@ -3592,10 +3592,11 @@ fn d1_export_rows(connection: &Connection, sql: &mut String, table: &str) -> Res
 
 /// The AUTOINCREMENT counters, without which a replayed database reissues
 /// ids. `sqlite_sequence` itself is never exported as a table -- its schema
-/// is implicit -- so its rows replay as a reset plus INSERTs, the way the
-/// sqlite3 shell dumps it. Under a table filter only the chosen tables'
-/// counters replay. Streams: the reset goes out when the first kept counter
-/// arrives, so an empty selection emits nothing at all.
+/// is implicit -- so its rows replay as one scoped DELETE per counter plus
+/// INSERTs. Each DELETE clears only its own counter, so a filtered or
+/// data-only dump replayed into an existing database leaves the counters it
+/// does not name alone. Under a table filter only the chosen tables'
+/// counters replay. Streams: an empty selection emits nothing at all.
 fn d1_export_sequence(
     connection: &Connection,
     sql: &mut String,
@@ -3630,10 +3631,16 @@ fn d1_export_sequence(
         if filtered && !chosen.iter().any(|table| table.eq_ignore_ascii_case(&name)) {
             continue;
         }
-        if !any {
-            d1_export_push(sql, "DELETE FROM \"sqlite_sequence\";\n")?;
-            any = true;
-        }
+        // Clear only this counter: a filtered or data-only dump replayed
+        // into an existing database must not reset other tables' counters.
+        d1_export_push(
+            sql,
+            &format!(
+                "DELETE FROM \"sqlite_sequence\" WHERE \"name\" = {};\n",
+                d1_export_string(&name)
+            ),
+        )?;
+        any = true;
         let tuple = format!("({}, {seq})", d1_export_string(&name));
         if first {
             first = false;
@@ -5581,6 +5588,13 @@ mod d1_export_tests {
              INSERT INTO \"odd \"\"name\"\"\" VALUES ('quoted'); \
              INSERT INTO packed VALUES (7);",
         );
+        // A deleted row leaves the AUTOINCREMENT counter above the highest
+        // id, so the round trip pins the exact counter, not one the replayed
+        // rows alone would rebuild.
+        source.exec(
+            "INSERT INTO users (name) VALUES ('zed'); \
+             DELETE FROM users WHERE name = 'zed';",
+        );
         let (dump, tables) = source.export(vec![], false, false);
         assert_eq!(
             tables,
@@ -5685,6 +5699,23 @@ mod d1_export_tests {
             }
         }
         ids
+    }
+
+    /// One table's AUTOINCREMENT counter, if the engine holds one.
+    fn counter(db: &TestDb, table: &str) -> Option<i64> {
+        with(&db.scope, |connection| {
+            without_sql_authorizer(connection, || {
+                connection
+                    .query_row(
+                        "SELECT seq FROM sqlite_sequence WHERE name = ?1",
+                        [table],
+                        |row| row.get(0),
+                    )
+                    .optional()
+                    .expect("counter reads")
+            })
+        })
+        .expect("db present")
     }
 
     #[test]
@@ -5824,6 +5855,102 @@ mod d1_export_tests {
             ),
             Ok(_) => panic!("export accepted --no-schema with --no-data"),
         }
+    }
+
+    #[test]
+    fn export_table_filter_leaves_unnamed_counters_alone() {
+        // A filtered dump replays into a database holding tables the dump
+        // never names: the import must leave their AUTOINCREMENT counters
+        // alone, or those tables reissue the ids of deleted rows.
+        let source = TestDb::open("export-filter-sequence");
+        source.exec(
+            "CREATE TABLE a (id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT); \
+             CREATE TABLE b (id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT); \
+             INSERT INTO a (v) VALUES ('one'), ('two'), ('three'); \
+             DELETE FROM a WHERE v = 'three'; \
+             INSERT INTO b (v) VALUES ('other');",
+        );
+        // Read the source counter before the target opens: opening a second
+        // scratch cell shadows the first on this thread.
+        let dumped = counter(&source, "a").expect("source holds a's counter");
+        assert_eq!(dumped, 3);
+        let (dump, tables) = source.export(vec!["a".to_string()], false, false);
+        assert_eq!(tables, vec!["a".to_string()]);
+        assert!(
+            !dump.contains("DELETE FROM \"sqlite_sequence\";"),
+            "blanket reset leaked: {dump}"
+        );
+        assert!(
+            dump.contains("DELETE FROM \"sqlite_sequence\" WHERE \"name\" = 'a';"),
+            "scoped reset missing: {dump}"
+        );
+
+        let target = TestDb::open("export-filter-sequence-target");
+        target.exec(
+            "CREATE TABLE b (id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT); \
+             INSERT INTO b (id, v) VALUES (1000, 'keep');",
+        );
+        assert_eq!(counter(&target, "b"), Some(1000));
+        target.exec(&dump);
+        assert_eq!(
+            counter(&target, "b"),
+            Some(1000),
+            "the replay kept b's counter"
+        );
+        assert_eq!(
+            counter(&target, "a"),
+            Some(dumped),
+            "the replay restored a's counter"
+        );
+        let rows: Vec<(i64, String)> = with(&target.scope, |connection| {
+            let mut statement = connection
+                .prepare("SELECT id, v FROM a ORDER BY id")
+                .expect("select");
+            statement
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .expect("map")
+                .collect::<rusqlite::Result<_>>()
+                .expect("rows")
+        })
+        .expect("db present");
+        assert_eq!(rows, vec![(1, "one".to_string()), (2, "two".to_string())]);
+    }
+
+    #[test]
+    fn export_no_schema_leaves_unnamed_counters_alone() {
+        // A data-only dump replays into an existing database, where every
+        // table it names already exists: the counters it does not name
+        // must survive the import.
+        let source = TestDb::open("export-noschema-sequence");
+        source.exec(
+            "CREATE TABLE a (id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT); \
+             CREATE TABLE b (id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT); \
+             INSERT INTO a (v) VALUES ('one'), ('two'), ('three'); \
+             DELETE FROM a WHERE v = 'three'; \
+             INSERT INTO b (v) VALUES ('other');",
+        );
+        let dumped = counter(&source, "a").expect("source holds a's counter");
+        let (dump, tables) = source.export(vec!["a".to_string()], true, false);
+        assert_eq!(tables, vec!["a".to_string()]);
+        assert!(!dump.contains("CREATE"), "schema leaked: {dump}");
+
+        let target = TestDb::open("export-noschema-sequence-target");
+        target.exec(
+            "CREATE TABLE a (id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT); \
+             CREATE TABLE b (id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT); \
+             INSERT INTO b (id, v) VALUES (1000, 'keep');",
+        );
+        target.exec(&dump);
+        assert_eq!(
+            counter(&target, "b"),
+            Some(1000),
+            "the replay kept b's counter"
+        );
+        assert_eq!(
+            counter(&target, "a"),
+            Some(dumped),
+            "the replay restored a's counter"
+        );
     }
 
     #[test]
