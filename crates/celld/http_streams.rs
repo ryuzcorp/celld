@@ -1,3 +1,4 @@
+// Modified by ryuzcorp (ryuzcorp/celld): WebSocket join tokens. Apache-2.0.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! The HTTP stream registry: request and response bodies that cross the host
@@ -1759,7 +1760,15 @@ pub(crate) fn encode_http_response(
     });
     if ws_target {
         let target = match response.websocket.as_ref() {
-            Some(HttpResponseWebSocket::Cell(target)) => Some(target),
+            Some(HttpResponseWebSocket::Cell(target)) if target.tunnel.is_none() => {
+                let mut target = target.clone();
+                // Mint the join token the caller's bind (or the next proxy's
+                // pass-through) must present. No metadata — an already
+                // released socket — mints nothing, and the join fails closed.
+                target.bind = crate::js::ws_mint_bind_token(target.id);
+                Some(target)
+            }
+            Some(HttpResponseWebSocket::Cell(target)) => Some(target.clone()),
             _ => None,
         };
         obj["wsTarget"] = serde_json::json!(target);

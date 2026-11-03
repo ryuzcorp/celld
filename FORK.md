@@ -9,7 +9,7 @@ README below is kept intact; this file documents the fork.
 
 - `main` mirrors upstream `main` and carries no patches.
 - `ryuzcorp/v<version>` is a line branch: the upstream tag `v<version>`
-  plus our patches as commits, one commit per patch, in `0001`-`0041`
+  plus our patches as commits, one commit per patch, in `0001`-`0042`
   order. Each patch commit is self-contained and carries its own tests.
 
 Upstream's `.github/workflows/release.yml` targets `ghcr.io/denoland` and
@@ -418,7 +418,7 @@ push to `ghcr.io/denoland`, but still. Pushing a branch named
   that host-written table. Stored-stub rows written before this
   patch decode as plain data on first read; storing them again
   writes the new envelope.
-- `0041` (sha TBD at merge) the operator-only KV and Queue fetch
+- `0041` (`2037226`) the operator-only KV and Queue fetch
   branches demand the same host-set operator-ingress marker 0022
   introduced: every KV fetch op and the Queue info/purge/pause/
   resume/peek/redrive ops refuse stub.fetch() without it, while the
@@ -442,6 +442,15 @@ push to `ghcr.io/denoland`, but still. Pushing a branch named
   ways (an old forward refuses against the new allowlist, a new
   forward errors against an old accept) and the alarm retries after
   convergence.
+- `0042` (sha TBD at merge) socket ids answer only their owner: a
+  WebSocket id is usable only by the cell scope or request context
+  that holds it (send, close, accept, hibernation list/tags,
+  attachments, auto-response, isolate-pulled reads, and the
+  registration ops), and TCP socket ids likewise by their event.
+  Ids are unguessable (f64-safe random, nonzero); joining another
+  cell's upgrade presents a single-use host-minted token, tunneled
+  upgrade parks use unguessable numbers, and a reloaded cell still
+  owns its sockets by scope after hibernation.
 
 Patches `0025`–`0034` are ported fixes from
 [meln1k/celld](https://github.com/meln1k/celld) by Nikita

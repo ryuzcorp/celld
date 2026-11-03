@@ -1,3 +1,4 @@
+// Modified by ryuzcorp (ryuzcorp/celld): WebSocket ownership. Apache-2.0.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! WebSockets on the ingress: accepting them, proxying them to the owner,
@@ -455,7 +456,12 @@ impl OutboundWebSocketSink {
                 SocketRoute::Cell(_) => None,
                 SocketRoute::Facet { facet, .. } => Some(facet.clone()),
             };
-            celld::js::ws_register_outbound(websocket, socket.scope(), facet);
+            celld::js::ws_register_outbound(
+                websocket,
+                socket.scope(),
+                facet,
+                celld::js::WsOwner::Cell(socket.scope().to_string()),
+            );
         }
     }
 }

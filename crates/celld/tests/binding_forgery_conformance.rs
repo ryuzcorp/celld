@@ -1,6 +1,6 @@
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 //
-// Modified by ryuzcorp (ryuzcorp/celld): binding-forgery conformance. Apache-2.0.
+// Modified by ryuzcorp (ryuzcorp/celld): binding-forgery conformance; WebSocket and TCP socket ownership. Apache-2.0.
 
 // A black-box runner, not node code: it boots the binary, copies fixtures,
 // and polls TCP with wall-clock deadlines, so the execution boundary's
@@ -13,6 +13,13 @@
 //! while its own declared bindings keep working. The victim fixture owns one
 //! resource of each type; the attacker fixture owns one of its own and tries
 //! to forge the victim's. See FORK.md patch 0011.
+//!
+//! The same runner also covers socket-id ownership (FORK.md patch 0042): a
+//! WebSocket or TCP id is usable only by the cell/request that owns it, ids
+//! are unguessable, and joining another cell's upgrade needs its token. The
+//! victim sockets live in the attacker fixture's own cells (cross-cell) and
+//! in the victim script (cross-script, through a double pass-through upgrade
+//! the test holds directly).
 //!
 //! One `celld dev` boots the attacker fixture; the victim fixture is
 //! pre-seeded into the dev bucket via the library (the same `build` + `write`
@@ -249,6 +256,149 @@ fn assert_denied(reply: &Value, path: &str) {
     );
 }
 
+/// What one frame read on a held WebSocket client found: a frame, a quiet
+/// connection (the read timed out), or a dead one.
+#[derive(Debug)]
+enum WsRead {
+    Frame(u8, Vec<u8>),
+    Timeout,
+    Eof,
+}
+
+/// Upgrade `path` and hold the client TCP: the worker passes a cell's 101
+/// through, so this stream is the cell socket's client for the rest of the
+/// test. Returns after the 101 headers, holding the socket open.
+fn hold_upgrade(node: &TestNode, path: &str) -> TcpStream {
+    let mut stream = TcpStream::connect(&node.public).expect("connect for upgrade");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .expect("upgrade timeout");
+    let wire = format!(
+        "GET {path} HTTP/1.1\r\nHost: {}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n",
+        node.public
+    );
+    stream.write_all(wire.as_bytes()).expect("write upgrade");
+    // Blocking reads to the header terminator; the read timeout above is the
+    // deadline, so a stall fails here instead of hanging the test.
+    let mut raw = Vec::new();
+    let mut byte = [0u8; 1];
+    loop {
+        match stream.read(&mut byte) {
+            Ok(1) => {
+                raw.push(byte[0]);
+                if raw.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            Ok(_) => panic!("upgrade {path}: connection closed before the 101"),
+            Err(error) => panic!("upgrade {path}: read: {error}"),
+        }
+    }
+    let head = String::from_utf8(raw).expect("101 head utf8");
+    let status: u16 = head
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|code| code.parse().ok())
+        .expect("101 status");
+    assert_eq!(status, 101, "upgrade {path}: {head}");
+    stream
+}
+
+/// Read one server-to-client frame, or time out proving the connection is
+/// quiet. Silence is the fixed behavior, so absence is asserted with a
+/// bounded wait rather than a sleep: anything the spray delivered arrives
+/// long before the deadline on loopback.
+fn read_ws_frame(stream: &mut TcpStream, timeout: Duration) -> WsRead {
+    stream
+        .set_read_timeout(Some(timeout))
+        .expect("frame timeout");
+    let mut head = [0u8; 2];
+    match read_exact_kind(stream, &mut head) {
+        ReadOutcome::Eof => return WsRead::Eof,
+        ReadOutcome::Timeout => return WsRead::Timeout,
+        ReadOutcome::Ok => {}
+    }
+    let opcode = head[0] & 0x0f;
+    assert_eq!(
+        head[1] & 0x80,
+        0,
+        "server frames are never masked: {head:?}"
+    );
+    let mut length = (head[1] & 0x7f) as u64;
+    if length == 126 {
+        let mut ext = [0u8; 2];
+        match read_exact_kind(stream, &mut ext) {
+            ReadOutcome::Ok => length = u16::from_be_bytes(ext) as u64,
+            outcome => panic!("frame length: {outcome:?}"),
+        }
+    } else if length == 127 {
+        let mut ext = [0u8; 8];
+        match read_exact_kind(stream, &mut ext) {
+            ReadOutcome::Ok => length = u64::from_be_bytes(ext),
+            outcome => panic!("frame length: {outcome:?}"),
+        }
+    }
+    assert!(length < 1024 * 1024, "frame too large: {length}");
+    let mut payload = vec![0u8; length as usize];
+    match read_exact_kind(stream, &mut payload) {
+        ReadOutcome::Ok => WsRead::Frame(opcode, payload),
+        ReadOutcome::Eof => WsRead::Eof,
+        ReadOutcome::Timeout => panic!("frame payload timed out mid-frame"),
+    }
+}
+
+#[derive(Debug)]
+enum ReadOutcome {
+    Ok,
+    Timeout,
+    Eof,
+}
+
+fn read_exact_kind(stream: &mut TcpStream, mut buf: &mut [u8]) -> ReadOutcome {
+    use std::io::Read;
+    while !buf.is_empty() {
+        match stream.read(buf) {
+            Ok(0) => return ReadOutcome::Eof,
+            Ok(n) => buf = &mut buf[n..],
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                ) =>
+            {
+                return ReadOutcome::Timeout
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::UnexpectedEof
+                        | std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::ConnectionAborted
+                        | std::io::ErrorKind::BrokenPipe
+                ) =>
+            {
+                return ReadOutcome::Eof
+            }
+            Err(error) => panic!("held connection read: {error}"),
+        }
+    }
+    ReadOutcome::Ok
+}
+
+/// Open a request the route never answers (`/tcp-hold` connects back to the
+/// node, notes its socket id, sends one request, and hangs): the returned
+/// stream keeps the victim connection — and its kernel buffers — alive while
+/// the test probes it from other requests.
+fn hold_tcp_hang(node: &TestNode) -> TcpStream {
+    let mut stream = TcpStream::connect(&node.public).expect("connect for hold");
+    let wire = format!(
+        "GET /tcp-hold HTTP/1.1\r\nHost: {}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+        node.public
+    );
+    stream.write_all(wire.as_bytes()).expect("write hold");
+    stream
+}
 #[test]
 fn binding_forgery_conformance() {
     let dir = tempfile::Builder::new()
@@ -647,6 +797,179 @@ fn binding_forgery_conformance() {
             .contains("callee-boom"),
         "{err}"
     );
+
+    // Socket ids are unguessable: a fresh allocation is never sequential.
+    let shape = get_json(&node, "/ws-id-shape");
+    assert_eq!(shape["ok"], true, "{shape}");
+    assert!(
+        shape["id"].as_u64().unwrap_or(0) > 1_000_000,
+        "/ws-id-shape allocates a guessable id: {shape}"
+    );
+
+    // Joining another cell's upgrade without its token is refused.
+    let bind = get_json(&node, "/ws-bind-forge");
+    assert_eq!(bind["ok"], true, "{bind}");
+    for (n, attempt) in bind["attempts"]
+        .as_array()
+        .expect("attempts")
+        .iter()
+        .enumerate()
+    {
+        assert_denied(attempt, &format!("/ws-bind-forge[{n}]"));
+    }
+
+    // Accepting another cell's socket id is refused, and the socket stays
+    // with its cell.
+    let held = get_json(&node, "/ws-holder-setup?cell=holder-a");
+    let victim = held["id"].as_u64().expect("held id");
+    let known = get_json(
+        &node,
+        &format!("/ws-accept-known?cell=holder-b&id={victim}"),
+    );
+    assert_refused(&known, "/ws-accept-known");
+    let list = get_json(&node, "/ws-list?cell=holder-a");
+    assert!(
+        list["sockets"]
+            .as_array()
+            .is_some_and(|sockets| { sockets.iter().any(|s| s["id"].as_u64() == Some(victim)) }),
+        "/ws-accept-known stole the socket: {list}"
+    );
+
+    // Accepting across the old sequential range steals nothing either.
+    let held = get_json(&node, "/ws-holder-setup?cell=holder-c");
+    let victim = held["id"].as_u64().expect("held id");
+    let spray = get_json(&node, "/ws-accept-spray?cell=holder-d&n=256");
+    assert_eq!(spray["ok"], true, "{spray}");
+    let list = get_json(&node, "/ws-list?cell=holder-c");
+    assert!(
+        list["sockets"]
+            .as_array()
+            .is_some_and(|sockets| { sockets.iter().any(|s| s["id"].as_u64() == Some(victim)) }),
+        "/ws-accept-spray stole the socket: {list}"
+    );
+
+    // An attachment set through another cell's id never lands.
+    let held = get_json(&node, "/ws-holder-setup?cell=holder-e");
+    let victim = held["id"].as_u64().expect("held id");
+    let set = get_json(
+        &node,
+        &format!("/ws-attach-known?cell=holder-f&id={victim}"),
+    );
+    assert_eq!(set["ok"], true, "{set}");
+    let attachments = get_json(&node, "/ws-attach-read?cell=holder-e");
+    assert!(
+        !attachments.to_string().contains("ws-attach"),
+        "/ws-attach-known wrote through: {attachments}"
+    );
+
+    // Auto-response state answers only the executing cell, like getWebSockets.
+    let forged = get_json(
+        &node,
+        "/ws-autoresponse-forge?cell=holder-h&victim=holder-g",
+    );
+    assert_eq!(forged["ok"], true, "{forged}");
+    assert_denied(&forged["set"], "/ws-autoresponse-forge set");
+    assert_denied(&forged["get"], "/ws-autoresponse-forge get");
+    let pair = get_json(&node, "/ws-autoresponse-read?cell=holder-g");
+    assert_eq!(pair["pair"], Value::Null, "{pair}");
+
+    // The legitimate kept-end join still works end to end.
+    let kept = get_json(&node, "/ws-kept-end");
+    assert_eq!(kept["ok"], true, "{kept}");
+    assert_eq!(kept["echo"], "echo:kept-hello", "{kept}");
+
+    // TCP: the binding's own round trip works.
+    let own = get_json(&node, "/tcp-own");
+    assert_eq!(own["ok"], true, "{own}");
+    assert_eq!(own["reachable"], true, "{own}");
+
+    // TCP theft by known id: the victim holds a replied connection; the
+    // thief's read on the victim's id fails exactly as a closed socket.
+    let victim_hold = hold_tcp_hang(&node);
+    poll_until("tcp id noted", Duration::from_secs(30), || {
+        let noted: Value = get(&node.public, "/tcp-noted")
+            .ok()
+            .and_then(|(status, body)| {
+                (status == 200).then(|| serde_json::from_str::<Value>(&body).ok())?
+            })?;
+        noted["id"].as_str().map(str::to_string)
+    });
+    let steal = get_json(&node, "/tcp-steal-known");
+    assert_eq!(steal["ok"], true, "{steal}");
+    assert_eq!(steal["threw"], true, "{steal}");
+    assert!(
+        steal["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("closed"),
+        "/tcp-steal-known refuses as a closed socket: {steal}"
+    );
+    assert!(
+        !steal.to_string().contains("tcp-ok"),
+        "/tcp-steal-known leaks the reply: {steal}"
+    );
+    drop(victim_hold);
+
+    // TCP theft across the old sequential range steals nothing either.
+    let victim_hold = hold_tcp_hang(&node);
+    poll_until("tcp id noted", Duration::from_secs(30), || {
+        let noted: Value = get(&node.public, "/tcp-noted")
+            .ok()
+            .and_then(|(status, body)| {
+                (status == 200).then(|| serde_json::from_str::<Value>(&body).ok())?
+            })?;
+        noted["id"].as_str().map(str::to_string)
+    });
+    let spray = get_json(&node, "/tcp-spray");
+    assert_eq!(spray["ok"], true, "{spray}");
+    assert_eq!(spray["threw"], true, "{spray}");
+    assert!(
+        !spray.to_string().contains("tcp-ok"),
+        "/tcp-spray leaks the reply: {spray}"
+    );
+    drop(victim_hold);
+
+    // A send spray across the old sequential range reaches no client: the
+    // held upgrade stays quiet. Anything delivered would arrive long before
+    // the deadline on loopback, so a frame here is the leak.
+    let mut held = hold_upgrade(&node, "/ws-pass-upgrade");
+    let spray = get_json(&node, "/ws-spray");
+    assert_eq!(spray["ok"], true, "{spray}");
+    match read_ws_frame(&mut held, Duration::from_secs(5)) {
+        WsRead::Timeout => {}
+        WsRead::Frame(opcode, payload) => {
+            panic!("/ws-spray drove the held socket: opcode={opcode} payload={payload:?}")
+        }
+        WsRead::Eof => panic!("/ws-spray closed the held socket"),
+    }
+    drop(held);
+
+    // A close spray likewise leaves the held upgrade open.
+    let mut held = hold_upgrade(&node, "/ws-pass-upgrade");
+    let spray = get_json(&node, "/ws-spray-close");
+    assert_eq!(spray["ok"], true, "{spray}");
+    match read_ws_frame(&mut held, Duration::from_secs(5)) {
+        WsRead::Timeout => {}
+        WsRead::Frame(opcode, payload) => {
+            panic!("/ws-spray-close drove the held socket: opcode={opcode} payload={payload:?}")
+        }
+        WsRead::Eof => panic!("/ws-spray-close closed the held socket"),
+    }
+    drop(held);
+
+    // The same spray against a cross-script victim: the double pass-through
+    // upgrade (attacker worker, victim worker, victim cell) stays quiet too.
+    let mut held = hold_upgrade(&node, "/ws-victim-proxy-upgrade");
+    let spray = get_json(&node, "/ws-spray");
+    assert_eq!(spray["ok"], true, "{spray}");
+    match read_ws_frame(&mut held, Duration::from_secs(5)) {
+        WsRead::Timeout => {}
+        WsRead::Frame(opcode, payload) => {
+            panic!("/ws-spray drove the cross-script socket: opcode={opcode} payload={payload:?}")
+        }
+        WsRead::Eof => panic!("/ws-spray closed the cross-script socket"),
+    }
+    drop(held);
 
     // H4: the plant hook exists on this test-hooks node (the plant tests
     // above used it); a shipping node never defines it.

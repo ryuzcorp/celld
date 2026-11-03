@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): binding-forgery conformance fixture. Apache-2.0.
+// Modified by ryuzcorp (ryuzcorp/celld): binding-forgery conformance fixture; WebSocket and TCP socket ownership. Apache-2.0.
 import { DurableObject, WorkflowEntrypoint } from 'cloudflare:workers';
 
 const J = (o, st = 200) => Response.json(o, { status: st });
@@ -43,6 +43,13 @@ const attempt = async (fn) => {
       error: String((error && error.message) || error),
     };
   }
+};
+
+const __wsUpgradeHeaders = {
+  Upgrade: 'websocket',
+  Connection: 'Upgrade',
+  'Sec-WebSocket-Key': 'dGhlIHNhbXBsZSBub25jZQ==',
+  'Sec-WebSocket-Version': '13',
 };
 
 export class AttackerDO extends DurableObject {
@@ -667,11 +674,124 @@ export class AttackerDO extends DurableObject {
     }
     return out;
   }
+  async webSocketMessage(ws, msg) {
+    const text = typeof msg === 'string' ? msg : '[binary]';
+    const inbox = JSON.parse((await this.ctx.storage.get('ws-inbox')) || '[]');
+    inbox.push(text);
+    await this.ctx.storage.put('ws-inbox', JSON.stringify(inbox));
+    ws.send(`echo:${text}`);
+  }
+  async webSocketClose(ws, code, reason) {
+    await this.ctx.storage.put(
+      'ws-closed', JSON.stringify({ code, reason: String(reason ?? '') }),
+    );
+  }
+  async webSocketError(ws, error) {
+    await this.ctx.storage.put(
+      'ws-error', String((error && error.message) || error),
+    );
+  }
   async fetch(req) {
     const sub = new URL(req.url).pathname.split('/').pop();
     if (sub === 'own') {
       await this.ctx.storage.put('k', 'own-value');
       return J({ value: await this.ctx.storage.get('k') });
+    }
+    if (sub === 'ws-accept') {
+      const pair = new WebSocketPair();
+      this.ctx.acceptWebSocket(pair[1], ['victim-tag']);
+      return new Response(null, { status: 101, webSocket: pair[0] });
+    }
+    if (sub === 'ws-accept-held') {
+      // Accept without answering 101: the socket lives in the registry with
+      // no transport, so id-ownership probes need no client connection.
+      const pair = new WebSocketPair();
+      this.ctx.acceptWebSocket(pair[1], ['held-tag']);
+      return J({ id: pair[1]._id });
+    }
+    if (sub === 'ws-list') {
+      return J({
+        sockets: this.ctx.getWebSockets().map((ws) => ({
+          id: ws._id, tags: ws._tags,
+        })),
+      });
+    }
+    if (sub === 'ws-attach-read') {
+      return J({
+        attachments: this.ctx.getWebSockets().map((ws) => {
+          try {
+            return ws.deserializeAttachment() ?? null;
+          } catch {
+            return 'unreadable';
+          }
+        }),
+      });
+    }
+    if (sub === 'ws-accept-known') {
+      const id = Number(new URL(req.url).searchParams.get('id'));
+      return J(await attempt(async () => {
+        this.ctx.acceptWebSocket(new WebSocket(id));
+        return { accepted: true };
+      }));
+    }
+    if (sub === 'ws-accept-spray') {
+      const n = Number(new URL(req.url).searchParams.get('n') || '256');
+      let threw = 0;
+      for (let i = 1; i <= n; i++) {
+        try {
+          this.ctx.acceptWebSocket(new WebSocket(i));
+        } catch {
+          threw++;
+        }
+      }
+      return J({ sprayed: n, threw });
+    }
+    if (sub === 'ws-attach-known') {
+      const id = Number(new URL(req.url).searchParams.get('id'));
+      new WebSocket(id).serializeAttachment({ pwned: 'ws-attach' });
+      return J({ set: true });
+    }
+    if (sub === 'ws-autoresponse-forge') {
+      // A forged method receiver: the auto-response methods read only
+      // `this._scope`, so a plain object carrying the victim's scope
+      // reaches the op, which refuses anything but the executing cell.
+      const victim = new URL(req.url).searchParams.get('victim') || 'holder-g';
+      const scope = `AttackerDO:${await doIdHex(
+        scriptKey('bf-attacker', 'AttackerDO'), victim,
+      )}`;
+      const set = await attempt(async () => {
+        this.ctx.setWebSocketAutoResponse.call(
+          { _scope: scope },
+          new WebSocketRequestResponsePair('ar-q', 'ar-pwned'),
+        );
+        return { set: true };
+      });
+      const get = await attempt(async () => {
+        const pair = this.ctx.getWebSocketAutoResponse.call({ _scope: scope });
+        return {
+          pair: pair === null
+            ? null
+            : { request: pair.request, response: pair.response },
+        };
+      });
+      return J({ set, get });
+    }
+    if (sub === 'ws-autoresponse-read') {
+      const pair = this.ctx.getWebSocketAutoResponse();
+      return J({
+        pair: pair === null
+          ? null
+          : { request: pair.request, response: pair.response },
+      });
+    }
+    if (sub === 'ws-tcp-note-id') {
+      await this.ctx.storage.put(
+        'tcp-victim-id', new URL(req.url).searchParams.get('id'),
+      );
+      return J({ ok: true });
+    }
+    if (sub === 'ws-tcp-read-id') {
+      return J({ id: await this.ctx.storage.get('tcp-victim-id') });
     }
     if (sub === 'forge-sql') {
       // Any Durable Object forges the victim D1 cell's SQL scope and
@@ -731,7 +851,22 @@ export class AttackerWF extends WorkflowEntrypoint {
 export default {
   async scheduled() {},
   async fetch(req, env) {
-    const t = new URL(req.url).pathname.slice(1);
+    const reqUrl = new URL(req.url);
+    const t = reqUrl.pathname.slice(1);
+    const q = reqUrl.searchParams;
+    const subFetch = async (cell, sub) => await (await env.OWN_NS.getByName(cell).fetch(
+      `https://x/sub/${sub}`,
+    )).json();
+    // Upgrade pass-throughs return the 101 unwrapped, so the test's own TCP
+    // becomes the client of the cell's socket. The subrequest carries the
+    // Upgrade header workerd demands before a response may carry a socket.
+    if (t === 'ws-pass-upgrade') {
+      const stub = env.OWN_NS.getByName('spray-holder');
+      return stub.fetch('https://x/sub/ws-accept', { headers: __wsUpgradeHeaders });
+    }
+    if (t === 'ws-victim-proxy-upgrade') {
+      return env.SB.fetch('https://victim/ws-up', { headers: __wsUpgradeHeaders });
+    }
     const run = async () => {
       switch (t) {
         case 'seed-victim': {
@@ -1186,6 +1321,204 @@ export default {
             return await cell.useStub(victim);
           });
           return { stored, rpc, forged };
+        }
+        case 'ws-id-shape': {
+          const pair = new WebSocketPair();
+          return { id: pair[0]._id };
+        }
+        case 'ws-bind-forge': {
+          const scope = `AttackerDO:${await doIdHex(
+            scriptKey('bf-attacker', 'AttackerDO'), 'holder-a',
+          )}`;
+          const targets = [
+            { id: 1, scope },
+            { id: 2 ** 53 - 1, scope },
+            { id: 1, scope: 'VictimDO:deadbeef' },
+          ];
+          const attempts = [];
+          for (const target of targets) {
+            attempts.push(await attempt(async () => {
+              const ws = new WebSocket(undefined, [], target);
+              ws.accept();
+              return { bound: true };
+            }));
+          }
+          return { attempts };
+        }
+        case 'ws-holder-setup': {
+          return await subFetch(q.get('cell') || 'holder-a', 'ws-accept-held');
+        }
+        case 'ws-list': {
+          return await subFetch(q.get('cell') || 'holder-a', 'ws-list');
+        }
+        case 'ws-attach-read': {
+          return await subFetch(q.get('cell') || 'holder-e', 'ws-attach-read');
+        }
+        case 'ws-accept-known': {
+          const r = await env.OWN_NS.getByName(q.get('cell') || 'holder-b').fetch(
+            `https://x/sub/ws-accept-known?id=${q.get('id')}`,
+          );
+          return await r.json();
+        }
+        case 'ws-accept-spray': {
+          const r = await env.OWN_NS.getByName(q.get('cell') || 'holder-d').fetch(
+            `https://x/sub/ws-accept-spray?n=${q.get('n') || '256'}`,
+          );
+          return await r.json();
+        }
+        case 'ws-attach-known': {
+          const r = await env.OWN_NS.getByName(q.get('cell') || 'holder-f').fetch(
+            `https://x/sub/ws-attach-known?id=${q.get('id')}`,
+          );
+          return await r.json();
+        }
+        case 'ws-autoresponse-forge': {
+          const r = await env.OWN_NS.getByName(q.get('cell') || 'holder-h').fetch(
+            `https://x/sub/ws-autoresponse-forge?victim=${q.get('victim') || 'holder-g'}`,
+          );
+          return await r.json();
+        }
+        case 'ws-autoresponse-read': {
+          return await subFetch(q.get('cell') || 'holder-g', 'ws-autoresponse-read');
+        }
+        case 'ws-kept-end': {
+          // The legitimate join: keep the client end of a subrequest upgrade,
+          // exchange one message with the cell, and report the echo.
+          const stub = env.OWN_NS.getByName('kept-end');
+          const res = await stub.fetch(
+            'https://x/sub/ws-accept', { headers: __wsUpgradeHeaders },
+          );
+          if (res.status !== 101 || !res.webSocket)
+            throw new Error(`no upgrade: ${res.status}`);
+          const ws = res.webSocket;
+          ws.accept();
+          ws.send('kept-hello');
+          const echo = await new Promise((resolve, reject) => {
+            ws.addEventListener('message', (ev) => resolve(ev.data), { once: true });
+            ws.addEventListener(
+              'close', () => reject(new Error('closed before echo')), { once: true },
+            );
+            ws.addEventListener(
+              'error',
+              (ev) => reject(new Error(`socket error: ${ev.message || 'unknown'}`)),
+              { once: true },
+            );
+          });
+          return { echo };
+        }
+        case 'ws-spray': {
+          for (let i = 1; i <= 512; i++) new WebSocket(i).send('pwned');
+          return { sprayed: 512 };
+        }
+        case 'ws-spray-close': {
+          for (let i = 1; i <= 512; i++) new WebSocket(i).close(4000, 'sprayed');
+          return { sprayed: 512 };
+        }
+        case 'tcp-probe': {
+          return { probe: 'tcp-ok' };
+        }
+        case 'tcp-own': {
+          const { connect } = await import('cloudflare:sockets');
+          const target = `${reqUrl.hostname}:${reqUrl.port || '80'}`;
+          const sock = connect(target);
+          await sock.opened;
+          const writer = sock.writable.getWriter();
+          await writer.write(te.encode(
+            `GET /tcp-probe HTTP/1.1\r\nHost: ${target}\r\n\r\n`,
+          ));
+          writer.releaseLock();
+          const reader = sock.readable.getReader();
+          let text = '';
+          for (;;) {
+            const { value, done } = await reader.read();
+            if (value) text += new TextDecoder().decode(value);
+            if (done || text.includes('tcp-ok')) break;
+          }
+          reader.releaseLock();
+          await sock.close();
+          return { reachable: text.includes('tcp-ok') };
+        }
+        case 'tcp-hold': {
+          // The theft victim: connect back to this node, expose our socket
+          // id for the known-id probe, send one request, then hold the
+          // request — and the connection with its kernel buffers — forever.
+          const { connect } = await import('cloudflare:sockets');
+          const target = `${reqUrl.hostname}:${reqUrl.port || '80'}`;
+          const sock = connect(target);
+          await sock.opened;
+          const stub = env.OWN_NS.getByName('tcp-coords');
+          await stub.fetch(`https://x/sub/ws-tcp-note-id?id=${sock._id}`);
+          const writer = sock.writable.getWriter();
+          await writer.write(te.encode(
+            `GET /tcp-probe HTTP/1.1\r\nHost: ${target}\r\n\r\n`,
+          ));
+          writer.releaseLock();
+          await new Promise(() => {});
+          return { unreachable: true };
+        }
+        case 'tcp-noted': {
+          return await subFetch('tcp-coords', 'ws-tcp-read-id');
+        }
+        case 'tcp-steal-known': {
+          const { connect } = await import('cloudflare:sockets');
+          const target = `${reqUrl.hostname}:${reqUrl.port || '80'}`;
+          const { id } = await subFetch('tcp-coords', 'ws-tcp-read-id');
+          const sock = connect(target);
+          await sock.opened;
+          sock._id = Number(id);
+          return await attempt(async () => {
+            const reader = sock.readable.getReader();
+            const { value } = await reader.read();
+            reader.releaseLock();
+            const text = new TextDecoder().decode(value || new Uint8Array());
+            return {
+              bytes: (value && value.byteLength) || 0,
+              head: text.slice(0, 60),
+            };
+          });
+        }
+        case 'tcp-spray': {
+          const { connect } = await import('cloudflare:sockets');
+          const target = `${reqUrl.hostname}:${reqUrl.port || '80'}`;
+          // One pending read per guessed id; exactly the victim's resolves
+          // with bytes. Rejections (failed opens, closed sockets) only count:
+          // the probe rejects solely when every id refused, and resolves with
+          // the first bytes any id yields. No timers; the victim's reply is
+          // the rendezvous. Thirty-two guesses cover the sequential ids a
+          // fresh node hands out without bursting a hundred connections.
+          const reads = [];
+          for (let i = 0; i < 32; i++) {
+            const s = connect(target);
+            const guess = i + 1;
+            // A failed open ends its stream without bytes; that is a refusal
+            // like any other, not a result. The id is reassigned after the
+            // open settles because the open resolution itself sets `_id`.
+            reads.push(s.opened.then(async () => {
+              s._id = guess;
+              const reader = s.readable.getReader();
+              const outcome = await reader.read();
+              reader.releaseLock();
+              if (outcome.done || !outcome.value || outcome.value.byteLength === 0)
+                throw new Error('socket is closed');
+              return outcome;
+            }, () => { throw new Error('socket is closed'); }));
+          }
+          return await attempt(async () => {
+            const { value } = await new Promise((resolve, reject) => {
+              let rejected = 0;
+              for (const read of reads) {
+                read.then(resolve, () => {
+                  if (++rejected === reads.length)
+                    reject(new Error('socket is closed'));
+                });
+              }
+            });
+            const text = new TextDecoder().decode(value || new Uint8Array());
+            return {
+              bytes: (value && value.byteLength) || 0,
+              head: text.slice(0, 60),
+            };
+          });
         }
         default:
           throw new Error(`no route ${t}`);

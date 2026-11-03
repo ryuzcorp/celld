@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): binding-forgery conformance fixture. Apache-2.0.
+// Modified by ryuzcorp (ryuzcorp/celld): binding-forgery conformance fixture; WebSocket and TCP socket ownership. Apache-2.0.
 import { DurableObject, WorkflowEntrypoint } from 'cloudflare:workers';
 
 export class VictimDO extends DurableObject {
@@ -10,8 +10,16 @@ export class VictimDO extends DurableObject {
     const r = await (await back.fetch('https://x/')).json();
     return { secret: r.secret };
   }
+  async webSocketMessage(ws, msg) {
+    ws.send(`echo:${typeof msg === 'string' ? msg : '[binary]'}`);
+  }
   async fetch(req) {
     const url = new URL(req.url);
+    if (url.pathname.split('/').pop() === 'ws-accept') {
+      const pair = new WebSocketPair();
+      this.ctx.acceptWebSocket(pair[1], ['victim-tag']);
+      return new Response(null, { status: 101, webSocket: pair[0] });
+    }
     if (url.searchParams.has('set')) {
       await this.ctx.storage.put('secret', url.searchParams.get('set'));
       return Response.json({ ok: true });
@@ -44,6 +52,17 @@ export default {
   async fetch(req, env) {
     const t = new URL(req.url).pathname.slice(1);
     if (t === 'ping') return J({ pong: true });
+    if (t === 'ws-up') {
+      const stub = env.NS.getByName('ws-victim');
+      return stub.fetch('https://x/sub/ws-accept', {
+        headers: {
+          Upgrade: 'websocket',
+          Connection: 'Upgrade',
+          'Sec-WebSocket-Key': 'dGhlIHNhbXBsZSBub25jZQ==',
+          'Sec-WebSocket-Version': '13',
+        },
+      });
+    }
     if (t === 'seed') {
       await env.DB.exec(
         'CREATE TABLE IF NOT EXISTS t (v TEXT)',
