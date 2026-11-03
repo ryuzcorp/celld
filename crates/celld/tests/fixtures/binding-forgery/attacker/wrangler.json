@@ -1,0 +1,22 @@
+{
+  "name": "bf-attacker",
+  "main": "worker.js",
+  "compatibility_date": "2026-02-12",
+  "no_bundle": true,
+  "services": [{ "binding": "SB", "service": "bf-victim" }],
+  "d1_databases": [
+    { "binding": "OWN_DB", "database_name": "bf-attacker-db" },
+    { "binding": "SHARED_DB", "database_name": "bf-shared-db" }
+  ],
+  "kv_namespaces": [{ "binding": "OWN_KV", "id": "bf-attacker-kv" }],
+  "queues": { "producers": [{ "binding": "OWN_Q", "queue": "bf-attacker-q" }] },
+  "durable_objects": {
+    "bindings": [{ "name": "OWN_NS", "class_name": "AttackerDO" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["AttackerDO"] }],
+  "workflows": [
+    { "binding": "OWN_WF", "name": "bf-attacker-wf", "class_name": "AttackerWF" }
+  ],
+  "r2_buckets": [{ "binding": "OWN_R2", "bucket_name": "bf-attacker-r2" }],
+  "triggers": { "crons": ["0 0 29 2 *"] }
+}

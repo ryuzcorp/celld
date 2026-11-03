@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): exec() waits for start(); exec pty/resize; fence node-netns exception; process-granularity exec kill; kill conformance tests; exec reads survive their subscribing event; worker container endpoints for the tenant egress policy; exec-kill tests share the common test runtime; bounded engine control calls; tiered lifecycle bound; orphan cleanup on failed start and exec; capped retry loops.
+// Modified by ryuzcorp (ryuzcorp/celld): exec() waits for start(); exec pty/resize; fence node-netns exception; process-granularity exec kill; kill conformance tests; exec reads survive their subscribing event; worker container endpoints for the tenant egress policy; exec-kill tests share the common test runtime; bounded engine control calls; tiered lifecycle bound; orphan cleanup on failed start and exec; capped retry loops; binding-forgery enforcement.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! Containers attached to Durable Objects: the engine side of
@@ -1887,6 +1887,7 @@ impl ContainerEngine {
             id,
             exec_id,
             container: cell.name.clone(),
+            scope: cell.scope.clone(),
             pid,
             user: params.user.clone(),
             is_pty,
@@ -2069,6 +2070,10 @@ pub struct ExecProcess {
     pub id: u64,
     exec_id: String,
     container: String,
+    /// The cell scope that opened this exec. Ids are process-global
+    /// sequential numbers, so the ops refuse an id another cell opened
+    /// rather than trust the caller's handle.
+    scope: String,
     pub pid: i64,
     user: Option<String>,
     pub is_pty: bool,
@@ -2123,8 +2128,10 @@ fn test_proc_senders() -> &'static TestProcSenders {
 /// feeds with [`test_proc_emit`] instead of a daemon pump, so the
 /// cross-event read path runs where no container engine exists. Only the
 /// read path is usable: `wait`/`kill`/`resize` would dial the dummy
-/// socket and fail, and the harness never calls them on a fake.
-pub fn test_proc_spawn() -> u64 {
+/// socket and fail, and the harness never calls them on a fake. `scope`
+/// is the spawning cell, like the real exec path records: the read and
+/// drop ops refuse an id another cell opened.
+pub fn test_proc_spawn(scope: &str) -> u64 {
     let id = next_exec_id();
     let (stdout_tx, stdout_rx) = mpsc::channel(16);
     let (stderr_tx, stderr_rx) = mpsc::channel(16);
@@ -2132,6 +2139,7 @@ pub fn test_proc_spawn() -> u64 {
         id,
         exec_id: format!("test-exec-{id}"),
         container: "test-container".to_string(),
+        scope: scope.to_string(),
         pid: 0,
         user: None,
         is_pty: false,
@@ -2168,6 +2176,12 @@ pub fn test_proc_eof(id: u64, which: u8) {
 }
 
 impl ExecProcess {
+    /// The cell scope that opened this exec, for the op layer's
+    /// ownership check.
+    pub(crate) fn owner_scope(&self) -> &str {
+        &self.scope
+    }
+
     /// One chunk of stdout (`1`) or stderr (`2`); empty at end of stream.
     ///
     /// `lease` names the read (one pull) and `prev_sub`/`my_sub` chain
@@ -2678,6 +2692,7 @@ mod pty_tests {
             id: 1,
             exec_id: "test-exec".to_string(),
             container: "test-container".to_string(),
+            scope: "TestClass:test-cell".to_string(),
             pid: 1234,
             user: None,
             is_pty,
@@ -3511,6 +3526,7 @@ mod retained_read_tests {
             id: 1,
             exec_id: "test-exec".to_string(),
             container: "test-container".to_string(),
+            scope: "TestClass:test-cell".to_string(),
             pid: 1234,
             user: None,
             is_pty: false,

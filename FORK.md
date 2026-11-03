@@ -9,7 +9,7 @@ README below is kept intact; this file documents the fork.
 
 - `main` mirrors upstream `main` and carries no patches.
 - `ryuzcorp/v<version>` is a line branch: the upstream tag `v<version>`
-  plus our patches as commits, one commit per patch, in `0001`-`0039`
+  plus our patches as commits, one commit per patch, in `0001`-`0040`
   order. Each patch commit is self-contained and carries its own tests.
 
 Upstream's `.github/workflows/release.yml` targets `ghcr.io/denoland` and
@@ -399,12 +399,25 @@ push to `ghcr.io/denoland`, but still. Pushing a branch named
   create/exec/wait retry loops share the 60 s aggregate cap. The
   websocket bind wait is unrefed: its reply is unobserved, so it no
   longer pins successful cell events.
-- `0039` (sha TBD at merge) staged activation: `celld deploy
+- `0039` (`0423c14`) staged activation: `celld deploy
   --no-activate` uploads a version without moving any pointer; `celld
   activate SCRIPT=VERSION...` serves a multi-script generation with one
   atomic fleet-pointer write (service bindings resolve from the
   pointer's component map, queue attachments publish at activate time);
   `celld discard` removes versions no pointer names.
+- `0040` (sha TBD at merge) bindings resolve from the script's
+  declared resources: cell dispatch and id derivation refuse names
+  the calling script never bound (D1, KV, queues, workflows,
+  Durable Object namespaces, reserved cells), runtime cells answer
+  an RPC allowlist, and cell-scoped ops (storage, SQL, alarms,
+  containers, facets, socket registry) answer only the executing
+  cell. Stubs received over RPC or storage keep working through
+  host-recorded grants: the host checks each lifted stub's brand
+  and the sender's rights and holds the stub table itself, writing
+  the envelope tag in Rust, and revive installs stubs only from
+  that host-written table. Stored-stub rows written before this
+  patch decode as plain data on first read; storing them again
+  writes the new envelope.
 
 Patches `0025`–`0034` are ported fixes from
 [meln1k/celld](https://github.com/meln1k/celld) by Nikita

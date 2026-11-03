@@ -1,0 +1,20 @@
+{
+  "name": "bf-victim",
+  "main": "worker.js",
+  "compatibility_date": "2026-02-12",
+  "no_bundle": true,
+  "d1_databases": [
+    { "binding": "DB", "database_name": "bf-victim-db" },
+    { "binding": "SHARED", "database_name": "bf-shared-db" }
+  ],
+  "kv_namespaces": [{ "binding": "KV", "id": "bf-victim-kv" }],
+  "queues": { "producers": [{ "binding": "Q", "queue": "bf-victim-q" }] },
+  "durable_objects": {
+    "bindings": [{ "name": "NS", "class_name": "VictimDO" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["VictimDO"] }],
+  "workflows": [
+    { "binding": "WF", "name": "bf-victim-wf", "class_name": "VictimWF" }
+  ],
+  "r2_buckets": [{ "binding": "R2", "bucket_name": "bf-victim-r2" }]
+}

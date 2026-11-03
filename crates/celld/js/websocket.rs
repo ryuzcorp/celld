@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): reaction-aware request resources; unrefed websocket bind wait.
+// Modified by ryuzcorp (ryuzcorp/celld): reaction-aware request resources; unrefed websocket bind wait; binding-forgery enforcement.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! WebSockets inside the isolate: the registry, the ops JS calls, and the
@@ -10,6 +10,17 @@
 //! until the gate opens, which is why emitting is not simply a send.
 use super::*;
 pub use crate::ws_registry::*;
+
+/// The scope this socket-registry op may address: the executing cell's
+/// own, or a throw. A `DurableObjectState` forged with another cell's
+/// scope reaches this boundary and no further.
+fn own_cell_socket(scope: &mut v8::PinScope, operation: &str, cell: String) -> Result<String, ()> {
+    if let Err(error) = super::binding_policy::require_executing_cell(scope, &cell) {
+        loader_throw(scope, &format!("{operation}: {error}"));
+        return Err(());
+    }
+    Ok(cell)
+}
 
 #[derive(Default)]
 pub(super) struct WsCapture {
@@ -690,6 +701,9 @@ pub(super) fn op_ws_accept(
             )
         }
     };
+    let Ok(cell) = own_cell_socket(scope, "acceptWebSocket", cell) else {
+        return;
+    };
     let replaced_regular_scope = {
         let registry = ws_registry();
         let mut registry = registry.lock().unwrap();
@@ -732,6 +746,9 @@ pub(super) fn op_ws_accept_regular(
         .map(|n| n.value() as u64)
         .unwrap_or(0);
     let cell = args.get(1).to_rust_string_lossy(scope);
+    let Ok(cell) = own_cell_socket(scope, "acceptWebSocket", cell) else {
+        return;
+    };
     let inserted = {
         let registry = ws_registry();
         let mut registry = registry.lock().unwrap();
@@ -762,6 +779,9 @@ pub(super) fn op_ws_list(
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
     let cell = args.get(0).to_rust_string_lossy(scope);
+    let Ok(cell) = own_cell_socket(scope, "getWebSockets", cell) else {
+        return;
+    };
     let tag = args.get(1);
     let tag = if tag.is_undefined() || tag.is_null() {
         None

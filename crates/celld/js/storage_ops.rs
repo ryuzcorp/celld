@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): reaction-aware request resources.
+// Modified by ryuzcorp (ryuzcorp/celld): reaction-aware request resources; binding-forgery enforcement.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! The V8 surface over `crate::storage`: key-value, SQL, and the value
@@ -10,12 +10,36 @@
 //! because it is what JS can see.
 use super::*;
 
+/// The scope this storage op may address: the executing cell's own, or a
+/// throw in the op's error shape. A storage object forged with another
+/// cell's scope reaches this boundary and no further.
+fn own_cell_storage(scope: &mut v8::PinScope, operation: &str, cell: String) -> Result<String, ()> {
+    if let Err(error) = super::binding_policy::require_executing_cell(scope, &cell) {
+        throw_storage_error(scope, operation, error);
+        return Err(());
+    }
+    Ok(cell)
+}
+
+/// The scope this SQL op may address: the executing cell's own, or a
+/// throw in the `SQL error: ` shape a Worker matches on.
+fn own_cell_sql(scope: &mut v8::PinScope, operation: &str, cell: String) -> Result<String, ()> {
+    if let Err(error) = super::binding_policy::require_executing_cell(scope, &cell) {
+        throw_sql_error(scope, format!("{operation}: {error}"));
+        return Err(());
+    }
+    Ok(cell)
+}
+
 pub(super) fn op_storage_get(
     scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
     let scope_s = args.get(0).to_rust_string_lossy(scope);
+    let Ok(scope_s) = own_cell_storage(scope, "get", scope_s) else {
+        return;
+    };
     let key = args.get(1).to_rust_string_lossy(scope);
     match storage::get_stored(&scope_s, &key) {
         Ok(Some(value)) => {
@@ -33,6 +57,9 @@ pub(super) fn op_storage_get_many(
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
     let cell = args.get(0).to_rust_string_lossy(scope);
+    let Ok(cell) = own_cell_storage(scope, "get", cell) else {
+        return;
+    };
     let keys = match storage_string_array(scope, args.get(1)) {
         Ok(keys) => keys,
         Err(error) => {
@@ -60,6 +87,9 @@ pub(super) fn op_storage_put(
     _rv: v8::ReturnValue<v8::Value>,
 ) {
     let s = args.get(0).to_rust_string_lossy(scope);
+    let Ok(s) = own_cell_storage(scope, "put", s) else {
+        return;
+    };
     let k = args.get(1).to_rust_string_lossy(scope);
     let Some(value) = serialize_storage_value(scope, args.get(2)) else {
         return;
@@ -74,6 +104,9 @@ pub(super) fn op_storage_put_many(
     _rv: v8::ReturnValue<v8::Value>,
 ) {
     let cell = args.get(0).to_rust_string_lossy(scope);
+    let Ok(cell) = own_cell_storage(scope, "put", cell) else {
+        return;
+    };
     let Ok(entries) = v8::Local::<v8::Array>::try_from(args.get(1)) else {
         throw_storage_error(scope, "put", "entries must be an array");
         return;
@@ -113,6 +146,9 @@ pub(super) fn op_storage_put_serialized(
     _rv: v8::ReturnValue<v8::Value>,
 ) {
     let cell = args.get(0).to_rust_string_lossy(scope);
+    let Ok(cell) = own_cell_storage(scope, "put", cell) else {
+        return;
+    };
     let key = args.get(1).to_rust_string_lossy(scope);
     let Some(bytes) = view_bytes(args.get(2)) else {
         throw_storage_error(scope, "put", "serialized row must be bytes");
@@ -131,6 +167,9 @@ pub(super) fn op_storage_queue_put_serialized(
     _rv: v8::ReturnValue<v8::Value>,
 ) {
     let cell = args.get(0).to_rust_string_lossy(scope);
+    let Ok(cell) = own_cell_storage(scope, "put", cell) else {
+        return;
+    };
     let key = args.get(1).to_rust_string_lossy(scope);
     let Some(bytes) = view_bytes(args.get(2)) else {
         throw_storage_error(scope, "put", "serialized row must be bytes");
@@ -162,6 +201,9 @@ pub(super) fn op_storage_queue_put(
     _rv: v8::ReturnValue<v8::Value>,
 ) {
     let cell = args.get(0).to_rust_string_lossy(scope);
+    let Ok(cell) = own_cell_storage(scope, "put", cell) else {
+        return;
+    };
     let key = args.get(1).to_rust_string_lossy(scope);
     let Some(value) = serialize_storage_value(scope, args.get(2)) else {
         return;
@@ -175,6 +217,9 @@ pub(super) fn op_storage_queue_put_many(
     _rv: v8::ReturnValue<v8::Value>,
 ) {
     let cell = args.get(0).to_rust_string_lossy(scope);
+    let Ok(cell) = own_cell_storage(scope, "put", cell) else {
+        return;
+    };
     let Ok(entries) = v8::Local::<v8::Array>::try_from(args.get(1)) else {
         throw_storage_error(scope, "put", "entries must be an array");
         return;
@@ -208,6 +253,9 @@ pub(super) fn op_storage_flush_pending_puts(
     _rv: v8::ReturnValue<v8::Value>,
 ) {
     let cell = args.get(0).to_rust_string_lossy(scope);
+    let Ok(cell) = own_cell_storage(scope, "put", cell) else {
+        return;
+    };
     if let Err(error) = flush_pending_puts(scope, &cell) {
         throw_storage_error(scope, "put", error);
     }
@@ -354,6 +402,87 @@ pub(super) fn op_storage_cancel_pending_puts(
     _rv: v8::ReturnValue<v8::Value>,
 ) {
     let cell = args.get(0).to_rust_string_lossy(scope);
+    let Ok(cell) = own_cell_storage(scope, "put", cell) else {
+        return;
+    };
+    actor_runtime_state(scope)
+        .pending_puts
+        .lock()
+        .expect("pending puts lock poisoned")
+        .remove(&cell);
+}
+
+/// `__storage_drop_pending_puts(cell)`: the retire path's cancel
+/// (`__retireInputGateContext` sweeping another actor with a host-derived
+/// scope from harness-local block state). Only the harness calls it, and
+/// the tenant-callable cancel above keeps its check.
+pub(super) fn op_storage_drop_pending_puts(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue<v8::Value>,
+) {
+    let cell = args.get(0).to_rust_string_lossy(scope);
+    actor_runtime_state(scope)
+        .pending_puts
+        .lock()
+        .expect("pending puts lock poisoned")
+        .remove(&cell);
+}
+
+/// `__storage_drop_pending_puts_own()`: the abort/reset paths' cancel
+/// (`_resetAfterConcurrencyFailure`, `abort`). The scope is derived from
+/// the executing cell host-side and no argument is trusted, so a mutated
+/// `ctx._scope` cannot drop another cell's buffered writes (H6). Only the
+/// harness calls this. Stateless events have no queue to drop.
+pub(super) fn op_storage_drop_pending_puts_own(
+    scope: &mut v8::PinScope,
+    _args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue<v8::Value>,
+) {
+    let Some(context) = super::event_context(scope) else {
+        return;
+    };
+    let Some(frame) = super::current_cell_event(&context) else {
+        return;
+    };
+    actor_runtime_state(scope)
+        .pending_puts
+        .lock()
+        .expect("pending puts lock poisoned")
+        .remove(&frame.storage);
+}
+
+/// `__storage_drop_pending_puts_reset(cell)`: the abort/reset paths' cancel
+/// for a stub-mediated call, where the executing cell is the caller and the
+/// reset actor is `cell` (its non-writable `_scope`, never a tenant value).
+/// Drops only when the host verifies `cell` is a cell of this isolate that
+/// is being reset: a live instance whose state is already aborted. Both
+/// reset paths set `_aborted` before calling and delete the instance after,
+/// so a wrong scope -- or a call outside a reset -- drops nothing. Only the
+/// harness calls this.
+pub(super) fn op_storage_drop_pending_puts_reset(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue<v8::Value>,
+) {
+    let cell = args.get(0).to_rust_string_lossy(scope);
+    if !celld_logic::cell::valid_cell_scope(&cell) {
+        return;
+    }
+    let resetting = (|| {
+        let cell_state = super::cell_state(scope).ok()?;
+        let key = v8::String::new(scope, "instances")?;
+        let instances = cell_state.get(scope, key.into())?.to_object(scope)?;
+        let key = v8::String::new(scope, &cell)?;
+        let instance = instances.get(scope, key.into())?.to_object(scope)?;
+        let key = v8::String::new(scope, "__celldState")?;
+        let state = instance.get(scope, key.into())?.to_object(scope)?;
+        let key = v8::String::new(scope, "_aborted")?;
+        Some(state.get(scope, key.into())?.is_true())
+    })();
+    if resetting != Some(true) {
+        return;
+    }
     actor_runtime_state(scope)
         .pending_puts
         .lock()
@@ -367,6 +496,9 @@ pub(super) fn op_sql_ingest(
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
     let cell = args.get(0).to_rust_string_lossy(scope);
+    let Ok(cell) = own_cell_sql(scope, "sql.ingest", cell) else {
+        return;
+    };
     let input = args.get(1).to_rust_string_lossy(scope);
     let out = match storage::sql_ingest(&cell, &input) {
         Ok((remainder, rows_written, statement_count)) => serde_json::json!({
@@ -400,6 +532,9 @@ pub(super) fn op_sql_cursor_start(
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
     let cell = args.get(0).to_rust_string_lossy(scope);
+    let Ok(cell) = own_cell_sql(scope, "sql.exec", cell) else {
+        return;
+    };
     let query = args.get(1).to_rust_string_lossy(scope);
     let timing_started = (tracing::enabled!(target: "queue_timing", tracing::Level::DEBUG)
         && cell
@@ -554,6 +689,14 @@ pub(super) fn op_sql_cursor_next(
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
     let cursor = args.get(0).integer_value(scope).unwrap_or(0).max(0) as u64;
+    // A cursor another cell opened answers as a missing one: a distinct
+    // refusal would turn a sequential id into a liveness oracle.
+    if let Some(owner) = storage::sql_cursor_scope(cursor) {
+        if super::binding_policy::require_executing_cell(scope, &owner).is_err() {
+            throw_sql_error(scope, "SQL cursor is no longer active");
+            return;
+        }
+    }
     match storage::sql_cursor_next(cursor) {
         Ok((Some(row), _)) => rv.set(sql_row_to_v8(scope, row).into()),
         Ok((None, rows_written)) => rv.set(v8::Number::new(scope, rows_written as f64).into()),
@@ -628,6 +771,29 @@ pub(super) fn op_sql_cursor_close(
     _rv: v8::ReturnValue<v8::Value>,
 ) {
     let cursor = args.get(0).integer_value(scope).unwrap_or(0).max(0) as u64;
+    // Closing another cell's cursor would be a cross-cell effect;
+    // silently keep what is not ours, as for an unknown id.
+    if let Some(owner) = storage::sql_cursor_scope(cursor) {
+        if super::binding_policy::require_executing_cell(scope, &owner).is_err() {
+            return;
+        }
+    }
+    storage::sql_cursor_close(cursor);
+}
+
+/// `__sql_cursor_close_finalizer(cursorId)`: the cursor finalizer's close.
+/// The finalizer runs in whatever turn collects the cursor — a foreign
+/// cell's event or no cell at all — where the executing-cell check would
+/// skip the close and leak the SQLite statement and snapshot. Only the
+/// harness finalizer calls this, with the id it registered at cursor
+/// creation (a later `_cursorId` reassignment cannot retarget it), so
+/// closing unconditionally frees only abandoned cursors of this isolate.
+pub(super) fn op_sql_cursor_close_finalizer(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue<v8::Value>,
+) {
+    let cursor = args.get(0).integer_value(scope).unwrap_or(0).max(0) as u64;
     storage::sql_cursor_close(cursor);
 }
 pub(super) fn op_sql_database_size(
@@ -636,6 +802,9 @@ pub(super) fn op_sql_database_size(
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
     let cell = args.get(0).to_rust_string_lossy(scope);
+    let Ok(cell) = own_cell_storage(scope, "sql.databaseSize", cell) else {
+        return;
+    };
     match storage::sql_database_size(&cell) {
         Ok(bytes) => rv.set(v8::Number::new(scope, bytes as f64).into()),
         Err(error) => throw_storage_error(scope, "sql.databaseSize", error),
@@ -651,6 +820,9 @@ pub(super) fn op_d1_run(
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
     let cell = args.get(0).to_rust_string_lossy(scope);
+    let Ok(cell) = own_cell_storage(scope, "d1", cell) else {
+        return;
+    };
     let request = args.get(1).to_rust_string_lossy(scope);
     let out = storage::d1_run_json(&cell, &request);
     rv.set(v8::String::new(scope, &out).unwrap().into());
@@ -716,6 +888,9 @@ pub(super) fn op_storage_transaction_control(
     _rv: v8::ReturnValue<v8::Value>,
 ) {
     let cell = args.get(0).to_rust_string_lossy(scope);
+    let Ok(cell) = own_cell_storage(scope, "transaction", cell) else {
+        return;
+    };
     let action = args.get(1).to_rust_string_lossy(scope);
     let nested = args.get(2).boolean_value(scope);
     let savepoint = args.get(3).to_rust_string_lossy(scope);
@@ -756,6 +931,9 @@ pub(super) fn op_storage_delete(
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
     let s = args.get(0).to_rust_string_lossy(scope);
+    let Ok(s) = own_cell_storage(scope, "delete", s) else {
+        return;
+    };
     let k = args.get(1).to_rust_string_lossy(scope);
     match storage::delete(&s, &k) {
         Ok(deleted) => rv.set(v8::Boolean::new(scope, deleted).into()),
@@ -768,6 +946,9 @@ pub(super) fn op_storage_delete_many(
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
     let cell = args.get(0).to_rust_string_lossy(scope);
+    let Ok(cell) = own_cell_storage(scope, "delete", cell) else {
+        return;
+    };
     let keys = match storage_string_array(scope, args.get(1)) {
         Ok(keys) => keys,
         Err(error) => {
@@ -798,6 +979,9 @@ pub(super) fn op_storage_list(
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
     let cell = args.get(0).to_rust_string_lossy(scope);
+    let Ok(cell) = own_cell_storage(scope, "list", cell) else {
+        return;
+    };
     let options = match serde_json::from_str::<StorageListOptions>(
         &args.get(1).to_rust_string_lossy(scope),
     ) {
@@ -836,6 +1020,9 @@ pub(super) fn op_storage_sync_list_start(
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
     let cell = args.get(0).to_rust_string_lossy(scope);
+    let Ok(cell) = own_cell_storage(scope, "kv.list", cell) else {
+        return;
+    };
     let options = match serde_json::from_str::<StorageListOptions>(
         &args.get(1).to_rust_string_lossy(scope),
     ) {
@@ -865,6 +1052,13 @@ pub(super) fn op_storage_sync_list_next(
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
     let cursor = args.get(0).integer_value(scope).unwrap_or(0).max(0) as u64;
+    // As for SQL cursors: another cell's cursor answers as a missing one.
+    if let Some(owner) = storage::sync_list_cursor_scope(cursor) {
+        if super::binding_policy::require_executing_cell(scope, &owner).is_err() {
+            throw_storage_error(scope, "kv.list", "sync KV cursor was invalidated");
+            return;
+        }
+    }
     match storage::sync_list_next(cursor) {
         Ok(Some((key, value))) => {
             let Some((decoded, _)) = deserialize_stored(scope, value, args.get(1)) else {
@@ -1055,10 +1249,22 @@ pub(super) fn deserialize_storage_value<'s>(
     }
 }
 
-/// First byte of a stored-stub row: a durable stub marker tree follows
-/// as an ordinary V8 clone. Plain rows keep V8's own 0xff prefix, so
-/// the tag branch never runs for them.
-const STORED_STUB_TAG: u8 = 0x01;
+/// First byte of a stored-stub row written by the host-table envelope:
+/// a `[tree, sideTable]` pair follows as an ordinary V8 clone, where the
+/// side table lists the host-checked stub scopes by path and the tree
+/// carries only inert placeholders. Plain rows keep V8's own 0xff prefix,
+/// so the tag branches never run for them.
+const STORED_STUB_TAG_V2: u8 = 0x03;
+/// First byte of a JS-table stored-stub row. The harness-built table was
+/// tenant-forgeable (H1/H2), so these decode as plain data with no revive
+/// and grant nothing. Legit pre-upgrade stored stubs come back as inert
+/// data; storing them again writes the host-table envelope.
+const STORED_STUB_TAG: u8 = 0x02;
+/// First byte of a pre-gate stored-stub row. The ungated lift wrote these,
+/// so their marker shapes are untrusted: they decode as plain data with no
+/// revive and grant nothing. Legit pre-upgrade stored stubs come back as
+/// inert data; storing them again writes the gated envelope.
+const STORED_STUB_TAG_V1: u8 = 0x01;
 
 fn wrap_stored<'s>(
     scope: &mut v8::PinScope<'s, '_>,
@@ -1071,19 +1277,28 @@ fn wrap_stored<'s>(
     pair.into()
 }
 
-/// Decode one stored row for JS. A stub-tagged row comes back as
-/// `[sentinel, tree]` (plus `true`), which only the storage wrapper —
-/// holder of the closure-private sentinel — turns back into live stubs.
+/// Decode one stored row for JS. A host-table stub-tagged row comes back
+/// as `[sentinel, [tree, sideTable]]` (plus `true`), which only the
+/// storage wrapper — holder of the closure-private sentinel — turns back
+/// into live stubs for the listed paths. Pre-host-table `0x01`/`0x02`
+/// rows decode as plain data with no revive and grant nothing.
 fn deserialize_stored<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     value: storage::StoredValue,
     sentinel: v8::Local<v8::Value>,
 ) -> Option<(v8::Local<'s, v8::Value>, bool)> {
     match value {
-        storage::StoredValue::V8(bytes) if bytes.first() == Some(&STORED_STUB_TAG) => {
+        storage::StoredValue::V8(bytes) if bytes.first() == Some(&STORED_STUB_TAG_V2) => {
             let tree =
                 deserialize_storage_value(scope, storage::StoredValue::V8(bytes[1..].to_vec()))?;
             Some((wrap_stored(scope, sentinel, tree), true))
+        }
+        storage::StoredValue::V8(bytes)
+            if bytes.first() == Some(&STORED_STUB_TAG)
+                || bytes.first() == Some(&STORED_STUB_TAG_V1) =>
+        {
+            deserialize_storage_value(scope, storage::StoredValue::V8(bytes[1..].to_vec()))
+                .map(|value| (value, false))
         }
         value => deserialize_storage_value(scope, value).map(|value| (value, false)),
     }
@@ -1242,10 +1457,378 @@ pub(super) fn op_storage_delete_all(
     _rv: v8::ReturnValue<v8::Value>,
 ) {
     let cell = args.get(0).to_rust_string_lossy(scope);
+    let Ok(cell) = own_cell_storage(scope, "deleteAll", cell) else {
+        return;
+    };
     let delete_alarm = args.get(1).boolean_value(scope);
     if let Err(error) = storage::delete_all_with_alarm(&cell, delete_alarm) {
         let message = v8::String::new(scope, &format!("deleteAll: {error}")).unwrap();
         let exception = v8::Exception::error(scope, message);
         scope.throw_exception(exception);
     }
+}
+
+/// `v8::Private` brand for Durable Object stub objects, set only by
+/// `__do_brand_stub` (called from `DurableObjectNamespace.get`). Tenant JS
+/// holds no reference to the key, so it can neither read nor forge the
+/// brand, and `Private` access runs no JS (no prototype to pollute). The
+/// value is a JSON `[class, value, name]` string captured at brand time;
+/// the lift check and record both read this single value, so no split.
+fn do_stub_brand_private<'s>(scope: &mut v8::PinScope<'s, '_>) -> v8::Local<'s, v8::Private> {
+    let name = v8::String::new(scope, "celld#doStub").unwrap();
+    v8::Private::for_api(scope, Some(name))
+}
+
+/// Unwrap a stub Proxy to its target object for branding. `Private` access
+/// on the Proxy itself would run the `get` trap (which answers undefined
+/// for symbols); the target holds the brand where tenant JS cannot reach.
+fn stub_brand_target<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    value: v8::Local<'s, v8::Value>,
+) -> Option<v8::Local<'s, v8::Object>> {
+    if let Ok(proxy) = v8::Local::<v8::Proxy>::try_from(value) {
+        if proxy.is_revoked() {
+            return None;
+        }
+        v8::Local::<v8::Object>::try_from(proxy.get_target(scope)).ok()
+    } else {
+        v8::Local::<v8::Object>::try_from(value).ok()
+    }
+}
+
+/// `__do_brand_stub(stub, class, value, name?)`: brand a freshly minted
+/// Durable Object stub with its scope. Only the harness calls this, from
+/// `get()`; user code cannot name the op. No rights check here: `get()`
+/// stays infallible-local per Cloudflare, and the lift record refuses what
+/// the sender could not dispatch to.
+pub(super) fn op_do_brand_stub<'a>(
+    scope: &mut v8::PinScope<'a, '_>,
+    args: v8::FunctionCallbackArguments<'a>,
+    _rv: v8::ReturnValue<v8::Value>,
+) {
+    let Some(target) = stub_brand_target(scope, args.get(0)) else {
+        return loader_throw(scope, "stub brand target is not an object");
+    };
+    let class = args.get(1).to_rust_string_lossy(scope);
+    let value = args.get(2).to_rust_string_lossy(scope);
+    let name_value = args.get(3);
+    let name = (!name_value.is_null_or_undefined()).then(|| name_value.to_rust_string_lossy(scope));
+    let json = serde_json::to_string(&(class, value, name))
+        .unwrap_or_else(|_| r#"["","",""]"#.to_string());
+    let Some(brand) = v8::String::new(scope, &json) else {
+        return;
+    };
+    let key = do_stub_brand_private(scope);
+    if target.set_private(scope, key, brand.into()) != Some(true) {
+        loader_throw(scope, "could not brand Durable Object stub");
+    }
+}
+
+/// `__do_lift_begin() -> token`: open a host-side lift table for one RPC
+/// or storage serialization. Only the harness calls this.
+pub(super) fn op_do_lift_begin(
+    scope: &mut v8::PinScope,
+    _args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let state = actor_runtime_state(scope);
+    let token = state
+        .do_lift_next
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        .wrapping_add(1);
+    let token = if token == 0 { 1 } else { token };
+    state
+        .do_lift_tables
+        .lock()
+        .expect("lift table lock poisoned")
+        .insert(token, Vec::new());
+    rv.set(v8::Number::new(scope, token as f64).into());
+}
+
+/// `__do_is_stub(value) -> bool`: whether `value` carries the host stub
+/// brand (a live Durable Object stub). No rights check, no record: the
+/// lift record and the revive guards use this to identify stubs without
+/// touching tenant-mutable `WeakMap` methods. Only the harness calls this.
+pub(super) fn op_do_is_stub<'a>(
+    scope: &mut v8::PinScope<'a, '_>,
+    args: v8::FunctionCallbackArguments<'a>,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let branded = (|| {
+        let target = stub_brand_target(scope, args.get(0))?;
+        let key = do_stub_brand_private(scope);
+        (target.has_private(scope, key) == Some(true)).then_some(())
+    })()
+    .is_some();
+    rv.set(v8::Boolean::new(scope, branded).into());
+}
+
+/// `__do_lift_abort(token)`: drop a lift table after a failed lift. Never
+/// throws; unknown tokens are a silent no-op.
+pub(super) fn op_do_lift_abort(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue<v8::Value>,
+) {
+    let token = args.get(0).integer_value(scope).unwrap_or(0).max(0) as u64;
+    actor_runtime_state(scope)
+        .do_lift_tables
+        .lock()
+        .expect("lift table lock poisoned")
+        .remove(&token);
+}
+
+/// Read a lift path array (absolute path from the envelope root) into Rust.
+/// Elements are keys or indices; both travel as strings (`node["0"]`
+/// addresses an array element exactly like `node[0]`). A `__proto__`,
+/// `constructor`, or `prototype` segment refuses the lift: the installer
+/// would otherwise walk or write through the prototype chain (a live stub
+/// onto `Object.prototype`), so the record fails before any grant mints.
+fn lift_path_segments(
+    scope: &mut v8::PinScope,
+    value: v8::Local<v8::Value>,
+) -> Option<Vec<String>> {
+    let array = v8::Local::<v8::Array>::try_from(value).ok()?;
+    let mut path = Vec::with_capacity(array.length() as usize);
+    for index in 0..array.length() {
+        let element = array.get_index(scope, index)?;
+        let segment = element.to_rust_string_lossy(scope);
+        if segment == "__proto__" || segment == "constructor" || segment == "prototype" {
+            return None;
+        }
+        path.push(segment);
+    }
+    Some(path)
+}
+
+/// `__do_lift_record(token, stub, path) -> bool`: if `stub` carries the
+/// host brand, refuse what the sender could not dispatch to (the exact
+/// `check_cell_call` predicate) and record the checked scope host-side;
+/// otherwise answer false so the caller treats the value as plain data.
+/// The check and the record read one host value atomically: no JS step
+/// sits between them, so H1 (array injection) and H2 (brand split) have
+/// no seam. Only the harness calls this, from the two lift walks.
+pub(super) fn op_do_lift_record<'a>(
+    scope: &mut v8::PinScope<'a, '_>,
+    args: v8::FunctionCallbackArguments<'a>,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let token = args.get(0).integer_value(scope).unwrap_or(0).max(0) as u64;
+    let branded = (|| {
+        let target = stub_brand_target(scope, args.get(1))?;
+        let key = do_stub_brand_private(scope);
+        if target.has_private(scope, key) != Some(true) {
+            return None;
+        }
+        let brand = target.get_private(scope, key)?;
+        let json = brand.to_rust_string_lossy(scope);
+        let (class, value, name): (String, String, Option<String>) =
+            serde_json::from_str(&json).ok()?;
+        Some((class, value, name))
+    })();
+    let Some((class, value, name)) = branded else {
+        rv.set(v8::Boolean::new(scope, false).into());
+        return;
+    };
+    let cell = format!("{class}:{value}");
+    if let Err(error) = super::binding_policy::check_lift(scope, &cell, name.as_deref()) {
+        return loader_throw(scope, &error);
+    }
+    let Some(path) = lift_path_segments(scope, args.get(2)) else {
+        return loader_throw(scope, "stub lift path is invalid");
+    };
+    let state = actor_runtime_state(scope);
+    let mut tables = state
+        .do_lift_tables
+        .lock()
+        .expect("lift table lock poisoned");
+    let Some(table) = tables.get_mut(&token) else {
+        return loader_throw(scope, "stub lift token is invalid");
+    };
+    table.push(super::DoLiftEntry {
+        path,
+        class,
+        value,
+        name,
+    });
+    rv.set(v8::Boolean::new(scope, true).into());
+}
+
+/// Build one host-checked table entry as a V8 object with data properties
+/// only (`create_data_property` bypasses any `Object.prototype` setter a
+/// tenant installed).
+fn lift_entry_value<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    entry: &super::DoLiftEntry,
+) -> Option<v8::Local<'s, v8::Value>> {
+    let object = v8::Object::new(scope);
+    let path = v8::Array::new(scope, entry.path.len() as i32);
+    for (index, segment) in entry.path.iter().enumerate() {
+        let value = v8::String::new(scope, segment)?;
+        path.set_index(scope, index as u32, value.into())?;
+    }
+    let set = |scope: &mut v8::PinScope<'s, '_>, name: &str, value: v8::Local<'s, v8::Value>| {
+        let key = v8::String::new(scope, name)?;
+        object
+            .create_data_property(scope, key.into(), value)
+            .filter(|ok| *ok)
+            .map(|_| ())
+    };
+    set(scope, "p", path.into())?;
+    set(scope, "c", v8::String::new(scope, &entry.class)?.into())?;
+    set(scope, "v", v8::String::new(scope, &entry.value)?.into())?;
+    match &entry.name {
+        Some(name) => set(scope, "n", v8::String::new(scope, name)?.into())?,
+        None => set(scope, "n", v8::null(scope).into())?,
+    }
+    Some(object.into())
+}
+
+/// Serialize `[tree, hostTable]` and prepend `tag`, all host-side: no JS
+/// array holds the table and no JS `Uint8Array.set` writes the tag (H1/H3
+/// have no seam). Consumes the token.
+fn finish_lift(
+    scope: &mut v8::PinScope,
+    token: u64,
+    tree: v8::Local<v8::Value>,
+    tag: u8,
+) -> Option<Vec<u8>> {
+    let table_entries = actor_runtime_state(scope)
+        .do_lift_tables
+        .lock()
+        .expect("lift table lock poisoned")
+        .remove(&token);
+    let table_entries = match table_entries {
+        Some(entries) => entries,
+        None => {
+            loader_throw(scope, "stub lift token is invalid");
+            return None;
+        }
+    };
+    let table = v8::Array::new(scope, table_entries.len() as i32);
+    for (index, entry) in table_entries.iter().enumerate() {
+        let value = lift_entry_value(scope, entry)?;
+        table.set_index(scope, index as u32, value)?;
+    }
+    let pair = v8::Array::new(scope, 2);
+    pair.set_index(scope, 0, tree)?;
+    pair.set_index(scope, 1, table.into())?;
+    let bytes = serialize_storage_value(scope, pair.into())?;
+    let mut out = Vec::with_capacity(bytes.len() + 1);
+    out.push(tag);
+    out.extend_from_slice(&bytes);
+    Some(out)
+}
+
+/// `__do_lift_finish_rpc(token, tree, caps) -> bytes`: envelope tags 5/6
+/// carry `[tree, hostTable]`; the tag, never the payload shape, selects
+/// the format. Only the harness calls this.
+pub(super) fn op_do_lift_finish_rpc(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let token = args.get(0).integer_value(scope).unwrap_or(0).max(0) as u64;
+    let caps = args.get(2).boolean_value(scope);
+    if let Some(bytes) = finish_lift(scope, token, args.get(1), if caps { 5 } else { 6 }) {
+        rv.set(super::bytes_value(scope, bytes));
+    }
+}
+
+/// `__do_lift_finish_stored(token, tree) -> bytes`: tag `0x03` carries the
+/// gated `[tree, hostTable]` envelope. Only the harness calls this.
+pub(super) fn op_do_lift_finish_stored(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let token = args.get(0).integer_value(scope).unwrap_or(0).max(0) as u64;
+    if let Some(bytes) = finish_lift(scope, token, args.get(1), STORED_STUB_TAG_V2) {
+        rv.set(super::bytes_value(scope, bytes));
+    }
+}
+
+/// `__rpc_encode_bare(tree, caps) -> bytes`: tags 1/2 carry a bare marker
+/// tree with no Durable Object stubs. The tag is written host-side so a
+/// polluted `Uint8Array.prototype.set` cannot flip it (H3).
+pub(super) fn op_rpc_encode_bare(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let caps = args.get(1).boolean_value(scope);
+    if let Some(bytes) = serialize_storage_value(scope, args.get(0)) {
+        let mut out = Vec::with_capacity(bytes.len() + 1);
+        out.push(if caps { 1 } else { 2 });
+        out.extend_from_slice(&bytes);
+        rv.set(super::bytes_value(scope, out));
+    }
+}
+
+/// `__bytes_tagged(tag, sc) -> bytes`: prepend one envelope tag byte
+/// host-side (the error envelope; stub envelopes use the finish ops).
+pub(super) fn op_bytes_tagged(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let tag = args.get(0).integer_value(scope).unwrap_or(-1);
+    if !(0..=255).contains(&tag) {
+        return loader_throw(scope, "envelope tag is invalid");
+    }
+    let Some(bytes) = super::view_bytes(args.get(1)) else {
+        return loader_throw(scope, "tagged payload must be bytes");
+    };
+    let mut out = Vec::with_capacity(bytes.len() + 1);
+    out.push(tag as u8);
+    out.extend_from_slice(&bytes);
+    rv.set(super::bytes_value(scope, out));
+}
+
+/// `__rpc_decode_bytes(bytes) -> [tag, decoded]`: check the envelope tag
+/// and slice host-side (no JS `subarray` to pollute), then deserialize.
+/// Tags 5/6 return the trusted `[tree, hostTable]` pair; legacy 3/4 return
+/// the tree only with no table, so pre-fix markers grant nothing; 0/1/2
+/// return the bare payload (0 is the `[error, props]` pair for the JS
+/// error path, sliced host-side so a polluted `subarray` cannot confuse
+/// the callee message).
+pub(super) fn op_rpc_decode_bytes(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let Some(bytes) = super::view_bytes(args.get(0)) else {
+        return loader_throw(scope, "rpc envelope must be bytes");
+    };
+    let Some(tag) = bytes.first().copied() else {
+        return loader_throw(scope, "rpc: corrupt clone payload");
+    };
+    let decoded = (|| {
+        if tag == 0xff {
+            return deserialize_storage_value(scope, storage::StoredValue::V8(bytes));
+        }
+        if tag == 0 || tag == 1 || tag == 2 || tag == 5 || tag == 6 {
+            return deserialize_storage_value(scope, storage::StoredValue::V8(bytes[1..].to_vec()));
+        }
+        if tag == 3 || tag == 4 {
+            let pair =
+                deserialize_storage_value(scope, storage::StoredValue::V8(bytes[1..].to_vec()))?;
+            // Legacy JS-built tables are untrusted: revive the tree with
+            // no table so every marker-shaped object stays inert data.
+            if let Ok(array) = v8::Local::<v8::Array>::try_from(pair) {
+                if array.length() == 2 {
+                    return array.get_index(scope, 0);
+                }
+            }
+            return Some(pair);
+        }
+        None
+    })();
+    let Some(decoded) = decoded else {
+        return loader_throw(scope, "rpc: corrupt clone payload");
+    };
+    let pair = v8::Array::new(scope, 2);
+    pair.set_index(scope, 0, v8::Number::new(scope, f64::from(tag)).into());
+    pair.set_index(scope, 1, decoded);
+    rv.set(pair.into());
 }

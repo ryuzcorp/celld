@@ -1,0 +1,13 @@
+{
+  "name": "abort-drain",
+  "main": "worker.js",
+  "compatibility_date": "2026-02-12",
+  "no_bundle": true,
+  "durable_objects": {
+    "bindings": [
+      { "name": "CALLER", "class_name": "Caller" },
+      { "name": "RESET", "class_name": "Reset" }
+    ]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Caller", "Reset"] }]
+}

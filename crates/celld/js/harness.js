@@ -1,8 +1,46 @@
-// Modified by ryuzcorp (ryuzcorp/celld): ctx.container.images; clone() of streaming and disturbed bodies; __celld$do on the service-binding RPC path; container exec pty/resize; cross-isolate RPC stubs and streams; container exec AbortSignal; test-only fake kill completion; exec reads survive their subscribing event; context end aborts finished uploads; tenant egress policy; D1 export; D1 export operator gate; D1 batch; test-only fake close/signal completion.
+// Modified by ryuzcorp (ryuzcorp/celld): ctx.container.images; clone() of streaming and disturbed bodies; __celld$do on the service-binding RPC path; container exec pty/resize; cross-isolate RPC stubs and streams; container exec AbortSignal; test-only fake kill completion; exec reads survive their subscribing event; context end aborts finished uploads; tenant egress policy; D1 export; D1 export operator gate; D1 batch; test-only fake close/signal completion; binding-forgery enforcement.
 // The DO object model and the Cloudflare-compatible runtime surface, run
 // once per isolate by `js.rs::install_harness` after the Web-API prelude.
 // Lived as a 4,000-line raw string inside js.rs until 2026-07-29; it is a
 // JavaScript program and belongs in a .js file, like the rest of src/js/.
+// Grant-path primordials, captured before tenant code runs: the lifts,
+// projection, and table install below use only these, so a tenant that
+// replaces `Array.prototype.push`, `WeakMap.prototype.get`,
+// `Uint8Array.prototype.set`, `Map`, `Object.keys`, and kin cannot break
+// legitimate stub transfers (availability) -- and forgery is closed
+// host-side regardless (the brand check, table, and tag live in Rust).
+const __primReflectApply = Reflect.apply;
+const __primArrayIsArray = Array.isArray;
+const __primObjectKeys = Object.keys;
+const __primGetProto = Object.getPrototypeOf;
+const __primHasOwn = Object.hasOwn;
+const __primDefineProp = Object.defineProperty;
+const __primMap = Map;
+const __primSet = Set;
+const __primWeakMap = WeakMap;
+const __primMapGet = Map.prototype.get;
+const __primMapSet = Map.prototype.set;
+const __primSetHas = Set.prototype.has;
+const __primSetAdd = Set.prototype.add;
+const __primWeakMapGet = WeakMap.prototype.get;
+const __primWeakMapHas = WeakMap.prototype.has;
+const __primWeakMapSet = WeakMap.prototype.set;
+const __primArrPush = Array.prototype.push;
+const __primArrSlice = Array.prototype.slice;
+const __primArrConcat = Array.prototype.concat;
+const __primStartsWith = String.prototype.startsWith;
+const __mapGet = (m, k) => __primReflectApply(__primMapGet, m, [k]);
+const __mapSet = (m, k, v) => __primReflectApply(__primMapSet, m, [k, v]);
+const __setHas = (s, v) => __primReflectApply(__primSetHas, s, [v]);
+const __setAdd = (s, v) => __primReflectApply(__primSetAdd, s, [v]);
+const __weakGet = (m, k) => __primReflectApply(__primWeakMapGet, m, [k]);
+const __weakHas = (m, k) => __primReflectApply(__primWeakMapHas, m, [k]);
+const __weakSet = (m, k, v) => __primReflectApply(__primWeakMapSet, m, [k, v]);
+const __arrPush = (a, ...items) => __primReflectApply(__primArrPush, a, items);
+const __arrSlice = (a, ...args) => __primReflectApply(__primArrSlice, a, args);
+const __arrConcat = (a, ...args) => __primReflectApply(__primArrConcat, a, args);
+const __startsWith = (s, prefix) =>
+  __primReflectApply(__primStartsWith, s, [prefix]);
 function __bodyBytes(body) {
   if (body == null) return new Uint8Array();
   if (body && body.__celldBodyBytes instanceof Uint8Array)
@@ -1319,7 +1357,7 @@ globalThis.clearTimeout = __clearTimer;
 globalThis.clearInterval = __clearTimer;
 
 const __sqlCursorFinalizer = typeof FinalizationRegistry === "function"
-  ? new FinalizationRegistry((cursorId) => __sql_cursor_close(cursorId))
+  ? new FinalizationRegistry((cursorId) => __sql_cursor_close_finalizer(cursorId))
   : null;
 
 // A `SqlStorageCursor` over one exec's result (Cloudflare DO SQL API).
@@ -1594,7 +1632,11 @@ class DurableObjectStorage {
     transactionDepth = 0,
     transactionControl = null,
   ) {
-    this._scope = scope;
+    // Non-writable: the scope reaches host ops, and a reassignment must
+    // not retarget them (H6). Tenant fixtures only read it.
+    __primDefineProp(this, "_scope", {
+      value: scope, enumerable: true, configurable: false, writable: false,
+    });
     this._state = state;
     this.sql = new SqlStorage(scope, state, this);
     this._transactionRoot = transactionRoot || this;
@@ -2703,7 +2745,12 @@ class Container {
 }
 class DurableObjectState {
   constructor(scope) {
-    this._scope = scope;
+    // Non-writable like storage above (H6): `abort()` and the reset path
+    // drop pending puts for this scope, and the host derives it from the
+    // executing cell as well, so a forged scope reaches neither.
+    __primDefineProp(this, "_scope", {
+      value: scope, enumerable: true, configurable: false, writable: false,
+    });
     this._aborted = false;
     this.storage = new DurableObjectStorage(scope, this);
     this.facets = new DurableObjectFacets(this);
@@ -2885,7 +2932,14 @@ class DurableObjectState {
   _resetAfterConcurrencyFailure(error) {
     if (this._aborted) return;
     this._aborted = true;
-    __storage_cancel_pending_puts(this._scope);
+    // Drop this scope's queued puts, not the executing cell's: under a
+    // stub-mediated caller the executing cell is the caller, whose puts
+    // must survive. The host verifies this scope is a resetting cell of
+    // this isolate before dropping.
+    if (__currentActorScope() === this._scope)
+      __storage_drop_pending_puts_own();
+    else
+      __storage_drop_pending_puts_reset(this._scope);
     const instance = __cell.instances[this._scope];
     if (instance && instance.__celldState === this)
       delete __cell.instances[this._scope];
@@ -2899,7 +2953,14 @@ class DurableObjectState {
   abort(reason) {
     if (this._aborted) return;
     this._aborted = true;
-    __storage_cancel_pending_puts(this._scope);
+    // Drop this scope's queued puts, not the executing cell's: under a
+    // stub-mediated caller the executing cell is the caller, whose puts
+    // must survive. The host verifies this scope is a resetting cell of
+    // this isolate before dropping.
+    if (__currentActorScope() === this._scope)
+      __storage_drop_pending_puts_own();
+    else
+      __storage_drop_pending_puts_reset(this._scope);
     const instance = __cell.instances[this._scope];
     if (instance && instance.__celldState === this)
       delete __cell.instances[this._scope];
@@ -3025,7 +3086,7 @@ const __currentActorEvent = () => {
 const __currentActorScope = () => __currentActorEvent()?.scope ?? "";
 const __beginActorEvent = (scope) => {
   __rpcSignalRefresh();
-  __refreshRetainedWaits();
+  __refreshRetainedWaits(scope);
   const event = { scope, context: String(__io_context_id()) };
   __actorEventStack.push(event);
   return event;
@@ -3094,7 +3155,7 @@ __celld.__retireInputGateContext = (context) => {
     );
     const instance = __cell.instances[scope];
     if (instance !== undefined) instance.__celldState._aborted = true;
-    __storage_cancel_pending_puts(scope);
+    __storage_drop_pending_puts(scope);
     if (instance !== undefined && __cell.instances[scope] === instance)
       delete __cell.instances[scope];
     for (const record of block.events.values()) {
@@ -3510,7 +3571,7 @@ __celld.__makeLoader = () => {
           `${JSON.stringify(__loaderServiceMarker)}.`,
           "DataCloneError");
       if (typeof v === "function" || v instanceof __cf.RpcTarget ||
-          __stubMeta.has(v) || __doStubMeta.has(v))
+          __weakHas(__stubMeta, v) || __do_is_stub(v))
         throw new DOMException(
           "Worker Loader env supports only Service Binding capabilities.",
           "DataCloneError");
@@ -3864,18 +3925,18 @@ const __rpcUnsupportedType = (value) => new DOMException(
 // so validation and serialization cannot invoke one getter twice. Native
 // clone types and RPC host types keep their own serializers.
 const __rpcProject = (value) => {
-  const seen = new Map();
-  const originals = new WeakMap();
-  const set = (target, key, value) => Object.defineProperty(target, key, {
+  const seen = new __primMap();
+  const originals = new __primWeakMap();
+  const set = (target, key, value) => __primDefineProp(target, key, {
     value, enumerable: true, configurable: true, writable: true,
   });
   const project = (v) => {
     if (v === null || (typeof v !== "object" && typeof v !== "function"))
       return v;
-    const cached = seen.get(v);
+    const cached = __mapGet(seen, v);
     if (cached !== undefined) return cached;
     if (typeof v === "function" || v instanceof __cf.RpcTarget ||
-        __stubMeta.has(v) || __svcMeta.has(v) || __doStubMeta.has(v) ||
+        __weakHas(__stubMeta, v) || __weakHas(__svcMeta, v) || __do_is_stub(v) ||
         v instanceof Headers || v instanceof Blob || v instanceof Request ||
         v instanceof Response || v instanceof ReadableStream ||
         v instanceof WritableStream || v instanceof AbortSignal ||
@@ -3887,42 +3948,44 @@ const __rpcProject = (value) => {
         (typeof WebAssembly !== "undefined" &&
           v instanceof WebAssembly.Module) ||
         __util_proxy_details(v) !== undefined) return v;
-    if (v instanceof Map) {
-      const out = new Map();
-      seen.set(v, out);
+    if (v instanceof __primMap) {
+      const out = new __primMap();
+      __mapSet(seen, v, out);
       for (const [key, entry] of v) {
-        out.set(project(key), project(entry));
+        __mapSet(out, project(key), project(entry));
       }
       return out;
     }
-    if (v instanceof Set) {
-      const out = new Set();
-      seen.set(v, out);
-      for (const entry of v) out.add(project(entry));
+    if (v instanceof __primSet) {
+      const out = new __primSet();
+      __mapSet(seen, v, out);
+      for (const entry of v) __setAdd(out, project(entry));
       return out;
     }
-    if (Array.isArray(v)) {
+    if (__primArrayIsArray(v)) {
       const out = new Array(v.length);
-      seen.set(v, out);
-      originals.set(out, v);
-      for (const key of Object.keys(v)) set(out, key, project(v[key]));
+      __mapSet(seen, v, out);
+      __weakSet(originals, out, v);
+      const keys = __primObjectKeys(v);
+      for (let i = 0; i < keys.length; i++) {
+        const key = keys[i];
+        set(out, key, project(v[key]));
+      }
       return out;
     }
-    if (Object.getPrototypeOf(v) !== Object.prototype)
+    if (__primGetProto(v) !== Object.prototype)
       throw __rpcUnsupportedType(v);
     const out = {};
-    seen.set(v, out);
-    originals.set(out, v);
-    for (const key of Object.keys(v)) set(out, key, project(v[key]));
+    __mapSet(seen, v, out);
+    __weakSet(originals, out, v);
+    const keys = __primObjectKeys(v);
+    for (let i = 0; i < keys.length; i++) {
+      const key = keys[i];
+      set(out, key, project(v[key]));
+    }
     return out;
   };
   return { tree: project(value), originals };
-};
-const __tagged = (tag, sc) => {
-  const out = new Uint8Array(sc.length + 1);
-  out[0] = tag;
-  out.set(sc, 1);
-  return out;
 };
 // ---- request-context confinement -------------------------------
 // Workerd ties I/O objects to the IoContext of the event that made
@@ -4151,12 +4214,11 @@ const __stubMeta = new WeakMap();
 // authoritative for routing; these only find the entry to run.
 const __hostStubs = new Map();
 const __hostStubLocals = new Map();
-// Keep the Durable Object brand outside the user-visible object. Reading a
-// string property here would invoke an inherited getter before validation can
-// reject its unsupported prototype. The entry snapshots the id and the
-// dispatch name at mint, so a later `stub.name =` cannot pollute the
-// receiver's idNames through the lift marker.
-const __doStubMeta = new WeakMap();
+// Durable Object stubs carry a host `v8::Private` brand (set by
+// `__do_brand_stub` in `get()`), read only by host ops (`__do_is_stub`,
+// `__do_lift_record`): no JS side table to pollute, and the brand
+// snapshots the id and dispatch name at mint, so a later `stub.name =`
+// cannot pollute the receiver's idNames.
 let __nextStubId = 1;
 const __stubIsolate = Math.random().toString(36).slice(2);
 const __newEntry = (target) => {
@@ -4732,13 +4794,17 @@ const __subscribeRetainedWait = (record) => {
 };
 // `subscribe` issues one backing wait for the current event and answers
 // its promise. Subscribes eagerly: the creating event is live, so an
-// await in the same event resolves through its own subscription.
+// await in the same event resolves through its own subscription. The
+// record keeps the owning cell scope: a refresh from another cell's
+// event must not re-subscribe it, or the owner check fails and settles
+// the wait with a refusal that has nothing to do with the waiter.
 const __retainedWait = (subscribe) => {
   const record = {
     id: __nextRetainedWaitId++,
     subscribe,
     settled: false,
     ctx: String(__io_context_id()),
+    scope: __currentActorScope(),
   };
   const promise = new Promise((resolve, reject) => {
     record.resolve = resolve;
@@ -4749,11 +4815,12 @@ const __retainedWait = (subscribe) => {
   __subscribeRetainedWait(record);
   return promise;
 };
-const __refreshRetainedWaits = () => {
+const __refreshRetainedWaits = (scope) => {
   if (__retainedWaits.size === 0) return;
   const ctx = String(__io_context_id());
   for (const record of __retainedWaits.values()) {
     if (record.settled || record.ctx === ctx) continue;
+    if (record.scope !== scope) continue;
     record.ctx = ctx;
     __subscribeRetainedWait(record);
   }
@@ -4784,6 +4851,97 @@ const __retainedExecRead = (id, which) => {
       });
   });
 };
+// A revived Durable Object stub holds one grant reference on its scope;
+// collection drops it, so the grant set tracks live stubs instead of
+// every scope ever received. Never throws: the release op is a no-op
+// for unknown scopes.
+const __doGrantFinalizer = typeof FinalizationRegistry === "function"
+  ? new FinalizationRegistry((cell) => {
+      try {
+        __do_release(cell);
+      } catch {}
+    })
+  : null;
+// Build a live stub for a side-table entry and grant its scope. The
+// entry's scope is what the lift checked before recording it, so the
+// grant mints only for host-checked scopes. A cross-script entry names
+// a class this isolate never declared; it revives with a placeholder
+// key (get() routes by the id value alone and never reads the key),
+// so a legitimately received stub survives the round trip.
+const __makeDoStubFromTable = (entry) => {
+  const doClass = entry.c;
+  let namespace;
+  try {
+    namespace = __cell.makeNamespace(doClass);
+  } catch {
+    namespace = new DurableObjectNamespace(doClass, "foreign");
+  }
+  const stub = namespace.get(
+    new DurableObjectId(doClass, entry.v, entry.n ?? undefined));
+  const cell = doClass + ":" + entry.v;
+  __do_grant(cell);
+  if (__doGrantFinalizer) __doGrantFinalizer.register(stub, cell);
+  return stub;
+};
+// Install side-table stubs into a decoded tree. Each entry names an
+// absolute path from the envelope root; only listed paths become stubs,
+// and any marker-shaped object in the payload stays inert data. The path
+// is validated before the grant mints (H5): a broken path -- which a
+// host-built envelope never produces -- installs nothing and grants
+// nothing, so no refcount leaks.
+const __installDoTable = (root, table) => {
+  if (!__primArrayIsArray(table) || table.length === 0) return root;
+  let out = root;
+  for (let t = 0; t < table.length; t++) {
+    const entry = table[t];
+    if (entry === null || typeof entry !== "object") continue;
+    const path = entry.p;
+    if (!__primArrayIsArray(path)) continue;
+    if (typeof entry.c !== "string" || typeof entry.v !== "string") continue;
+    // Prototype-chain segments install nothing and grant nothing, as
+    // defense in depth for rows written before the record-time check.
+    let refused = false;
+    for (let r = 0; r < path.length; r++) {
+      const seg = path[r];
+      if (seg === "__proto__" ||
+          seg === "constructor" || seg === "prototype") {
+        refused = true;
+        break;
+      }
+    }
+    if (refused) continue;
+    if (path.length === 0) {
+      out = __makeDoStubFromTable(entry);
+      continue;
+    }
+    let node = out;
+    let ok = true;
+    for (let i = 0; i < path.length - 1; i++) {
+      if (node === null || typeof node !== "object") {
+        ok = false;
+        break;
+      }
+      // Own-property walk only: a forged intermediate has no own
+      // property here (a `__proto__` placeholder is lost in the clone),
+      // so the entry installs nothing and grants nothing.
+      if (!__primHasOwn(node, path[i])) {
+        ok = false;
+        break;
+      }
+      node = node[path[i]];
+    }
+    if (!ok || node === null || typeof node !== "object") continue;
+    const last = path[path.length - 1];
+    if (!__primHasOwn(node, last)) continue;
+    // Own-property write through the captured primordial, never a plain
+    // assignment through a possibly-inherited setter.
+    __primDefineProp(node, last, {
+      value: __makeDoStubFromTable(entry),
+      writable: true, enumerable: true, configurable: true,
+    });
+  }
+  return out;
+};
 // Replace stub-able values with wire markers. Runs only after a
 // plain clone failed, so plain-data serialization never pays for
 // it. Passing an existing stub transfers its reference: the
@@ -4796,12 +4954,23 @@ const __retainedExecRead = (id, which) => {
 // service-binding mode: only Durable Object stubs cross (by value,
 // no caps), every other capability stays a DataCloneError as with
 // false.
+//
+// Durable Object stubs do not mint shape markers in the tree. The lift
+// records each host-checked scope in a host-side table outside the tenant
+// payload and leaves an inert placeholder behind; revive installs stubs
+// only for listed paths, so a marker-shaped object a tenant smuggles
+// into the payload -- through a class instance the lift leaves to the
+// clone, or any future opaque type -- revives as data and grants nothing.
+// The table lives host-side under `token` (no JS array to inject into),
+// and the envelope tag is written host-side at finish.
 const __stubLift = (value, allowCapabilities = true, originals, collector = null) => {
   let lifted = false;
   // Capabilities (stubs, disposers) root the callee context;
-  // by-value host types do not -- they pick the 0x02 envelope.
+  // by-value host types do not -- they pick the bare envelope.
   let caps = false;
-  const seen = new Map();
+  const seen = new __primMap();
+  const token = __do_lift_begin();
+  let hasDo = false;
   const ctx = __ctxNow();
   const doOnly = allowCapabilities === "do";
   const allowAll = allowCapabilities === true;
@@ -4814,12 +4983,40 @@ const __stubLift = (value, allowCapabilities = true, originals, collector = null
     caps = true;
     return __liftStream(v.body, host, collector);
   };
-  const lift = (v) => {
+  const lift = (v, path) => {
     if (v === null ||
         (typeof v !== "object" && typeof v !== "function")) return v;
-    const cached = seen.get(v);
-    if (cached !== undefined) return cached;
-    const meta = __stubMeta.get(v);
+    const cached = __mapGet(seen, v);
+    if (cached !== undefined) {
+      // The same stub at a second path needs its own host-table entry.
+      if (cached === null) {
+        try {
+          __do_lift_record(token, v, __arrSlice(path));
+        } catch (error) {
+          throw new DOMException(
+            String((error && error.message) || error), "DataCloneError");
+        }
+      }
+      return cached;
+    }
+    // Host-branded stubs record first, before any WeakMap brand check a
+    // tenant could pollute. The host reads the brand (no JS), refuses
+    // what the sender could not dispatch to, and records host-side.
+    if (__do_is_stub(v)) {
+      if (!allowAll && !doOnly && !host) return v;
+      try {
+        __do_lift_record(token, v, __arrSlice(path));
+      } catch (error) {
+        throw new DOMException(
+          String((error && error.message) || error), "DataCloneError");
+      }
+      lifted = true;
+      if (allowAll || host) caps = true;
+      hasDo = true;
+      __mapSet(seen, v, null);
+      return null;
+    }
+    const meta = __weakGet(__stubMeta, v);
     if (meta) {
       if (!allowAll && !host) return v;
       lifted = true;
@@ -4830,7 +5027,7 @@ const __stubLift = (value, allowCapabilities = true, originals, collector = null
       if (meta.ctx !== ctx) throw __ctxError("Client");
       meta.disposed = true; // the ref moves to the receiver
       __ctxUnregister(meta);
-      if (collector !== null) collector.handles.push(meta);
+      if (collector !== null) __arrPush(collector.handles, meta);
       // A received host stub forwards its host id: the reference moves
       // and the round trip stays one hop. This isolate's hold moves with
       // it; the receiver acquires on revive.
@@ -4843,7 +5040,7 @@ const __stubLift = (value, allowCapabilities = true, originals, collector = null
                          t: __stubIsolate, h: 1,
                          scope: coords.scope, epoch: coords.epoch,
                          gen: coords.gen, c: meta.callable };
-        seen.set(v, marker);
+        __mapSet(seen, v, marker);
         return marker;
       }
       if (host) {
@@ -4853,16 +5050,16 @@ const __stubLift = (value, allowCapabilities = true, originals, collector = null
                            t: __stubIsolate, h: 1,
                            scope: coords.scope, epoch: coords.epoch,
                            gen: coords.generation, c: meta.callable };
-          seen.set(v, marker);
+          __mapSet(seen, v, marker);
           return marker;
         }
       }
       const marker = { "__celld$stub": meta.entry.id,
                        t: __stubIsolate, c: meta.callable };
-      seen.set(v, marker);
+      __mapSet(seen, v, marker);
       return marker;
     }
-    const svc = __svcMeta.get(v);
+    const svc = __weakGet(__svcMeta, v);
     if (svc !== undefined) {
       if (!allowAll && !host) return v;
       // A loopback service stub (ctx.exports): name + props cross
@@ -4872,8 +5069,8 @@ const __stubLift = (value, allowCapabilities = true, originals, collector = null
       lifted = true;
       caps = true;
       const marker = { "__celld$svc": svc.name, t: __stubIsolate };
-      seen.set(v, marker);
-      if (svc.props !== undefined) marker.p = lift(svc.props);
+      __mapSet(seen, v, marker);
+      if (svc.props !== undefined) marker.p = lift(svc.props, __arrConcat(path, "p"));
       return marker;
     }
     // Workerd refuses to serialize its promise/property handles.
@@ -4888,7 +5085,7 @@ const __stubLift = (value, allowCapabilities = true, originals, collector = null
       lifted = true;
       caps = true;
       const entry = __newEntry(v);
-      if (collector !== null) collector.entries.push({ entry, bridge: false });
+      if (collector !== null) __arrPush(collector.entries, { entry, bridge: false });
       const callable = typeof v === "function";
       if (host) {
         const coords = __exportHostStub(entry, "target");
@@ -4897,24 +5094,14 @@ const __stubLift = (value, allowCapabilities = true, originals, collector = null
                            t: __stubIsolate, h: 1,
                            scope: coords.scope, epoch: coords.epoch,
                            gen: coords.generation, c: callable };
-          seen.set(v, marker);
+          __mapSet(seen, v, marker);
           return marker;
         }
       }
       const marker = { "__celld$stub": entry.id,
                        t: __stubIsolate,
                        c: callable };
-      seen.set(v, marker);
-      return marker;
-    }
-    const doMeta = __doStubMeta.get(v);
-    if (doMeta !== undefined) {
-      if (!allowAll && !doOnly && !host) return v;
-      lifted = true;
-      if (allowAll || host) caps = true;
-      const marker = { "__celld$do": doMeta.id._className,
-                       v: doMeta.id._value, n: doMeta.name ?? null };
-      seen.set(v, marker);
+      __mapSet(seen, v, marker);
       return marker;
     }
     // HTTP host types cross by value, as in Workerd's RPC
@@ -4956,11 +5143,11 @@ const __stubLift = (value, allowCapabilities = true, originals, collector = null
     }
     if (marker !== undefined) {
       lifted = true;
-      seen.set(v, marker);
+      __mapSet(seen, v, marker);
       return marker;
     }
-    const proto = Object.getPrototypeOf(v);
-    if (!Array.isArray(v) &&
+    const proto = __primGetProto(v);
+    if (!__primArrayIsArray(v) &&
         proto !== Object.prototype && proto !== null) {
       // A Proxy emulating neither a plain object nor an RpcTarget
       // is Workerd's canonical proxy serialization error.
@@ -4972,28 +5159,34 @@ const __stubLift = (value, allowCapabilities = true, originals, collector = null
           "Proxy's prototype chain.", "DataCloneError");
       return v; // host/other: leave to the clone
     }
-    const out = Array.isArray(v) ? [] : {};
-    seen.set(v, out);
-    for (const key of Object.keys(v)) {
+    const out = __primArrayIsArray(v) ? [] : {};
+    __mapSet(seen, v, out);
+    const keys = __primObjectKeys(v);
+    for (let ki = 0; ki < keys.length; ki++) {
+      const key = keys[ki];
       // A user value shaped like a wire marker would revive as a live
       // handle. Refuse it on every lift path, including lift=false and
       // storage, so only harness-minted markers (from stubs the sender
-      // actually holds) ever reach the revive path.
-      if (key.startsWith("__celld$"))
+      // could already dispatch to -- the lift checks) ever reach the
+      // revive path. Durable Object stubs additionally record in the
+      // host-side table, so even a shape that reaches the tree grants
+      // nothing.
+      if (__startsWith(key, "__celld$"))
         throw new DOMException(
           'Could not serialize object with reserved key "' + key + '".',
           "DataCloneError");
-      out[key] = lift(v[key]);
+      out[key] = lift(v[key], __arrConcat(path, key));
     }
-    const disposerSource = originals?.get(v) ?? v;
+    const orig = originals == null ? undefined : __weakGet(originals, v);
+    const disposerSource = orig ?? v;
     const disposer = disposerSource[Symbol.dispose];
-    if ((allowAll || host) && !Array.isArray(v) &&
+    if ((allowAll || host) && !__primArrayIsArray(v) &&
         typeof disposer === "function") {
       lifted = true;
       caps = true;
       const entry =
         __newEntry(__rpcBindMethod(disposer, disposerSource));
-      if (collector !== null) collector.entries.push({ entry, bridge: false });
+      if (collector !== null) __arrPush(collector.entries, { entry, bridge: false });
       // A host disposer crosses as its coordinates; an old reader looks
       // a bare id up and drops a shape it cannot use (fail-closed).
       if (host) {
@@ -5008,8 +5201,18 @@ const __stubLift = (value, allowCapabilities = true, originals, collector = null
     }
     return out;
   };
-  const tree = lift(value);
-  return lifted ? { tree, caps } : null;
+  let tree;
+  try {
+    tree = lift(value, []);
+  } catch (error) {
+    __do_lift_abort(token);
+    throw error;
+  }
+  if (!lifted) {
+    __do_lift_abort(token);
+    return null;
+  }
+  return { tree, caps, token, hasDo };
 };
 // Revive host-type markers into real instances, adopting the wire
 // bytes directly -- no copy beyond the clone's own.
@@ -5199,13 +5402,24 @@ const __reviveSignal = (marker, id) => {
 // The inverse: markers become live handles. `handles` collects the
 // revived stubs (for call-end param disposal or result-tree
 // disposal); `disposers` collects remote Symbol.dispose entries.
-const __stubRevive = (value) => {
+// `doTable` is the lift's side table: Durable Object stubs install only
+// from listed paths before shape revival runs. A `__celld$do`-shaped
+// object in the payload is inert data in every path -- including legacy
+// envelopes from unpatched senders, which grant nothing.
+const __stubRevive = (value, doTable) => {
   const handles = [];
   const disposers = [];
-  const seen = new Set();
+  const seen = new __primSet();
+  value = __installDoTable(value, doTable);
   const revive = (v) => {
     if (v === null || typeof v !== "object") return v;
-    const stubId = v["__celld$stub"];
+    // Side-table stubs installed above are live handles, not markers:
+    // reading a marker key on one would invoke its proxy trap.
+    if (__do_is_stub(v) || __weakHas(__stubMeta, v)) return v;
+    // Own-property shape reads only: an inherited marker (smuggled via
+    // the shared prototype) must not revive -- plain data falls through.
+    const stubId =
+      __primHasOwn(v, "__celld$stub") ? v["__celld$stub"] : undefined;
     if (stubId !== undefined) {
       // A host marker revives over the stub channel, whichever isolate
       // this is -- including the minting one. The revive acquires this
@@ -5219,13 +5433,13 @@ const __stubRevive = (value) => {
           __stub_acquire(stubId);
         } catch {}
         const stub = __makeStub(__hostStubEntry(stubId, v), v.c, rctx);
-        const meta = __stubMeta.get(stub);
+        const meta = __weakGet(__stubMeta, stub);
         if (meta) {
           if (rctx === undefined) {
             meta.disposed = true;
             __stub_release(stubId).catch(() => {});
           }
-          handles.push(meta);
+          __arrPush(handles, meta);
         }
         return stub;
       }
@@ -5234,56 +5448,55 @@ const __stubRevive = (value) => {
       const stub = entry === undefined
         ? __foreignStub()
         : __makeStub(entry, v.c);
-      const meta = __stubMeta.get(stub);
-      if (meta) handles.push(meta);
+      const meta = __weakGet(__stubMeta, stub);
+      if (meta) __arrPush(handles, meta);
       return stub;
     }
-    const svcName = v["__celld$svc"];
+    const svcName =
+      __primHasOwn(v, "__celld$svc") ? v["__celld$svc"] : undefined;
     if (svcName !== undefined)
       return v.t === __stubIsolate
         ? __entrypointStub(svcName, revive(v.p))
         : __foreignStub();
-    const doClass = v["__celld$do"];
-    if (doClass !== undefined) {
-      // A cross-script marker names a class this isolate never declared.
-      // The lift-time reserved-key check ensures only harness-minted
-      // markers reach here, so revive foreign classes with a placeholder
-      // key: get() routes by the id value alone and never reads the key.
-      let namespace;
-      try {
-        namespace = __cell.makeNamespace(doClass);
-      } catch {
-        namespace = new DurableObjectNamespace(doClass, "foreign");
-      }
-      return namespace.get(
-        new DurableObjectId(doClass, v.v, v.n ?? undefined));
-    }
-    const hdr = v["__celld$hdr"];
+    // No `__celld$do` shape branch: Durable Object stubs install only
+    // from the side table above. Marker-shaped payload objects fall
+    // through to plain-data revival and grant nothing.
+    const hdr =
+      __primHasOwn(v, "__celld$hdr") ? v["__celld$hdr"] : undefined;
     if (hdr !== undefined) return new Headers(hdr);
-    const blobBytes = v["__celld$blob"];
+    const blobBytes =
+      __primHasOwn(v, "__celld$blob") ? v["__celld$blob"] : undefined;
     if (blobBytes !== undefined) return __reviveBlob(v, blobBytes);
-    const reqUrl = v["__celld$req"];
+    const reqUrl =
+      __primHasOwn(v, "__celld$req") ? v["__celld$req"] : undefined;
     if (reqUrl !== undefined)
       return __reviveRequest(v, reqUrl, revive);
-    if (v["__celld$res"] !== undefined)
+    const resMarker =
+      __primHasOwn(v, "__celld$res") ? v["__celld$res"] : undefined;
+    if (resMarker !== undefined)
       return __reviveResponse(v, revive);
-    const rsId = v["__celld$rs"];
+    const rsId =
+      __primHasOwn(v, "__celld$rs") ? v["__celld$rs"] : undefined;
     if (rsId !== undefined)
       return __reviveStream(v, rsId, true, handles);
-    const wsId = v["__celld$ws"];
+    const wsId =
+      __primHasOwn(v, "__celld$ws") ? v["__celld$ws"] : undefined;
     if (wsId !== undefined)
       return __reviveStream(v, wsId, false, handles);
-    const sigId = v["__celld$sig"];
+    const sigId =
+      __primHasOwn(v, "__celld$sig") ? v["__celld$sig"] : undefined;
     if (sigId !== undefined) return __reviveSignal(v, sigId);
-    if (seen.has(v)) return v;
-    seen.add(v);
-    if (Array.isArray(v)) {
+    if (__setHas(seen, v)) return v;
+    __setAdd(seen, v);
+    if (__primArrayIsArray(v)) {
       for (let i = 0; i < v.length; i++) v[i] = revive(v[i]);
       return v;
     }
-    const proto = Object.getPrototypeOf(v);
+    const proto = __primGetProto(v);
     if (proto !== Object.prototype && proto !== null) return v;
-    for (const key of Object.keys(v)) {
+    const keys = __primObjectKeys(v);
+    for (let ki = 0; ki < keys.length; ki++) {
+      const key = keys[ki];
       if (key === "__celld$disp") {
         const disp = v[key];
         // A host disposer crosses as its coordinates; invoking it is a
@@ -5298,10 +5511,10 @@ const __stubRevive = (value) => {
             __stub_acquire(disp.id);
           } catch {}
           if (rctx === undefined) __stub_release(disp.id).catch(() => {});
-          else disposers.push(__hostStubEntry(disp.id, disp));
+          else __arrPush(disposers, __hostStubEntry(disp.id, disp));
         } else {
           const entry = __stubEntries.get(disp);
-          if (entry) disposers.push(entry);
+          if (entry) __arrPush(disposers, entry);
         }
         delete v[key];
         continue;
@@ -5743,29 +5956,52 @@ const __entrypointStub = (name, props) => {
 const __storedSentinel = {};
 const __storedLift = (value) => {
   let lifted = false;
-  const seen = new Map();
-  const lift = (v) => {
+  const seen = new __primMap();
+  const token = __do_lift_begin();
+  const lift = (v, path) => {
     if (v === null ||
         (typeof v !== "object" && typeof v !== "function")) return v;
-    const cached = seen.get(v);
-    if (cached !== undefined) return cached;
+    const cached = __mapGet(seen, v);
+    if (cached !== undefined) {
+      if (cached === null) {
+        try {
+          __do_lift_record(token, v, __arrSlice(path));
+        } catch (error) {
+          throw new DOMException(
+            String((error && error.message) || error), "DataCloneError");
+        }
+      }
+      return cached;
+    }
+    // Host-branded stubs record first, before any other brand check.
+    if (__do_is_stub(v)) {
+      try {
+        __do_lift_record(token, v, __arrSlice(path));
+      } catch (error) {
+        throw new DOMException(
+          String((error && error.message) || error), "DataCloneError");
+      }
+      lifted = true;
+      __mapSet(seen, v, null);
+      return null;
+    }
     // Ordering mirrors __stubLift: identify proxies by their
     // side tables and brands before touching any property -- a
     // stub or pipeline proxy answers every property read with a
     // fresh RpcProperty node.
-    if (__stubMeta.has(v) || v instanceof __cf.RpcTarget)
+    if (__weakHas(__stubMeta, v) || v instanceof __cf.RpcTarget)
       throw new DOMException(
         "Durable Object storage can only store stubs with " +
         "durable identity: service stubs from ctx.exports and " +
         "Durable Object stubs. This value is a transient RPC " +
         "handle that would not survive a restart.",
         "DataCloneError");
-    const svc = __svcMeta.get(v);
+    const svc = __weakGet(__svcMeta, v);
     if (svc !== undefined) {
       lifted = true;
       const marker = { "__celld$svc": svc.name };
-      seen.set(v, marker);
-      if (svc.props !== undefined) marker.p = lift(svc.props);
+      __mapSet(seen, v, marker);
+      if (svc.props !== undefined) marker.p = lift(svc.props, __arrConcat(path, "p"));
       return marker;
     }
     if (v instanceof __cf.RpcPromise ||
@@ -5776,86 +6012,117 @@ const __storedLift = (value) => {
         '". This type does not support serialization.',
         "DataCloneError");
     if (typeof v === "function") return v; // leave to the clone
-    const doMeta = __doStubMeta.get(v);
-    if (doMeta !== undefined) {
-      lifted = true;
-      const marker = { "__celld$do": doMeta.id._className,
-                       v: doMeta.id._value, n: doMeta.name ?? null };
-      seen.set(v, marker);
-      return marker;
-    }
-    if (Array.isArray(v)) {
+    if (__primArrayIsArray(v)) {
       const out = [];
-      seen.set(v, out);
+      __mapSet(seen, v, out);
       // Indices copy below; extras are dropped, but a forged marker in an
       // extra must still be refused, not silently kept as inert data.
-      for (const key of Object.keys(v)) {
-        if (key.startsWith("__celld$"))
+      const ekeys = __primObjectKeys(v);
+      for (let ei = 0; ei < ekeys.length; ei++) {
+        const key = ekeys[ei];
+        if (__startsWith(key, "__celld$"))
           throw new DOMException(
             'Could not serialize object with reserved key "' + key + '".',
             "DataCloneError");
       }
-      for (let i = 0; i < v.length; i++) out[i] = lift(v[i]);
+      for (let i = 0; i < v.length; i++) out[i] = lift(v[i], __arrConcat(path, i));
       return out;
     }
-    const proto = Object.getPrototypeOf(v);
+    const proto = __primGetProto(v);
     if (proto !== Object.prototype && proto !== null)
       return v; // host/other: leave to the clone
     const out = {};
-    seen.set(v, out);
-    for (const key of Object.keys(v)) {
+    __mapSet(seen, v, out);
+    const keys = __primObjectKeys(v);
+    for (let ki = 0; ki < keys.length; ki++) {
+      const key = keys[ki];
       // As in __stubLift: a user value shaped like a wire marker would
       // revive as a live stub on read. Refuse it while lifting.
-      if (key.startsWith("__celld$"))
+      if (__startsWith(key, "__celld$"))
         throw new DOMException(
           'Could not serialize object with reserved key "' + key + '".',
           "DataCloneError");
-      out[key] = lift(v[key]);
+      out[key] = lift(v[key], __arrConcat(path, key));
     }
     return out;
   };
-  const tree = lift(value);
-  return lifted ? tree : null;
+  let tree;
+  try {
+    tree = lift(value, []);
+  } catch (error) {
+    __do_lift_abort(token);
+    throw error;
+  }
+  if (!lifted) {
+    __do_lift_abort(token);
+    return null;
+  }
+  return { tree, token };
 };
 // Encode one stub-bearing value for storage. Rethrows the original
 // clone error when nothing was liftable, so plain uncloneables
-// fail exactly as they always did.
+// fail exactly as they always did. Tag 0x03 carries the host-table
+// `[tree, sideTable]` envelope (table and tag written host-side);
+// pre-host-table 0x01/0x02 rows read back as plain data with no revive.
 const __storedBytes = (value, error) => {
-  const tree = __storedLift(value);
-  if (tree === null) throw error;
-  return __tagged(1, __sc_encode(tree));
+  const lifted = __storedLift(value);
+  if (lifted === null) throw error;
+  try {
+    return __do_lift_finish_stored(lifted.token, lifted.tree);
+  } catch (error_) {
+    throw new DOMException(
+      String((error_ && error_.message) || error_), "DataCloneError");
+  }
 };
-const __storedRevive = (value) => {
-  const seen = new Set();
+// Test-only: write a pre-gate 0x01 envelope with an arbitrary tree, so
+// the upgrade path (old rows grant nothing) is exercisable. Defined only
+// on nodes booted with CELLD_TEST_WAIT=1, like the other test-only
+// globals; production isolates never define it (H4). Planting 0x01 is
+// safe by construction -- those rows decode as plain data.
+if (__test_wait_enabled())
+  globalThis.__celldPlantStoredV1ForTestOnly = (scope, key, tree) => {
+    __storage_put_serialized(String(scope), String(key),
+      __bytes_tagged(1, __sc_encode(tree)));
+  };
+const __storedRevive = (pair) => {
+  const seen = new __primSet();
+  let value = __primArrayIsArray(pair) ? pair[0] : pair;
+  const table = __primArrayIsArray(pair) ? pair[1] : undefined;
+  value = __installDoTable(value, table);
   const revive = (v) => {
     if (v === null || typeof v !== "object") return v;
-    const svcName = v["__celld$svc"];
+    if (__do_is_stub(v)) return v;
+    const svcName =
+      __primHasOwn(v, "__celld$svc") ? v["__celld$svc"] : undefined;
     if (svcName !== undefined)
       return __entrypointStub(svcName, revive(v.p));
-    const doClass = v["__celld$do"];
-    if (doClass !== undefined)
-      return __cell.makeNamespace(doClass).get(
-        new DurableObjectId(doClass, v.v, v.n ?? undefined));
-    if (seen.has(v)) return v;
-    seen.add(v);
-    if (Array.isArray(v)) {
+    // No `__celld$do` shape branch: stored stubs install only from the
+    // side table above. Marker-shaped payload objects -- including any
+    // smuggled through a class instance -- stay inert data.
+    if (__setHas(seen, v)) return v;
+    __setAdd(seen, v);
+    if (__primArrayIsArray(v)) {
       for (let i = 0; i < v.length; i++) v[i] = revive(v[i]);
       return v;
     }
-    const proto = Object.getPrototypeOf(v);
+    const proto = __primGetProto(v);
     if (proto !== Object.prototype && proto !== null) return v;
-    for (const key of Object.keys(v)) v[key] = revive(v[key]);
+    const keys = __primObjectKeys(v);
+    for (let ki = 0; ki < keys.length; ki++) {
+      const key = keys[ki];
+      v[key] = revive(v[key]);
+    }
     return v;
   };
   return revive(value);
 };
 const __unwrapStored = (v) =>
-  Array.isArray(v) && v[0] === __storedSentinel
+  __primArrayIsArray(v) && v[0] === __storedSentinel
     ? __storedRevive(v[1]) : v;
 // A map result is wrapped as a whole only when it holds at least
 // one tagged row, so the per-entry walk never runs on plain data.
 const __unwrapStoredMap = (v) => {
-  if (!Array.isArray(v) || v[0] !== __storedSentinel) return v;
+  if (!__primArrayIsArray(v) || v[0] !== __storedSentinel) return v;
   const map = v[1];
   for (const [key, value] of map)
     map.set(key, __unwrapStored(value));
@@ -5890,6 +6157,14 @@ const __ctxExports = () => __ctxExportsCache ??= (() => {
 // Object RPC across isolates), "do" is the cross-isolate
 // service-binding mode (DO stubs plus signals only); elsewhere they
 // stay a DataCloneError, exactly as before stubs existed.
+//
+// Tags 1/2 carry a bare marker tree with no Durable Object stubs. Tags
+// 5/6 carry `[tree, hostTable]` with the host-side table; the tag, never
+// the payload shape, tells the two apart, so a legacy tree that happens
+// to look like a pair cannot smuggle a table. Legacy 3/4 (JS-built
+// tables) revive the tree with no table and grant nothing. Every tag is
+// written host-side, so a polluted `Uint8Array.prototype.set` cannot
+// flip it (H3).
 const __rpcOut = (value, lift) => {
   const projected = __rpcProject(value);
   try {
@@ -5913,8 +6188,11 @@ const __rpcOut = (value, lift) => {
     }
     if (lifted === null) throw __dataCloneError(error);
     try {
-      return __tagged(
-        lifted.caps ? 1 : 2, __sc_encode(lifted.tree));
+      if (lifted.hasDo) {
+        return __do_lift_finish_rpc(lifted.token, lifted.tree, lifted.caps);
+      }
+      __do_lift_abort(lifted.token);
+      return __rpc_encode_bare(lifted.tree, lifted.caps);
     } catch (error_) {
       __unliftFailed(collector);
       throw __dataCloneError(error_);
@@ -5922,7 +6200,8 @@ const __rpcOut = (value, lift) => {
   }
 };
 // A callee exception as tagged bytes: the Error crosses by value
-// (V8 serializes Error natively), custom own properties beside it.
+// (V8 serializes Error natively), custom own properties beside it. The
+// tag is written host-side with the other envelope tags.
 const __rpcErrOut = (error) => {
   // `name` rides in the props: V8 only round-trips the standard
   // Error subclass names, and e.g. DataCloneError must survive.
@@ -5935,7 +6214,7 @@ const __rpcErrOut = (error) => {
     const error_ = new Error(String(error?.message ?? error));
     sc = __sc_encode([error_, { name: String(error?.name ?? "Error") }]);
   }
-  return __tagged(0, sc);
+  return __bytes_tagged(0, sc);
 };
 // The callee half of one RPC: run `body`, answer tagged bytes.
 const __rpcRun = async (body, lift) => {
@@ -5946,23 +6225,44 @@ const __rpcRun = async (body, lift) => {
   }
 };
 const __rpcDesArgs = (bytes) => {
-  if (bytes[0] === 0xff)
-    return { args: __sc_decode(bytes), received: [] };
-  const revived = __stubRevive(__sc_decode(bytes.subarray(1)));
+  const [tag, decoded] = __rpc_decode_bytes(bytes);
+  if (tag === 0xff)
+    return { args: decoded, received: [] };
+  if (tag === 5 || tag === 6) {
+    const revived = __stubRevive(decoded[0], decoded[1]);
+    return { args: revived.value, received: revived.handles };
+  }
+  const revived = __stubRevive(decoded);
   return { args: revived.value, received: revived.handles };
 };
 // The caller half: decode a reply, rebuilding stubs and rethrowing
 // callee exceptions as real Errors with the callee's own
-// properties, `.remote`, and a local (caller-side) stack.
+// properties, `.remote`, and a local (caller-side) stack. The tag is
+// checked and sliced host-side; legacy 3/4 arrive as the tree with no
+// table and grant nothing.
 const __rpcDes = (bytes) => {
-  if (bytes[0] === 0xff) return __sc_decode(bytes);
-  if (bytes[0] === 1 || bytes[0] === 2) {
+  const [tag, decoded] = __rpc_decode_bytes(bytes);
+  if (tag === 0) {
+    const [error, props] = decoded;
+    if (error instanceof Error) {
+      Object.assign(error, props);
+      error.remote = true;
+      const local = new Error().stack;
+      error.stack = error.name + ": " + error.message +
+        local.slice(local.indexOf("\n"));
+    }
+    throw error;
+  }
+  {
+    if (tag === 0xff) return decoded;
     const { value, handles, disposers } =
-      __stubRevive(__sc_decode(bytes.subarray(1)));
+      (tag === 5 || tag === 6)
+        ? __stubRevive(decoded[0], decoded[1])
+        : __stubRevive(decoded);
     if (value !== null && typeof value === "object" &&
-        !__stubMeta.has(value) &&
+        !__weakHas(__stubMeta, value) &&
         (handles.length > 0 || disposers.length > 0)) {
-      Object.defineProperty(value, Symbol.dispose, {
+      __primDefineProp(value, Symbol.dispose, {
         configurable: true,
         value: () => {
           for (const handle of handles) __disposeStub(handle);
@@ -5986,15 +6286,6 @@ const __rpcDes = (bytes) => {
     }
     return value;
   }
-  const [error, props] = __sc_decode(bytes.subarray(1));
-  if (error instanceof Error) {
-    Object.assign(error, props);
-    error.remote = true;
-    const local = new Error().stack;
-    error.stack = error.name + ": " + error.message +
-      local.slice(local.indexOf("\n"));
-  }
-  throw error;
 };
 // Deprecated Fetcher `get()`/`put()`/`delete()` HTTP helpers, kept by
 // the fetcher_has_get_put_delete compat flag (Workerd http.c++):
@@ -6197,7 +6488,7 @@ class DurableObjectNamespace {
         )),
       );
     }});
-    __doStubMeta.set(stub, { id, name: dispatchName });
+    __do_brand_stub(stub, id._className, id._value, dispatchName ?? null);
     return stub;
   }
 }
@@ -6326,12 +6617,41 @@ const __dispatchTo = __celld.__dispatchTo = async (
     __endActorEvent(actorEvent);
   }
 };
-// The D1 binding reaches its cell over stub RPC with exactly these three
-// methods (`D1Database._query`, `_batch`, and `exec` below). Everything else
-// on the cell (export, migrate) is operator-only and enters over `fetch`
-// with the operator-ingress marker instead, so RPC to any other method on a
-// D1 scope refuses as if the method did not exist.
-const __D1_RPC_ALLOWLIST = new Set(["__d1Query", "__d1Batch", "__d1Exec"]);
+// What a Worker stub may invoke on a runtime-supplied cell, by class.
+// Resolving any method name here used to expose operator-only and
+// internal methods (__d1Migrate, __kvSweep, ...) to every stub holder,
+// so runtime classes answer an allowlist while user classes keep open
+// dispatch. The methods below are exactly the ones the binding clients
+// and the queue cell's DLQ forward call; `fetch` travels the doFetch
+// path, not this one, and is unaffected. Everything else on a D1 cell
+// (export, migrate) is operator-only and enters over `fetch` with the
+// operator-ingress marker instead, so RPC to any other method refuses
+// as if the method did not exist.
+const __D1_RPC_METHODS = new Set(["__d1Query", "__d1Batch", "__d1Exec"]);
+const __KV_RPC_METHODS = new Set(["__kvGet", "__kvPut", "__kvDelete", "__kvList"]);
+const __QUEUE_RPC_METHODS = new Set(["__queueSend", "__queueMetrics", "__queueDlqAcceptBatch"]);
+const __WORKFLOW_RPC_METHODS = new Set([
+  "__wfCreate",
+  "__wfStatus",
+  "__wfDelete",
+  "__wfPause",
+  "__wfResume",
+  "__wfRestart",
+  "__wfTerminate",
+  "__wfSendEvent",
+]);
+const __NO_RPC_METHODS = new Set();
+const __rpcMethodAllowlist = (className) => {
+  switch (className) {
+    case "__D1Database": return __D1_RPC_METHODS;
+    case "__KvNamespace": return __KV_RPC_METHODS;
+    case "__Queue": return __QUEUE_RPC_METHODS;
+    case ".cron": return __NO_RPC_METHODS;
+    default:
+      if (className.startsWith("__Workflow.")) return __WORKFLOW_RPC_METHODS;
+      return null;
+  }
+};
 const __rpcTargetMethod = async (scope, method) => {
   const inst = await _readyInstance(scope);
   if (!inst.__celldState._rpcOk)
@@ -6341,7 +6661,9 @@ const __rpcTargetMethod = async (scope, method) => {
       "order to enable RPC, make sure your class extends the " +
       "special class `DurableObject`, which can be imported from " +
       "the module \"cloudflare:workers\".");
-  if (scope.startsWith("__D1Database:") && !__D1_RPC_ALLOWLIST.has(method))
+  const className = scope.slice(0, scope.indexOf(":"));
+  const allowed = __rpcMethodAllowlist(className);
+  if (allowed !== null && !allowed.has(method))
     throw new TypeError(method + " is not a function");
   const fn = inst[method];
   if (typeof fn !== "function")
@@ -6957,11 +7279,11 @@ const __entrypointOp = (name, path, argsSc, local, makeInst, props) => {
     try {
       __disposeNewHostHandles(id, null);
       // Registered work drains before a plain reply. A
-      // capability-bearing reply (tag 1) must not wait: a returned
+      // capability-bearing reply (tags 1 and 5) must not wait: a returned
       // stream's chunks may be produced by that very work, which
       // cannot finish until the caller pulls (returnReadableStream's
       // waitUntil writer would deadlock behind its own reply).
-      if (reply[0] !== 1 && drain !== null) await drain;
+      if (reply[0] !== 1 && reply[0] !== 5 && drain !== null) await drain;
       // ctx.abort() during the call supersedes its result; the raw
       // reason rejects the caller (same isolate -- identity holds).
       if (__abortedCtxs.size !== 0) {
@@ -8319,6 +8641,11 @@ class __QueueCell {
       group.push(row);
     }
     for (const [targetName, rows] of groups) {
+      // A deployment-declared dead-letter edge: the target queue is not
+      // necessarily one this cell's script binds as a producer, so the
+      // forward grants its scope before resolving it. Dispatch refuses
+      // undeclared names otherwise, and a Worker cannot name this op.
+      __do_grant_name(__cell.namespaceKeys["__Queue"], targetName);
       const target = __cell.makeNamespace("__Queue").getByName(targetName);
       await target.__queueDlqAcceptBatch({
         transfers: rows.map((row) => ({
@@ -12278,7 +12605,7 @@ const __entrypointContext = (props = __defaultProps) => ({
 });
 const __beginEvent = __celld.__beginEvent = (props = __defaultProps) => {
   __rpcSignalRefresh();
-  __refreshRetainedWaits();
+  __refreshRetainedWaits("");
   __event_begin();
   return __entrypointContext(props);
 };
