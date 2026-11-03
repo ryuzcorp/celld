@@ -1,4 +1,4 @@
-// Modified for Noite (ryuzcorp/noite, docker/celld/patches): node:crypto scrypt; container exec resize op.
+// Modified by ryuzcorp (ryuzcorp/celld): node:crypto scrypt; container exec resize op.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 // The raw V8 adapter and its child modules remain outside the Actor execution

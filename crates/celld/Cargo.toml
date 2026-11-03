@@ -1,4 +1,4 @@
-# Modified for Noite (ryuzcorp/noite, docker/celld/patches): node:crypto scrypt.
+# Modified by ryuzcorp (ryuzcorp/celld): node:crypto scrypt.
 [package]
 name = "celld"
 version = "0.6.3"

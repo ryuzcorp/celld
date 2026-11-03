@@ -1,4 +1,4 @@
-<!-- Modified for Noite (ryuzcorp/noite, docker/celld/patches): node:crypto scrypt; cloned streaming bodies. -->
+<!-- Modified by ryuzcorp (ryuzcorp/celld): node:crypto scrypt; cloned streaming bodies. -->
 # Cloudflare compatibility
 
 This page lists only the differences from the linked Cloudflare APIs. An entry

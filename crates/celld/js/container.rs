@@ -1,4 +1,4 @@
-// Modified for Noite (ryuzcorp/noite, docker/celld/patches): exec() waits for start(); exec pty/resize.
+// Modified by ryuzcorp (ryuzcorp/celld): exec() waits for start(); exec pty/resize.
 //! Host ops behind `ctx.container`.
 //!
 //! JavaScript owns the surface and every validation message, copied from

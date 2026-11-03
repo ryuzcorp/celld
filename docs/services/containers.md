@@ -1,4 +1,4 @@
-<!-- Modified for Noite (ryuzcorp/noite, docker/celld/patches): ctx.container.images. -->
+<!-- Modified by ryuzcorp (ryuzcorp/celld): ctx.container.images. -->
 # Containers
 
 A container runs a program that is not JavaScript beside the Worker that needs

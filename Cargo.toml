@@ -1,4 +1,4 @@
-# Modified for Noite (ryuzcorp/noite, docker/celld/patches): node:crypto scrypt.
+# Modified by ryuzcorp (ryuzcorp/celld): node:crypto scrypt.
 # Clean-sheet celld workspace. `crates/logic` owns all behavioral state and
 # decisions; `crates/celld` is only an effect executor and adapter host.
 [workspace]
