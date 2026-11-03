@@ -52,11 +52,6 @@ fn fixture_source() -> PathBuf {
         .expect("fixture exists")
 }
 
-fn free_port() -> u16 {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("probe bind");
-    listener.local_addr().expect("probe addr").port()
-}
-
 /// Tempdir for one fixture copy: `/dev/shm` when usable, else the
 /// default tempdir.
 ///
@@ -177,12 +172,13 @@ impl TestNode {
     }
 
     fn boot_with_env(fixture: &Path, name: &str, env: &[(&str, &str)]) -> Self {
-        let port = free_port();
+        // Port zero: the OS assigns the worker port, so parallel boots
+        // can never claim the same one; discovery below learns it.
         let mut child = Command::new(celld_binary())
             .arg("dev")
             .arg(fixture)
             .arg("--port")
-            .arg(port.to_string())
+            .arg("0")
             .arg("--no-watch")
             .arg("--clean")
             .arg("--logs")
@@ -196,7 +192,7 @@ impl TestNode {
         // Drain both pipes so a chatty child can never block on a full
         // one. The drains only discard: the supervisor block-buffers
         // into pipes, so its log lines are not a discovery channel and
-        // the internal port comes from /proc below instead.
+        // both ports come from /proc below instead.
         std::thread::spawn(move || {
             let mut sink = Vec::new();
             let _ = stdout.read_to_end(&mut sink);
@@ -205,33 +201,44 @@ impl TestNode {
             let mut sink = Vec::new();
             let _ = stderr.read_to_end(&mut sink);
         });
-        let public = format!("127.0.0.1:{port}");
-        // The kill-on-drop guard exists before the readiness poll, so a
-        // boot timeout or an early child exit cannot leak the server.
+        // The kill-on-drop guard exists before discovery, so a boot
+        // timeout or an early child exit cannot leak the server; the
+        // addresses are placeholders until discovery fills them.
         let mut node = Self {
             child,
-            public: public.clone(),
+            public: String::new(),
             internal: String::new(),
         };
-        // Readiness is the public port answering with the app loaded; the
-        // internal port is the node child's other loopback listener.
-        node.internal = poll_until(&format!("{name} boot"), Duration::from_secs(120), || {
-            if !probe(&public, "/scope?name=probe") {
-                return None;
-            }
-            if let Some(status) = node.child.try_wait().expect("poll child") {
-                panic!("{name}: celld dev exited during boot: {status}");
-            }
-            let mut internal = None;
-            for pid in child_pids(node.child.id()) {
-                for found in listening_loopback_ports(pid) {
-                    if found != port {
-                        internal = Some(found);
+        // Discovery doubles as readiness: the node binds two loopback
+        // listeners, and the one answering /scope with 200 is the worker
+        // listener (the operator listener 404s it). Neither answers
+        // before the app loads.
+        let (public, internal) =
+            poll_until(&format!("{name} boot"), Duration::from_secs(120), || {
+                // Liveness first: a dead child must fail fast, not burn
+                // the deadline on refused probes.
+                if let Some(status) = node.child.try_wait().expect("poll child") {
+                    panic!("{name}: celld dev exited during boot: {status}");
+                }
+                let mut public = None;
+                let mut internal = None;
+                for pid in child_pids(node.child.id()) {
+                    for found in listening_loopback_ports(pid) {
+                        let addr = format!("127.0.0.1:{found}");
+                        if probe(&addr, "/scope?name=probe") {
+                            public = Some(addr);
+                        } else if internal.is_none() {
+                            internal = Some(addr);
+                        }
                     }
                 }
-            }
-            internal.map(|port| format!("127.0.0.1:{port}"))
-        });
+                match (public, internal) {
+                    (Some(public), Some(internal)) => Some((public, internal)),
+                    _ => None,
+                }
+            });
+        node.public = public;
+        node.internal = internal;
         node
     }
 
@@ -330,11 +337,7 @@ fn caller_stats(node: &TestNode) -> Value {
     get_json(node, "/caller-stats")
 }
 
-fn poll_until(
-    name: &str,
-    deadline: Duration,
-    mut condition: impl FnMut() -> Option<String>,
-) -> String {
+fn poll_until<T>(name: &str, deadline: Duration, mut condition: impl FnMut() -> Option<T>) -> T {
     let start = Instant::now();
     loop {
         if let Some(done) = condition() {
