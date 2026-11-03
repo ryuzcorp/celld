@@ -1,4 +1,4 @@
-// Modified for Noite (ryuzcorp/noite, docker/celld/patches): exec() waits for start().
+// Modified for Noite (ryuzcorp/noite, docker/celld/patches): exec() waits for start(); exec pty/resize.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! Containers attached to Durable Objects: the engine side of
@@ -1318,32 +1318,22 @@ impl ContainerEngine {
         if !cell.running() {
             return Err(anyhow!("exec() requires a running container."));
         }
-        let mut body = json!({
-            "AttachStdin": true,
-            "AttachStdout": true,
-            "AttachStderr": true,
-            "Tty": false,
-            "Cmd": params.cmd,
-        });
-        if !params.env.is_empty() {
-            body["Env"] = json!(params
-                .env
-                .iter()
-                .map(|(name, value)| format!("{name}={value}"))
-                .collect::<Vec<_>>());
-        }
-        if let Some(cwd) = &params.cwd {
-            body["WorkingDir"] = json!(cwd);
-        }
-        if let Some(user) = &params.user {
-            body["User"] = json!(user);
+        // Fail before the daemon creates anything: a size rides only with a
+        // PTY, as a positive pair. The op already enforces this for JS
+        // callers; the engine refuses it here so a direct caller cannot
+        // orphan a started exec on a resize the daemon would refuse.
+        match (params.pty, params.cols, params.rows) {
+            (false, None, None) | (true, None, None) => {}
+            (true, Some(cols), Some(rows)) if cols != 0 && rows != 0 => {}
+            (false, _, _) => return Err(anyhow!("exec(): pty size without pty")),
+            _ => return Err(anyhow!("exec(): pty size must be positive cols and rows")),
         }
         let created = self
             .docker
             .expect(
                 "POST",
                 &format!("/containers/{}/exec", cell.name),
-                Some(body),
+                Some(exec_create_body(&params)),
                 "create exec",
             )
             .await?
@@ -1357,7 +1347,7 @@ impl ContainerEngine {
             .docker
             .hijack(
                 &format!("/exec/{exec_id}/start"),
-                json!({ "Detach": false, "Tty": false }),
+                json!({ "Detach": false, "Tty": params.pty }),
             )
             .await?;
         // Docker reports `Running: false` with no pid before it has spawned
@@ -1383,22 +1373,56 @@ impl ContainerEngine {
             }
             asyncrt::sleep(Duration::from_millis(50)).await;
         }
+        if params.pty {
+            if let (Some(cols), Some(rows)) = (params.cols, params.rows) {
+                if let Err(resize_err) = self
+                    .docker
+                    .expect(
+                        "POST",
+                        &exec_resize_path(&exec_id, cols, rows),
+                        None,
+                        "resize exec",
+                    )
+                    .await
+                {
+                    // The daemon-side process is already running; kill it so
+                    // a failed resize doesn't orphan a process with no handle.
+                    // Best-effort: the resize error is what the caller sees.
+                    let _ = kill_via_exec(&self.docker, &cell.name, pid, 9).await;
+                    return Err(resize_err);
+                }
+            }
+        }
         let (read, write) = tokio::io::split(stream);
         let (stdout_tx, stdout_rx) = mpsc::channel(16);
         let (stderr_tx, stderr_rx) = mpsc::channel(16);
         let combined = params.combined;
+        let is_pty = params.pty;
         let ended = watch::channel(false).0;
         let ended_ = ended.clone();
-        asyncrt::spawn(async move {
-            demux(read, stdout_tx, stderr_tx, combined).await;
-            ended_.send_replace(true);
-        })
-        .detach();
+        if is_pty {
+            // A TTY stream is raw bytes, not multiplexed frames, with
+            // stderr merged into stdout by the daemon; there is no
+            // separate stderr, so its sender is dropped at once.
+            drop(stderr_tx);
+            asyncrt::spawn(async move {
+                pump_raw(read, stdout_tx).await;
+                ended_.send_replace(true);
+            })
+            .detach();
+        } else {
+            asyncrt::spawn(async move {
+                demux(read, stdout_tx, stderr_tx, combined).await;
+                ended_.send_replace(true);
+            })
+            .detach();
+        }
         let process = Arc::new(ExecProcess {
             id: next_exec_id(),
             exec_id,
             container: cell.name.clone(),
             pid,
+            is_pty,
             docker: self.docker.clone(),
             stdin: tokio::sync::Mutex::new(Some(write)),
             stdout: tokio::sync::Mutex::new(stdout_rx),
@@ -1422,6 +1446,84 @@ pub struct ExecParams {
     pub user: Option<String>,
     /// stderr folded into stdout.
     pub combined: bool,
+    /// Allocate a pseudo-TTY (`Tty`), with an initial size when set.
+    pub pty: bool,
+    pub cols: Option<u16>,
+    pub rows: Option<u16>,
+}
+
+/// The `POST /containers/{id}/exec` body for one exec, pure so tests pin the
+/// `Tty` shape without an engine.
+fn exec_create_body(params: &ExecParams) -> Value {
+    let mut body = json!({
+        "AttachStdin": true,
+        "AttachStdout": true,
+        "AttachStderr": true,
+        "Tty": params.pty,
+        "Cmd": params.cmd,
+    });
+    if !params.env.is_empty() {
+        body["Env"] = json!(params
+            .env
+            .iter()
+            .map(|(name, value)| format!("{name}={value}"))
+            .collect::<Vec<_>>());
+    }
+    if let Some(cwd) = &params.cwd {
+        body["WorkingDir"] = json!(cwd);
+    }
+    if let Some(user) = &params.user {
+        body["User"] = json!(user);
+    }
+    body
+}
+
+/// The `POST /exec/{id}/resize` path: `h` is rows, `w` is cols.
+fn exec_resize_path(exec_id: &str, cols: u16, rows: u16) -> String {
+    format!("/exec/{exec_id}/resize?h={rows}&w={cols}")
+}
+
+/// The `POST /containers/{id}/exec` body that runs `kill -<signal> <pid>`,
+/// pure so tests pin the shape without an engine.
+fn kill_exec_body(pid: i64, signal: u32) -> Value {
+    json!({
+        "AttachStdin": false, "AttachStdout": false, "AttachStderr": false,
+        "Cmd": ["kill", format!("-{signal}"), pid.to_string()],
+    })
+}
+
+/// Deliver a signal by a second exec of `kill`: the Engine API has no exec
+/// kill. Used by `ExecProcess::kill` and, best-effort with SIGKILL, to clean
+/// up a daemon-side process whose post-start resize failed before its handle
+/// was registered.
+async fn kill_via_exec(
+    docker: &Docker,
+    container: &str,
+    pid: i64,
+    signal: u32,
+) -> anyhow::Result<()> {
+    let created = docker
+        .expect(
+            "POST",
+            &format!("/containers/{container}/exec"),
+            Some(kill_exec_body(pid, signal)),
+            "create exec",
+        )
+        .await?
+        .json()?;
+    let id = created
+        .get("Id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("exec create answered without an id"))?;
+    docker
+        .expect(
+            "POST",
+            &format!("/exec/{id}/start"),
+            Some(json!({ "Detach": true })),
+            "start exec",
+        )
+        .await?;
+    Ok(())
 }
 
 type WriteHalf = tokio::io::WriteHalf<Box<dyn Stream>>;
@@ -1431,6 +1533,7 @@ pub struct ExecProcess {
     exec_id: String,
     container: String,
     pub pid: i64,
+    pub is_pty: bool,
     docker: Docker,
     stdin: tokio::sync::Mutex<Option<WriteHalf>>,
     stdout: tokio::sync::Mutex<mpsc::Receiver<Bytes>>,
@@ -1533,33 +1636,49 @@ impl ExecProcess {
     /// The Engine API has no exec kill, so the signal is delivered by a
     /// second exec of `kill`, as workerd does.
     pub async fn kill(&self, signal: u32) -> anyhow::Result<()> {
-        let body = json!({
-            "AttachStdin": false, "AttachStdout": false, "AttachStderr": false,
-            "Cmd": ["kill", format!("-{signal}"), self.pid.to_string()],
-        });
-        let created = self
-            .docker
-            .expect(
-                "POST",
-                &format!("/containers/{}/exec", self.container),
-                Some(body),
-                "create exec",
-            )
-            .await?
-            .json()?;
-        let id = created
-            .get("Id")
-            .and_then(Value::as_str)
-            .ok_or_else(|| anyhow!("exec create answered without an id"))?;
+        kill_via_exec(&self.docker, &self.container, self.pid, signal).await
+    }
+
+    /// Resize a PTY exec's terminal. Refused on a non-TTY process, where the
+    /// daemon has nothing to resize.
+    pub async fn resize(&self, cols: u16, rows: u16) -> anyhow::Result<()> {
+        if !self.is_pty {
+            anyhow::bail!("resize() requires a PTY process");
+        }
+        if cols == 0 || rows == 0 {
+            anyhow::bail!("resize() dimensions must be positive");
+        }
         self.docker
             .expect(
                 "POST",
-                &format!("/exec/{id}/start"),
-                Some(json!({ "Detach": true })),
-                "start exec",
+                &exec_resize_path(&self.exec_id, cols, rows),
+                None,
+                "resize exec",
             )
             .await?;
         Ok(())
+    }
+}
+
+/// Forward a TTY exec's raw stream to stdout until the daemon closes it.
+/// Unlike [`demux`], there are no multiplex frames to split.
+async fn pump_raw(mut read: tokio::io::ReadHalf<Box<dyn Stream>>, stdout: mpsc::Sender<Bytes>) {
+    let mut buf = vec![0u8; 8192];
+    loop {
+        match read.read(&mut buf).await {
+            Ok(0) | Err(_) => return,
+            Ok(n) => {
+                if stdout
+                    .send(Bytes::copy_from_slice(&buf[..n]))
+                    .await
+                    .is_err()
+                {
+                    // The reader went away; keep draining so the process is
+                    // not blocked on a full pipe.
+                    continue;
+                }
+            }
+        }
     }
 }
 
@@ -1706,5 +1825,171 @@ mod start_order_tests {
         assert!(*cell.started.borrow() < run);
         drop(task);
         assert_eq!(*cell.started.borrow(), run);
+    }
+}
+
+#[cfg(test)]
+mod pty_tests {
+    use super::*;
+
+    fn params(pty: bool) -> ExecParams {
+        ExecParams {
+            cmd: vec!["sh".to_string()],
+            env: vec![("A".to_string(), "b".to_string())],
+            cwd: Some("/work".to_string()),
+            user: Some("nobody".to_string()),
+            combined: false,
+            pty,
+            cols: None,
+            rows: None,
+        }
+    }
+
+    #[test]
+    fn exec_create_carries_tty() {
+        let plain = exec_create_body(&params(false));
+        assert_eq!(plain["Tty"], serde_json::json!(false));
+        assert_eq!(plain["Cmd"], serde_json::json!(["sh"]));
+        assert_eq!(plain["Env"], serde_json::json!(["A=b"]));
+        assert_eq!(plain["WorkingDir"], serde_json::json!("/work"));
+        assert_eq!(plain["User"], serde_json::json!("nobody"));
+        let tty = exec_create_body(&params(true));
+        assert_eq!(tty["Tty"], serde_json::json!(true));
+        assert_eq!(tty["Cmd"], serde_json::json!(["sh"]));
+    }
+
+    #[test]
+    fn resize_path_puts_rows_in_h_and_cols_in_w() {
+        assert_eq!(
+            exec_resize_path("abc123", 100, 30),
+            "/exec/abc123/resize?h=30&w=100"
+        );
+    }
+
+    #[test]
+    fn kill_body_runs_kill_minus_signal_pid() {
+        let body = kill_exec_body(1234, 9);
+        assert_eq!(body["Cmd"], serde_json::json!(["kill", "-9", "1234"]));
+        assert_eq!(body["AttachStdin"], serde_json::json!(false));
+        assert_eq!(body["AttachStdout"], serde_json::json!(false));
+        assert_eq!(body["AttachStderr"], serde_json::json!(false));
+    }
+
+    fn test_cell() -> CellContainer {
+        CellContainer {
+            scope: "s".into(),
+            name: "n".into(),
+            spec: Arc::new(ContainerSpec {
+                class_name: "C".into(),
+                image: "celld-image:x".into(),
+                instance_type: None,
+                max_instances: None,
+                runtime: None,
+            }),
+            state: Mutex::new(CellState::default()),
+            processes: Mutex::new(Vec::new()),
+            exit: watch::channel(None).0,
+            started: watch::channel(0).0,
+        }
+    }
+
+    fn test_engine() -> ContainerEngine {
+        ContainerEngine {
+            runtime: None,
+            dns: Vec::new(),
+            resolv_conf: None,
+            docker: Docker::new("/nonexistent-celld-test.sock"),
+            node: "test".to_string(),
+            bucket: None,
+            images: Mutex::new(HashMap::new()),
+            cells: Mutex::new(HashMap::new()),
+            networks: tokio::sync::Mutex::new(None),
+            fenced: tokio::sync::Mutex::new(false),
+        }
+    }
+
+    /// P4: a PTY size that the daemon would refuse fails before the daemon
+    /// creates anything, so no started exec is orphaned. The engine points
+    /// at an unreachable socket: a validation failure must come back as the
+    /// validation message, never as a connection error.
+    #[tokio::test]
+    async fn exec_rejects_pty_size_before_start() {
+        let engine = test_engine();
+        let cell = Arc::new(test_cell());
+        let run = cell.begin_run();
+        cell.finish_start(run);
+
+        let mut bad = params(false);
+        bad.cols = Some(80);
+        bad.rows = Some(24);
+        // `ExecProcess` has no `Debug`, so no `unwrap_err()`; `.err()` needs none.
+        let err = engine.exec(&cell, bad).await.err().expect("exec must fail");
+        assert!(err.to_string().contains("pty size without pty"), "{err:#}");
+
+        let mut bad = params(true);
+        bad.cols = Some(0);
+        bad.rows = Some(24);
+        let err = engine.exec(&cell, bad).await.err().expect("exec must fail");
+        assert!(err.to_string().contains("must be positive"), "{err:#}");
+
+        let mut bad = params(true);
+        bad.cols = Some(80);
+        bad.rows = None;
+        let err = engine.exec(&cell, bad).await.err().expect("exec must fail");
+        assert!(err.to_string().contains("must be positive"), "{err:#}");
+
+        // Valid sizes pass validation and reach the daemon (which fails to
+        // connect here, proving the validation passed rather than bailed).
+        let mut good = params(true);
+        good.cols = Some(80);
+        good.rows = Some(24);
+        let err = engine
+            .exec(&cell, good)
+            .await
+            .err()
+            .expect("exec must fail");
+        assert!(
+            err.to_string().contains("connect to the container engine"),
+            "{err:#}"
+        );
+    }
+
+    fn test_process(is_pty: bool) -> ExecProcess {
+        let (_stdout_tx, stdout_rx) = mpsc::channel(1);
+        let (_stderr_tx, stderr_rx) = mpsc::channel(1);
+        ExecProcess {
+            id: 1,
+            exec_id: "test-exec".to_string(),
+            container: "test-container".to_string(),
+            pid: 1234,
+            is_pty,
+            docker: Docker::new("/nonexistent-celld-test.sock"),
+            stdin: tokio::sync::Mutex::new(None),
+            stdout: tokio::sync::Mutex::new(stdout_rx),
+            stderr: tokio::sync::Mutex::new(stderr_rx),
+            ended: watch::channel(false).0,
+            exit_code: tokio::sync::Mutex::new(None),
+        }
+    }
+
+    /// `resize()` refuses a non-PTY process and zero dims before touching
+    /// the daemon; valid dims reach it.
+    #[tokio::test]
+    async fn resize_refuses_non_pty_and_zero_dims() {
+        let plain = test_process(false);
+        let err = plain.resize(80, 24).await.unwrap_err();
+        assert!(err.to_string().contains("requires a PTY"), "{err:#}");
+
+        let pty = test_process(true);
+        let err = pty.resize(0, 24).await.unwrap_err();
+        assert!(err.to_string().contains("must be positive"), "{err:#}");
+        let err = pty.resize(80, 0).await.unwrap_err();
+        assert!(err.to_string().contains("must be positive"), "{err:#}");
+
+        let err = pty.resize(80, 24).await.unwrap_err();
+        assert!(
+            err.to_string().contains("connect to the container engine"),
+            "{err:#}"
+        );
     }
 }

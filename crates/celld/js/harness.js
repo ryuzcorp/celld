@@ -1,4 +1,4 @@
-// Modified for Noite (ryuzcorp/noite, docker/celld/patches): ctx.container.images; clone() of streaming and disturbed bodies; __celld$do on the service-binding RPC path.
+// Modified for Noite (ryuzcorp/noite, docker/celld/patches): ctx.container.images; clone() of streaming and disturbed bodies; __celld$do on the service-binding RPC path; container exec pty/resize.
 // The DO object model and the Cloudflare-compatible runtime surface, run
 // once per isolate by `js.rs::install_harness` after the Web-API prelude.
 // Lived as a 4,000-line raw string inside js.rs until 2026-07-29; it is a
@@ -2349,13 +2349,21 @@ class ContainerExecOutput {
   }
 }
 class ContainerExecProcess {
-  constructor(id, pid, stdinMode, stdoutMode, stderrMode) {
-    this._id = id;
+  // The host process id is private: ids are process-global sequential
+  // numbers, and a mutable `this._id` let any container-DO code retarget
+  // wait/drop/kill/resize at another cell's exec. Streams already pin the
+  // construction-time id via closure.
+  #id;
+  constructor(id, pid, stdinMode, stdoutMode, stderrMode, isPty = false) {
+    this.#id = id;
     this.pid = pid;
+    this.isPty = !!isPty;
     this._outputCalled = false;
     this._exitCode = null;
     this.stdout = stdoutMode === "pipe" ? __execStream(id, 1) : null;
-    this.stderr = stderrMode === "pipe" ? __execStream(id, 2) : null;
+    // A PTY merges stderr into stdout; there is no separate stream.
+    this.stderr = this.isPty || stderrMode !== "pipe"
+      ? null : __execStream(id, 2);
     this.stdin = stdinMode === "pipe"
       ? new WritableStream({
         write: (chunk) => __container_exec_write(id, __bytesOf(chunk)),
@@ -2366,7 +2374,7 @@ class ContainerExecProcess {
   }
   get exitCode() {
     if (this._exitCode === null) {
-      this._exitCode = __container_exec_wait(this._id).then(Number);
+      this._exitCode = __container_exec_wait(this.#id).then(Number);
     }
     return this._exitCode;
   }
@@ -2383,12 +2391,20 @@ class ContainerExecProcess {
     const [stdout, stderr] = await Promise.all([all(this.stdout), all(this.stderr)]);
     const exitCode = await this.exitCode;
     // Nothing else can read the process now, so the host can forget it.
-    __container_exec_drop(this._id);
+    __container_exec_drop(this.#id);
     return new ContainerExecOutput(stdout, stderr, exitCode);
   }
   kill(signal = 15) {
     if (!__validSignal(signal)) throw new RangeError("Invalid signal number.");
-    __container_exec_kill(this._id, signal).catch(() => {});
+    __container_exec_kill(this.#id, signal).catch(() => {});
+  }
+  async resize(cols, rows) {
+    if (!this.isPty)
+      throw new Error("resize() requires a PTY process.");
+    if (!Number.isInteger(cols) || cols <= 0 || cols > 65535 ||
+        !Number.isInteger(rows) || rows <= 0 || rows > 65535)
+      throw new TypeError("resize() cols and rows must be 1..=65535.");
+    await __container_exec_resize(this.#id, cols, rows);
   }
 }
 const __bytesOf = (chunk) => {
@@ -2549,14 +2565,37 @@ class Container {
       else if (o.stdin instanceof ReadableStream) stdinMode = "stream";
       else throw new TypeError('stdin must be a ReadableStream or the string "pipe".');
     }
+    // `pty` is `true` for the daemon default size or `{ cols, rows }` for an
+    // initial size (either dimension defaults to 80x24 when omitted).
+    let pty = false;
+    let cols;
+    let rows;
+    if (o.pty !== undefined && o.pty !== false && o.pty !== null) {
+      if (o.pty === true) {
+        pty = true;
+      } else if (typeof o.pty === "object" && !Array.isArray(o.pty)) {
+        pty = true;
+        cols = o.pty.cols ?? 80;
+        rows = o.pty.rows ?? 24;
+        if (!Number.isInteger(cols) || cols <= 0 || cols > 65535 ||
+            !Number.isInteger(rows) || rows <= 0 || rows > 65535)
+          throw new TypeError("pty cols and rows must be 1..=65535.");
+      } else {
+        throw new TypeError('pty must be true or { cols, rows }.');
+      }
+    }
+    if (pty && combined)
+      throw new TypeError('stderr: "combined" requires a non-PTY exec.');
     const params = {
       cmd: Array.from(cmd, String),
       env: __containerEnvList(o.env),
       combined,
+      pty,
     };
     if (o.cwd !== undefined) params.cwd = String(o.cwd);
     if (o.user !== undefined) params.user = String(o.user);
-    const { id, pid } = JSON.parse(
+    if (cols !== undefined) { params.cols = cols; params.rows = rows; }
+    const { id, pid, isPty } = JSON.parse(
       await __container_exec(this._scope, JSON.stringify(params)),
     );
     if (stdinMode === "stream") {
@@ -2577,7 +2616,8 @@ class Container {
     } else if (stdinMode === "none") {
       __container_exec_close(id).catch(() => {});
     }
-    return new ContainerExecProcess(id, pid, stdinMode, stdoutMode, stderrMode);
+    return new ContainerExecProcess(
+      id, pid, stdinMode, stdoutMode, stderrMode, isPty);
   }
   inspect() {
     return Promise.reject(new Error("inspect() is not implemented in celld"));

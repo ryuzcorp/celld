@@ -1,4 +1,4 @@
-// Modified for Noite (ryuzcorp/noite, docker/celld/patches): exec() waits for start().
+// Modified for Noite (ryuzcorp/noite, docker/celld/patches): exec() waits for start(); exec pty/resize.
 //! Host ops behind `ctx.container`.
 //!
 //! JavaScript owns the surface and every validation message, copied from
@@ -211,6 +211,10 @@ struct ExecArgs {
     user: Option<String>,
     #[serde(default)]
     combined: bool,
+    #[serde(default)]
+    pty: bool,
+    cols: Option<u16>,
+    rows: Option<u16>,
 }
 
 pub(super) fn op_container_exec(
@@ -224,6 +228,18 @@ pub(super) fn op_container_exec(
         Ok(request) => request,
         Err(error) => return loader_throw(scope, &format!("exec(): {error}")),
     };
+    // Ops reach the harness as closure params, not globals, so tenant code
+    // cannot call this directly; validate here as defense-in-depth against
+    // harness bugs. The boundary is wrapper validation plus the handle's
+    // private id. A size rides only with a PTY, as a pair, and both
+    // dimensions are positive.
+    let (cols, rows) = match (request.pty, request.cols, request.rows) {
+        (false, None, None) => (None, None),
+        (false, _, _) => return loader_throw(scope, "exec(): pty size without pty"),
+        (true, None, None) => (None, None),
+        (true, Some(cols), Some(rows)) if cols != 0 && rows != 0 => (Some(cols), Some(rows)),
+        _ => return loader_throw(scope, "exec(): pty size must be positive cols and rows"),
+    };
     let async_id = asyncrt::enqueue(async move {
         let (engine, cell) = cell_for(&cell).await?;
         let process = engine
@@ -235,12 +251,20 @@ pub(super) fn op_container_exec(
                     cwd: request.cwd,
                     user: request.user,
                     combined: request.combined,
+                    pty: request.pty,
+                    cols,
+                    rows,
                 },
             )
             .await
             .map_err(|error| format!("{error:#}"))?;
         Ok::<String, String>(
-            serde_json::json!({ "id": process.id, "pid": process.pid }).to_string(),
+            serde_json::json!({
+                "id": process.id,
+                "pid": process.pid,
+                "isPty": process.is_pty,
+            })
+            .to_string(),
         )
     });
     rv.set(promise_for(scope, async_id));
@@ -327,6 +351,30 @@ pub(super) fn op_container_exec_kill(
     let async_id = asyncrt::enqueue_unrefed(async move {
         process?
             .kill(signal)
+            .await
+            .map_err(|error| format!("{error:#}"))?;
+        Ok::<String, String>(String::new())
+    });
+    rv.set(promise_for(scope, async_id));
+}
+
+pub(super) fn op_container_exec_resize(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let process = process_arg(scope, &args);
+    let cols = number_arg(scope, &args, 1);
+    let rows = number_arg(scope, &args, 2);
+    let (Ok(cols), Ok(rows)) = (u16::try_from(cols), u16::try_from(rows)) else {
+        return loader_throw(scope, "resize(): cols and rows must be 1..=65535");
+    };
+    if cols == 0 || rows == 0 {
+        return loader_throw(scope, "resize(): cols and rows must be 1..=65535");
+    }
+    let async_id = asyncrt::enqueue_unrefed(async move {
+        process?
+            .resize(cols, rows)
             .await
             .map_err(|error| format!("{error:#}"))?;
         Ok::<String, String>(String::new())
