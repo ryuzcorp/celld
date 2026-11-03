@@ -9,7 +9,7 @@ README below is kept intact; this file documents the fork.
 
 - `main` mirrors upstream `main` and carries no patches.
 - `ryuzcorp/v<version>` is a line branch: the upstream tag `v<version>`
-  plus our patches as commits, one commit per patch, in `0001`-`0034`
+  plus our patches as commits, one commit per patch, in `0001`-`0035`
   order. Each patch commit is self-contained and carries its own tests.
 
 Upstream's `.github/workflows/release.yml` targets `ghcr.io/denoland` and
@@ -345,6 +345,18 @@ push to `ghcr.io/denoland`, but still. Pushing a branch named
   balancer skip it — so no peer restores it from the bucket
   alone and loses the acknowledged tail; counted by the new
   `DormantKeptUnfolded` probe. Adds a scripted reproduction.
+- `0035` (sha TBD at merge) wake-coverage follow-ups to the
+  ported `0027`: the startup alarm observation is sent under
+  the registry lock after the cell is registered, so a racing
+  coverage report finds the handle; coverage reports compare
+  alarm installations, not full snapshots, so a committed write
+  advancing the cached position drops no `Confirmed`; and a
+  coverage-only confirmation no longer cancels a non-drain
+  eviction. Adds regression tests for all three plus
+  `seal_absent_log` coverage; the exec-kill lib tests install
+  the execution domain through the same shared test runtime,
+  since a second `set_host_handle` would trip its
+  exactly-once assert in one test binary.
 
 Patches `0025`–`0034` are ported fixes from
 [meln1k/celld](https://github.com/meln1k/celld) by Nikita

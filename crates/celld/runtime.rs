@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): cross-isolate RPC stubs and streams; D1 export operator-ingress marker; ported from meln1k/celld: report wake coverage after maintenance (e6cb9a3).
+// Modified by ryuzcorp (ryuzcorp/celld): cross-isolate RPC stubs and streams; D1 export operator-ingress marker; ported from meln1k/celld: report wake coverage after maintenance (e6cb9a3); wake coverage follow-ups: startup observation ordering, installation comparison.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 // RuntimeManager is the V8 cell-host arm, so its executor and observability
@@ -1334,7 +1334,6 @@ impl RuntimeManager {
                 return Err(error);
             }
         };
-        (self.alarm_observer)(cell.clone(), alarm, WakeCoverage::Unconfirmed);
         let startup_us = startup_timing.emit("ready", "");
 
         {
@@ -1357,6 +1356,11 @@ impl RuntimeManager {
                     }),
                 },
             );
+            // Under the lock, after the insert, like the reporter: a
+            // coverage report racing the startup observation then finds
+            // the handle instead of dropping its report, and this
+            // observation keeps its order relative to the reporter's.
+            (self.alarm_observer)(cell.clone(), alarm, WakeCoverage::Unconfirmed);
             Ok((placed_in, generation.id))
         }
     }
@@ -1687,7 +1691,10 @@ impl RuntimeManager {
     /// send every new installation uncovered, and a restored alarm keeps the
     /// core refusing eviction until some later activity finishes. This reads
     /// and sends under the registry lock, like the reporter, so it cannot
-    /// overtake a newer installation. It says nothing once the cache moved on.
+    /// overtake a newer installation. It says nothing once the cache holds
+    /// a different installation; a committed write can advance the cached
+    /// position without installing a new alarm, so the comparison is by
+    /// installation, not by full snapshot.
     pub(crate) fn report_alarm_coverage(
         &self,
         cell: &str,
@@ -1702,7 +1709,10 @@ impl RuntimeManager {
             return;
         };
         let alarm = handle.alarm;
-        if alarm != maintained || alarm.at_ms().is_none() || !self.alarm_covered(cell, alarm) {
+        if !alarm.same_installation(maintained)
+            || alarm.at_ms().is_none()
+            || !self.alarm_covered(cell, alarm)
+        {
             return;
         }
         (self.alarm_observer)(cell.to_string(), alarm, WakeCoverage::Confirmed);
@@ -3667,5 +3677,302 @@ fn install_container_specs(generation: &Generation) {
     }
     if let Ok(handle) = tokio::runtime::Handle::try_current() {
         handle.spawn(crate::container::prewarm());
+    }
+}
+
+#[cfg(test)]
+mod wake_coverage_tests {
+    use super::*;
+    use crate::engine_api::{Compat, WorkerConfigOptions};
+    use celld_logic::wake::{AlarmSnapshot, AlarmSource, PublicationId};
+    use std::sync::mpsc;
+
+    const TEST_SCRIPT: &str = r#"
+import { DurableObject } from 'cloudflare:workers';
+export class ProbeDO extends DurableObject {}
+export default { fetch() { return new Response('ok'); } };
+"#;
+
+    fn ensure_v8() {
+        static V8: std::sync::Once = std::sync::Once::new();
+        V8.call_once(|| {
+            // Before any thread this test spawns: PKRU access is
+            // inherited at thread creation (see `init_v8`).
+            init_engine();
+        });
+    }
+
+    fn test_worker_config() -> Arc<WorkerConfig> {
+        Arc::new(WorkerConfig::new(WorkerConfigOptions {
+            src: TEST_SCRIPT.into(),
+            script_name: "coverage-test".into(),
+            do_classes: vec!["ProbeDO".into()],
+            bindings: Vec::new(),
+            r2_bindings: Vec::new(),
+            d1_bindings: Vec::new(),
+            kv_bindings: Vec::new(),
+            queue_bindings: Vec::new(),
+            queue_consumers: Vec::new(),
+            workflow_bindings: Vec::new(),
+            vars: Vec::new(),
+            node: "n0".into(),
+            modules: Vec::new(),
+            compat: Compat::default(),
+        }))
+    }
+
+    fn test_generation(
+        pool: Arc<crate::pool::Pool>,
+        config: Option<Arc<WorkerConfig>>,
+    ) -> Generation {
+        let mut cell_configs = HashMap::new();
+        let mut cell_isolates = HashMap::new();
+        if let Some(config) = config {
+            cell_configs.insert("ProbeDO".to_string(), config);
+            cell_isolates.insert("coverage-test".to_string(), pool.clone());
+        }
+        Generation {
+            id: crate::generation::FIRST_GENERATION,
+            version: "test".into(),
+            prefix: String::new(),
+            script_name: "coverage-test".into(),
+            stateless: StatelessRuntime {
+                node: Arc::from("n0"),
+                region: Arc::from("test"),
+                isolates: pool,
+            },
+            services: HashMap::new(),
+            cell_configs,
+            cell_isolates,
+            default_do_class: None,
+            assets: HashMap::new(),
+            containers: Vec::new(),
+            fence_image: None,
+        }
+    }
+
+    enum StartupSignal {
+        Observed((String, AlarmSnapshot, WakeCoverage)),
+        StartFailed(String),
+    }
+
+    /// The startup alarm observation must run after the cell's handle is
+    /// in `starting`, under the registry lock: a coverage report racing
+    /// in between otherwise finds no handle and is dropped. The
+    /// observer blocks on a channel, so the probe below runs while the
+    /// observation is in flight with no timing involved: a free lock
+    /// means the observation ran before the insert.
+    #[test]
+    fn startup_observation_runs_after_the_starting_insert() {
+        ensure_v8();
+        let runtime = crate::asyncrt::shared_test_runtime();
+        let dir = tempfile::tempdir().expect("test data dir");
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let release_rx = Mutex::new(release_rx);
+        let observed_flag = Arc::new(AtomicBool::new(false));
+        let failed_tx = entered_tx.clone();
+        let observer: AlarmObserver = {
+            let observed_flag = observed_flag.clone();
+            Arc::new(move |cell, alarm, coverage| {
+                observed_flag.store(true, Ordering::SeqCst);
+                entered_tx
+                    .send(StartupSignal::Observed((cell, alarm, coverage)))
+                    .expect("test observes startup");
+                release_rx
+                    .lock()
+                    .expect("release gate poisoned")
+                    .recv()
+                    .expect("test releases startup");
+            })
+        };
+        let config = test_worker_config();
+        let pool = Arc::new(crate::pool::Pool::new(
+            pool_limits(),
+            admission_wait(),
+            Box::new({
+                let config = config.clone();
+                move || Worker::load_config(config.clone())
+            }),
+        ));
+        let manager = RuntimeManager::start(
+            test_generation(pool, Some(config)),
+            RuntimeOptions {
+                data_dir: dir.path().join("data"),
+                replication: None,
+                wake: None,
+                alarm_observer: observer,
+                node: "n0".into(),
+                region: "test".into(),
+                bucket: None,
+            },
+        )
+        .expect("test manager starts");
+        let cell = "ProbeDO:coverage-a";
+        // The restore step before a production start creates this; the
+        // test drives the start alone.
+        crate::asyncrt::fs()
+            .create_dir_all(
+                manager
+                    .db_path(cell, 1)
+                    .parent()
+                    .expect("cell db has a parent dir"),
+            )
+            .expect("cell storage dir");
+        let started = {
+            let manager = manager.clone();
+            let cell = cell.to_string();
+            std::thread::spawn(move || runtime.handle().block_on(manager.start_cell(cell, 1, true)))
+        };
+        // A start that fails before observing must fail the test, not
+        // hang it in the receive below: the joiner reports it.
+        let joined = std::thread::spawn(move || {
+            let result = started.join().expect("start thread joins");
+            if !observed_flag.load(Ordering::SeqCst) {
+                failed_tx
+                    .send(StartupSignal::StartFailed(format!("{result:?}")))
+                    .expect("test reports a failed start");
+            }
+            result
+        });
+        let (observed_cell, _alarm, coverage) = match entered_rx.recv().expect("startup signal") {
+            StartupSignal::Observed(observed) => observed,
+            StartupSignal::StartFailed(error) => {
+                panic!("start_cell failed before observing: {error}")
+            }
+        };
+        assert_eq!(observed_cell, cell);
+        assert_eq!(coverage, WakeCoverage::Unconfirmed);
+        let saw_handle = match manager.cells.try_lock() {
+            Ok(registry) => {
+                let present = registry.starting.contains_key(cell);
+                drop(registry);
+                release_tx.send(()).expect("release startup");
+                present
+            }
+            Err(_) => {
+                release_tx.send(()).expect("release startup");
+                manager
+                    .cells
+                    .lock()
+                    .expect("cell registry poisoned")
+                    .starting
+                    .contains_key(cell)
+            }
+        };
+        joined
+            .join()
+            .expect("joiner thread joins")
+            .expect("cell starts");
+        assert!(
+            saw_handle,
+            "the startup observation must find the starting handle"
+        );
+    }
+
+    /// A committed write can advance the cached alarm position without
+    /// installing a new alarm, while maintenance for the older snapshot
+    /// is still pending. The coverage report must compare installations,
+    /// not full snapshots, or the `Confirmed` is dropped and the cell
+    /// stays uncovered until later activity.
+    #[test]
+    fn coverage_report_compares_installations_not_snapshots() {
+        let runtime = crate::asyncrt::shared_test_runtime();
+        let _guard = runtime.enter();
+        let dir = tempfile::tempdir().expect("test data dir");
+        let database = dir.path().join("objects.sqlite3");
+        let bucket = crate::dev::open_local_bucket(&database).expect("dev bucket");
+        let replication =
+            Replication::start(bucket, &dir.path().join("watch"), None, "test".into(), None)
+                .expect("replication starts");
+        let wake = Arc::new(crate::wake::WakeFlusher::new());
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let observer: AlarmObserver = {
+            let observed = observed.clone();
+            Arc::new(move |cell, alarm, coverage| {
+                observed
+                    .lock()
+                    .expect("observation log poisoned")
+                    .push((cell, alarm, coverage));
+            })
+        };
+        let pool = Arc::new(crate::pool::Pool::new(
+            pool_limits(),
+            admission_wait(),
+            Box::new(|| anyhow::bail!("no isolates in this test")),
+        ));
+        let manager = RuntimeManager::start(
+            test_generation(pool, None),
+            RuntimeOptions {
+                data_dir: dir.path().join("data"),
+                replication: Some(replication),
+                wake: Some(wake.clone()),
+                alarm_observer: observer,
+                node: "n0".into(),
+                region: "test".into(),
+                bucket: None,
+            },
+        )
+        .expect("test manager starts");
+
+        let cell = "ProbeDO:coverage-b";
+        let id = PublicationId {
+            epoch: 1,
+            sequence: 1,
+        };
+        let at_ms = 1_800_000_000_000;
+        let maintained = AlarmSnapshot::committed(Some(at_ms), AlarmSource { id, position: 1 });
+        let cached = AlarmSnapshot::committed(Some(at_ms), AlarmSource { id, position: 2 });
+        assert_ne!(maintained, cached);
+        assert!(cached.same_installation(maintained));
+        wake.core.lock().unwrap().confirm(cell, maintained);
+        {
+            let mut registry = manager.cells.lock().expect("cell registry poisoned");
+            registry.published.insert(
+                cell.to_string(),
+                CellHandle {
+                    epoch: 1,
+                    generation: crate::generation::FIRST_GENERATION,
+                    startup_us: 0,
+                    residency: crate::pool::Residency::without_worker_for_test(),
+                    alarm: cached,
+                    requests: Arc::new(CellRequestAdmission {
+                        in_flight: AtomicUsize::new(0),
+                        saturated: AtomicBool::new(false),
+                        limit: DEFAULT_MAX_CELL_REQUESTS,
+                    }),
+                },
+            );
+        }
+        manager.report_alarm_coverage(cell, maintained);
+        {
+            let observed = observed.lock().expect("observation log poisoned");
+            assert_eq!(
+                observed.len(),
+                1,
+                "the advanced-position report is confirmed"
+            );
+            assert_eq!(observed[0].0, cell);
+            assert_eq!(observed[0].1, cached);
+            assert_eq!(observed[0].2, WakeCoverage::Confirmed);
+        }
+
+        // A report for a different installation still says nothing.
+        let other = AlarmSnapshot::committed(Some(at_ms + 1_000), AlarmSource { id, position: 1 });
+        manager.report_alarm_coverage(cell, other);
+        assert_eq!(
+            observed.lock().expect("observation log poisoned").len(),
+            1,
+            "a different installation stays silent"
+        );
+
+        // So does a report the flusher does not cover.
+        wake.forget(cell);
+        manager.report_alarm_coverage(cell, cached);
+        assert_eq!(
+            observed.lock().expect("observation log poisoned").len(),
+            1,
+            "an uncovered installation stays silent"
+        );
     }
 }

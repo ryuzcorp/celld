@@ -3227,7 +3227,16 @@ impl State {
             // alarm) is therefore confirmation, not new demand. Cancelling
             // here re-emits EnsureDurable forever while the cell has no pin.
             let safe_drain_refresh = self.draining && (at_ms.is_none() || covered);
-            if !safe_drain_refresh {
+            // A coverage-only confirmation is maintenance finishing, not
+            // new demand: the alarm matches the one the core already
+            // holds, and only its coverage is news. Cancelling on it has
+            // the same forever-eviction effect outside a drain.
+            let alarm_unchanged = match cell.alarm {
+                Some(AlarmState::Armed { at_ms: current, .. })
+                | Some(AlarmState::Firing { at_ms: current, .. }) => at_ms == Some(current),
+                None => at_ms.is_none(),
+            };
+            if !safe_drain_refresh && !(covered && alarm_unchanged) {
                 self.probe(Probe::AlarmCancelledEviction);
                 self.cancel_eviction(id, &mut cell, epoch, EvictCancellation::Alarm, effects);
             }

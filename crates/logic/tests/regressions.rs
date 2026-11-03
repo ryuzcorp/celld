@@ -525,10 +525,6 @@ fn a_fence_clears_a_balancing_handoff() {
     shell.state.validate().expect("state invariant");
 }
 
-/// A preserve retires a startup confirmation read that is still in
-/// flight. It used to retire the owner read but leave the cell in the
-/// confirmation set: `validate` failed. The preserve now settles the
-/// confirmation too.
 /// A request's durability proof fails on a cell holding a regular socket.
 /// The reset discards the runtime, and it used to drop the sockets only
 /// once the stop landed: until then a stopping cell held a live
@@ -624,6 +620,10 @@ fn a_hibernatable_socket_event_waits_on_a_quiescing_cell() {
     shell.state.validate().expect("state invariant");
 }
 
+/// A preserve retires a startup confirmation read that is still in
+/// flight. It used to retire the owner read but leave the cell in the
+/// confirmation set: `validate` failed. The preserve now settles the
+/// confirmation too.
 #[test]
 fn a_preserve_settles_a_confirming_read() {
     let mut shell = Shell::new(4, |effect| matches!(effect, Effect::ReadOwner { .. }));
@@ -763,4 +763,92 @@ fn a_takeover_seals_a_lease_that_never_opened_a_log() {
         )),
         "{effects:?}"
     );
+}
+
+/// A wake-maintenance coverage confirmation lands while a policy
+/// eviction is proving durability. The alarm matches the one the core
+/// already holds, so the report is maintenance finishing, not new
+/// demand: it used to cancel the eviction, which the policy then
+/// re-emitted while the cell had no pin. The eviction now runs on.
+#[test]
+fn a_coverage_confirmation_does_not_cancel_an_eviction() {
+    let mut shell = Shell::new(2, |effect| matches!(effect, Effect::EnsureDurable { .. }));
+    shell.start();
+    shell.serve(1, "a");
+    // Past the imminence window, or the policy eviction is refused.
+    let at_ms = NOW_MS as i64 + 7_200_000;
+    shell.observe_alarm("a", at_ms);
+    let effects = shell.send(Event::Evict { cell: "a".into() });
+    assert!(
+        effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::EnsureDurable { cell, .. } if cell == "a")),
+        "the policy eviction proves durability: {effects:?}"
+    );
+
+    // Maintenance confirms the installation the core already holds.
+    shell.observe_alarm("a", at_ms);
+    let cancelled = shell
+        .state
+        .probes()
+        .find(|(probe, _)| *probe == Probe::AlarmCancelledEviction)
+        .map(|(_, count)| count);
+    assert_eq!(cancelled, Some(0), "coverage alone cancels no eviction");
+
+    // The eviction is still proving: answering its held proof stops
+    // the runtime instead of reaching a retired operation.
+    let held = std::mem::take(&mut shell.held);
+    shell.hold = |_| false;
+    let mut stopped = false;
+    for effect in held {
+        if let Some(reply) = shell.answer(&effect) {
+            stopped |= shell
+                .send(reply)
+                .iter()
+                .any(|effect| matches!(effect, Effect::StopRuntime { cell, .. } if cell == "a"));
+        }
+    }
+    assert!(stopped, "the eviction runs on after the confirmation");
+    shell.state.validate().expect("state invariant");
+}
+
+/// A covered observation that moves the alarm still rescues the cell:
+/// only coverage-only confirmations skip the eviction cancel.
+#[test]
+fn a_covered_alarm_change_still_cancels_an_eviction() {
+    let mut shell = Shell::new(2, |effect| matches!(effect, Effect::EnsureDurable { .. }));
+    shell.start();
+    shell.serve(1, "a");
+    let at_ms = NOW_MS as i64 + 7_200_000;
+    shell.observe_alarm("a", at_ms);
+    let effects = shell.send(Event::Evict { cell: "a".into() });
+    assert!(
+        effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::EnsureDurable { cell, .. } if cell == "a")),
+        "the policy eviction proves durability: {effects:?}"
+    );
+
+    shell.observe_alarm("a", at_ms + 60_000);
+    let cancelled = shell
+        .state
+        .probes()
+        .find(|(probe, _)| *probe == Probe::AlarmCancelledEviction)
+        .map(|(_, count)| count);
+    assert_eq!(cancelled, Some(1), "a moved alarm still cancels");
+
+    // The proof now reaches a retired operation: no stop follows.
+    let held = std::mem::take(&mut shell.held);
+    shell.hold = |_| false;
+    let mut stopped = false;
+    for effect in held {
+        if let Some(reply) = shell.answer(&effect) {
+            stopped |= shell
+                .send(reply)
+                .iter()
+                .any(|effect| matches!(effect, Effect::StopRuntime { cell, .. } if cell == "a"));
+        }
+    }
+    assert!(!stopped, "the cancelled eviction stops nothing");
+    shell.state.validate().expect("state invariant");
 }
