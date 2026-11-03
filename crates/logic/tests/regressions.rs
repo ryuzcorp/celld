@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): ported from meln1k/celld: scripted core-bug reproductions (ea471ee, e46a685, 6d61462).
+// Modified by ryuzcorp (ryuzcorp/celld): ported from meln1k/celld: scripted core-bug reproductions (ea471ee, e46a685, 6d61462, 18d3bf9).
 //! Scripted reproductions of core bugs the deterministic simulator
 //! (`crates/sim`) found. Each drives the core through a minimal shell that
 //! answers every effect at once, except the ones a test holds back to
@@ -392,5 +392,20 @@ fn a_failed_proof_settles_an_alarm_still_running() {
         now_mono_ms: MONO_MS,
         result: Ok((AlarmSnapshot::without_wake(None), true, Some(2))),
     });
+    shell.state.validate().expect("state invariant");
+}
+
+/// A node at its resident ceiling, holding only a cell whose alarm is due
+/// within `alarm_resident_ms`, gets a request for another cell. Holding a
+/// cell to save a wake is meant only for a node with room to spare, but the
+/// refusal applied to demand shedding too: the waiter stayed parked until
+/// its deadline, on every node whose residents all held near alarms.
+#[test]
+fn a_full_node_sheds_a_cell_whose_alarm_is_near() {
+    let mut shell = Shell::new(1, |_| false);
+    shell.start();
+    shell.serve(1, "a");
+    shell.observe_alarm("a", NOW_MS as i64 + 600_000);
+    shell.serve(2, "b");
     shell.state.validate().expect("state invariant");
 }
