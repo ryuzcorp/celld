@@ -1,4 +1,4 @@
-<!-- Modified by ryuzcorp (ryuzcorp/celld): node:crypto scrypt; cloned streaming bodies; cross-isolate RPC stubs and streams. -->
+<!-- Modified by ryuzcorp (ryuzcorp/celld): node:crypto scrypt; cloned streaming bodies; cross-isolate RPC stubs and streams; per-node Workers Cache API. -->
 # Cloudflare compatibility
 
 This page lists only the differences from the linked Cloudflare APIs. An entry
@@ -53,7 +53,7 @@ An unsupported feature that does not cause an error is a defect.
 | [Performance and timers](#performance-and-timers) | **Yes** |
 | Console | **Yes** |
 | [Node.js compatibility](#nodejs-compatibility) | **Partial** |
-| [Cache](#cache) | **Partial** |
+| [Cache](#cache) | **Yes** |
 | HTMLRewriter | **Yes** |
 | [TCP sockets](#tcp-sockets) | **Yes** |
 | EventSource | **Yes** |
@@ -224,9 +224,14 @@ execution.
 
 ### [Cache](https://developers.cloudflare.com/workers/runtime-apis/cache/)
 
-celld provides an always-miss cache because it has no shared edge cache.
-`put()` validates and consumes a response but stores nothing, `match()` returns
-`undefined`, and `delete()` returns `false`.
+See [Cache](services/cache.md) for the full behavior, freshness rules, and
+limits.
+
+- The cache is per-node and in-memory: entries survive across isolates of
+  one script on one node, never cross scripts, and never cross nodes.
+- `fetch()` neither reads nor populates the cache, and `cf.cacheKey` is
+  unsupported; the request URL is the whole key.
+- No API purges by `Cache-Tag`; purge by URL with `delete`.
 
 ### [TCP sockets](https://developers.cloudflare.com/workers/runtime-apis/tcp-sockets/)
 

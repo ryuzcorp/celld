@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): node:crypto scrypt; container exec resize op; cross-isolate RPC stubs and streams; test-only fake exec ops; fake kill completion op; exec reads survive their subscribing event.
+// Modified by ryuzcorp (ryuzcorp/celld): node:crypto scrypt; container exec resize op; cross-isolate RPC stubs and streams; test-only fake exec ops; fake kill completion op; exec reads survive their subscribing event; per-node Workers Cache API ops.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 // The raw V8 adapter and its child modules remain outside the Actor execution
@@ -6908,6 +6908,9 @@ ops! { OP_NAMES, install_op_functions,
         "__storage_sync_list_start" => storage_ops::op_storage_sync_list_start,
         "__storage_sync_list_next" => storage_ops::op_storage_sync_list_next,
         "__storage_delete_all" => storage_ops::op_storage_delete_all,
+        "__cache_put" => cache_ops::op_cache_put,
+        "__cache_match" => cache_ops::op_cache_match,
+        "__cache_delete" => cache_ops::op_cache_delete,
         "$$urlParse" => op_url_parse,
         "$$urlPatternParse" => op_urlpattern_parse,
         "$$urlPatternMatchInput" => op_urlpattern_match_input,
@@ -11138,6 +11141,7 @@ fn op_test_queue_rearm_bounded(
 // `celld r2` writes an object a binding then reads, so the operator command
 // calls the very functions the ops call rather than a second implementation
 // of the object record.
+mod cache_ops;
 pub(crate) mod r2_ops;
 mod storage_ops;
 use storage_ops::{actor_runtime_state, throw_storage_error};

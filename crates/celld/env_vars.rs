@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): validate CELLD_MEMORY_SCOPE.
+// Modified by ryuzcorp (ryuzcorp/celld): validate CELLD_MEMORY_SCOPE; CELLD_CACHE_MAX_BYTES validation.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! Strict runtime environment parsing.
@@ -273,6 +273,7 @@ pub fn validate() -> anyhow::Result<()> {
         "CELLD_ADMISSION_WAIT_MS",
         "CELLD_ALARM_RESIDENT_MS",
         "CELLD_ASSET_CACHE_BYTES",
+        "CELLD_CACHE_MAX_BYTES",
         "CELLD_DEPLOY_MAX_AGE_S",
         "CELLD_LOCAL_CACHE_MAX_BYTES",
         "CELLD_LTX_TRUNCATE_PAGES",

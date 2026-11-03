@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): cross-isolate RPC stubs and streams; operator token for the internal listener.
+// Modified by ryuzcorp (ryuzcorp/celld): cross-isolate RPC stubs and streams; operator token for the internal listener; per-node Workers Cache API.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 #![warn(clippy::disallowed_methods, clippy::disallowed_types)]
@@ -102,6 +102,7 @@ pub mod upload_table;
 pub mod wake;
 pub mod wake_entry;
 pub mod wake_format;
+pub mod worker_cache;
 pub mod ws_client;
 pub mod ws_registry;
 

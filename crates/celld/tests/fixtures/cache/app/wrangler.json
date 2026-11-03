@@ -1,0 +1,7 @@
+{
+  "name": "cache-app",
+  "main": "worker.js",
+  "compatibility_date": "2026-02-12",
+  "no_bundle": true,
+  "services": [{ "binding": "SB", "service": "cache-probe" }]
+}
