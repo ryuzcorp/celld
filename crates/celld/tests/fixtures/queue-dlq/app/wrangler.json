@@ -1,0 +1,22 @@
+{
+  "name": "queue-dlq",
+  "main": "worker.js",
+  "compatibility_date": "2026-02-12",
+  "no_bundle": true,
+  "queues": {
+    "producers": [
+      { "binding": "Q_SRC", "queue": "dlq-src" },
+      { "binding": "Q_DLQ", "queue": "dlq-dst" }
+    ],
+    "consumers": [
+      {
+        "queue": "dlq-src",
+        "max_batch_size": 10,
+        "max_batch_timeout": 0,
+        "max_retries": 1,
+        "retry_delay": 0,
+        "dead_letter_queue": "dlq-dst"
+      }
+    ]
+  }
+}

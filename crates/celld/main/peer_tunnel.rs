@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): operator token for the internal listener; D1 export operator-ingress marker.
+// Modified by ryuzcorp (ryuzcorp/celld): operator token for the internal listener; D1 export operator-ingress marker; trusted cell RPC; marker-aware tunnel negotiation; trusted-header control strip.
 // Copyright 2026 Deno Land Inc. All rights reserved.
 
 //! The peer tunnel: an upgraded stream per peer, plain HTTP inside.
@@ -47,16 +47,26 @@ pub(crate) const NAME_HEADER: &str = "x-cells-do-name";
 pub(crate) const REQUEST_ID_HEADER: &str = "x-cells-request-id";
 pub(crate) const HANDOFF_HEADER: &str = "x-cells-capacity-handoff";
 pub(crate) const OPERATOR_HEADER: &str = "x-cells-operator";
+/// A peer that sends this header on establishment forwards only host-set
+/// markers: it strips the marker headers from application input (fetch) or
+/// never takes them from it (RPC). Older peers on the same tunnel version
+/// send no flag, so node B can tell a marker node A set from one a Worker
+/// on node A smuggled through. Unknown establishment headers are ignored,
+/// so the flag crosses a rolling upgrade in both directions.
+pub(crate) const MARKERS_HEADER: &str = "x-cells-tunnel-markers";
 
 /// The inner headers node A owns. A overwrites them on the way in and B
 /// strips them on the way out, so an application header with a reserved name
-/// is dropped rather than obeyed.
-const CONTROL_HEADERS: [&str; 5] = [
+/// is dropped rather than obeyed. Nothing on the fetch path reads the
+/// trusted marker, but the name is reserved anyway, so a future reader
+/// cannot be smuggled one.
+const CONTROL_HEADERS: [&str; 6] = [
     SCOPE_HEADER,
     NAME_HEADER,
     REQUEST_ID_HEADER,
     HANDOFF_HEADER,
     OPERATOR_HEADER,
+    TRUSTED_HEADER,
 ];
 
 enum TunnelKind {
@@ -72,6 +82,31 @@ pub(crate) struct TunnelControl {
     pub(crate) request_id: Option<celld::js::RequestId>,
     pub(crate) capacity_handoff: bool,
     pub(crate) operator_ingress: bool,
+}
+
+/// Node B: whether the establishing peer negotiated the marker-aware
+/// tunnel. The flag rides the fleet-authenticated establishment, which a
+/// Worker cannot influence: node A's host code builds those headers.
+fn negotiated_markers(headers: &hyper::HeaderMap) -> bool {
+    headers
+        .get(MARKERS_HEADER)
+        .is_some_and(|value| value.as_bytes() == b"1")
+}
+
+/// Node B honors a marker header only from a peer that negotiated the
+/// marker-aware tunnel. An older peer forwards a Worker's application
+/// headers with these names unstripped, so honoring them would let a
+/// Worker there forge operator ingress (fetch) or a trusted call (RPC)
+/// here.
+fn honored_operator(headers: &hyper::HeaderMap, marker_aware: bool) -> bool {
+    marker_aware && headers.get(OPERATOR_HEADER).is_some()
+}
+
+fn honored_trusted(headers: &hyper::HeaderMap, marker_aware: bool) -> bool {
+    marker_aware
+        && headers
+            .get(TRUSTED_HEADER)
+            .is_some_and(|value| value.as_bytes() == b"1")
 }
 
 pub(crate) fn is_tunnel_request(request: &Request<Incoming>) -> bool {
@@ -134,6 +169,13 @@ pub(crate) fn accept(mut request: Request<Incoming>, app: AppHandle) -> HttpRepl
             return peer_response(response(StatusCode::BAD_REQUEST, "unknown tunnel kind"));
         }
     };
+    // The markers are protocol-negotiated: without the flag this peer
+    // predates them, so its marker headers are untrusted input rather than
+    // node A's word. The headers are still stripped as control headers, but
+    // never honored; a legit operator call through such a peer fails closed
+    // in the cell's operator-only branch with the usual "is an operator
+    // operation" refusal.
+    let marker_aware = negotiated_markers(headers);
     let upgrade = hyper::upgrade::on(&mut request);
     tokio::spawn(async move {
         let upgraded = match upgrade.await {
@@ -141,8 +183,8 @@ pub(crate) fn accept(mut request: Request<Incoming>, app: AppHandle) -> HttpRepl
             Err(_) => return,
         };
         match kind {
-            TunnelKind::Do => serve_do(upgraded, app).await,
-            TunnelKind::Rpc => serve_rpc(upgraded, app).await,
+            TunnelKind::Do => serve_do(upgraded, app, marker_aware).await,
+            TunnelKind::Rpc => serve_rpc(upgraded, app, marker_aware).await,
         }
     });
     let mut reply = response(StatusCode::SWITCHING_PROTOCOLS, "");
@@ -165,7 +207,7 @@ pub(crate) fn accept(mut request: Request<Incoming>, app: AppHandle) -> HttpRepl
 /// dispatch it exactly as the enveloped path did, and let the reply stream
 /// back as an ordinary HTTP response. The connection serves calls until the
 /// peer closes it or an inner upgrade consumes it.
-async fn serve_do(upgraded: hyper::upgrade::Upgraded, app: AppHandle) {
+async fn serve_do(upgraded: hyper::upgrade::Upgraded, app: AppHandle, marker_aware: bool) {
     let service = service_fn(move |mut inner: Request<Incoming>| {
         let app = app.clone();
         async move {
@@ -191,7 +233,7 @@ async fn serve_do(upgraded: hyper::upgrade::Upgraded, app: AppHandle) {
                     .and_then(|value| value.to_str().ok())
                     .and_then(celld::js::parse_request_id),
                 capacity_handoff: inner.headers().get(HANDOFF_HEADER).is_some(),
-                operator_ingress: inner.headers().get(OPERATOR_HEADER).is_some(),
+                operator_ingress: honored_operator(inner.headers(), marker_aware),
             };
             // A tunneled upgrade is the client's own handshake, so the
             // owner answers it directly: fastwebsockets computes the 101
@@ -374,6 +416,7 @@ async fn establish(peer: &Peer<'_>, kind: &'static str) -> anyhow::Result<Tunnel
         .header(reqwest::header::UPGRADE, TUNNEL_PROTOCOL)
         .header(reqwest::header::CONNECTION, "upgrade")
         .header(VERSION_HEADER, TUNNEL_VERSION)
+        .header(MARKERS_HEADER, "1")
         .header(KIND_HEADER, kind)
         .header(
             peer_auth::RESPONSE_VERSION_HEADER,
@@ -554,11 +597,12 @@ pub(crate) async fn fetch(
 }
 
 pub(crate) const METHOD_HEADER: &str = "x-cells-rpc-method";
+pub(crate) const TRUSTED_HEADER: &str = "x-cells-rpc-trusted";
 
 /// One inner request, one RPC: the method name rides a header, the
 /// arguments ride the body, and the content type says which encoding the
 /// caller used.
-async fn serve_rpc(upgraded: hyper::upgrade::Upgraded, app: AppHandle) {
+async fn serve_rpc(upgraded: hyper::upgrade::Upgraded, app: AppHandle, marker_aware: bool) {
     let service = service_fn(move |inner: Request<Incoming>| {
         let app = app.clone();
         async move {
@@ -591,6 +635,12 @@ async fn serve_rpc(upgraded: hyper::upgrade::Upgraded, app: AppHandle) {
                     "RPC method header is missing",
                 )));
             };
+            // A trusted call is one a harness host op built on its node,
+            // never a stub call: the target resolves the method without the
+            // tenant RPC allowlist. The tunnel is peer-authenticated and the
+            // peer negotiated the marker-aware tunnel on establishment, so
+            // the header carries across nodes; absent means untrusted.
+            let trusted = honored_trusted(inner.headers(), marker_aware);
             let body =
                 match collect_limited_body(inner.into_body(), MAX_PEER_FORWARD_BODY_BYTES).await {
                     Ok(body) => body,
@@ -611,7 +661,7 @@ async fn serve_rpc(upgraded: hyper::upgrade::Upgraded, app: AppHandle) {
                     }
                 }
             };
-            let reply = dispatch_forwarded_rpc(app, scope, name, method, args).await;
+            let reply = dispatch_forwarded_rpc(app, scope, name, method, args, trusted).await;
             Ok(reply)
         }
     });
@@ -627,6 +677,7 @@ pub(crate) async fn rpc(
     name: Option<&str>,
     method: &str,
     args: &celld::js::RpcData,
+    trusted: bool,
 ) -> anyhow::Result<Response<PooledResponseBody>> {
     let (content_type, payload) = match args {
         celld::js::RpcData::Json(json) => ("application/json", Bytes::from(json.clone())),
@@ -644,6 +695,9 @@ pub(crate) async fn rpc(
                 .header(hyper::header::CONTENT_TYPE, content_type);
             if let Some(name) = name {
                 inner = inner.header(NAME_HEADER, name);
+            }
+            if trusted {
+                inner = inner.header(TRUSTED_HEADER, "1");
             }
             Ok(inner.body(body)?)
         },
@@ -839,5 +893,86 @@ mod operator_tests {
         .expect("inner request");
         assert!(!plain.headers().contains_key(OPERATOR_HEADER));
         assert!(CONTROL_HEADERS.contains(&OPERATOR_HEADER));
+    }
+
+    fn establishment(flag: Option<&'static str>) -> hyper::HeaderMap {
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert(
+            hyper::header::HeaderName::from_static(VERSION_HEADER),
+            hyper::header::HeaderValue::from_static(TUNNEL_VERSION),
+        );
+        if let Some(flag) = flag {
+            headers.insert(
+                hyper::header::HeaderName::from_static(MARKERS_HEADER),
+                hyper::header::HeaderValue::from_static(flag),
+            );
+        }
+        headers
+    }
+
+    fn inner_with_markers() -> hyper::HeaderMap {
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert(
+            hyper::header::HeaderName::from_static(OPERATOR_HEADER),
+            hyper::header::HeaderValue::from_static("1"),
+        );
+        headers.insert(
+            hyper::header::HeaderName::from_static(TRUSTED_HEADER),
+            hyper::header::HeaderValue::from_static("1"),
+        );
+        headers
+    }
+
+    #[test]
+    fn trusted_marker_is_a_control_header_on_the_fetch_tunnel() {
+        // Nothing on the fetch path reads the trusted marker today, but the
+        // name is reserved anyway: a smuggled application header with it is
+        // dropped rather than forwarded to the cell.
+        assert!(CONTROL_HEADERS.contains(&TRUSTED_HEADER));
+        let smuggled = vec![(TRUSTED_HEADER.to_string(), "1".to_string())];
+        let plain = inner_request(
+            &control(false),
+            "http://cell/",
+            "POST",
+            &smuggled,
+            full_body(Bytes::new()),
+        )
+        .expect("inner request");
+        assert!(!plain.headers().contains_key(TRUSTED_HEADER));
+    }
+
+    #[test]
+    fn markers_are_protocol_negotiated() {
+        // A current peer announces the marker-aware tunnel on establishment.
+        assert!(negotiated_markers(&establishment(Some("1"))));
+        // An older peer on the same tunnel version sends no flag, and a
+        // wrong value negotiates nothing.
+        assert!(!negotiated_markers(&establishment(None)));
+        assert!(!negotiated_markers(&establishment(Some("0"))));
+        assert!(!negotiated_markers(&establishment(Some("yes"))));
+    }
+
+    #[test]
+    fn forged_markers_from_an_old_peer_are_not_honored() {
+        // A simulated old-version peer: no flag on establishment, forged
+        // marker headers on the inner request — a Worker there smuggled
+        // them through as application headers. Neither marker is honored.
+        let marker_aware = negotiated_markers(&establishment(None));
+        let inner = inner_with_markers();
+        assert!(!honored_operator(&inner, marker_aware));
+        assert!(!honored_trusted(&inner, marker_aware));
+    }
+
+    #[test]
+    fn current_peer_forwarding_honors_host_set_markers() {
+        // A current peer negotiated the flag, so its markers are node A's
+        // word and both are honored; absent still means unmarked.
+        let marker_aware = negotiated_markers(&establishment(Some("1")));
+        let inner = inner_with_markers();
+        assert!(honored_operator(&inner, marker_aware));
+        assert!(honored_trusted(&inner, marker_aware));
+        let bare = hyper::HeaderMap::new();
+        assert!(!honored_operator(&bare, marker_aware));
+        assert!(!honored_trusted(&bare, marker_aware));
     }
 }

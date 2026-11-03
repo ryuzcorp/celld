@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): runtime-isolate host fixture. Apache-2.0.
+// Modified by ryuzcorp (ryuzcorp/celld): runtime-isolate host fixture; Queue pollution-gate probes. Apache-2.0.
 // The first script in the fleet: its module top level overrides the shared
 // primordials that the runtime cells' gates and data paths use, then answers
 // /health and forwards every /v/* probe to the second script over a service
@@ -58,9 +58,13 @@ WeakSet.prototype.has = function (v) {
   if (v instanceof Request) return true;
   return __origReflectApply(__origWeakSetHas, this, [v]);
 };
-// RPC allowlist: every internal method reads as allowlisted.
+// RPC allowlist: every internal method reads as allowlisted. The unknown
+// content type reads as known too: the queue's cell-side validation checks
+// membership the same way, and a polluted `Set.prototype.has` answering
+// true for it smuggles an "evil-type" send past the check when the queue
+// cell shares the polluting script's pool.
 Set.prototype.has = function (v) {
-  if (typeof v === "string" && isInternal(v)) return true;
+  if (typeof v === "string" && (isInternal(v) || v === "evil-type")) return true;
   return __origReflectApply(__origSetHas, this, [v]);
 };
 // Stub-op input gate for queue cells.

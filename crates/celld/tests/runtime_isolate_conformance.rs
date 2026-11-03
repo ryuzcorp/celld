@@ -1,6 +1,6 @@
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 //
-// Modified by ryuzcorp (ryuzcorp/celld): shared runtime cells run in a dedicated runtime isolate pool.
+// Modified by ryuzcorp (ryuzcorp/celld): shared runtime cells run in a dedicated runtime isolate pool; Queue/KV operator fetch gate refusals.
 // Apache-2.0.
 
 // A black-box runner, not node code: it boots the binary, copies fixtures,
@@ -435,38 +435,75 @@ fn runtime_isolate_conformance() {
     assert_eq!(redirected["ok"], true, "{redirected}");
     assert_eq!(redirected["result"]["threw"], true, "{redirected}");
 
-    // The KV binding and its open fetch surface keep working, with and
-    // without a top-level marker.
+    // The KV binding keeps working, but the fetch surface is the
+    // operator's: stub.fetch get/put refuse without the host-set marker,
+    // with and without a top-level marker. The host's WeakSet override
+    // reads every Request as operator, so these 403s pin the runtime
+    // pool as well as the gate.
     let kv = get_json(&node, "/v/kv-binding-ok");
     assert_eq!(kv["ok"], true, "{kv}");
     assert_eq!(kv["result"]["got"], "v1", "{kv}");
     assert_eq!(kv["result"]["gone"], Value::Null, "{kv}");
     let kv_get = get_json(&node, "/v/kv-fetch-get");
     assert_eq!(kv_get["ok"], true, "{kv_get}");
-    assert_eq!(kv_get["result"]["status"], 200, "{kv_get}");
-    assert_eq!(kv_get["result"]["found"], true, "{kv_get}");
+    assert_eq!(kv_get["result"]["status"], 403, "{kv_get}");
+    assert!(
+        kv_get["result"]["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("operator"),
+        "{kv_get}"
+    );
     let kv_marked = get_json(&node, "/v/kv-fetch-get-marker");
     assert_eq!(kv_marked["ok"], true, "{kv_marked}");
-    assert_eq!(kv_marked["result"]["status"], 200, "{kv_marked}");
-    assert_eq!(kv_marked["result"]["found"], true, "{kv_marked}");
+    assert_eq!(kv_marked["result"]["status"], 403, "{kv_marked}");
+    assert!(
+        kv_marked["result"]["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("operator"),
+        "{kv_marked}"
+    );
     let kv_put = get_json(&node, "/v/kv-fetch-put-marker");
     assert_eq!(kv_put["ok"], true, "{kv_put}");
-    assert_eq!(kv_put["result"]["status"], 200, "{kv_put}");
-    assert_eq!(kv_put["result"]["ok"], true, "{kv_put}");
+    assert_eq!(kv_put["result"]["status"], 403, "{kv_put}");
+    assert!(
+        kv_put["result"]["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("operator"),
+        "{kv_put}"
+    );
+    // The refused put wrote nothing.
     let kv_k2 = get_json(&node, "/v/kv-get-k2");
     assert_eq!(kv_k2["ok"], true, "{kv_k2}");
-    assert_eq!(kv_k2["result"]["value"], "v2", "{kv_k2}");
+    assert_eq!(kv_k2["result"]["value"], Value::Null, "{kv_k2}");
 
-    // Queue producers send and the open info surface answers, with and
-    // without a top-level marker.
+    // Queue producers send, but the info surface is the operator's:
+    // stub.fetch info refuses without the marker, with and without a
+    // top-level marker.
     let sent = get_json(&node, "/v/qsend");
     assert_eq!(sent["ok"], true, "{sent}");
     let info = get_json(&node, "/v/qinfo");
     assert_eq!(info["ok"], true, "{info}");
-    assert_eq!(info["result"]["status"], 200, "{info}");
+    assert_eq!(info["result"]["status"], 403, "{info}");
+    assert!(
+        info["result"]["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("operator"),
+        "{info}"
+    );
     let info_marked = get_json(&node, "/v/qinfo-marker");
     assert_eq!(info_marked["ok"], true, "{info_marked}");
-    assert_eq!(info_marked["result"]["status"], 200, "{info_marked}");
+    assert_eq!(info_marked["result"]["status"], 403, "{info_marked}");
+    assert!(
+        info_marked["result"]["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("operator"),
+        "{info_marked}"
+    );
 
     // Every sent message is delivered exactly once by id: the polluted
     // JSON.stringify would have failed the dispatch serialization, so a

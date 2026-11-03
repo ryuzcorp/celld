@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): ctx.container.images; clone() of streaming and disturbed bodies; __celld$do on the service-binding RPC path; container exec pty/resize; cross-isolate RPC stubs and streams; container exec AbortSignal; test-only fake kill completion; exec reads survive their subscribing event; context end aborts finished uploads; tenant egress policy; D1 export; D1 export operator gate; D1 batch; test-only fake close/signal completion; binding-forgery enforcement.
+// Modified by ryuzcorp (ryuzcorp/celld): ctx.container.images; clone() of streaming and disturbed bodies; __celld$do on the service-binding RPC path; container exec pty/resize; cross-isolate RPC stubs and streams; container exec AbortSignal; test-only fake kill completion; exec reads survive their subscribing event; context end aborts finished uploads; tenant egress policy; D1 export; D1 export operator gate; D1 batch; test-only fake close/signal completion; binding-forgery enforcement; Queue/KV operator fetch gate; Queue/KV stub-RPC allowlists; Queue DLQ host-op forward; Queue send/DLQ cell-side validation; trusted-RPC target pin; Queue operator internal re-checks.
 // The DO object model and the Cloudflare-compatible runtime surface, run
 // once per isolate by `js.rs::install_harness` after the Web-API prelude.
 // Lived as a 4,000-line raw string inside js.rs until 2026-07-29; it is a
@@ -6622,14 +6622,25 @@ const __dispatchTo = __celld.__dispatchTo = async (
 // internal methods (__d1Migrate, __kvSweep, ...) to every stub holder,
 // so runtime classes answer an allowlist while user classes keep open
 // dispatch. The methods below are exactly the ones the binding clients
-// and the queue cell's DLQ forward call; `fetch` travels the doFetch
-// path, not this one, and is unaffected. Everything else on a D1 cell
-// (export, migrate) is operator-only and enters over `fetch` with the
-// operator-ingress marker instead, so RPC to any other method refuses
-// as if the method did not exist.
+// call; `fetch` travels the doFetch path, not this one, and is
+// unaffected.
+// - D1: `D1Database._query`, `_batch`, and `exec`. Export and migrate are
+//   operator-only and enter over `fetch` with the operator-ingress marker.
+// - KV: `get`/`getWithMetadata` (single and bulk) over `__kvGet`, `put`
+//   over `__kvPut`, `delete`/`deleteBulk` over `__kvDelete`, and `list`
+//   (cursors included) over `__kvList`. `__kvSweep` runs inside the
+//   cell's own alarm and `__kvMetrics` inside the marker-gated fetch
+//   `info` branch.
+// - Queue: `send`/`sendBatch` over `__queueSend` and `metrics()` over
+//   `__queueMetrics`. The cell's own DLQ forward rides the
+//   `__queue_dlq_forward` host op, so `__queueDlqAcceptBatch` resolves
+//   without this allowlist and needs no entry; `_purge`, `_peek`,
+//   `_setPaused`, and `_redrive` are operator-only over marker-gated
+//   `fetch`, and delivery hands off over the `__queue_dispatch` host op.
+// Any other method on these classes refuses as if it did not exist.
 const __D1_RPC_METHODS = new Set(["__d1Query", "__d1Batch", "__d1Exec"]);
 const __KV_RPC_METHODS = new Set(["__kvGet", "__kvPut", "__kvDelete", "__kvList"]);
-const __QUEUE_RPC_METHODS = new Set(["__queueSend", "__queueMetrics", "__queueDlqAcceptBatch"]);
+const __QUEUE_RPC_METHODS = new Set(["__queueSend", "__queueMetrics"]);
 const __WORKFLOW_RPC_METHODS = new Set([
   "__wfCreate",
   "__wfStatus",
@@ -6652,7 +6663,7 @@ const __rpcMethodAllowlist = (className) => {
       return null;
   }
 };
-const __rpcTargetMethod = async (scope, method) => {
+const __rpcResolveInstance = async (scope) => {
   const inst = await _readyInstance(scope);
   if (!inst.__celldState._rpcOk)
     throw new TypeError(
@@ -6661,6 +6672,10 @@ const __rpcTargetMethod = async (scope, method) => {
       "order to enable RPC, make sure your class extends the " +
       "special class `DurableObject`, which can be imported from " +
       "the module \"cloudflare:workers\".");
+  return inst;
+};
+const __rpcTargetMethod = async (scope, method) => {
+  const inst = await __rpcResolveInstance(scope);
   const className = scope.slice(0, scope.indexOf(":"));
   const allowed = __rpcMethodAllowlist(className);
   if (allowed !== null && !allowed.has(method))
@@ -6670,11 +6685,33 @@ const __rpcTargetMethod = async (scope, method) => {
     throw new TypeError(method + " is not a function");
   return [inst, fn];
 };
+// A call a harness host op built (today only the Queue DLQ forward):
+// the same resolution without the tenant allowlist. The op is a
+// harness parameter a bundle cannot name, and the host op authenticated
+// its caller before the call routed, so reaching here passed the host
+// gate already.
+const __rpcTrustedTargetMethod = async (scope, method) => {
+  // Pinned at the target as well as the caller: the sole trusted caller
+  // (the Queue DLQ forward host op) targets only this method, and anything
+  // else refuses here, so a future trusted caller, a header confusion, or a
+  // bug cannot reach operator methods over trusted RPC.
+  if (!scope.startsWith("__Queue:") || method !== "__queueDlqAcceptBatch")
+    throw new TypeError(method + " is not a function");
+  const inst = await __rpcResolveInstance(scope);
+  const fn = inst[method];
+  if (typeof fn !== "function")
+    throw new TypeError(method + " is not a function");
+  return [inst, fn];
+};
 // The byte path always lifts stub-able values into the reply, with
 // host-routable ids: they revive over the stub channel in any isolate
 // on this node, including this one. Callee exceptions cross in
 // the error envelope on every flavor.
-__celld.__dispatchRpc = async (scope, method, args) => {
+__celld.__dispatchRpc = async (scope, method, args, trusted) => {
+  const resolve = (scope, method) =>
+    trusted === true
+      ? __rpcTrustedTargetMethod(scope, method)
+      : __rpcTargetMethod(scope, method);
   const actorEvent = __beginActorEvent(scope);
   // A stub received by this invocation dies with it: the reply lift
   // already moved what the call returned, so ending the context only
@@ -6687,7 +6724,7 @@ __celld.__dispatchRpc = async (scope, method, args) => {
       // Answer in kind.
       if (typeof args === "string") {
         return await __ctxRun(ctxId, async () => {
-          const [inst, fn] = await __rpcTargetMethod(scope, method);
+          const [inst, fn] = await resolve(scope, method);
           const result = await fn.apply(inst, JSON.parse(args));
           return JSON.stringify(result) ?? "null";
         });
@@ -6702,7 +6739,7 @@ __celld.__dispatchRpc = async (scope, method, args) => {
               const broken = __brokenActors.get(scope);
               if (broken !== undefined) throw broken;
             }
-            const [inst, fn] = await __rpcTargetMethod(scope, method);
+            const [inst, fn] = await resolve(scope, method);
             return fn.apply(inst, decoded.args);
           }, "host");
         } finally {
@@ -7748,6 +7785,41 @@ const __queueEncode = (body, requestedType) => {
   return { body: bytes, contentType, size: bytes.byteLength };
 };
 
+// The cell mistrusts every entry that crosses RPC: the binding encodes
+// correctly, but a stub holder calls `__queueSend` directly with
+// hand-built entries. `__queueSend` and the DLQ accept funnel through
+// these checks, so a forged size, content type, or oversize body never
+// reaches storage. Ids are minted at the insert, never read off the wire.
+const __QUEUE_CONTENT_TYPES = new Set(["text", "bytes", "json", "v8"]);
+
+const __queueEntryBody = (body) => {
+  if (body instanceof ArrayBuffer) return new Uint8Array(body.slice(0));
+  if (ArrayBuffer.isView(body)) {
+    return new Uint8Array(
+      body.buffer.slice(body.byteOffset, body.byteOffset + body.byteLength),
+    );
+  }
+  throw __queueError("a message body must be an ArrayBuffer or a typed array");
+};
+
+const __queueCheckContentType = (contentType) => {
+  if (!__QUEUE_CONTENT_TYPES.has(contentType)) {
+    throw __queueError(
+      `contentType must be "text", "bytes", "json", or "v8", got ${JSON.stringify(contentType)}`,
+    );
+  }
+  return contentType;
+};
+
+const __queueCheckBodySize = (body) => {
+  if (body.byteLength > __queueLimits().maxMessageBytes) {
+    throw __queueError(
+      `a message is at most ${__queueLimits().maxMessageBytes} bytes, got ${body.byteLength}`,
+    );
+  }
+  return body.byteLength;
+};
+
 // A lease-scoped read must seek, not walk the backlog. The plan is the only
 // evidence that says which, and it is cheap to ask for, so a gated test seam
 // reads it from the shipped query rather than from a copy that can drift.
@@ -8267,7 +8339,41 @@ class __QueueCell {
   }
 
   __queueSend({ entries }) {
-    const bytes = entries.reduce((total, entry) => total + entry.size, 0);
+    // Direct stub RPC bypasses the binding's encoder, so the cell repeats
+    // its checks: the batch shape, every content type and delay, and the
+    // per-message and per-batch byte bounds. The size must equal the
+    // actual body length; the insert below mints the id.
+    if (!Array.isArray(entries) || entries.length === 0) {
+      throw __queueError("sendBatch() needs at least one message");
+    }
+    if (entries.length > __queueLimits().maxBatchMessages) {
+      throw __queueError(
+        `a batch has at most ${__queueLimits().maxBatchMessages} messages`,
+      );
+    }
+    let bytes = 0;
+    for (const entry of entries) {
+      if (entry === null || typeof entry !== "object") {
+        throw __queueError("each batch entry needs a body");
+      }
+      __queueCheckContentType(entry.contentType);
+      const body = __queueEntryBody(entry.body);
+      const size = __queueCheckBodySize(body);
+      if (entry.size !== size) {
+        throw __queueError(
+          `a message size must equal its body byte length, got ${entry.size} for ${size} bytes`,
+        );
+      }
+      entry.delaySeconds = __queueDelay(entry.delaySeconds, 0);
+      entry.body = body;
+      entry.size = size;
+      bytes += size;
+    }
+    if (bytes > __queueLimits().maxBatchBytes) {
+      throw __queueError(
+        `a batch is at most ${__queueLimits().maxBatchBytes} bytes, got ${bytes}`,
+      );
+    }
     return new Promise((resolve, reject) => {
       let group = this._producerGroup;
       if (group !== null &&
@@ -8566,39 +8672,67 @@ class __QueueCell {
   // The target deduplicates the stable transfer identity. The source can
   // therefore repeat this call after a stop between the target commit and the
   // source delete without creating a second message.
+  //
+  // The forward arrives over the `__queue_dlq_forward` host op, never stub
+  // RPC, so this method is off the tenant allowlist. The host still trusts
+  // nothing on the wire: the id is minted here, the size recomputed from
+  // the body bytes, and the content type and bounds rechecked.
   async __queueDlqAcceptBatch({ transfers }) {
     if (!Array.isArray(transfers) || transfers.length === 0 ||
         transfers.length > __queueLimits().maxBatchMessages) {
       throw __queueError("a Queue transfer batch has an invalid size");
     }
+    const now = Date.now();
+    const accepted = [];
     for (const transfer of transfers) {
-      if (transfer.deadLetterSource !== null &&
-          typeof transfer.deadLetterSource !== "string") {
+      if (transfer === null || typeof transfer !== "object") {
+        throw __queueError("a Queue transfer is malformed");
+      }
+      const { transferId, entry, deadLetterSource } = transfer;
+      if (typeof transferId !== "string" || transferId.length === 0) {
+        throw __queueError("a Queue transfer has an invalid identity");
+      }
+      if (deadLetterSource !== null &&
+          (typeof deadLetterSource !== "string" || deadLetterSource.length === 0)) {
         throw __queueError("a Queue transfer has an invalid dead-letter source");
       }
+      if (entry === null || typeof entry !== "object") {
+        throw __queueError("a Queue transfer has an invalid entry");
+      }
+      __queueCheckContentType(entry.contentType);
+      const body = __queueEntryBody(entry.body);
+      const size = __queueCheckBodySize(body);
+      accepted.push({
+        transferId,
+        deadLetterSource,
+        id: __queueMessageId(now),
+        body,
+        contentType: entry.contentType,
+        size,
+      });
     }
-    const now = Date.now();
     const sql = this._open();
     this.ctx.storage.transactionSync(() => {
-      for (const { transferId, entry, deadLetterSource } of transfers) {
-        const accepted = sql.exec(
-          `SELECT message_id, dead_letter_source
+      for (const transfer of accepted) {
+        const receipt = sql.exec(
+          `SELECT dead_letter_source
              FROM ${__QUEUE_TRANSFER_RECEIPTS}
             WHERE transfer_id = ?`,
-          transferId,
+          transfer.transferId,
         ).toArray()[0];
-        if (accepted !== undefined && (accepted.message_id !== entry.id ||
-            accepted.dead_letter_source !== deadLetterSource)) {
-          throw __queueError("a DLQ transfer collided with another message identity");
+        if (receipt !== undefined) {
+          if (receipt.dead_letter_source !== transfer.deadLetterSource) {
+            throw __queueError("a DLQ transfer collided with another message identity");
+          }
+          continue;
         }
-        if (accepted !== undefined) continue;
         sql.exec(
           `INSERT INTO ${__QUEUE_TRANSFER_RECEIPTS}
              (transfer_id, message_id, dead_letter_source, expires_at)
            VALUES (?, ?, ?, ?)`,
-          transferId,
-          entry.id,
-          deadLetterSource,
+          transfer.transferId,
+          transfer.id,
+          transfer.deadLetterSource,
           now + __queueLimits().retentionMs,
         );
         sql.exec(
@@ -8606,14 +8740,14 @@ class __QueueCell {
              (id, body, content_type, size, enqueued_at, visible_at,
               attempts, dlq_transfer_id, dead_letter_source)
            VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)`,
-          entry.id,
-          entry.body,
-          entry.contentType,
-          entry.size,
+          transfer.id,
+          transfer.body,
+          transfer.contentType,
+          transfer.size,
           now,
           now,
-          transferId,
-          deadLetterSource,
+          transfer.transferId,
+          transfer.deadLetterSource,
         );
       }
     });
@@ -8646,22 +8780,31 @@ class __QueueCell {
       // forward grants its scope before resolving it. Dispatch refuses
       // undeclared names otherwise, and a Worker cannot name this op.
       __do_grant_name(__cell.namespaceKeys["__Queue"], targetName);
-      const target = __cell.makeNamespace("__Queue").getByName(targetName);
-      await target.__queueDlqAcceptBatch({
-        transfers: rows.map((row) => ({
-          transferId: row.dlq_transfer_id,
-          // A dead-letter transfer records where redrive returns the message.
-          // A redrive returns it to ordinary queue state, so the source marker
-          // must not follow it and make a later redrive bounce it backwards.
-          deadLetterSource: row.transfer_kind === "dead-letter" ? this.queue : null,
-          entry: {
-            id: row.id,
-            body: row.body,
-            contentType: row.content_type,
-            size: row.size,
-          },
-        })),
-      });
+      // The forward rides the host op, never stub RPC: the target resolves
+      // the accept without the tenant allowlist, so the method stays
+      // uncallable for a stub holder. The scope and name come from the same
+      // namespace lookup the binding uses, and the envelope matches the
+      // stub proxy's (`__rpcOut`/`__rpcDes`). The wire carries only the
+      // body and content type; the target mints the id and recomputes the
+      // size, so a replayed batch cannot plant a forged identity.
+      const { id, name } = __cell.makeNamespace("__Queue").getByName(targetName);
+      await __rpcDes(await __queue_dlq_forward(
+        id._scope(),
+        name ?? null,
+        __rpcOut([{
+          transfers: rows.map((row) => ({
+            transferId: row.dlq_transfer_id,
+            // A dead-letter transfer records where redrive returns the message.
+            // A redrive returns it to ordinary queue state, so the source marker
+            // must not follow it and make a later redrive bounce it backwards.
+            deadLetterSource: row.transfer_kind === "dead-letter" ? this.queue : null,
+            entry: {
+              body: row.body,
+              contentType: row.content_type,
+            },
+          })),
+        }], "host"),
+      ));
       if (typeof __test_queue_dlq_accepted === "function") {
         __test_queue_dlq_accepted();
       }
@@ -8868,7 +9011,19 @@ class __QueueCell {
     return true;
   }
 
-  async _purge() {
+  _requireOperator(request, operation, command) {
+    // Defence in depth beyond the fetch gate: these methods are also
+    // reachable over stub RPC, where only the tenant allowlist stands
+    // between a stub holder and a purge. The marker lives in a
+    // harness-private WeakSet keyed by the server-side Request, so an RPC
+    // caller cannot supply a member: only the fetch branch below, holding
+    // the host-built request, passes.
+    if (!__operatorIngressRequests.has(request))
+      throw __queueError(`${operation} is an operator operation; use \`${command}\``);
+  }
+
+  async _purge(request) {
+    this._requireOperator(request, "purge", "celld queue purge");
     const now = Date.now();
     const sql = this._open();
     let deleted = 0;
@@ -8923,7 +9078,12 @@ class __QueueCell {
     return { deleted, leased, metrics: this._metrics(now) };
   }
 
-  async _setPaused(paused) {
+  async _setPaused(paused, request) {
+    this._requireOperator(
+      request,
+      paused ? "pause" : "resume",
+      paused ? "celld queue pause" : "celld queue resume",
+    );
     this._setMeta("paused", paused ? "1" : null);
     await this._rearm();
     return { paused, ...this._metrics() };
@@ -8937,7 +9097,8 @@ class __QueueCell {
     return limit;
   }
 
-  _peek(limit) {
+  _peek(limit, request) {
+    this._requireOperator(request, "peek", "celld queue peek");
     const now = Date.now();
     const cutoff = now - __queueLimits().retentionMs;
     const rows = this._open().exec(
@@ -8980,7 +9141,8 @@ class __QueueCell {
     };
   }
 
-  async _redrive(limit) {
+  async _redrive(limit, request) {
+    this._requireOperator(request, "redrive", "celld queue redrive");
     // Finish an interrupted move before selecting more work. A transfer mark
     // is durable, so selecting it a second time would invent another identity
     // where replaying the existing identity is sufficient.
@@ -9041,6 +9203,16 @@ class __QueueCell {
     } catch {
       return new Response("invalid Queue request", { status: 400 });
     }
+    // The same cell answers a Worker's stub.fetch() and the operator CLI's
+    // `/runtime/` dispatch, so the operator-only branches demand the
+    // host-set operator-ingress marker on the server-side Request. Settlement
+    // stays open: the host's consumer driver settles through here without the
+    // marker, and a settlement without a live lease id 409s.
+    const operator = __operatorIngressRequests.has(request);
+    const refuse = (operation, command) => Response.json(
+      { error: `QUEUE_ERROR: ${operation} is an operator operation; use \`${command}\`` },
+      { status: 403 },
+    );
     try {
       if (path === "/__qSettle") {
         return await this._settle(body)
@@ -9048,6 +9220,7 @@ class __QueueCell {
           : new Response("stale Queue settlement", { status: 409 });
       }
       if (body.op === "info") {
+        if (!operator) return refuse("info", "celld queue info");
         const metrics = this._metrics();
         const stored = this._open().exec(
           `SELECT stored_count FROM ${__QUEUE_STATS} WHERE id = 1`,
@@ -9055,22 +9228,27 @@ class __QueueCell {
         return Response.json({ result: { ...metrics, stored, paused: this._paused() } });
       }
       if (body.op === "purge") {
-        return Response.json({ result: await this._purge() });
+        if (!operator) return refuse("purge", "celld queue purge");
+        return Response.json({ result: await this._purge(request) });
       }
       if (body.op === "pause") {
-        return Response.json({ result: await this._setPaused(true) });
+        if (!operator) return refuse("pause", "celld queue pause");
+        return Response.json({ result: await this._setPaused(true, request) });
       }
       if (body.op === "resume") {
-        return Response.json({ result: await this._setPaused(false) });
+        if (!operator) return refuse("resume", "celld queue resume");
+        return Response.json({ result: await this._setPaused(false, request) });
       }
       if (body.op === "peek") {
+        if (!operator) return refuse("peek", "celld queue peek");
         return Response.json({
-          result: this._peek(this._operatorLimit(body.limit, 10)),
+          result: this._peek(this._operatorLimit(body.limit, 10), request),
         });
       }
       if (body.op === "redrive") {
+        if (!operator) return refuse("redrive", "celld queue redrive");
         return Response.json({
-          result: await this._redrive(this._operatorLimit(body.limit, 100)),
+          result: await this._redrive(this._operatorLimit(body.limit, 100), request),
         });
       }
       return Response.json(
