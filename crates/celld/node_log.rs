@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): operator token for the internal listener.
+// Modified by ryuzcorp (ryuzcorp/celld): operator token for the internal listener; list_page resume is a cursor.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! v0 of the in-fleet replicated log tier (`CELLD_DURABILITY=fleet`).
@@ -43,6 +43,7 @@ use futures_util::FutureExt;
 use futures_util::StreamExt;
 
 use crate::bucket::Bucket;
+use crate::bucket::ListAfter;
 use crate::ltx_repl::ShipEntry;
 use crate::peer_auth::PeerAuth;
 
@@ -6298,7 +6299,7 @@ impl NodeLogManager {
             .bucket
             .list_page(
                 &prefix,
-                cursor.as_deref(),
+                cursor.as_deref().map(ListAfter::Cursor),
                 BUNDLE_GC_EXAMINED_PER_TICK,
                 None,
             )

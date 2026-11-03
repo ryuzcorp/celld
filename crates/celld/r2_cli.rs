@@ -1,3 +1,4 @@
+// Modified by ryuzcorp (ryuzcorp/celld): r2 list --delimiter, a binding-shape --page, and --cursor continuation.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 // The R2 CLI reads operator input and object bodies outside node storage.
@@ -51,12 +52,15 @@ use std::path::PathBuf;
 /// of a body that can be many gigabytes.
 const READ_CHUNK: usize = 1 << 20;
 
-/// One object in a listing.
+/// One object in a listing. The row continues past the cursor the
+/// store answered the row with: the key itself, wrapped with the
+/// listing's bound when the walk is seeded.
 struct Object {
     key: String,
     size: u64,
     etag: Option<String>,
     uploaded_ms: i64,
+    cursor: String,
 }
 
 impl Record for Object {
@@ -76,7 +80,66 @@ impl Record for Object {
 
 impl Resumable for Object {
     fn cursor(&self) -> &str {
-        &self.key
+        &self.cursor
+    }
+}
+
+/// One prefix a delimiter rolled up, in a text listing. The row
+/// continues past the last key that rolled into it: the prefix string
+/// itself encodes ahead of its keys, so resuming after it would re-walk
+/// the whole folder.
+struct Prefix {
+    prefix: String,
+    cursor: String,
+}
+
+impl Record for Prefix {
+    fn json(&self) -> Value {
+        json!({ "prefix": self.prefix })
+    }
+
+    fn text(&self) -> Cow<'_, str> {
+        Cow::Borrowed(&self.prefix)
+    }
+}
+
+impl Resumable for Prefix {
+    fn cursor(&self) -> &str {
+        &self.cursor
+    }
+}
+
+/// One row of a text listing, in the store's walk order: objects and the
+/// prefixes a delimiter rolled up, interleaved by first key. Without a
+/// delimiter the page carries no prefixes, so the output is one key per
+/// line exactly as before.
+enum Row {
+    Object(Object),
+    Prefix(Prefix),
+}
+
+impl Record for Row {
+    fn json(&self) -> Value {
+        match self {
+            Self::Object(object) => object.json(),
+            Self::Prefix(prefix) => prefix.json(),
+        }
+    }
+
+    fn text(&self) -> Cow<'_, str> {
+        match self {
+            Self::Object(object) => object.text(),
+            Self::Prefix(prefix) => prefix.text(),
+        }
+    }
+}
+
+impl Resumable for Row {
+    fn cursor(&self) -> &str {
+        match self {
+            Self::Object(object) => object.cursor(),
+            Self::Prefix(prefix) => prefix.cursor(),
+        }
     }
 }
 
@@ -201,7 +264,29 @@ pub async fn run(arguments: Vec<String>) -> anyhow::Result<()> {
                 .map_err(anyhow::Error::msg)?;
             note!("deleted {} object(s)", keys.len());
         }
-        Action::List { prefix, bounds } => {
+        Action::List {
+            prefix,
+            delimiter,
+            page,
+            cursor,
+            bounds,
+        } => {
+            // `--page` prints one page object — the shape a Worker's
+            // `list()` returns — so its cursor is in-band and there is no
+            // resume line to print. `--json` keeps its one-record-per-line
+            // output, unchanged from upstream.
+            if page {
+                let page = list_json(
+                    bucket,
+                    &prefix,
+                    delimiter.as_deref(),
+                    &bounds,
+                    cursor.as_deref(),
+                )
+                .await?;
+                Output::new(Format::Text).line(format_args!("{page}"))?;
+                return Ok(());
+            }
             let mut out = Output::new(if command.json {
                 Format::Json
             } else {
@@ -209,69 +294,184 @@ pub async fn run(arguments: Vec<String>) -> anyhow::Result<()> {
             });
             let listed = list(&mut out, &bounds, |resume, want| {
                 let prefix = prefix.clone();
-                // An operator's `--after` is a key and the driver's own
-                // continuation is the cursor a truncated page answered
-                // with. R2 reads the cursor first and both name the same
-                // place, so either one resumes strictly after that key.
-                let (cursor, after) = match resume {
-                    Resume::From(after) => (String::new(), after.unwrap_or_default()),
-                    Resume::Token(token) => (token, String::new()),
-                };
+                let delimiter = delimiter.clone();
+                let cursor = cursor.clone();
                 async move {
-                    let page = crate::js::r2_ops::list(
-                        bucket,
-                        &json!({
-                            "prefix": prefix,
-                            "cursor": cursor,
-                            "startAfter": after,
-                            "limit": want,
-                        })
-                        .to_string(),
-                    )
-                    .await
-                    .map_err(anyhow::Error::msg)?;
-                    let objects = page
-                        .get("objects")
-                        .and_then(Value::as_array)
-                        .ok_or_else(|| anyhow!("the listing carried no objects: {page}"))?;
-                    let rows = objects
-                        .iter()
-                        .map(|object| Object {
-                            key: object
-                                .get("key")
-                                .and_then(Value::as_str)
-                                .unwrap_or_default()
-                                .to_string(),
-                            size: object
-                                .get("size")
-                                .and_then(Value::as_u64)
-                                .unwrap_or_default(),
-                            etag: object
-                                .get("etag")
-                                .and_then(Value::as_str)
-                                .map(str::to_string),
-                            uploaded_ms: object
-                                .get("uploaded")
-                                .and_then(Value::as_i64)
-                                .unwrap_or_default(),
-                        })
-                        .collect();
-                    // The store's own truncation signal, never a row
-                    // count: a page filled exactly to its bound is not
-                    // evidence that another object exists.
-                    let next = page
-                        .get("cursor")
-                        .and_then(Value::as_str)
-                        .map(str::to_string);
-                    Ok(Page { rows, next })
+                    fetch_text_page(bucket, &prefix, delimiter.as_deref(), &resume, cursor, want)
+                        .await
                 }
             })
             .await?;
             out.finish()?;
-            listed.report("object", "--after");
+            // The continuation is the store's cursor past the last printed
+            // row, never `--after`: `startAfter` compares decoded keys
+            // while the store walks the encoded form, so continuing by key
+            // silently drops keys where the two orders disagree.
+            listed.report("object", "--cursor");
         }
     }
     Ok(())
+}
+
+/// One page of a text listing, through the same request the binding
+/// sends. An operator's `--after` bounds the first page and the
+/// driver's own continuation — or the operator's `--cursor` — carries
+/// the walk; R2 reads the cursor first, so when both are present the
+/// cursor wins.
+async fn fetch_text_page(
+    bucket: &str,
+    prefix: &str,
+    delimiter: Option<&str>,
+    resume: &Resume,
+    seed: Option<String>,
+    want: usize,
+) -> anyhow::Result<Page<Row>> {
+    let (cursor, after) = match resume {
+        Resume::From(after) => (seed, after.clone()),
+        Resume::Token(token) => (Some(token.clone()), None),
+    };
+    let page = crate::js::r2_ops::list_entries(
+        bucket,
+        &crate::js::r2_ops::list_request(
+            prefix,
+            cursor.as_deref(),
+            after.as_deref(),
+            want,
+            delimiter,
+            false,
+        ),
+    )
+    .await
+    .map_err(anyhow::Error::msg)?;
+    let rows = page
+        .entries
+        .into_iter()
+        .map(|row| match row {
+            crate::bucket::BlobRow::Object { entry, cursor } => Row::Object(Object {
+                key: entry.key,
+                size: entry.size,
+                etag: entry.etag,
+                uploaded_ms: entry.uploaded_ms,
+                cursor,
+            }),
+            crate::bucket::BlobRow::Prefix(prefix) => Row::Prefix(Prefix {
+                prefix: prefix.prefix,
+                cursor: prefix.cursor,
+            }),
+        })
+        .collect();
+    // The store's own truncation signal, never a row count: a page
+    // filled exactly to its bound is not evidence that another object
+    // exists.
+    Ok(Page {
+        rows,
+        next: page.cursor,
+    })
+}
+
+/// One listed object in the binding's shape: the key, size, etag and
+/// upload time the text listing prints, plus the `httpMetadata` and
+/// `customMetadata` the `include` half of the request fetched with one
+/// head per object.
+fn object_json(object: &Value) -> Value {
+    json!({
+        "key": object.get("key").and_then(Value::as_str).unwrap_or_default(),
+        "size": object.get("size").and_then(Value::as_u64).unwrap_or_default(),
+        "etag": object.get("etag").and_then(Value::as_str),
+        "uploaded": object.get("uploaded").and_then(Value::as_i64).unwrap_or_default(),
+        "httpMetadata": object.get("http").cloned().unwrap_or(json!({})),
+        "customMetadata": object.get("custom").cloned().unwrap_or(json!({})),
+    })
+}
+
+/// One listing page in the shape a Worker's `list()` returns, through the
+/// same `r2_ops::list` call the binding makes. `--all` walks every page
+/// and merges them; otherwise this is one page and its cursor continues
+/// it with `--cursor`.
+async fn list_json(
+    bucket: &str,
+    prefix: &str,
+    delimiter: Option<&str>,
+    bounds: &Bounds,
+    seed: Option<&str>,
+) -> anyhow::Result<Value> {
+    let mut objects = Vec::new();
+    let mut prefixes = Vec::new();
+    // A prefix the walk already reported costs nothing. Keys under a
+    // prefix sort contiguously, so one the store produced never answers
+    // twice; the set is insurance for keys another tool wrote.
+    let mut seen = std::collections::BTreeSet::new();
+    let mut cursor: Option<String> = seed.map(str::to_string);
+    let mut after = bounds.after.clone();
+    loop {
+        let page = crate::js::r2_ops::list(
+            bucket,
+            &crate::js::r2_ops::list_request(
+                prefix,
+                cursor.as_deref(),
+                after.as_deref(),
+                match bounds.all {
+                    true => Bounds::MAX_PAGE,
+                    false => bounds.limit.min(Bounds::MAX_PAGE),
+                },
+                delimiter,
+                true,
+            ),
+        )
+        .await
+        .map_err(anyhow::Error::msg)?;
+        let listed = page
+            .get("objects")
+            .and_then(Value::as_array)
+            .ok_or_else(|| anyhow!("the listing carried no objects: {page}"))?;
+        objects.extend(listed.iter().map(object_json));
+        let rolled = page
+            .get("prefixes")
+            .and_then(Value::as_array)
+            .ok_or_else(|| anyhow!("the listing carried no prefixes: {page}"))?;
+        for prefix in rolled.iter().filter_map(Value::as_str) {
+            // One page never repeats a prefix, so the set only pays on a
+            // multi-page walk.
+            if bounds.all && !seen.insert(prefix.to_string()) {
+                continue;
+            }
+            prefixes.push(Value::String(prefix.to_string()));
+        }
+        let truncated = page
+            .get("truncated")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let next = page
+            .get("cursor")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        // R2 omits `cursor` entirely when the listing is complete,
+        // and callers test `truncated` before reading it.
+        if !bounds.all {
+            let mut page = json!({
+                "objects": objects,
+                "delimitedPrefixes": prefixes,
+                "truncated": truncated,
+            });
+            if let (true, Some(next)) = (truncated, next) {
+                page["cursor"] = Value::String(next);
+            }
+            return Ok(page);
+        }
+        match (truncated, next) {
+            (true, Some(next)) => {
+                cursor = Some(next);
+                after = None;
+            }
+            _ => {
+                return Ok(json!({
+                    "objects": objects,
+                    "delimitedPrefixes": prefixes,
+                    "truncated": false,
+                }));
+            }
+        }
+    }
 }
 
 /// Where a `put` reads its body. A named file and standard input are both
@@ -322,6 +522,11 @@ enum Action {
     },
     List {
         prefix: String,
+        delimiter: Option<String>,
+        /// Print one binding-shaped page object instead of records.
+        page: bool,
+        /// Resume after the cursor a truncated listing answered with.
+        cursor: Option<String>,
         bounds: Bounds,
     },
 }
@@ -375,11 +580,14 @@ impl Command {
         let mut pipe = false;
         let mut metadata = None;
         let mut prefix = String::new();
+        let mut delimiter = None;
+        let mut cursor = None;
         let mut http = BTreeMap::new();
         let mut cache_expiry = None;
         let mut fleet = crate::cli_options::FleetFlags::default();
         let mut bounds = Bounds::default();
         let mut json = false;
+        let mut page = false;
         while let Some(argument) = arguments.next() {
             let mut value = |flag: &str| {
                 arguments
@@ -397,7 +605,10 @@ impl Command {
                     })?);
                 }
                 "--prefix" => prefix = value("--prefix")?,
+                "--delimiter" => delimiter = Some(value("--delimiter")?),
+                "--cursor" => cursor = Some(value("--cursor")?),
                 "--json" => json = true,
+                "--page" => page = true,
                 // celld has neither concept, and a flag that silently means
                 // nothing is the gap the compatibility page forbids.
                 flag @ ("--local" | "--remote" | "--jurisdiction") => bail!(
@@ -450,6 +661,9 @@ impl Command {
                 refuse("--path", file.is_some())?;
                 refuse("--pipe", pipe)?;
                 refuse("--metadata or a content flag", write_flags)?;
+                refuse("--delimiter", delimiter.is_some())?;
+                refuse("--cursor", cursor.is_some())?;
+                refuse("--page", page)?;
                 let key = one_key(&verb)?;
                 match verb.as_str() {
                     "get" => Action::Get { key },
@@ -457,6 +671,9 @@ impl Command {
                 }
             }
             "put" => {
+                refuse("--delimiter", delimiter.is_some())?;
+                refuse("--cursor", cursor.is_some())?;
+                refuse("--page", page)?;
                 let key = one_key("put")?;
                 // Reading a body from a terminal by default would hang
                 // with no output, so standard input is opt-in.
@@ -478,6 +695,9 @@ impl Command {
                 refuse("--path", file.is_some())?;
                 refuse("--pipe", pipe)?;
                 refuse("--metadata or a content flag", write_flags)?;
+                refuse("--delimiter", delimiter.is_some())?;
+                refuse("--cursor", cursor.is_some())?;
+                refuse("--page", page)?;
                 if positional.is_empty() {
                     bail!("celld r2 delete needs at least one key");
                 }
@@ -490,8 +710,16 @@ impl Command {
                 if !positional.is_empty() {
                     bail!("celld r2 list takes no positional arguments; use --prefix");
                 }
+                // `--page` already prints one JSON page object, so `--json`
+                // beside it is refused rather than silently meaning nothing.
+                if page && json {
+                    bail!("`celld r2 list --page` prints JSON already; it takes no `--json`");
+                }
                 Action::List {
                     prefix,
+                    delimiter,
+                    page,
+                    cursor,
                     bounds: bounds.clone(),
                 }
             }
@@ -564,7 +792,7 @@ USAGE
   celld r2 head   <bucket-name> <key>    [--json] [fleet options]
   celld r2 put    <bucket-name> <key>    --path FILE | --pipe [put options]
   celld r2 delete <bucket-name> <key>... [fleet options]
-  celld r2 list   <bucket-name>          [--prefix P] [listing options]
+  celld r2 list   <bucket-name>          [--prefix P] [--delimiter D] [listing options]
 
 The bucket name is the `bucket_name` from the project's `r2_buckets` entry,
 not the binding name. `get` writes the object to stdout as bytes, so an
@@ -578,7 +806,22 @@ PUT OPTIONS
 
 LISTING OPTIONS (list)
   --prefix P          list only the keys under this prefix
+  --delimiter D       roll up keys below D into delimitedPrefixes
+  --cursor C          continue after the cursor a truncated listing answered
+  --page              print one binding-shaped page object (see below)
 {LISTING_HELP}
+
+With --page, list prints one page object — objects with key, size,
+etag, uploaded, httpMetadata and customMetadata, plus
+delimitedPrefixes, truncated and cursor — the fields of a Worker's
+list() page other than version, checksums and storageClass. Without it, list prints one key per line (one JSON record
+per line with --json), with rolled-up prefixes on their own lines in
+walk order.
+
+Continue a truncated listing with --cursor, as the resume line says:
+--after bounds the first page past a key, while the cursor continues
+the walk past exactly what the listing consumed. When both are given
+the cursor wins, as in a Worker's list().
 
 FLEET OPTIONS
 {FLEET_HELP}
@@ -589,4 +832,702 @@ beside the five content headers. A copy made with another tool still reads
 through the binding, and its user metadata becomes its customMetadata."
     );
     let _ = crate::cli_output::Output::new(crate::cli_output::Format::Text).help(&text);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(arguments: &[&str]) -> anyhow::Result<Option<Command>> {
+        Command::parse(
+            arguments
+                .iter()
+                .map(|argument| argument.to_string())
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn list_takes_a_delimiter() {
+        let command = parse(&["list", "bucket", "--delimiter", "/"])
+            .expect("parse the listing")
+            .expect("a verb was given");
+        assert!(
+            matches!(command.action, Action::List { delimiter: Some(delimiter), .. } if delimiter == "/")
+        );
+    }
+
+    #[test]
+    fn other_verbs_refuse_a_delimiter() {
+        for verb in ["get", "head", "put", "delete"] {
+            let arguments: Vec<&str> = match verb {
+                "put" => vec![verb, "bucket", "key", "--delimiter", "/", "--pipe"],
+                "get" | "head" => vec![verb, "bucket", "key", "--delimiter", "/"],
+                _ => vec![verb, "bucket", "key", "--delimiter", "/"],
+            };
+            assert!(parse(&arguments).is_err(), "{verb} accepted --delimiter");
+        }
+    }
+
+    /// `--json` keeps upstream's one-record-per-line listing; only
+    /// `--page` switches to the page object, and only `list` takes it.
+    #[test]
+    fn page_is_its_own_flag() {
+        let json = parse(&["list", "bucket", "--json"])
+            .expect("parse the listing")
+            .expect("a verb was given");
+        assert!(json.json);
+        assert!(matches!(json.action, Action::List { page: false, .. }));
+        let page = parse(&["list", "bucket", "--page"])
+            .expect("parse the listing")
+            .expect("a verb was given");
+        assert!(matches!(page.action, Action::List { page: true, .. }));
+        for arguments in [
+            ["get", "bucket", "key", "--page"].as_slice(),
+            ["head", "bucket", "key", "--page"].as_slice(),
+            ["put", "bucket", "key", "--page", "--pipe"].as_slice(),
+            ["delete", "bucket", "key", "--page"].as_slice(),
+        ] {
+            assert!(parse(arguments).is_err(), "{arguments:?} accepted --page");
+        }
+    }
+
+    /// The text listing prints one key per line, with rolled-up prefixes
+    /// on their own lines; a prefix row resumes after the last key that
+    /// rolled into it.
+    #[test]
+    fn text_rows_still_print_keys() {
+        let row = Row::Object(Object {
+            key: "photos/sun.png".to_string(),
+            size: 3,
+            etag: None,
+            uploaded_ms: 0,
+            cursor: "photos/sun.png".to_string(),
+        });
+        assert_eq!(row.text(), "photos/sun.png");
+        assert_eq!(row.cursor(), "photos/sun.png");
+        let row = Row::Prefix(Prefix {
+            prefix: "photos/".to_string(),
+            cursor: "photos/sun.png".to_string(),
+        });
+        assert_eq!(row.text(), "photos/");
+        assert_eq!(row.cursor(), "photos/sun.png");
+    }
+
+    /// `--page` lists one binding-shaped page through the store: decoded
+    /// keys with their `httpMetadata`, the rolled-up prefixes, and the
+    /// cursor that continues a truncated page.
+    #[tokio::test]
+    async fn json_lists_one_binding_shaped_page() {
+        // The bindings' store, shared with the `r2_store` suite (a second
+        // install is ignored); buckets isolate.
+        crate::host_channels::set_r2_store(crate::bucket::Bucket::for_test());
+        for (key, content_type) in [
+            ("a/1", None),
+            ("a/2", None),
+            ("b/1", None),
+            ("top.txt", Some("text/plain")),
+        ] {
+            let request = serde_json::from_value(serde_json::json!({
+                "http": { "contentType": content_type },
+            }))
+            .expect("parse the put options");
+            crate::r2_store::put_once(
+                "jsoncli".to_string(),
+                key.to_string(),
+                b"body".to_vec(),
+                request,
+            )
+            .await
+            .expect("put the test object");
+        }
+        let mut bounds = Bounds::default();
+        bounds.limit = 2;
+        let page = list_json("jsoncli", "", Some("/"), &bounds, None)
+            .await
+            .expect("list the page");
+        assert_eq!(
+            page.get("delimitedPrefixes"),
+            Some(&json!(["a/", "b/"])),
+            "the page rolls folders up: {page}"
+        );
+        assert_eq!(page.get("truncated"), Some(&json!(true)));
+        let cursor = page
+            .get("cursor")
+            .and_then(Value::as_str)
+            .expect("a truncated page names its cursor");
+        bounds.limit = 100;
+        let page = list_json("jsoncli", "", Some("/"), &bounds, Some(cursor))
+            .await
+            .expect("list the next page");
+        let objects = page
+            .get("objects")
+            .and_then(Value::as_array)
+            .expect("the page carries objects");
+        assert_eq!(objects.len(), 1);
+        assert_eq!(
+            objects[0]
+                .pointer("/httpMetadata/contentType")
+                .and_then(Value::as_str),
+            Some("text/plain")
+        );
+        assert_eq!(page.get("truncated"), Some(&json!(false)));
+    }
+
+    /// One listed object in the binding's shape: the record's `http`
+    /// becomes `httpMetadata` and its `custom` becomes `customMetadata`,
+    /// and a missing map is empty rather than absent.
+    #[test]
+    fn objects_carry_http_metadata() {
+        let object = json!({
+            "key": "photos/sun.png",
+            "size": 3,
+            "etag": "\"abc\"",
+            "uploaded": 1_791_234_567_000i64,
+            "http": { "contentType": "image/png" },
+            "custom": { "team": "field" },
+        });
+        assert_eq!(
+            object_json(&object),
+            json!({
+                "key": "photos/sun.png",
+                "size": 3,
+                "etag": "\"abc\"",
+                "uploaded": 1_791_234_567_000i64,
+                "httpMetadata": { "contentType": "image/png" },
+                "customMetadata": { "team": "field" },
+            })
+        );
+        let bare = json!({"key": "k", "size": 0, "uploaded": 0});
+        assert_eq!(object_json(&bare).get("httpMetadata"), Some(&json!({})));
+        assert_eq!(object_json(&bare).get("customMetadata"), Some(&json!({})));
+    }
+
+    async fn put_plain(bucket: &str, key: &str) {
+        crate::host_channels::set_r2_store(crate::bucket::Bucket::for_test());
+        let request = serde_json::from_value(serde_json::json!({ "http": {} }))
+            .expect("parse the put options");
+        crate::r2_store::put_once(
+            bucket.to_string(),
+            key.to_string(),
+            b"body".to_vec(),
+            request,
+        )
+        .await
+        .expect("put the test object");
+    }
+
+    async fn list_page(
+        bucket: &str,
+        prefix: &str,
+        cursor: Option<&str>,
+        after: Option<&str>,
+        limit: usize,
+        delimiter: Option<&str>,
+    ) -> Value {
+        crate::r2_store::list(
+            bucket,
+            &crate::js::r2_ops::list_request(prefix, cursor, after, limit, delimiter, false),
+        )
+        .await
+        .expect("list the page")
+    }
+
+    fn listed_objects(page: &Value) -> Vec<String> {
+        page.get("objects")
+            .and_then(Value::as_array)
+            .expect("the page carries objects")
+            .iter()
+            .map(|object| {
+                object
+                    .get("key")
+                    .and_then(Value::as_str)
+                    .expect("an object carries its key")
+                    .to_string()
+            })
+            .collect()
+    }
+
+    fn listed_prefixes(page: &Value) -> Vec<String> {
+        page.get("prefixes")
+            .and_then(Value::as_array)
+            .expect("the page carries prefixes")
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect()
+    }
+
+    fn listed_truncated(page: &Value) -> bool {
+        page.get("truncated")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    }
+
+    /// Keys whose encoded walk order disagrees with decoded UTF-8 byte
+    /// order: `~` and non-ASCII bytes sort after plain letters decoded,
+    /// before them encoded. `%`, spaces, `?` and `+` round-trip through
+    /// the same codec.
+    const ADVERSARIAL_FLAT: &[&str] = &[
+        "a~", "aa", "m", "z", "~tilde", "éclair", "zebra", "ABC", "abc", "100%", "1000", "a b",
+        "a+b", "a?b",
+    ];
+
+    /// Nested keys for delimiter walks: a long run under `a/` forces page
+    /// boundaries inside one prefix, and escapables appear both in
+    /// prefixes and in trailing segments.
+    const ADVERSARIAL_NESTED: &[&str] = &[
+        "a/1", "a/2", "a/3", "a/4", "a/5", "a~/1", "b/1", "m", "top.txt", "é/x", "x/é", "sp ace/f",
+        "a//deep", "trail/", "%/pct", "zz",
+    ];
+
+    /// An escapable inside the listed prefix itself, with out-of-scope
+    /// keys that must never leak into the walk.
+    const ADVERSARIAL_PREFIX: &str = "p~/";
+    const ADVERSARIAL_ESCAPED: &[&str] = &[
+        "p~/a", "p~/a/1", "p~/a/2", "p~/~", "p~/é/x", "other/1", "p/1",
+    ];
+
+    /// The decoded-sorted objects and prefixes a complete walk over `keys`
+    /// must report: R2 rolls a key up at the delimiter's first occurrence
+    /// past the prefix, and `seed` bounds the walk's first page.
+    fn expected_listed(
+        keys: &[&str],
+        prefix: &str,
+        delimiter: Option<&str>,
+        seed: Option<&str>,
+    ) -> (Vec<String>, Vec<String>) {
+        let mut selected: Vec<&str> = keys
+            .iter()
+            .copied()
+            .filter(|key| {
+                if !key.starts_with(prefix) {
+                    return false;
+                }
+                match seed {
+                    None => true,
+                    Some(bound) => *key > bound,
+                }
+            })
+            .collect();
+        selected.sort_unstable();
+        let mut objects = Vec::new();
+        let mut prefixes = std::collections::BTreeSet::new();
+        for key in selected {
+            let remainder = key
+                .strip_prefix(prefix)
+                .expect("the filter matched the prefix");
+            match delimiter.and_then(|delimiter| remainder.find(delimiter)) {
+                Some(at) => {
+                    let delimiter = delimiter.expect("the match names it");
+                    prefixes.insert(format!("{prefix}{}", &remainder[..at + delimiter.len()]));
+                }
+                None => objects.push(key.to_string()),
+            }
+        }
+        (objects, prefixes.into_iter().collect())
+    }
+
+    /// A Worker's page walk: the first page may carry a `startAfter`
+    /// bound, every continuation carries the cursor the store answered
+    /// with.
+    async fn walk_binding(
+        bucket: &str,
+        prefix: &str,
+        delimiter: Option<&str>,
+        limit: usize,
+        seed: Option<&str>,
+    ) -> (Vec<String>, Vec<String>) {
+        let mut objects = Vec::new();
+        let mut prefixes = Vec::new();
+        let mut cursor: Option<String> = None;
+        let mut after = seed.map(str::to_string);
+        loop {
+            let page = list_page(
+                bucket,
+                prefix,
+                cursor.as_deref(),
+                after.as_deref(),
+                limit,
+                delimiter,
+            )
+            .await;
+            objects.extend(listed_objects(&page));
+            prefixes.extend(listed_prefixes(&page));
+            if !listed_truncated(&page) {
+                break;
+            }
+            cursor = page
+                .get("cursor")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            assert!(
+                cursor.is_some(),
+                "a truncated page names its cursor: {page}"
+            );
+            after = None;
+        }
+        (objects, prefixes)
+    }
+
+    /// The CLI's resume flow: page the text listing's rows in walk order
+    /// and continue with `--cursor` past the last printed row, exactly as
+    /// the resume line instructs. A stall or a silent omission here is a
+    /// stall or a silent omission for every script following the hint.
+    async fn walk_hint(
+        bucket: &str,
+        prefix: &str,
+        delimiter: Option<&str>,
+        limit: usize,
+        seed: Option<&str>,
+    ) -> (Vec<String>, Vec<String>) {
+        let mut objects = Vec::new();
+        let mut prefixes = Vec::new();
+        let mut cursor: Option<String> = None;
+        let mut after = seed.map(str::to_string);
+        let mut pages = 0;
+        loop {
+            pages += 1;
+            assert!(
+                pages <= 64,
+                "the hint walk stalled: page {pages} repeats its own hint"
+            );
+            let page = fetch_text_page(
+                bucket,
+                prefix,
+                delimiter,
+                &Resume::From(after.clone()),
+                cursor.clone(),
+                limit,
+            )
+            .await
+            .expect("list the page");
+            let mut hint = None;
+            for row in &page.rows {
+                match row {
+                    Row::Object(object) => objects.push(object.key.clone()),
+                    Row::Prefix(prefix) => prefixes.push(prefix.prefix.clone()),
+                }
+                hint = Some(row.cursor().to_string());
+            }
+            let Some(last) = hint else {
+                assert!(page.next.is_none(), "an empty page names no continuation");
+                break;
+            };
+            if page.next.is_none() {
+                break;
+            }
+            cursor = Some(last);
+            after = None;
+        }
+        (objects, prefixes)
+    }
+
+    /// A `--page` walk: single pages chained by the in-band cursor, as a
+    /// script paging `--page --cursor` walks.
+    async fn walk_page(
+        bucket: &str,
+        prefix: &str,
+        delimiter: Option<&str>,
+        limit: usize,
+        seed: Option<&str>,
+    ) -> (Vec<String>, Vec<String>) {
+        let mut objects = Vec::new();
+        let mut prefixes = Vec::new();
+        let mut cursor: Option<String> = None;
+        let mut after = seed.map(str::to_string);
+        loop {
+            let mut bounds = Bounds::default();
+            bounds.limit = limit;
+            bounds.after = after.clone();
+            let page = list_json(bucket, prefix, delimiter, &bounds, cursor.as_deref())
+                .await
+                .expect("list the page");
+            objects.extend(
+                page.get("objects")
+                    .and_then(Value::as_array)
+                    .expect("the page carries objects")
+                    .iter()
+                    .map(|object| {
+                        object
+                            .get("key")
+                            .and_then(Value::as_str)
+                            .expect("an object carries its key")
+                            .to_string()
+                    }),
+            );
+            prefixes.extend(
+                page.get("delimitedPrefixes")
+                    .and_then(Value::as_array)
+                    .expect("the page carries prefixes")
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string),
+            );
+            if !page
+                .get("truncated")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                break;
+            }
+            cursor = page
+                .get("cursor")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            assert!(
+                cursor.is_some(),
+                "a truncated page names its cursor: {page}"
+            );
+            after = None;
+        }
+        (objects, prefixes)
+    }
+
+    /// Paging is complete over keys whose encoded and decoded orders
+    /// disagree: every walk — binding tokens, CLI hints, and `--page`
+    /// cursors, small limits, plain and seeded starts, flat and
+    /// rolled-up — reports each key and each folder exactly once. The
+    /// walk-order check first proves the corpus is adversarial: without
+    /// a disagreement the completeness check below would pass vacuously.
+    #[tokio::test]
+    async fn paging_is_complete_over_adversarial_keys() {
+        for key in ADVERSARIAL_FLAT {
+            put_plain("advflat", key).await;
+        }
+        for key in ADVERSARIAL_NESTED {
+            put_plain("advnest", key).await;
+        }
+        for key in ADVERSARIAL_ESCAPED {
+            put_plain("advesc", key).await;
+        }
+        for (bucket, keys, prefix) in [
+            ("advflat", ADVERSARIAL_FLAT, ""),
+            ("advnest", ADVERSARIAL_NESTED, ""),
+            ("advesc", ADVERSARIAL_ESCAPED, ADVERSARIAL_PREFIX),
+        ] {
+            // The walk order is the encoded order; it must differ from
+            // decoded-sorted order or the corpus proves nothing.
+            let (walked, _) = walk_binding(bucket, prefix, None, 1000, None).await;
+            let (sorted, _) = expected_listed(keys, prefix, None, None);
+            assert_ne!(
+                walked, sorted,
+                "the {bucket} corpus walks in decoded order: no order disagrees"
+            );
+            for delimiter in [None, Some("/")] {
+                for limit in [1, 2, 3] {
+                    for seed in [None, sorted.get(sorted.len() / 2).map(String::as_str)] {
+                        let (expected_objects, expected_prefixes) =
+                            expected_listed(keys, prefix, delimiter, seed);
+                        for (name, walked) in [
+                            (
+                                "binding",
+                                walk_binding(bucket, prefix, delimiter, limit, seed).await,
+                            ),
+                            (
+                                "hint",
+                                walk_hint(bucket, prefix, delimiter, limit, seed).await,
+                            ),
+                            (
+                                "page",
+                                walk_page(bucket, prefix, delimiter, limit, seed).await,
+                            ),
+                        ] {
+                            let mut objects = walked.0;
+                            objects.sort_unstable();
+                            assert_eq!(
+                                objects, expected_objects,
+                                "{name} walk over {bucket} (delimiter {delimiter:?}, limit {limit}, seed {seed:?}): keys skipped or duplicated"
+                            );
+                            // One folder per rolled-up prefix: keys under a
+                            // prefix sort contiguously, so a reported folder
+                            // is always fully consumed in its page.
+                            let mut prefixes = walked.1;
+                            prefixes.sort_unstable();
+                            assert_eq!(
+                                prefixes, expected_prefixes,
+                                "{name} walk over {bucket} (delimiter {delimiter:?}, limit {limit}, seed {seed:?}): prefixes skipped or duplicated"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// A delimiter page's trailing prefix resumes past the folder: the
+    /// next page lists what follows it, not the folder again. The row's
+    /// cursor is the last key that rolled into it, not the prefix string,
+    /// which encodes ahead of the keys it stands for.
+    #[tokio::test]
+    async fn delimiter_hint_passes_its_prefix() {
+        for key in ["a/1", "a/2", "b/1", "top.txt"] {
+            put_plain("hintprefix", key).await;
+        }
+        let page = fetch_text_page("hintprefix", "", Some("/"), &Resume::From(None), None, 2)
+            .await
+            .expect("list the page");
+        let rows: Vec<String> = page
+            .rows
+            .iter()
+            .map(|row| row.text().into_owned())
+            .collect();
+        assert_eq!(rows, ["a/", "b/"]);
+        assert!(page.next.is_some());
+        let hint = page
+            .rows
+            .last()
+            .map(Resumable::cursor)
+            .expect("a row to resume after")
+            .to_string();
+        assert_eq!(hint, "b/1");
+        let resumed = fetch_text_page(
+            "hintprefix",
+            "",
+            Some("/"),
+            &Resume::From(None),
+            Some(hint),
+            100,
+        )
+        .await
+        .expect("list the next page");
+        let rows: Vec<String> = resumed
+            .rows
+            .iter()
+            .map(|row| row.text().into_owned())
+            .collect();
+        assert_eq!(rows, ["top.txt"], "the folder answered twice");
+    }
+
+    /// When `--cursor` and `--after` meet, the cursor wins, as in a
+    /// Worker's `list()`: the seed continues the walk it came from, and
+    /// the bound only starts one.
+    #[tokio::test]
+    async fn cursor_seed_wins_over_after() {
+        for key in ["a", "b", "c"] {
+            put_plain("cursorwins", key).await;
+        }
+        let rows = |page: &Page<Row>| {
+            page.rows
+                .iter()
+                .map(|row| row.text().into_owned())
+                .collect::<Vec<_>>()
+        };
+        let from_cursor = fetch_text_page(
+            "cursorwins",
+            "",
+            None,
+            &Resume::From(None),
+            Some("a".to_string()),
+            100,
+        )
+        .await
+        .expect("list the page");
+        assert_eq!(rows(&from_cursor), ["b", "c"]);
+        let both = fetch_text_page(
+            "cursorwins",
+            "",
+            None,
+            &Resume::From(Some("b".to_string())),
+            Some("a".to_string()),
+            100,
+        )
+        .await
+        .expect("list the page");
+        assert_eq!(rows(&both), ["b", "c"]);
+        let bound = fetch_text_page(
+            "cursorwins",
+            "",
+            None,
+            &Resume::From(Some("b".to_string())),
+            None,
+            100,
+        )
+        .await
+        .expect("list the page");
+        assert_eq!(rows(&bound), ["c"]);
+    }
+
+    /// A complete `--page` omits `cursor`, as a Worker's `list()` does:
+    /// callers test `truncated` before reading it.
+    #[tokio::test]
+    async fn page_omits_cursor_when_complete() {
+        for key in ["a", "b"] {
+            put_plain("pagecursor", key).await;
+        }
+        let bounds = Bounds::default();
+        let page = list_json("pagecursor", "", None, &bounds, None)
+            .await
+            .expect("list the page");
+        assert_eq!(page.get("truncated"), Some(&json!(false)));
+        assert!(
+            page.get("cursor").is_none(),
+            "a complete page names no cursor: {page}"
+        );
+    }
+
+    /// A `--page` object carries the `customMetadata` a Worker's `list()`
+    /// returns when the caller asked for it, as it carries `httpMetadata`.
+    #[tokio::test]
+    async fn page_objects_carry_custom_metadata() {
+        crate::host_channels::set_r2_store(crate::bucket::Bucket::for_test());
+        let request = serde_json::from_value(serde_json::json!({
+            "http": {},
+            "custom": { "team": "field" },
+        }))
+        .expect("parse the put options");
+        crate::r2_store::put_once(
+            "pagecustom".to_string(),
+            "report.txt".to_string(),
+            b"body".to_vec(),
+            request,
+        )
+        .await
+        .expect("put the test object");
+        let bounds = Bounds::default();
+        let page = list_json("pagecustom", "", None, &bounds, None)
+            .await
+            .expect("list the page");
+        let objects = page
+            .get("objects")
+            .and_then(Value::as_array)
+            .expect("the page carries objects");
+        assert_eq!(objects.len(), 1);
+        assert_eq!(
+            objects[0].get("customMetadata"),
+            Some(&json!({ "team": "field" })),
+            "the page carries customMetadata: {page}"
+        );
+    }
+
+    /// `--page` already prints one JSON page object, so `--json` beside
+    /// it is refused rather than silently meaning nothing.
+    #[test]
+    fn page_refuses_json() {
+        assert!(parse(&["list", "bucket", "--page", "--json"]).is_err());
+    }
+
+    /// A truncated listing continues with the cursor it answered with,
+    /// past any order the keys sort in.
+    #[test]
+    fn list_takes_a_cursor() {
+        let command = parse(&["list", "bucket", "--cursor", "a/2"])
+            .expect("parse the listing")
+            .expect("a verb was given");
+        assert!(
+            matches!(command.action, Action::List { cursor: Some(cursor), .. } if cursor == "a/2")
+        );
+    }
+
+    #[test]
+    fn other_verbs_refuse_a_cursor() {
+        for verb in ["get", "head", "put", "delete"] {
+            let arguments: Vec<&str> = match verb {
+                "put" => vec![verb, "bucket", "key", "--cursor", "a/2", "--pipe"],
+                "get" | "head" => vec![verb, "bucket", "key", "--cursor", "a/2"],
+                _ => vec![verb, "bucket", "key", "--cursor", "a/2"],
+            };
+            assert!(parse(&arguments).is_err(), "{verb} accepted --cursor");
+        }
+    }
 }

@@ -9,7 +9,7 @@ README below is kept intact; this file documents the fork.
 
 - `main` mirrors upstream `main` and carries no patches.
 - `ryuzcorp/v<version>` is a line branch: the upstream tag `v<version>`
-  plus our patches as commits, one commit per patch, in `0001`-`0016`
+  plus our patches as commits, one commit per patch, in `0001`-`0017`
   order. Each patch commit is self-contained and carries its own tests.
 
 Upstream's `.github/workflows/release.yml` targets `ghcr.io/denoland` and
@@ -222,7 +222,7 @@ push to `ghcr.io/denoland`, but still. Pushing a branch named
   and the container is untouched. The image needs `sh`, `grep` and
   `/proc`; an undelivered kill logs `container_exec_kill_failed`. This
   also makes `0010`'s abort signal reach the process.
-- `0016` (sha TBD at merge) container exec reads survive their
+- `0016` (`219b790`) container exec reads survive their
   subscribing event: a read issued in one event and consumed in
   another (a read-ahead, a terminal frame) re-subscribes per event
   like a retained wait instead of hanging on the dropped op, while
@@ -230,6 +230,14 @@ push to `ghcr.io/denoland`, but still. Pushing a branch named
   re-subscription and the lease slot turns a late pile-up aside, so
   bytes arrive exactly once. Test-only in-memory exec processes
   stand in for the daemon where no engine exists.
+- `0017` (sha TBD at merge) `celld r2 list` takes `--delimiter` and,
+  with `--page`, prints one page — decoded keys with `httpMetadata`
+  and `customMetadata`, plus `delimitedPrefixes`, `truncated` and
+  `cursor` — through the same listing the R2 binding calls; a truncated
+  listing continues with `--cursor`, because `startAfter` compares
+  decoded keys in UTF-8 byte order while the store walks the encoded
+  form, so continuing by `--after` can omit keys. `--json` keeps
+  upstream's one-record-per-line output.
 
 ## Releases
 
