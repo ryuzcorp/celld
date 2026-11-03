@@ -1,4 +1,4 @@
-// Modified for Noite (ryuzcorp/noite, docker/celld/patches): exec() waits for start(); exec pty/resize.
+// Modified by ryuzcorp (ryuzcorp/celld): exec() waits for start(); exec pty/resize.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! Containers attached to Durable Objects: the engine side of

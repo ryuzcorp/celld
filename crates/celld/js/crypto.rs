@@ -1,4 +1,4 @@
-// Modified for Noite (ryuzcorp/noite, docker/celld/patches): node:crypto scrypt.
+// Modified by ryuzcorp (ryuzcorp/celld): node:crypto scrypt.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! Web Crypto and node:crypto: the key formats and the primitives.

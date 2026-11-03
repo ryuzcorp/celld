@@ -1,4 +1,4 @@
-// Modified for Noite (ryuzcorp/noite, docker/celld/patches): node:crypto scrypt.
+// Modified by ryuzcorp (ryuzcorp/celld): node:crypto scrypt.
 // node:crypto for celld -- a port of Workerd's implementation at commit
 // 191a27f941300dd8956f2afeb66c10a651108c0b. Copyright (c) 2017-2022
 // Cloudflare, Inc. (Apache-2.0), itself adapted from Node.js (Joyent and
