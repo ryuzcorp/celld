@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): idempotent content-tagged image create.
+// Modified by ryuzcorp (ryuzcorp/celld): idempotent content-tagged image create; tag-race tests run the fake engine through sh.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 // Deployment is an operator control-plane path outside the Actor execution
@@ -768,12 +768,17 @@ fn engine_cli() -> String {
     std::env::var("CELLD_DOCKER").unwrap_or_else(|_| "docker".to_string())
 }
 
-fn run_engine_cli(cli: &str, args: &[&str], what: &str) -> anyhow::Result<String> {
-    let output = Command::new(cli)
+/// Run the engine CLI: `cli` is the program and any leading arguments.
+fn run_engine_cli(cli: &[&str], args: &[&str], what: &str) -> anyhow::Result<String> {
+    let (program, leading) = cli
+        .split_first()
+        .context("the engine CLI names no program")?;
+    let output = Command::new(program)
+        .args(leading)
         .args(args)
         .stdin(std::process::Stdio::null())
         .output()
-        .with_context(|| format!("{what}: run `{cli}`; is a Docker or Podman CLI on PATH?"))?;
+        .with_context(|| format!("{what}: run `{program}`; is a Docker or Podman CLI on PATH?"))?;
     if !output.status.success() {
         bail!(
             "{what} failed:\n{}",
@@ -796,12 +801,13 @@ fn run_engine_cli(cli: &str, args: &[&str], what: &str) -> anyhow::Result<String
 /// builds, so their hash names the image everywhere: in the manifest, in
 /// the bucket key, and as the tag every engine holds it under.
 fn resolve_image(root: &Path, image: &str, platform: Option<&str>) -> anyhow::Result<String> {
-    resolve_image_cli(&engine_cli(), root, image, platform)
+    resolve_image_cli(&[&engine_cli()], root, image, platform)
 }
 
-/// `resolve_image` against an explicit engine CLI.
+/// `resolve_image` against an explicit engine CLI: the program and any
+/// leading arguments.
 fn resolve_image_cli(
-    cli: &str,
+    cli: &[&str],
     root: &Path,
     image: &str,
     platform: Option<&str>,
@@ -3081,12 +3087,14 @@ mod deploy_contract {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
 
-    /// A fake engine CLI: builds answer with `built_id`, inspects of that
-    /// id answer with `built_content`, inspects of anything else (the
+    /// A fake engine CLI script: builds answer with `built_id`, inspects of
+    /// that id answer with `built_content`, inspects of anything else (the
     /// content tag under contention) answer with `tagged_content`, and
-    /// every tag fails the way the engine fails a lost tag race.
+    /// every tag fails the way the engine fails a lost tag race. Tests run
+    /// it through `sh` rather than executing it: executing a file just
+    /// written races any concurrent test's fork, which can still hold the
+    /// write descriptor, and fails with ETXTBSY.
     fn fake_engine(
         dir: &Path,
         built_id: &str,
@@ -3115,7 +3123,6 @@ fi
         .replace("CELLD_TEST_BUILT_CONTENT", built_content)
         .replace("CELLD_TEST_TAGGED_CONTENT", tagged_content);
         std::fs::write(&cli, script).unwrap();
-        std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
         cli
     }
 
@@ -3123,8 +3130,8 @@ fi
         std::fs::write(dir.join("Dockerfile"), "FROM scratch\n").unwrap();
     }
 
-    fn cli_str(cli: &Path) -> &str {
-        cli.to_str().unwrap()
+    fn sh(script: &Path) -> [&str; 2] {
+        ["/bin/sh", script.to_str().unwrap()]
     }
 
     #[test]
@@ -3133,7 +3140,7 @@ fi
         dockerfile_project(dir.path());
         let content = "[layer-a]{config-a}";
         let cli = fake_engine(dir.path(), "fake-built-id", content, content);
-        let reference = resolve_image_cli(cli_str(&cli), dir.path(), "Dockerfile", None)
+        let reference = resolve_image_cli(&sh(&cli), dir.path(), "Dockerfile", None)
             .expect("an identical image under the tag is the lost race's winner");
         assert_eq!(
             reference,
@@ -3151,7 +3158,7 @@ fi
             "[layer-a]{config-a}",
             "[layer-b]{config-b}",
         );
-        let error = resolve_image_cli(cli_str(&cli), dir.path(), "Dockerfile", None)
+        let error = resolve_image_cli(&sh(&cli), dir.path(), "Dockerfile", None)
             .expect_err("a different image under the tag must still fail");
         let message = format!("{error:?}");
         assert!(
