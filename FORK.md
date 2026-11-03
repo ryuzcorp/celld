@@ -84,14 +84,16 @@ publish resolves `v<new>` from origin, and refuses without it:
     # confirm v<new> is the expected upstream commit
     git push origin v<new>
 
-then start a new line branch at the new upstream tag and rebase the
-patch commits onto it:
+then create the new line branch at the bare upstream tag, and carry the
+patch commits over on a separate patch branch (never rebase the old line
+branch itself; it keeps serving its published tags):
 
-    git checkout -b ryuzcorp/v<new> v<new>
-    git rebase --onto v<new> v<old> ryuzcorp/v<old>
+    git push origin v<new>:refs/heads/ryuzcorp/v<new>
+    git checkout -b patches-v<new> ryuzcorp/v<old>
+    git rebase --onto v<new> v<old>
 
 then resolve conflicts, run the full test suite, and open a pull request
-into the new line branch.
+from `patches-v<new>` into `ryuzcorp/v<new>`.
 
 ## Rulesets
 
@@ -102,7 +104,9 @@ protection behind them. These rulesets are live:
   direct pushes), 0 approvals, strict required checks `Test and build
   (amd64)` and `Test and build (arm64)`, linear history with
   rebase-only merges, no force-push, no deletion, and resolved-threads
-  required. The repo allows rebase merges only.
+  required. Creating a new line branch is exempt from the required checks
+  (it starts at a bare upstream tag); everything after goes through pull
+  requests. The repo allows rebase merges only.
 - `release tags` on `v*-ryuzcorp.*`: creation restricted to repo
   admins, no update, no deletion.
 - `upstream tags immutable` on `v[0-9]*`: no update, no deletion (the
