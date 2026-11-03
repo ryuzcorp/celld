@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): operator token for the internal listener; list_page resume is a cursor; ported from meln1k/celld: seal a dead lease that never opened a log (01522b3).
+// Modified by ryuzcorp (ryuzcorp/celld): operator token for the internal listener; list_page resume is a cursor; ported from meln1k/celld: seal a dead lease that never opened a log (01522b3); seal_absent_log regression tests.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! v0 of the in-fleet replicated log tier (`CELLD_DURABILITY=fleet`).
@@ -7028,3 +7028,205 @@ impl NodeLogManager {
 
 #[cfg(all(test, celld_internal_tests))]
 include!(env!("CELLD_INTERNAL_NODE_LOG_OBSERVERS"));
+
+#[cfg(test)]
+mod seal_absent_log_tests {
+    use super::*;
+    use crate::ownership_store::{NodeLeaseWire, NodeLoadWire, NodeLogWire};
+
+    fn test_manager(dir: &std::path::Path) -> (NodeLogManager, Arc<Bucket>) {
+        let database = dir.join("objects.sqlite3");
+        let bucket = Arc::new(crate::dev::open_local_bucket(&database).expect("dev bucket"));
+        let replication = crate::ltx_replication::Replication::start(
+            bucket.as_ref().clone(),
+            &dir.join("watch"),
+            None,
+            "test".into(),
+            None,
+        )
+        .expect("replication starts");
+        let ownership = Arc::new(crate::ownership_store::BucketOwnership::new(
+            bucket.as_ref().clone(),
+            bucket.as_ref().clone(),
+            "n0".into(),
+            "test-probe-key".into(),
+        ));
+        let own_log = Arc::new(OwnLog {
+            ownership,
+            nudge: Box::new(|| {}),
+            write_lock: tokio::sync::Mutex::new(()),
+        });
+        let auth = Arc::new(PeerAuth::new([0u8; 32], "n0").expect("test auth"));
+        let manager = NodeLogManager::new(
+            "n0/gen1",
+            bucket.clone(),
+            own_log,
+            replication.ltx(),
+            auth,
+            celld_logic::log_evict::EvictionPolicy::default(),
+        );
+        (manager, bucket)
+    }
+
+    fn lease(expires_ms: u64, log: Option<NodeLogWire>) -> NodeLeaseWire {
+        NodeLeaseWire {
+            node: "dead".into(),
+            expires_ms,
+            addr: String::new(),
+            probe_public_key: String::new(),
+            peer_protocol: 1,
+            paced_handoff: false,
+            generation: String::new(),
+            log,
+            load: NodeLoadWire::default(),
+        }
+    }
+
+    fn open_log() -> NodeLogWire {
+        NodeLogWire {
+            state: "open".into(),
+            epoch: 1,
+            ensemble: Vec::new(),
+            tiered: 0,
+            may_have_fleet_acks: false,
+            claimant: None,
+            claimed_ms: None,
+        }
+    }
+
+    /// A missing lease proves the node never acked past the bucket.
+    #[test]
+    fn absent_lease_is_a_proof() {
+        let runtime = crate::asyncrt::shared_test_runtime();
+        let dir = tempfile::tempdir().expect("test dir");
+        let (manager, _) = test_manager(dir.path());
+        let proved = runtime
+            .block_on(manager.seal_absent_log("dead"))
+            .expect("seal runs");
+        assert!(proved, "a missing lease proves the bucket complete");
+    }
+
+    /// A lease that reads live refuses the seal instead of fencing a
+    /// session that may still be writing.
+    #[test]
+    fn live_lease_refuses_the_seal() {
+        let runtime = crate::asyncrt::shared_test_runtime();
+        let dir = tempfile::tempdir().expect("test dir");
+        let (manager, bucket) = test_manager(dir.path());
+        runtime.block_on(async {
+            let now = crate::ownership_store::now_ms();
+            bucket
+                .put(
+                    &lease_key("dead"),
+                    serde_json::to_vec(&lease(now + 3_600_000, None)).expect("wire encodes"),
+                )
+                .await
+                .expect("seed lease");
+            let error = manager
+                .seal_absent_log("dead")
+                .await
+                .expect_err("a live lease refuses");
+            assert!(
+                error.to_string().contains("live again"),
+                "the refusal names the live lease: {error}"
+            );
+        });
+    }
+
+    /// A dead lease with no log seals: the written record carries a
+    /// sealed epoch-zero log and keeps the dead expiry, so the seal
+    /// fences without reviving.
+    #[test]
+    fn dead_logless_lease_seals() {
+        let runtime = crate::asyncrt::shared_test_runtime();
+        let dir = tempfile::tempdir().expect("test dir");
+        let (manager, bucket) = test_manager(dir.path());
+        runtime.block_on(async {
+            bucket
+                .put(
+                    &lease_key("dead"),
+                    serde_json::to_vec(&lease(1, None)).expect("wire encodes"),
+                )
+                .await
+                .expect("seed lease");
+            let sealed = manager.seal_absent_log("dead").await.expect("seal runs");
+            assert!(sealed, "the seal wins on a dead logless lease");
+            let (bytes, _) = bucket
+                .get(&lease_key("dead"))
+                .await
+                .expect("read back")
+                .expect("record exists");
+            let wire: NodeLeaseWire = serde_json::from_slice(&bytes).expect("wire parses");
+            assert_eq!(wire.expires_ms, 1, "the seal extends no expiry");
+            let log = wire.log.expect("the seal wrote a log");
+            assert_eq!(log.state, "sealed");
+            assert_eq!(log.epoch, 0);
+        });
+    }
+
+    /// A dead lease that gained a log is not sealed: `false` re-reads
+    /// and the record goes through normal recovery instead.
+    #[test]
+    fn log_gaining_lease_rereads() {
+        let runtime = crate::asyncrt::shared_test_runtime();
+        let dir = tempfile::tempdir().expect("test dir");
+        let (manager, bucket) = test_manager(dir.path());
+        runtime.block_on(async {
+            bucket
+                .put(
+                    &lease_key("dead"),
+                    serde_json::to_vec(&lease(1, Some(open_log()))).expect("wire encodes"),
+                )
+                .await
+                .expect("seed lease");
+            let sealed = manager.seal_absent_log("dead").await.expect("seal runs");
+            assert!(!sealed, "a log-gaining lease re-reads");
+        });
+    }
+
+    /// The CAS-conflict arm: a renewal landing between the seal's read
+    /// and its write moves the etag, so the write applies nothing and
+    /// the seal reports `false` (re-read) rather than fencing on stale
+    /// state. The seal reads fresh on every call, so the conflict is
+    /// driven here through the write it performs.
+    #[test]
+    fn stale_token_loses_the_seal_cas() {
+        let runtime = crate::asyncrt::shared_test_runtime();
+        let dir = tempfile::tempdir().expect("test dir");
+        let (_, bucket) = test_manager(dir.path());
+        runtime.block_on(async {
+            let key = lease_key("dead");
+            bucket
+                .put(
+                    &key,
+                    serde_json::to_vec(&lease(1, None)).expect("wire encodes"),
+                )
+                .await
+                .expect("seed lease");
+            let (bytes, token) = bucket
+                .get(&key)
+                .await
+                .expect("read back")
+                .expect("record exists");
+            let wire: NodeLeaseWire = serde_json::from_slice(&bytes).expect("wire parses");
+            // A renewal lands after the read and moves the etag.
+            let mut renewed = wire.clone();
+            renewed.expires_ms = crate::ownership_store::now_ms() + 3_600_000;
+            bucket
+                .put(&key, serde_json::to_vec(&renewed).expect("wire encodes"))
+                .await
+                .expect("renew lease");
+            let applied = write_dead_record(
+                &bucket,
+                "dead",
+                &wire,
+                &log_tier::sealed_absent(),
+                false,
+                &token,
+            )
+            .await
+            .expect("cas runs");
+            assert!(applied.is_none(), "a stale token loses the CAS race");
+        });
+    }
+}

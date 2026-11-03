@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): exec() waits for start(); exec pty/resize; fence node-netns exception; process-granularity exec kill; kill conformance tests; exec reads survive their subscribing event; worker container endpoints for the tenant egress policy.
+// Modified by ryuzcorp (ryuzcorp/celld): exec() waits for start(); exec pty/resize; fence node-netns exception; process-granularity exec kill; kill conformance tests; exec reads survive their subscribing event; worker container endpoints for the tenant egress policy; exec-kill tests share the common test runtime.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! Containers attached to Durable Objects: the engine side of
@@ -3100,13 +3100,12 @@ mod kill_tests {
     }
 
     /// The engine futures these tests run spawn their demux pumps
-    /// through the execution domain, installed here once for the test
-    /// binary.
+    /// through the execution domain. The shared test runtime installs
+    /// it once for the test binary; installing a second handle here
+    /// would trip `set_host_handle`'s exactly-once assert now that
+    /// other lib tests share the same installer.
     fn ensure_domain() {
-        static DOMAIN: std::sync::Once = std::sync::Once::new();
-        DOMAIN.call_once(|| {
-            asyncrt::set_host_handle(tokio::runtime::Handle::current());
-        });
+        let _ = asyncrt::shared_test_runtime();
     }
 
     /// exec sleep -> kill(9) -> exitCode settles 137, container alive:

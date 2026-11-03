@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): cross-isolate RPC stubs and streams.
+// Modified by ryuzcorp (ryuzcorp/celld): cross-isolate RPC stubs and streams; worker-less residency for registry tests.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 // Isolate admission and deadlines are in the V8 arm outside the Actor execution
@@ -534,6 +534,33 @@ impl Drop for Residency {
             self.slot.adopted_cells.fetch_sub(1, Ordering::Relaxed);
         }
         self.slot.cells.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// A residency over a worker-less slot, for registry tests that never
+/// adopt or enter it. The slot counts mirror `house`/`Drop` exactly.
+#[cfg(test)]
+impl Residency {
+    pub(crate) fn without_worker_for_test() -> Self {
+        let slot = Arc::new_cyclic(|me| Slot {
+            me: me.clone(),
+            id: 0,
+            heap_id: next_heap_id(),
+            worker: tokio::sync::Mutex::new(None),
+            turn_scheduler: TurnScheduler::default(),
+            queue_producers: Mutex::new(std::collections::HashMap::new()),
+            turns: AtomicUsize::new(0),
+            requests: AtomicUsize::new(0),
+            freed: Arc::new(tokio::sync::Notify::new()),
+            reclaim: None,
+            loaded_worker: false,
+            cells: AtomicUsize::new(0),
+            adopted_cells: AtomicUsize::new(0),
+            retiring: AtomicBool::new(false),
+            #[cfg(celld_internal_tests)]
+            turn_observations: Mutex::new(Vec::new()),
+        });
+        slot.house(1)
     }
 }
 

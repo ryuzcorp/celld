@@ -1,3 +1,4 @@
+// Modified by ryuzcorp (ryuzcorp/celld): shared Tokio runtime for node-booting unit tests.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 // This module owns the ambient production primitives which the boundary lint
@@ -193,6 +194,25 @@ pub fn set_host_handle(handle: tokio::runtime::Handle) {
         PROCESS_DOMAIN.set(ProductionDomain::new(handle)).is_ok(),
         "asyncrt::set_host_handle must run exactly once"
     );
+}
+
+/// The process-wide Tokio runtime unit tests boot node state on, with
+/// the asyncrt host handle installed exactly once. `#[tokio::test]`
+/// runtimes die with their test, so sharing one runtime keeps the
+/// installed handle (and every task spawned through it) alive for the
+/// whole test process.
+#[cfg(test)]
+pub(crate) fn shared_test_runtime() -> &'static tokio::runtime::Runtime {
+    static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+    RUNTIME.get_or_init(|| {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(4)
+            .enable_all()
+            .build()
+            .expect("test runtime builds");
+        set_host_handle(runtime.handle().clone());
+        runtime
+    })
 }
 
 /// Return the Tokio handle for the V8 arm.
