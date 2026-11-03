@@ -9,7 +9,7 @@ README below is kept intact; this file documents the fork.
 
 - `main` mirrors upstream `main` and carries no patches.
 - `ryuzcorp/v<version>` is a line branch: the upstream tag `v<version>`
-  plus our patches as commits, one commit per patch, in `0001`-`0030`
+  plus our patches as commits, one commit per patch, in `0001`-`0031`
   order. Each patch commit is self-contained and carries its own tests.
 
 Upstream's `.github/workflows/release.yml` targets `ghcr.io/denoland` and
@@ -323,6 +323,13 @@ push to `ghcr.io/denoland`, but still. Pushing a branch named
   and fence clears the handoff mark; preserve settles a
   confirming read. Adds scripted reproductions for the drain
   ceiling, the handoff wait and clear, and the preserve settle.
+- `0031` (sha TBD at merge) port of the two core fixes in
+  meln1k/celld@468b456 (lib.rs hunks only; sim/docs files not
+  ported): a reset drops the cell's sockets with its runtime,
+  fixing the `live transport while not resident` panic, and a
+  hibernatable socket's events wait for the restarted runtime
+  on a quiescing cell, fixing the swap deadlock. Adds scripted
+  reproductions for both.
 
 ## Releases
 
