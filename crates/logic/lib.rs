@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): ported from meln1k/celld: retire a superseded ownership release (ea471ee).
+// Modified by ryuzcorp (ryuzcorp/celld): ported from meln1k/celld: coordination-core fixes (ea471ee, e46a685).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! Clean-sheet celld decision core.
@@ -6658,6 +6658,11 @@ impl State {
                 self.cell_ops.remove(&op);
             }
             set_phase(&mut self.occupied, &mut cell, Phase::Fenced);
+            // A startup confirmation read cannot settle a fenced cell: its
+            // answer is stale on arrival, and the node is halting.
+            if std::mem::take(&mut cell.confirming) {
+                self.settle_confirmation(&id);
+            }
             cell.waiting_for = None;
             cell.waiting_activation = None;
             cell.alarm = None;
