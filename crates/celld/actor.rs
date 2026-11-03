@@ -1,3 +1,4 @@
+// Modified by ryuzcorp (ryuzcorp/celld): cross-isolate RPC stubs and streams.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! The serial lifecycle executor and its shell-side request drivers.
@@ -1773,6 +1774,16 @@ impl AppHandle {
         let Ok(mut state) = serde_json::from_str::<serde_json::Value>(&state) else {
             return state;
         };
+        // Live cross-isolate RPC stubs: an operator watches this beside the
+        // isolate census, because a count that grows without bound is a stub
+        // leak in one of the resident cells. The per-scope breakdown names
+        // the leaking scope; the upload count covers caller-pushed streams,
+        // which share the stub lifetime. Ids never surface here.
+        state["hostStubCount"] = serde_json::Value::from(crate::stub_table::host_stub_count());
+        state["hostStubCountByScope"] =
+            serde_json::to_value(crate::stub_table::host_stub_counts_by_scope())
+                .unwrap_or(serde_json::Value::Null);
+        state["uploadCount"] = serde_json::Value::from(crate::upload_table::upload_count());
         if !pins.is_empty() {
             state["drainPins"] =
                 serde_json::to_value(pins).unwrap_or_else(|_| serde_json::json!([]));

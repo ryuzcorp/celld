@@ -1,4 +1,4 @@
-<!-- Modified by ryuzcorp (ryuzcorp/celld): node:crypto scrypt; cloned streaming bodies. -->
+<!-- Modified by ryuzcorp (ryuzcorp/celld): node:crypto scrypt; cloned streaming bodies; cross-isolate RPC stubs and streams. -->
 # Cloudflare compatibility
 
 This page lists only the differences from the linked Cloudflare APIs. An entry
@@ -91,16 +91,65 @@ The `tail` and `email` handlers are unavailable.
 
 ### [RPC](https://developers.cloudflare.com/workers/runtime-apis/rpc/)
 
-- An RPC stub cannot cross an isolate boundary.
-- An `AbortSignal` in a Durable Object RPC call does not cross a node boundary.
+- Durable Object RPC stubs cross isolate boundaries on the same node: a
+  method called on a stub returned by another isolate runs against the
+  owning cell. A stub whose owner runs on another node rejects with a
+  clear error (no cross-node forwarding yet); a stub whose owner was
+  evicted or reloaded rejects like a released same-isolate stub. Old-shape
+  markers (no host id) keep failing on use exactly as before.
+- A stub (or stream) received by a caller is owned by the caller's
+  request: when the fetch/RPC/alarm/queue invocation ends, everything it
+  still holds is disposed and every release routes to the owner. There is
+  no idle expiry: a quiet-but-live handle stays usable however long
+  nothing flows, and a validated operation pins its entry so a release
+  racing it cannot fail it. Owner eviction revokes synchronously, and
+  isolate retirement releases whatever the freed isolate still held.
+- A caller-owned `ReadableStream` passed in call arguments crosses to the
+  cell through an upload channel: the caller's isolate pumps it host-side
+  (bounded, backpressured) and the cell pulls. Cancellation propagates
+  both ways, and the channel dies with the sender's invocation. A
+  caller-owned `WritableStream` has no reverse path: it keeps a
+  same-isolate marker and fails on use across isolates.
+- Minting is capped per scope (4096 live stubs) and per process (65536
+  stubs, 8192 uploads), failing the call with a clear error past the cap.
+  `CELLD_STUB_SCOPE_CAP`, `CELLD_STUB_PROCESS_CAP`, and `CELLD_UPLOAD_CAP`
+  override the caps. Stub ids are 128-bit bearer tokens bound to the
+  isolate that revived them; a stolen id alone is useless, and ids never
+  log or serialize observably. Upload ids are process-wide bearer tokens
+  without holder binding (any isolate presenting one can pull, push, or
+  cancel it), contained by the same unguessability, uniform errors, and
+  non-observability: markers never surface to script, and forwarding
+  moves the wrapper rather than the id. One celld process is one fleet,
+  so the bearer boundary is the process.
+- An `AbortSignal` in a Durable Object RPC call crosses on the same node
+  (live: the receiver observes an abort the sender fires later) but does
+  not cross a node boundary.
 - A remote RPC retries only when the failed peer attempt did not start the
   method. Use a stable operation ID for an application retry.
+- Deviations from workerd stub lifetime: a stub used only from `waitUntil`
+  work after the handler settles is already disposed; a stub a Durable
+  Object stores on its instance does not survive into a later invocation;
+  a stub does not survive a socket upgrade. Each fails closed with a
+  disposed error instead of leaking.
+- `globalThis.__celldStubStatsForTestOnly()` reports this isolate's stub
+  counts for the conformance suite. It exists only on nodes booted with
+  `CELLD_TEST_STUB_STATS=1` (a process environment variable, which tenant
+  code cannot set); production isolates never define it. It is test
+  tooling, not a runtime API.
 
 ### [Streams](https://developers.cloudflare.com/workers/runtime-apis/streams/)
 
 - celld expires an unclaimed and inactive HTTP stream after 60 seconds. A
   successful stream operation starts a new 60-second period.
 - An expired or unknown stream reports an error instead of EOF.
+- Byte streams cross isolate boundaries on the same node as part of Durable
+  Object RPC, in both directions: a `ReadableStream` returned by a cell
+  reads chunk by chunk, and a `WritableStream` it returns accepts writes,
+  closes, and aborts. A `ReadableStream` passed in call arguments crosses
+  the other way, pumped caller-side through a bounded host channel the
+  cell pulls (see RPC above). Only byte chunks cross that channel: a
+  non-bytes chunk fails the stream with a disconnect rather than
+  mangling it. Nothing here expires on a timer.
 
 ### [WebSockets](https://developers.cloudflare.com/workers/runtime-apis/websockets/)
 

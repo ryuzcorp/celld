@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): node:crypto scrypt; container exec resize op.
+// Modified by ryuzcorp (ryuzcorp/celld): node:crypto scrypt; container exec resize op; cross-isolate RPC stubs and streams.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 // The raw V8 adapter and its child modules remain outside the Actor execution
@@ -83,6 +83,7 @@ pub use crate::host_channels::set_kv_blob_store;
 pub use crate::host_channels::set_outbound_ws_tx;
 pub use crate::host_channels::set_queue_dispatch_tx;
 pub use crate::host_channels::set_rpc_call_tx;
+pub use crate::host_channels::set_stub_call_tx;
 pub use crate::host_channels::set_svc_call_tx;
 pub use crate::host_channels::set_svc_rpc_tx;
 pub use crate::host_channels::AssetCallReq;
@@ -91,6 +92,8 @@ pub use crate::host_channels::GateReq;
 pub use crate::host_channels::QueueDispatchReq;
 pub use crate::host_channels::QueueLeaseRef;
 pub use crate::host_channels::RpcCallReq;
+pub use crate::host_channels::RpcStubReq;
+pub use crate::host_channels::StubOperation;
 pub use crate::host_channels::SvcCallReq;
 pub use crate::host_channels::SvcRpcReq;
 #[cfg(celld_internal_tests)]
@@ -100,6 +103,7 @@ pub(crate) use crate::host_channels::FACET_TX;
 pub(crate) use crate::host_channels::GATE_TX;
 pub(crate) use crate::host_channels::QUEUE_DISPATCH_TX;
 pub(crate) use crate::host_channels::RPC_CALL_TX;
+pub(crate) use crate::host_channels::STUB_CALL_TX;
 pub(crate) use crate::host_channels::SVC_CALL_TX;
 pub(crate) use crate::host_channels::SVC_RPC_TX;
 pub(crate) use crate::http_streams::claim_http_stream;
@@ -605,6 +609,21 @@ pub enum CellJob {
         args: RpcData,
         reply: tokio::sync::oneshot::Sender<Result<RpcOutcome>>,
     },
+    /// One operation on a cross-isolate RPC stub owned by `scope`: a
+    /// method/property path against the exporting entry, or a release of
+    /// it. Answers an `RpcOutcome` like `Rpc`, so replies gate the same
+    /// way. Never creates the instance: dispatch validated the minting
+    /// residency before driving.
+    StubOp {
+        scope: String,
+        stub_id: String,
+        path: Vec<String>,
+        /// Structured-clone arguments, or `None` for a property GET.
+        /// Ignored for a release.
+        args: Option<RpcData>,
+        release: bool,
+        reply: tokio::sync::oneshot::Sender<Result<RpcOutcome>>,
+    },
     WsOpen {
         scope: String,
         ws_id: u64,
@@ -666,6 +685,7 @@ impl CellJob {
         match self {
             CellJob::Fetch { scope, .. }
             | CellJob::Rpc { scope, .. }
+            | CellJob::StubOp { scope, .. }
             | CellJob::WsOpen { scope, .. }
             | CellJob::WsMessage { scope, .. }
             | CellJob::WsClosed { scope, .. }
@@ -706,6 +726,7 @@ impl CellJob {
         match self {
             CellJob::Fetch { reply, .. } => drop(reply.send(Err(error))),
             CellJob::Rpc { reply, .. } => drop(reply.send(Err(error))),
+            CellJob::StubOp { reply, .. } => drop(reply.send(Err(error))),
             CellJob::WsOpen { reply, .. } => drop(reply.send(Err(error))),
             CellJob::WsMessage { reply, .. } => drop(reply.send(Err(error))),
             CellJob::WsClosed { reply, .. } => drop(reply.send(Err(error))),
@@ -5326,6 +5347,69 @@ fn begin_cell(tc: &mut v8::PinScope, job: CellJob, event_time: i64) -> Begun {
                 },
             )
         }
+        CellJob::StubOp {
+            scope,
+            stub_id,
+            path,
+            args,
+            release,
+            reply,
+        } => {
+            // No actor-name registration: a stub op never creates the
+            // instance, and dispatch proved the minting residency still
+            // serves this scope before driving.
+            start_cell_event(
+                tc,
+                &scope,
+                Answer::CellRpc(reply),
+                None,
+                None,
+                false,
+                |tc| {
+                    let recv = v8::undefined(tc).into();
+                    if release {
+                        let f = internal_function(tc, "__disposeHostStub")?;
+                        // Caller-controlled strings, already bounded in
+                        // dispatch; a V8 allocation failure fails the drive,
+                        // never panics across the boundary.
+                        let scope = v8::String::new(tc, &scope)
+                            .ok_or_else(|| anyhow!("stub scope is not representable"))?;
+                        let stub_id = v8::String::new(tc, &stub_id)
+                            .ok_or_else(|| anyhow!("stub id is not representable"))?;
+                        let arguments = [scope.into(), stub_id.into()];
+                        return f
+                            .call(tc, recv, &arguments)
+                            .ok_or_else(|| anyhow!("disposeHostStub threw"));
+                    }
+                    let f = internal_function(tc, "__dispatchStubOp")?;
+                    let mut parts = Vec::with_capacity(path.len());
+                    for part in &path {
+                        let part = v8::String::new(tc, part)
+                            .ok_or_else(|| anyhow!("stub path is not representable"))?;
+                        parts.push(part.into());
+                    }
+                    let path = parts;
+                    // Caller-controlled strings, already bounded in
+                    // dispatch; a V8 allocation failure fails the drive,
+                    // never panics across the boundary.
+                    let scope = v8::String::new(tc, &scope)
+                        .ok_or_else(|| anyhow!("stub scope is not representable"))?;
+                    let stub_id = v8::String::new(tc, &stub_id)
+                        .ok_or_else(|| anyhow!("stub id is not representable"))?;
+                    let arguments = [
+                        scope.into(),
+                        stub_id.into(),
+                        v8::Array::new_with_elements(tc, &path).into(),
+                        match args {
+                            Some(args) => rpc_data_value(tc, args),
+                            None => v8::null(tc).into(),
+                        },
+                    ];
+                    f.call(tc, recv, &arguments)
+                        .ok_or_else(|| anyhow!("dispatchStubOp threw"))
+                },
+            )
+        }
         CellJob::WsOpen {
             scope,
             ws_id,
@@ -5741,7 +5825,11 @@ fn start_fetch<'s>(
         FetchTarget::Default(fetch) => {
             let env = harness_env(tc)?;
             let execution_ctx = begin_event_context(tc)?;
-            fetch.call(tc, recv, &[req, env, execution_ctx])
+            // Through the dispatch wrapper, not the handler directly: it
+            // establishes the invocation's stub context (received stubs
+            // die with the request) and ends it when the answer settles.
+            let dispatch = internal_function(tc, "__dispatchDefaultFetch")?;
+            dispatch.call(tc, recv, &[fetch.into(), req, env, execution_ctx])
         }
     };
     let Some(ret) = ret else {
@@ -6825,6 +6913,20 @@ ops! { OP_NAMES, install_op_functions,
         "__rpc_signal_unsubscribe" => op_rpc_signal_unsubscribe,
         "__do_id" => op_do_id,
         "__rpc_call" => op_rpc_call,
+        "__stub_call" => op_stub_call,
+        "__stub_release" => op_stub_release,
+        "__stub_export" => op_stub_export,
+        "__stub_unexport" => op_stub_unexport,
+        "__stub_acquire" => op_stub_acquire,
+        "__stub_handoff" => op_stub_handoff,
+        "__test_stub_stats_enabled" => op_test_stub_stats_enabled,
+        "__upload_new" => op_upload_new,
+        "__upload_push" => op_upload_push,
+        "__upload_pull" => op_upload_pull,
+        "__upload_close" => op_upload_close,
+        "__upload_fail" => op_upload_fail,
+        "__upload_cancel" => op_upload_cancel,
+        "__upload_abort" => op_upload_abort,
         "__sc_encode" => storage_ops::op_sc_encode,
         "__sc_decode" => storage_ops::op_sc_decode,
         "__structured_clone" => storage_ops::op_structured_clone,
@@ -8986,6 +9088,410 @@ fn op_rpc_call(
     });
     let p = promise_for(scope, id);
     rv.set(p);
+}
+
+/// `__stub_call(stubId, scope, pathJson, argsSc|null)` -> Promise<Uint8Array>;
+/// one operation on a cross-isolate RPC stub. Arguments and result are V8
+/// structured-clone bytes; a null `argsSc` is a property GET. The id, scope,
+/// and path are bounded here (fast, clear errors) and re-checked in dispatch
+/// (authoritative): nothing unbounded reaches the table lookup or a V8
+/// string. Validation happens in dispatch, against the host stub table,
+/// with the caller's heap for the holder check.
+fn op_stub_call(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let stub_id = args.get(0).to_rust_string_lossy(scope);
+    if !crate::stub_table::valid_host_stub_id(&stub_id) {
+        return loader_throw(scope, "stub id is malformed");
+    }
+    let cell = args.get(1).to_rust_string_lossy(scope);
+    if !celld_logic::cell::valid_cell_scope(&cell) {
+        return loader_throw(scope, "stub scope is malformed");
+    }
+    let path: Vec<String> = match serde_json::from_str(&args.get(2).to_rust_string_lossy(scope)) {
+        Ok(path) => path,
+        Err(error) => return loader_throw(scope, &format!("stub path is invalid: {error}")),
+    };
+    if !crate::stub_table::valid_stub_path(&path) {
+        return loader_throw(scope, "stub path breaks the walk budget");
+    }
+    let call_args = args.get(3);
+    let args = (!call_args.is_null())
+        .then(|| RpcData::V8(view_bytes(call_args).unwrap_or_default().into()));
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let gate = egress_gate_request(&event_context(scope), celld_logic::Channel::CellRpc);
+    let caller = crate::pool::current_slot().map(|slot| slot.heap_id());
+    let request = RpcStubReq {
+        scope: cell,
+        stub_id,
+        operation: StubOperation::Call { path, args },
+        caller,
+        reply: tx,
+    };
+    // An io-context op: a floating stub op (a stream cancel, close, or
+    // abort the caller does not await) must survive its event, or the
+    // terminal signal never reaches the owner and the entry leaks until
+    // the sweep. Awaited calls behave as before: their event waits.
+    let id = asyncrt::enqueue_io_context(async move {
+        gated_channel_send(gate, &STUB_CALL_TX, request, "no RPC stub channel").await?;
+        match rx.await {
+            Ok(Ok(RpcData::V8(bytes))) => Ok(Vec::<u8>::from(bytes)),
+            Ok(Ok(RpcData::Json(_))) => {
+                Err("RPC stub answered JSON to a structured-clone call".into())
+            }
+            Ok(Err(e)) => Err(format!("{e}")),
+            Err(e) => Err(format!("stub proxy dropped: {e}")),
+        }
+    });
+    rv.set(promise_for(scope, id));
+}
+
+/// Resolve an empty answer for a release that routes nowhere: an unknown
+/// or malformed id, a release from an isolate holding nothing, or a hold
+/// dropped while other holders remain. Release is idempotent.
+fn resolve_empty_release(scope: &mut v8::PinScope, mut rv: v8::ReturnValue<v8::Value>) {
+    let empty = bytes_value(scope, Vec::new());
+    let done = resolved_promise(scope, empty).expect("a release can resolve an empty answer");
+    rv.set(done.into());
+}
+
+/// `__stub_release(stubId)` -> Promise<Uint8Array>; drops one hold of the
+/// caller's heap for a cross-isolate RPC stub. When the last hold goes the
+/// owner's local entry is disposed by a routed release, and the entry is
+/// taken once that dispose drives (or once the last in-flight op unpins).
+/// While other holders or pins are out, nothing routes. A release from an
+/// isolate holding nothing frees nothing: only a holder may free the
+/// handle, so a forged release cannot dispose the victim's stub.
+fn op_stub_release(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let stub_id = args.get(0).to_rust_string_lossy(scope);
+    if !crate::stub_table::valid_host_stub_id(&stub_id) {
+        resolve_empty_release(scope, rv);
+        return;
+    }
+    let Some(holder) = crate::pool::current_slot().map(|slot| slot.heap_id()) else {
+        resolve_empty_release(scope, rv);
+        return;
+    };
+    // The scope and epoch come from the table, not the caller: a release
+    // names only the id, and the table is authoritative for the rest.
+    let crate::stub_table::ReleaseAction::Route {
+        scope_epoch: (cell, epoch),
+    } = crate::stub_table::release_host_stub_hold(&stub_id, holder)
+    else {
+        resolve_empty_release(scope, rv);
+        return;
+    };
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let gate = egress_gate_request(&event_context(scope), celld_logic::Channel::CellRpc);
+    let request = RpcStubReq {
+        scope: cell,
+        stub_id,
+        operation: StubOperation::Release { epoch },
+        caller: None,
+        reply: tx,
+    };
+    // An io-context op: a release is always fire-and-forget (disposal
+    // paths cannot await), so a handler-lifetime op would die with the
+    // disposing event and the owner's entry would leak until eviction.
+    let id = asyncrt::enqueue_io_context(async move {
+        gated_channel_send(gate, &STUB_CALL_TX, request, "no RPC stub channel").await?;
+        match rx.await {
+            Ok(Ok(_)) => Ok(Vec::new()),
+            Ok(Err(e)) => Err(format!("{e}")),
+            Err(e) => Err(format!("stub proxy dropped: {e}")),
+        }
+    });
+    rv.set(promise_for(scope, id));
+}
+
+/// `__stub_export(scope, kind)` -> JSON `{id, scope, epoch, generation}`;
+/// exports one local entry of `scope` under a host-routable id. Synchronous:
+/// the table is process-local. A facet scope exports under its root's scope
+/// and epoch, so the stub dies with the root. Throws when the scope has no
+/// live residency here, so the lifter can push the value through an upload
+/// channel or keep a same-isolate marker. Past either mint cap it throws a
+/// `celld_cap_exceeded:` error instead, which the lifter propagates: a cap
+/// fails the call with a clear error, never mints dead handles silently.
+fn op_stub_export(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let cell = args.get(0).to_rust_string_lossy(scope);
+    let Some(kind) = crate::stub_table::StubKind::parse(&args.get(1).to_rust_string_lossy(scope))
+    else {
+        return loader_throw(scope, "stub export kind is invalid");
+    };
+    let generation = current_generation(scope);
+    if generation == 0 {
+        return loader_throw(scope, "stub export needs an application generation");
+    }
+    // A facet scope is never published, so a stub minted under one could
+    // never validate: export under the facet's root scope and epoch
+    // instead, so the stub dies with the root. An own-script facet runs
+    // in the root's isolate, so dispatch finds the entry there; a facet
+    // in a loaded Worker's isolate keeps failing closed (its generation
+    // never matches the root's, and the root isolate holds no entry).
+    let (root, epoch) = match crate::storage::embedded_root_gate(&cell) {
+        Some(gate) => (gate.cell, gate.epoch),
+        None => {
+            let Some(epoch) = crate::storage::activation_epoch(&cell) else {
+                return loader_throw(scope, "stub export needs a resident owning cell");
+            };
+            (cell.clone(), epoch)
+        }
+    };
+    let id = match crate::stub_table::mint_host_stub(root.clone(), epoch, generation, kind) {
+        Ok(id) => id,
+        Err(crate::stub_table::MintRejection::ScopeCap) => {
+            return loader_throw(
+                scope,
+                &format!(
+                    "celld_cap_exceeded: too many live cross-isolate RPC stubs for {root} \
+                     (limit {}); release idle stubs",
+                    crate::stub_table::scope_cap()
+                ),
+            );
+        }
+        Err(crate::stub_table::MintRejection::ProcessCap) => {
+            return loader_throw(
+                scope,
+                &format!(
+                    "celld_cap_exceeded: too many live cross-isolate RPC stubs on this node \
+                     (limit {}); release idle stubs",
+                    crate::stub_table::process_cap()
+                ),
+            );
+        }
+        Err(crate::stub_table::MintRejection::Occupied) => {
+            return loader_throw(scope, "stub export id collided");
+        }
+    };
+    let exported = serde_json::json!({
+        "id": id,
+        "scope": root,
+        "epoch": epoch,
+        "generation": generation,
+    });
+    let Some(exported) = v8::String::new(scope, &exported.to_string()) else {
+        return loader_throw(scope, "stub export is not representable");
+    };
+    rv.set(exported.into());
+}
+
+/// `__stub_unexport(stubId)`; forgets one host id without routing anywhere.
+/// The owner's `__cellRelease` calls this synchronously for every id the
+/// residency exported, so eviction needs no round trip to revoke them.
+fn op_stub_unexport(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue<v8::Value>,
+) {
+    let stub_id = args.get(0).to_rust_string_lossy(scope);
+    if !crate::stub_table::valid_host_stub_id(&stub_id) {
+        return;
+    }
+    crate::stub_table::unexport_host_stub(&stub_id);
+}
+
+/// `__stub_acquire(stubId)`; registers one live handle of this isolate for
+/// a revived host stub, or for a `dup()` of one. Synchronous and
+/// best-effort: the table is process-local, and a revive racing owner
+/// eviction simply finds no entry — its handle then fails on use like any
+/// released stub.
+fn op_stub_acquire(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue<v8::Value>,
+) {
+    let stub_id = args.get(0).to_rust_string_lossy(scope);
+    if !crate::stub_table::valid_host_stub_id(&stub_id) {
+        return;
+    }
+    let Some(holder) = crate::pool::current_slot().map(|slot| slot.heap_id()) else {
+        return;
+    };
+    crate::stub_table::acquire_host_stub(&stub_id, holder);
+}
+
+/// `__stub_handoff(stubId)`; moves one hold off this isolate for a handle
+/// forwarded into an envelope. The receiver acquires on revive; between
+/// the two the entry waits in transit.
+fn op_stub_handoff(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue<v8::Value>,
+) {
+    let stub_id = args.get(0).to_rust_string_lossy(scope);
+    if !crate::stub_table::valid_host_stub_id(&stub_id) {
+        return;
+    }
+    let Some(holder) = crate::pool::current_slot().map(|slot| slot.heap_id()) else {
+        return;
+    };
+    crate::stub_table::handoff_host_stub(&stub_id, holder);
+}
+
+/// `__test_stub_stats_enabled()` -> bool; whether this node defines the
+/// test-only stub-stats global. True only with `CELLD_TEST_STUB_STATS=1`
+/// in the node's process environment, which tenant code cannot set: the
+/// harness reads it once per isolate and leaves production isolates
+/// without the hook.
+fn op_test_stub_stats_enabled(
+    scope: &mut v8::PinScope,
+    _args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    rv.set(v8::Boolean::new(scope, crate::stub_table::test_stub_stats_enabled()).into());
+}
+
+/// `__upload_new()` -> JSON `{id}`; opens one caller-pushed byte channel
+/// for a stream no cell owns. Past the process cap it throws a
+/// `celld_cap_exceeded:` error, which the lifter propagates: a cap fails
+/// the call with a clear error, never mints a dead handle silently.
+fn op_upload_new(
+    scope: &mut v8::PinScope,
+    _args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let Some(holder) = crate::pool::current_slot().map(|slot| slot.heap_id()) else {
+        return loader_throw(scope, "upload needs a driving isolate");
+    };
+    let id = match crate::upload_table::create_upload(holder) {
+        Ok(id) => id,
+        Err(crate::upload_table::UploadRejection::ProcessCap) => {
+            return loader_throw(
+                scope,
+                &format!(
+                    "celld_cap_exceeded: too many live caller-pushed RPC streams on this node \
+                     (limit {}); release idle streams",
+                    crate::upload_table::upload_cap()
+                ),
+            );
+        }
+    };
+    let opened = serde_json::json!({ "id": id });
+    let Some(opened) = v8::String::new(scope, &opened.to_string()) else {
+        return loader_throw(scope, "upload open is not representable");
+    };
+    rv.set(opened.into());
+}
+
+/// `__upload_push(uploadId, chunk)` -> Promise<Uint8Array>; appends one
+/// chunk to a caller-pushed channel, waiting for buffer room. An
+/// io-context op: the sender's pump is floating work that must settle
+/// (or reject at the terminal) even after its event ends, or the pump
+/// parks forever on a promise nobody polls.
+fn op_upload_push(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let id = args.get(0).to_rust_string_lossy(scope);
+    if !crate::stub_table::valid_host_stub_id(&id) {
+        return loader_throw(scope, "upload id is malformed");
+    }
+    let Some(chunk) = view_bytes(args.get(1)) else {
+        return loader_throw(scope, "upload chunk must be bytes");
+    };
+    let promise = asyncrt::enqueue_io_context(async move {
+        crate::upload_table::push_upload(&id, chunk)
+            .await
+            .map(|()| Vec::new())
+    });
+    rv.set(promise_for(scope, promise));
+}
+
+/// `__upload_pull(uploadId)` -> Promise<Uint8Array>; pulls one chunk from
+/// a caller-pushed channel, waiting for data or the terminal. Resolves a
+/// tag-prefixed buffer: `0x00` plus bytes is a chunk, a lone `0x01` is
+/// EOF; failures reject with the disconnect error. A handler op: the
+/// receiver awaits it as application work.
+fn op_upload_pull(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let id = args.get(0).to_rust_string_lossy(scope);
+    if !crate::stub_table::valid_host_stub_id(&id) {
+        return loader_throw(scope, "upload id is malformed");
+    }
+    let promise = asyncrt::enqueue(async move {
+        let pulled = crate::upload_table::pull_upload(&id).await?;
+        if pulled.done {
+            crate::upload_table::reap_drained_upload(&id);
+            Ok(vec![0x01])
+        } else {
+            let mut out = Vec::with_capacity(pulled.bytes.len() + 1);
+            out.push(0x00);
+            out.extend_from_slice(&pulled.bytes);
+            Ok(out)
+        }
+    });
+    rv.set(promise_for(scope, promise));
+}
+
+/// `__upload_close(uploadId)`; the sender closed the origin cleanly:
+/// buffered chunks still drain, then the receiver reads EOF.
+fn op_upload_close(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue<v8::Value>,
+) {
+    let id = args.get(0).to_rust_string_lossy(scope);
+    if !crate::stub_table::valid_host_stub_id(&id) {
+        return;
+    }
+    crate::upload_table::close_upload(&id);
+}
+
+/// `__upload_fail(uploadId)`; the sender's origin errored. Reasons do not
+/// cross: the receiver observes the generic disconnect, like every other
+/// RPC stream teardown.
+fn op_upload_fail(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue<v8::Value>,
+) {
+    let id = args.get(0).to_rust_string_lossy(scope);
+    if !crate::stub_table::valid_host_stub_id(&id) {
+        return;
+    }
+    crate::upload_table::fail_upload(&id);
+}
+
+/// `__upload_cancel(uploadId)`; the receiver is done: the sender's next
+/// push is rejected so its pump stops and cancels the origin.
+fn op_upload_cancel(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue<v8::Value>,
+) {
+    let id = args.get(0).to_rust_string_lossy(scope);
+    if !crate::stub_table::valid_host_stub_id(&id) {
+        return;
+    }
+    crate::upload_table::cancel_upload(&id);
+}
+
+/// `__upload_abort(uploadId)`; the sender is gone (context end or abort).
+/// Best-effort: an unknown id is already gone.
+fn op_upload_abort(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue<v8::Value>,
+) {
+    let id = args.get(0).to_rust_string_lossy(scope);
+    if !crate::stub_table::valid_host_stub_id(&id) {
+        return;
+    }
+    crate::upload_table::abort_upload(&id);
 }
 
 /// Outbound `fetch` — the op behind the harness's `fetch()`. Resolves to a JSON

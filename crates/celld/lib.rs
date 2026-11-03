@@ -1,3 +1,4 @@
+// Modified by ryuzcorp (ryuzcorp/celld): cross-isolate RPC stubs and streams.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 #![warn(clippy::disallowed_methods, clippy::disallowed_types)]
@@ -94,7 +95,9 @@ pub mod replication;
 pub mod runtime;
 pub mod startup;
 pub mod storage;
+pub mod stub_table;
 pub mod telemetry;
+pub mod upload_table;
 pub mod wake;
 pub mod wake_entry;
 pub mod wake_format;

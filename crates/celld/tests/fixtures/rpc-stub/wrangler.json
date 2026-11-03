@@ -1,0 +1,11 @@
+{
+  "name": "rpc-stub",
+  "main": "index.js",
+  "compatibility_date": "2026-01-01",
+  "no_bundle": true,
+  "durable_objects": {
+    "bindings": [{ "name": "CAP", "class_name": "Cap" }]
+  },
+  "services": [{ "binding": "SELF", "service": "rpc-stub" }],
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Cap"] }]
+}

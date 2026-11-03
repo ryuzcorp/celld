@@ -1,3 +1,4 @@
+// Modified by ryuzcorp (ryuzcorp/celld): cross-isolate RPC stubs and streams.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 // The binary contains connection, startup, shutdown, and V8 shell code. The
@@ -25,7 +26,8 @@ use celld::generation::{
 };
 use celld::js::{
     ArmGate, AssetCallReq, Compat, DoCallReq, HttpResponse, HttpResponseWebSocket, QueueBinding,
-    QueueDispatchReq, RpcCallReq, SvcCallReq, SvcRpcReq, WorkerConfigOptions, WorkflowBinding,
+    QueueDispatchReq, RpcCallReq, RpcStubReq, StubOperation, SvcCallReq, SvcRpcReq,
+    WorkerConfigOptions, WorkflowBinding,
 };
 use celld::ownership_store::{now_ms, BucketOwnership};
 use celld::peer_auth::{self, PeerAuth};
@@ -1531,6 +1533,278 @@ async fn dispatch_rpc_call(app: AppHandle, call: RpcCallReq) {
                 } else {
                     celld::js::RpcData::Json(String::from_utf8_lossy(&body).into_owned())
                 });
+            }
+        }
+    }
+    .await;
+    let _ = reply.send(result);
+}
+
+/// What a caller sees when the stub's owner is gone: the eviction error the
+/// harness raises for a released same-isolate stub, verbatim, so a stub that
+/// worked yesterday fails exactly like one that never crossed. Mirrors
+/// `__releasedStubError` in `js/harness.js`; the two must stay identical.
+const RELEASED_STUB_ERROR: &str =
+    "The Durable Object that returned this RPC stub no longer runs on this node.";
+
+/// What a caller sees when the stub's owner runs on another node. Phase 1
+/// serves same-node stubs only; a forwarding phase can reuse the envelope.
+fn remote_stub_owner_error(node: &str) -> String {
+    format!(
+        "The Durable Object that returned this RPC stub runs on another node ({node}); \
+         cross-node stub calls are not supported."
+    )
+}
+
+/// Release-drive attempts before a routed dispose requeues for a
+/// bounded background retry. Attempts re-check the epoch first, so an
+/// eviction between tries ends the loop instead of driving nowhere.
+const STUB_RELEASE_DRIVE_ATTEMPTS: usize = 3;
+
+/// Background retry rounds after the inline drive attempts fail, and
+/// the delay between rounds. Transient dispatch pressure clears inside
+/// this window; sustained failure frees the entry anyway (below), so a
+/// retained entry never holds host caps until owner eviction.
+const STUB_RELEASE_RETRY_ROUNDS: usize = 5;
+const STUB_RELEASE_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// Drops one stub-table pin when the driving operation exits, on every
+/// path: success, drive failure, re-validation failure, remote owner.
+/// A release that raced the op completes its removal here.
+struct StubPinGuard {
+    stub_id: Option<String>,
+}
+
+impl StubPinGuard {
+    fn hold(stub_id: String) -> Self {
+        Self {
+            stub_id: Some(stub_id),
+        }
+    }
+}
+
+impl Drop for StubPinGuard {
+    fn drop(&mut self) {
+        if let Some(stub_id) = self.stub_id.take() {
+            celld::stub_table::unpin_host_stub(&stub_id);
+        }
+    }
+}
+
+/// What one stub-release drive round found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StubReleaseDrive {
+    /// The dispose drove against the owner: take the entry.
+    Driven,
+    /// The owner left local residency: no attempt can drive, so the
+    /// entry takes like the pre-loop mismatch.
+    Unroutable,
+    /// Every attempt failed transiently: requeue for a bounded retry.
+    Failed,
+}
+
+impl StubReleaseDrive {
+    fn settled(self) -> bool {
+        !matches!(self, Self::Failed)
+    }
+}
+
+/// Drive one routed stub dispose against the minting residency. Never
+/// activates: the residency is either still here, in which case the
+/// dispose runs, or it is gone, in which case its `__cellRelease`
+/// already freed the entry.
+async fn drive_stub_release(
+    app: &AppHandle,
+    scope: &str,
+    stub_id: &str,
+    epoch: u64,
+) -> StubReleaseDrive {
+    let runtime = match app.runtime.as_ref() {
+        Some(runtime) => runtime,
+        None => return StubReleaseDrive::Unroutable,
+    };
+    let resident_epoch = || runtime.published_epoch(scope);
+    if resident_epoch() != Some(epoch) {
+        return StubReleaseDrive::Unroutable;
+    }
+    // The owner left local residency mid-drive (evicted, or migrated
+    // away): no later attempt can drive, so the round reports
+    // unroutable like the pre-loop mismatch. Anything else that fails
+    // fails the round for a bounded retry.
+    for attempt in 0..STUB_RELEASE_DRIVE_ATTEMPTS {
+        if resident_epoch() != Some(epoch) {
+            return StubReleaseDrive::Unroutable;
+        }
+        if attempt > 0 {
+            celld::asyncrt::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let Ok(routed) = app.request(scope.to_string()).await else {
+            continue;
+        };
+        if !matches!(routed.route, Route::Local) {
+            return StubReleaseDrive::Unroutable;
+        }
+        if resident_epoch() != Some(epoch) {
+            // The route is Local, so the request pinned the cell until
+            // its activity ends: release it even though no drive runs.
+            drop(app.activity(routed.request, scope.to_string()));
+            return StubReleaseDrive::Unroutable;
+        }
+        let local_request_id = local_dispatch_request_id(None);
+        let completed = app
+            .local_request(routed.request, scope.to_string(), local_request_id, "local")
+            .run(runtime.stub_op(
+                scope.to_string(),
+                stub_id.to_string(),
+                Vec::new(),
+                None,
+                true,
+            ))
+            .await;
+        if completed.result.map_err(local_request_error).is_ok() {
+            return StubReleaseDrive::Driven;
+        }
+    }
+    StubReleaseDrive::Failed
+}
+
+/// Drive one routed stub dispose against the minting residency, then take
+/// the table entry. A drive that fails past every inline attempt keeps
+/// the entry but requeues a bounded, paced retry instead of waiting for
+/// owner eviction: transient dispatch pressure still completes the
+/// release. If the retries exhaust, the entry frees anyway and owner
+/// eviction unexports the undisposed owner entry (the pre-keep
+/// backstop). The warn names the scope only: ids are never logged.
+async fn release_stub_to_owner(app: &AppHandle, scope: &str, stub_id: &str, epoch: u64) {
+    if drive_stub_release(app, scope, stub_id, epoch)
+        .await
+        .settled()
+    {
+        celld::stub_table::take_routed_stub_release(stub_id);
+        return;
+    }
+    let app = app.clone();
+    let scope = scope.to_string();
+    let stub_id = stub_id.to_string();
+    celld::asyncrt::spawn(async move {
+        let settled = celld::stub_table::requeue_release_drive(
+            STUB_RELEASE_RETRY_ROUNDS,
+            {
+                let (app, scope, stub_id) = (app.clone(), scope.clone(), stub_id.clone());
+                move || {
+                    let (app, scope, stub_id) = (app.clone(), scope.clone(), stub_id.clone());
+                    async move {
+                        drive_stub_release(&app, &scope, &stub_id, epoch)
+                            .await
+                            .settled()
+                    }
+                }
+            },
+            || celld::asyncrt::sleep(STUB_RELEASE_RETRY_DELAY),
+        )
+        .await;
+        celld::stub_table::take_routed_stub_release(&stub_id);
+        if !settled {
+            tracing::warn!(
+                scope,
+                "stub release could not reach its owner after retries; freeing the entry"
+            );
+        }
+    });
+}
+
+async fn dispatch_stub_call(app: AppHandle, call: RpcStubReq) {
+    let RpcStubReq {
+        scope,
+        stub_id,
+        operation,
+        caller,
+        reply,
+    } = call;
+    let result = async {
+        anyhow::ensure!(
+            celld_logic::cell::valid_cell_scope(&scope),
+            "cell scope is malformed or exceeds the fleet storage limit"
+        );
+        let runtime = app.runtime.as_ref().context("no cell runtime")?;
+        // The residency currently serving the scope, if the cell is
+        // resident on this node. Read without activating: an evicted
+        // owner rejects below instead of cold-starting to reject.
+        //
+        // Export mints against storage's activation epoch while this
+        // reads the published map. The two agree whenever a cell serves
+        // and disagree only mid-transition (activation installed before
+        // publish, unpublished before close), where both directions fail
+        // closed: a mint for a non-serving residency validates to
+        // NotResident, and a stale id validates to EpochMismatch. A
+        // spurious reject inside the window is transient availability,
+        // and the re-validation after the pin already re-reads.
+        let resident = || {
+            runtime
+                .published_epoch(&scope)
+                .zip(runtime.published_generation(&scope))
+                .map(|(epoch, generation)| celld::stub_table::ResidentCell { epoch, generation })
+        };
+        match operation {
+            StubOperation::Release { epoch } => {
+                release_stub_to_owner(&app, &scope, &stub_id, epoch).await;
+                Ok(celld::js::RpcData::V8(Bytes::new()))
+            }
+            StubOperation::Call { path, args } => {
+                // Authoritative format checks: the op already rejected
+                // these fast, but the channel is the trust boundary for
+                // what reaches the table lookup and V8. The format is
+                // public, so a clear error leaks nothing.
+                if !celld::stub_table::valid_host_stub_id(&stub_id) {
+                    anyhow::bail!("stub id is malformed");
+                }
+                if !celld::stub_table::valid_stub_path(&path) {
+                    anyhow::bail!("stub path breaks the walk budget");
+                }
+                let Some(caller) = caller else {
+                    anyhow::bail!(RELEASED_STUB_ERROR);
+                };
+                // Every other validation failure means the minting
+                // residency is gone from this op's view, or the caller
+                // holds nothing for the id; the id itself is never
+                // logged. A success pins the entry for the drive.
+                celld::stub_table::validate_host_stub(&stub_id, &scope, resident(), caller)
+                    .map_err(|_| anyhow::anyhow!(RELEASED_STUB_ERROR))?;
+                let _pin = StubPinGuard::hold(stub_id.clone());
+                let Routed { request, route } = app
+                    .request(scope.clone())
+                    .await
+                    .map_err(|error| anyhow::anyhow!("route stub call {scope}: {error:?}"))?;
+                match route {
+                    Route::Local => {
+                        // The cell may have been evicted and reactivated
+                        // between validation and the pin; re-validating
+                        // keeps the op from landing on a new residency.
+                        // Takes no second pin: the first covers the drive.
+                        // On failure the Local route's request still needs
+                        // its activity released, or it pins the cell and
+                        // blocks eviction and handoff draining.
+                        celld::stub_table::revalidate_host_stub(
+                            &stub_id,
+                            &scope,
+                            resident(),
+                            caller,
+                        )
+                        .map_err(|_| {
+                            drop(app.activity(request, scope.clone()));
+                            anyhow::anyhow!(RELEASED_STUB_ERROR)
+                        })?;
+                        let local_request_id = local_dispatch_request_id(None);
+                        let completed = app
+                            .local_request(request, scope.clone(), local_request_id, "local")
+                            .run(runtime.stub_op(scope, stub_id, path, args, false))
+                            .await;
+                        Ok(completed.result.map_err(local_request_error)?.data)
+                    }
+                    Route::Remote { node, .. } => {
+                        anyhow::bail!(remote_stub_owner_error(node.as_str()))
+                    }
+                }
             }
         }
     }
@@ -4342,6 +4616,8 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
     }
     let (rpc_call_tx, mut rpc_call_rx) = mpsc::unbounded_channel();
     celld::js::set_rpc_call_tx(rpc_call_tx);
+    let (stub_call_tx, mut stub_call_rx) = mpsc::unbounded_channel();
+    celld::js::set_stub_call_tx(stub_call_tx);
     let (service_call_tx, mut service_call_rx) = mpsc::unbounded_channel();
     celld::js::set_svc_call_tx(service_call_tx);
     let (service_rpc_tx, mut service_rpc_rx) = mpsc::unbounded_channel();
@@ -4422,6 +4698,12 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
         })
         .detach();
     }
+
+    // No RPC stub sweeper: a stub whose holding invocation is alive stays
+    // usable however long it stays quiet. Entries die on release (dispose,
+    // invocation end, context abort), on owner eviction, or on the
+    // retirement backstop for provably-gone holders — never on a timer.
+    // Upload channels (caller-pushed streams) have the same lifetime.
 
     // The fleet-aware first-readiness gate: withhold the first health 200
     // until no donor is mid-handoff and every live peer publishes successor
@@ -4811,6 +5093,12 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
                 };
                 do_calls.push(Box::pin(dispatch_rpc_call(app.clone(), call)));
             }
+            call = stub_call_rx.recv() => {
+                let Some(call) = call else {
+                    anyhow::bail!("Durable Object RPC stub channel closed");
+                };
+                do_calls.push(Box::pin(dispatch_stub_call(app.clone(), call)));
+            }
             call = asset_call_rx.recv() => {
                 let Some(call) = call else {
                     anyhow::bail!("asset call channel closed");
@@ -5128,6 +5416,12 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
                     };
                     do_calls.push(Box::pin(dispatch_rpc_call(app.clone(), call)));
                 }
+                call = stub_call_rx.recv() => {
+                    let Some(call) = call else {
+                        anyhow::bail!("Durable Object RPC stub channel closed during shutdown pre-drain");
+                    };
+                    do_calls.push(Box::pin(dispatch_stub_call(app.clone(), call)));
+                }
                 call = asset_call_rx.recv() => {
                     let Some(call) = call else {
                         anyhow::bail!("asset call channel closed during shutdown pre-drain");
@@ -5323,6 +5617,12 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
                         anyhow::bail!("Durable Object RPC channel closed during shutdown");
                     };
                     do_calls.push(Box::pin(dispatch_rpc_call(app.clone(), call)));
+                }
+                call = stub_call_rx.recv() => {
+                    let Some(call) = call else {
+                        anyhow::bail!("Durable Object RPC stub channel closed during shutdown");
+                    };
+                    do_calls.push(Box::pin(dispatch_stub_call(app.clone(), call)));
                 }
                 call = asset_call_rx.recv() => {
                     let Some(call) = call else {
