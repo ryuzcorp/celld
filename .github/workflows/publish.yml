@@ -4,9 +4,11 @@
 # consumers pin it by digest (see FORK.md).
 #
 #   `verify`   the tag names a `<version>`/`<n>` pair, the tree's
-#              Cargo.toml agrees on `<version>`, and the tagged commit
-#              is the current tip of the matching `ryuzcorp/v<version>`
-#              branch (tags on old or bare-upstream commits are refused)
+#              Cargo.toml agrees on `<version>`, the upstream `v<version>`
+#              tag exists and is an ancestor of the tagged commit, and the
+#              tagged commit is the current tip of the matching
+#              `ryuzcorp/v<version>` branch (tags on old or bare-upstream
+#              commits are refused)
 #   `push`     per architecture: refuse an already-published tag (only
 #              a confirmed "not found" lets it publish), then run the
 #              Dockerfile's test stage and push the arch image
@@ -53,16 +55,25 @@ jobs:
             echo "refusing tag $GITHUB_REF_NAME: want v<version>-ryuzcorp.<n>" >&2
             exit 1
           fi
-          sha=$(git rev-parse "$GITHUB_REF_NAME^{commit}")
+          sha=$(git rev-parse "refs/tags/$GITHUB_REF_NAME^{commit}")
           # The tree must agree it is this line's version.
-          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' crates/celld/Cargo.toml | head -1)
+          version=$(awk '/^\[package\]/{p=1;next} /^\[/{p=0} p&&/^version = "/{gsub(/"/,"");print $3;exit}' crates/celld/Cargo.toml)
           if [ "$version" != "$base" ]; then
             echo "refusing tag $GITHUB_REF_NAME: Cargo.toml says $version" >&2
             exit 1
           fi
-          # The upstream tag the line branch builds on must exist: its
-          # commit becomes the now.ryuzcorp.celld.upstream label.
-          git rev-parse "v$base^{commit}" > /dev/null
+          # The upstream tag the line branch builds on must exist on
+          # origin: its commit becomes the now.ryuzcorp.celld.upstream
+          # label, and it must be an ancestor of the tagged commit, so
+          # a moved upstream tag cannot lie in the provenance label.
+          if ! upstream=$(git rev-parse "refs/tags/v$base^{commit}" 2>/dev/null); then
+            echo "refusing tag $GITHUB_REF_NAME: no upstream v$base tag on origin (mirror it first)" >&2
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "$upstream" "$sha"; then
+            echo "refusing tag $GITHUB_REF_NAME: upstream v$base ($upstream) is not an ancestor of $sha" >&2
+            exit 1
+          fi
           # The tagged commit must sit on the matching line branch, so a
           # tag on main or on another line can never publish this name.
           if ! git fetch --quiet origin "ryuzcorp/v$base"; then
@@ -116,9 +127,13 @@ jobs:
           set -euo pipefail
           tag="${GITHUB_REF_NAME#v}"
           base="${tag%-ryuzcorp.*}"
+          if [[ ! $tag =~ ^[0-9]+\.[0-9]+\.[0-9]+-ryuzcorp\.[1-9][0-9]*$ ]]; then
+            echo "refusing unexpected tag $GITHUB_REF_NAME" >&2
+            exit 1
+          fi
           image="ghcr.io/ryuzcorp/celld"
-          sha=$(git rev-parse "$GITHUB_REF_NAME^{commit}")
-          upstream=$(git rev-parse "v$base^{commit}")
+          sha=$(git rev-parse "refs/tags/$GITHUB_REF_NAME^{commit}")
+          upstream=$(git rev-parse "refs/tags/v$base^{commit}")
           # Only a confirmed "not found" lets a level publish: any other
           # inspect failure (auth, registry outage) stops the run.
           if found=$(docker buildx imagetools inspect "$image:$tag" 2>&1); then
@@ -168,6 +183,10 @@ jobs:
         run: |
           set -euo pipefail
           tag="${GITHUB_REF_NAME#v}"
+          if [[ ! $tag =~ ^[0-9]+\.[0-9]+\.[0-9]+-ryuzcorp\.[1-9][0-9]*$ ]]; then
+            echo "refusing unexpected tag $GITHUB_REF_NAME" >&2
+            exit 1
+          fi
           image="ghcr.io/ryuzcorp/celld"
           docker buildx imagetools create --tag "$image:$tag" \
             "$image:$tag-amd64" "$image:$tag-arm64"
