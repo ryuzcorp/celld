@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): ctx.container.images; clone() of streaming and disturbed bodies; __celld$do on the service-binding RPC path; container exec pty/resize; cross-isolate RPC stubs and streams; container exec AbortSignal; test-only fake kill completion; exec reads survive their subscribing event; context end aborts finished uploads; tenant egress policy.
+// Modified by ryuzcorp (ryuzcorp/celld): ctx.container.images; clone() of streaming and disturbed bodies; __celld$do on the service-binding RPC path; container exec pty/resize; cross-isolate RPC stubs and streams; container exec AbortSignal; test-only fake kill completion; exec reads survive their subscribing event; context end aborts finished uploads; tenant egress policy; D1 export; D1 export operator gate.
 // The DO object model and the Cloudflare-compatible runtime surface, run
 // once per isolate by `js.rs::install_harness` after the Web-API prelude.
 // Lived as a 4,000-line raw string inside js.rs until 2026-07-29; it is a
@@ -391,6 +391,10 @@ globalThis.Response = class Response {
 const __HTTP_METHODS = new Set(
   ["GET", "HEAD", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"]);
 const __FETCH_REDIRECT_MODES = new Set(["follow", "manual", "error"]);
+// Server-side Requests that entered over the authenticated operator route.
+// The host marks them at dispatch; operator-only cell branches demand
+// membership. Script never observes the set itself, only the refusals.
+const __operatorIngressRequests = new WeakSet();
 globalThis.Request = class Request {
   constructor(input, init = {}) {
     const prior = input instanceof Request ? input : null;
@@ -494,6 +498,12 @@ globalThis.Request = class Request {
       : suppliedSignal
         ? this.signal
         : (prior ? prior._signalForSubrequests : null);
+    // Operator ingress lives in `__operatorIngressRequests`, which only the
+    // host's `__makeRequest` adds to when it builds the server-side Request
+    // for a call that entered over the authenticated `/runtime/` route. The
+    // constructor honors no init key for it, so tenant script cannot mark
+    // even its own local Request objects, and `new Request(prior)` never
+    // inherits membership.
   }
   get headers() {
     if (this._headers === null) {
@@ -551,17 +561,23 @@ globalThis.Request = class Request {
 };
 const __makeRequest = __celld.__makeRequest = (
   url, method, body, headersJson = "[]", signal = undefined,
-  incomingSignal = false,
-) => new Request(url, {
-  // The raw header JSON, not a parsed object: an incoming request whose
-  // handler never reads `.headers` (a hello world, or a Worker that only
-  // routes to a cell) then never parses it. See `get headers()`.
-  // celld cannot prove Cloudflare edge metadata, so the object stays empty.
-  // In particular, no client-controlled header becomes a country or a colo;
-  // the forwarded-authority trust flag does not establish geolocation trust.
-  method, body, __headersJson: headersJson, signal, cf: {},
-  __celldIncomingSignal: incomingSignal,
-});
+  incomingSignal = false, operatorIngress = false,
+) => {
+  const request = new Request(url, {
+    // The raw header JSON, not a parsed object: an incoming request whose
+    // handler never reads `.headers` (a hello world, or a Worker that only
+    // routes to a cell) then never parses it. See `get headers()`.
+    // celld cannot prove Cloudflare edge metadata, so the object stays empty.
+    // In particular, no client-controlled header becomes a country or a colo;
+    // the forwarded-authority trust flag does not establish geolocation trust.
+    method, body, __headersJson: headersJson, signal, cf: {},
+    __celldIncomingSignal: incomingSignal,
+  });
+  // Marked here, on the host-built server-side Request only: no
+  // tenant-visible init field exists, so tenant script cannot forge it.
+  if (operatorIngress === true) __operatorIngressRequests.add(request);
+  return request;
+};
 const __fmt = (a) => a.map((x) => {
   if (typeof x === "string") return x;
   if (x instanceof Error) return x.stack || (x.name + ": " + x.message);
@@ -6246,6 +6262,7 @@ __celld.__makeIncomingRequest = (
   headersJson, undefined, true);
 const __dispatchTo = __celld.__dispatchTo = async (
   scope, url, method, body, headersJson, requestId = null, bodyStreamId = null,
+  operatorIngress = false,
 ) => {
   // A routed body that must not be collected crosses as a host stream id; the
   // handler here reads it in parts. A held body arrives as its bytes.
@@ -6273,6 +6290,7 @@ const __dispatchTo = __celld.__dispatchTo = async (
           headersJson,
           requestController.signal,
           true,
+          operatorIngress,
         )));
     })();
     // The caller's abandonment reaches the target through
@@ -6308,6 +6326,12 @@ const __dispatchTo = __celld.__dispatchTo = async (
     __endActorEvent(actorEvent);
   }
 };
+// The D1 binding reaches its cell over stub RPC with exactly these three
+// methods (`D1Database._query`, `_batch`, and `exec` below). Everything else
+// on the cell (export, migrate) is operator-only and enters over `fetch`
+// with the operator-ingress marker instead, so RPC to any other method on a
+// D1 scope refuses as if the method did not exist.
+const __D1_RPC_ALLOWLIST = new Set(["__d1Query", "__d1Batch", "__d1Exec"]);
 const __rpcTargetMethod = async (scope, method) => {
   const inst = await _readyInstance(scope);
   if (!inst.__celldState._rpcOk)
@@ -6317,6 +6341,8 @@ const __rpcTargetMethod = async (scope, method) => {
       "order to enable RPC, make sure your class extends the " +
       "special class `DurableObject`, which can be imported from " +
       "the module \"cloudflare:workers\".");
+  if (scope.startsWith("__D1Database:") && !__D1_RPC_ALLOWLIST.has(method))
+    throw new TypeError(method + " is not a function");
   const fn = inst[method];
   if (typeof fn !== "function")
     throw new TypeError(method + " is not a function");
@@ -8873,9 +8899,18 @@ class __D1DatabaseCell {
     } catch {
       return Response.json({ error: "D1_ERROR: invalid request body" }, { status: 400 });
     }
+    // The same cell answers a Worker's stub.fetch() and the operator CLI's
+    // `/runtime/` dispatch, so the operator-only branches demand the
+    // host-set operator-ingress marker on the server-side Request.
+    const operator = __operatorIngressRequests.has(request);
+    const refuse = (operation, command) => Response.json(
+      { error: `D1_ERROR: ${operation} is an operator operation; use \`${command}\`` },
+      { status: 403 },
+    );
     try {
       let result;
       if (body.migrate !== undefined) {
+        if (!operator) return refuse("migrate", "celld d1 migrations apply");
         result = this.__d1Migrate(
           String(body.migrate.name),
           String(body.migrate.sql),
@@ -8883,11 +8918,15 @@ class __D1DatabaseCell {
         );
       } else if (body.exec !== undefined) {
         // The CLI asks for rows; the Worker binding's exec() never does.
+        if (!!body.exec.rows && !operator) return refuse("exec with rows", "celld d1 execute");
         result = __d1Run(this.ctx.storage.sql._scope, {
           mode: "exec",
           sql: String(body.exec.sql),
           rows: !!body.exec.rows,
         });
+      } else if (body.export !== undefined) {
+        if (!operator) return refuse("export", "celld d1 export");
+        result = this.__d1Export(body.export || {});
       } else {
         result = this.__d1Query(body.statements || []);
       }
@@ -8903,6 +8942,18 @@ class __D1DatabaseCell {
       rows: false,
     });
     return { count: result.count, duration: result.duration };
+  }
+  // The CLI's dump path. The engine reads the whole dump under one
+  // transaction, so what crosses here is a single snapshot even while
+  // the database takes writes.
+  __d1Export(options) {
+    const tables = Array.isArray(options.tables) ? options.tables.map(String) : [];
+    return __d1Run(this.ctx.storage.sql._scope, {
+      mode: "export",
+      tables,
+      no_schema: !!options.no_schema,
+      no_data: !!options.no_data,
+    });
   }
   // Apply one migration and record it. The engine runs the file, the
   // bookkeeping insert (the name is a bound parameter, so a file name never

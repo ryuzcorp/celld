@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): operator token for the internal listener.
+// Modified by ryuzcorp (ryuzcorp/celld): operator token for the internal listener; D1 export operator-ingress marker.
 // Copyright 2026 Deno Land Inc. All rights reserved.
 
 //! The peer tunnel: an upgraded stream per peer, plain HTTP inside.
@@ -46,11 +46,18 @@ pub(crate) const SCOPE_HEADER: &str = "x-cells-scope";
 pub(crate) const NAME_HEADER: &str = "x-cells-do-name";
 pub(crate) const REQUEST_ID_HEADER: &str = "x-cells-request-id";
 pub(crate) const HANDOFF_HEADER: &str = "x-cells-capacity-handoff";
+pub(crate) const OPERATOR_HEADER: &str = "x-cells-operator";
 
 /// The inner headers node A owns. A overwrites them on the way in and B
 /// strips them on the way out, so an application header with a reserved name
 /// is dropped rather than obeyed.
-const CONTROL_HEADERS: [&str; 4] = [SCOPE_HEADER, NAME_HEADER, REQUEST_ID_HEADER, HANDOFF_HEADER];
+const CONTROL_HEADERS: [&str; 5] = [
+    SCOPE_HEADER,
+    NAME_HEADER,
+    REQUEST_ID_HEADER,
+    HANDOFF_HEADER,
+    OPERATOR_HEADER,
+];
 
 enum TunnelKind {
     Do,
@@ -64,6 +71,7 @@ pub(crate) struct TunnelControl {
     pub(crate) name: Option<String>,
     pub(crate) request_id: Option<celld::js::RequestId>,
     pub(crate) capacity_handoff: bool,
+    pub(crate) operator_ingress: bool,
 }
 
 pub(crate) fn is_tunnel_request(request: &Request<Incoming>) -> bool {
@@ -183,6 +191,7 @@ async fn serve_do(upgraded: hyper::upgrade::Upgraded, app: AppHandle) {
                     .and_then(|value| value.to_str().ok())
                     .and_then(celld::js::parse_request_id),
                 capacity_handoff: inner.headers().get(HANDOFF_HEADER).is_some(),
+                operator_ingress: inner.headers().get(OPERATOR_HEADER).is_some(),
             };
             // A tunneled upgrade is the client's own handshake, so the
             // owner answers it directly: fastwebsockets computes the 101
@@ -241,6 +250,7 @@ async fn serve_do(upgraded: hyper::upgrade::Upgraded, app: AppHandle) {
                 headers,
                 request_id: control.request_id,
                 capacity_handoff: control.capacity_handoff,
+                operator_ingress: control.operator_ingress,
             };
             let outcome = dispatch_forwarded_fetch(app.clone(), control.scope, fetch, body).await;
             let (target, worker_headers) = match outcome {
@@ -422,6 +432,9 @@ fn inner_request(
     }
     if control.capacity_handoff {
         inner = inner.header(HANDOFF_HEADER, "1");
+    }
+    if control.operator_ingress {
+        inner = inner.header(OPERATOR_HEADER, "1");
     }
     Ok(inner.body(body)?)
 }
@@ -777,4 +790,54 @@ pub(crate) fn response_stream(body: PooledResponseBody) -> HttpChunkStream {
 #[cfg(all(test, celld_internal_tests))]
 mod private_tests {
     include!(env!("CELLD_CONFORMANCE_PEER_TUNNEL_TESTS"));
+}
+
+#[cfg(test)]
+mod operator_tests {
+    use super::*;
+
+    fn control(operator_ingress: bool) -> TunnelControl {
+        TunnelControl {
+            scope: "__D1Database:00".to_string(),
+            name: None,
+            request_id: None,
+            capacity_handoff: false,
+            operator_ingress,
+        }
+    }
+
+    #[test]
+    fn operator_marker_rides_the_tunnel_only_from_control() {
+        // An operator call carries the marker to the owner.
+        let marked = inner_request(
+            &control(true),
+            "http://cell/",
+            "POST",
+            &[],
+            full_body(Bytes::new()),
+        )
+        .expect("inner request");
+        assert_eq!(
+            marked
+                .headers()
+                .get(OPERATOR_HEADER)
+                .map(|value| value.as_bytes()),
+            Some(b"1".as_slice()),
+        );
+        // A plain call carries no marker, even when the application smuggles
+        // the header name: control headers are node A's to set, and an
+        // application header with a reserved name is dropped rather than
+        // obeyed.
+        let smuggled = vec![(OPERATOR_HEADER.to_string(), "1".to_string())];
+        let plain = inner_request(
+            &control(false),
+            "http://cell/",
+            "POST",
+            &smuggled,
+            full_body(Bytes::new()),
+        )
+        .expect("inner request");
+        assert!(!plain.headers().contains_key(OPERATOR_HEADER));
+        assert!(CONTROL_HEADERS.contains(&OPERATOR_HEADER));
+    }
 }

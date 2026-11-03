@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): node:crypto scrypt; container exec resize op; cross-isolate RPC stubs and streams; test-only fake exec ops; fake kill completion op; exec reads survive their subscribing event; per-node Workers Cache API ops; tenant egress policy.
+// Modified by ryuzcorp (ryuzcorp/celld): node:crypto scrypt; container exec resize op; cross-isolate RPC stubs and streams; test-only fake exec ops; fake kill completion op; exec reads survive their subscribing event; per-node Workers Cache API ops; tenant egress policy; D1 export operator-ingress marker.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 // The raw V8 adapter and its child modules remain outside the Actor execution
@@ -199,6 +199,12 @@ pub struct DoCallReq {
     /// The dispatching handler's trace context, read from CPED at the
     /// call site, so the cell's span joins the caller's trace.
     pub parent: Option<crate::telemetry::TraceContext>,
+    /// True only for a call that entered over the authenticated operator
+    /// route (`/runtime/`), set by the host at ingress — never from a
+    /// header, a body, or script. It rides the owner-forwarding hop and
+    /// lands on the server-side Request, where operator-only branches
+    /// (D1 export) demand it.
+    pub operator_ingress: bool,
 }
 static DO_CALL_TX: OnceLock<tokio::sync::mpsc::UnboundedSender<DoCallReq>> = OnceLock::new();
 
@@ -629,6 +635,10 @@ pub enum CellJob {
         /// Where this call sits in its caller's order for this cell, if it
         /// came from a script rather than from a peer or the ingress.
         order: Option<CallOrder>,
+        /// Whether the call entered over the authenticated operator route.
+        /// The drive hands it to `__dispatchTo`, which marks the
+        /// server-side Request for operator-only branches.
+        operator_ingress: bool,
     },
     Rpc {
         request_id: Option<RequestId>,
@@ -5389,6 +5399,7 @@ fn begin_cell(tc: &mut v8::PinScope, job: CellJob, event_time: i64) -> Begun {
             headers,
             reply,
             order: _,
+            operator_ingress,
         } => {
             if let Err(error) = register_actor_name(tc, &scope, name.as_deref()) {
                 let _ = reply.send(Err(error));
@@ -5429,6 +5440,7 @@ fn begin_cell(tc: &mut v8::PinScope, job: CellJob, event_time: i64) -> Begun {
                             None => v8::null(tc).into(),
                         },
                         stream_id,
+                        v8::Boolean::new(tc, operator_ingress).into(),
                     ];
                     let recv = v8::undefined(tc).into();
                     f.call(tc, recv, &arguments)
@@ -8761,6 +8773,7 @@ fn op_facet_fetch(
             headers,
             reply,
             order: None,
+            operator_ingress: false,
         };
         let driving = tokio::spawn(crate::runtime::drive_cell(
             facet.slot.affiliate(),
@@ -9019,6 +9032,9 @@ fn op_do_call_impl(
         reply: tx,
         order,
         parent: current_trace_context(scope),
+        // A script's own stub.fetch() is never operator ingress, whatever
+        // headers or body it carries.
+        operator_ingress: false,
     };
     let stream_service = http_stream_service();
     let id = asyncrt::enqueue(async move {

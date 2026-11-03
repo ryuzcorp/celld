@@ -1,4 +1,5 @@
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
+// Modified by ryuzcorp (ryuzcorp/celld): D1 export operator-ingress marker.
 
 //! Routed local execution and the durability gate for outgoing effects.
 use crate::actor::{ActivityGuard, AppHandle, LocalRequestFailure, Routed};
@@ -108,6 +109,10 @@ pub struct CallContext {
     /// Reclaims a streamed body abandoned by an early error. A local target or
     /// the peer HTTP body takes ownership before this guard is disarmed.
     pub body_guard: RequestBodyGuard,
+    /// Whether the call entered over the authenticated operator route.
+    /// Outlives one dispatch attempt so a retry after a stale remote route
+    /// re-enters with the same marker.
+    pub operator_ingress: bool,
 }
 
 /// Split a proxied call into its cross-attempt context, its consumable
@@ -136,6 +141,7 @@ pub fn split_do_call(
         reply,
         order,
         parent,
+        operator_ingress,
     } = call;
     (
         CallContext {
@@ -146,6 +152,7 @@ pub fn split_do_call(
             cancel,
             order,
             body_guard,
+            operator_ingress,
         },
         CallPayload {
             name,
@@ -279,6 +286,7 @@ pub async fn dispatch_call_attempt(
                     request_id: call.request_id,
                     order: call.order.take(),
                     parent: call.parent,
+                    operator_ingress: call.operator_ingress,
                 },
                 call.cancel.take(),
                 &mut call.body_guard,
@@ -412,4 +420,37 @@ pub fn local_response_stream(
             }
         },
     ))
+}
+
+#[cfg(test)]
+mod operator_tests {
+    use super::*;
+
+    fn split_operator(operator_ingress: bool) -> bool {
+        let body = RequestBody::Bytes(bytes::Bytes::new());
+        let (reply, _) = oneshot::channel();
+        let (context, _, _) = split_do_call(DoCallReq {
+            request_id: None,
+            cancel: None,
+            deliver_abort_to_handler: false,
+            scope: "__D1Database:00".to_string(),
+            name: None,
+            url: "http://cell/".to_string(),
+            method: "POST".to_string(),
+            body_guard: RequestBodyGuard::of(&body),
+            body,
+            headers: Vec::new(),
+            reply,
+            order: None,
+            parent: None,
+            operator_ingress,
+        });
+        context.operator_ingress
+    }
+
+    #[test]
+    fn split_do_call_keeps_the_operator_marker() {
+        assert!(split_operator(true));
+        assert!(!split_operator(false));
+    }
 }

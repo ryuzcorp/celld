@@ -9,7 +9,7 @@ README below is kept intact; this file documents the fork.
 
 - `main` mirrors upstream `main` and carries no patches.
 - `ryuzcorp/v<version>` is a line branch: the upstream tag `v<version>`
-  plus our patches as commits, one commit per patch, in `0001`-`0021`
+  plus our patches as commits, one commit per patch, in `0001`-`0022`
   order. Each patch commit is self-contained and carries its own tests.
 
 Upstream's `.github/workflows/release.yml` targets `ghcr.io/denoland` and
@@ -262,7 +262,7 @@ push to `ghcr.io/denoland`, but still. Pushing a branch named
   probed-free port; the conformance suites boot with port zero and
   discover the worker (200 on `/scope` or `/health`) and operator
   listeners via `/proc`.
-- `0021` (sha TBD at merge) tenant egress policy: `CELLD_EGRESS=public`
+- `0021` (`899897d`) tenant egress policy: `CELLD_EGRESS=public`
   refuses Worker `fetch()`/`connect()`/outbound-WebSocket dials to
   non-public addresses (loopback, private, link-local, CGNAT, ULA,
   unspecified, multicast, reserved, IPv4-mapped and transition-embedded
@@ -271,6 +271,18 @@ push to `ghcr.io/denoland`, but still. Pushing a branch named
   address; tenant clients ignore proxies, celld's own traffic and
   published container endpoints are exempt, and refused fetches reject
   with `TypeError`.
+- `0022` (sha TBD at merge) `celld d1 export` writes a consistent SQL
+  dump: the owner node reads schema beside data under one transaction, so the
+  dump is a single snapshot even under concurrent writes; `--table`
+  (repeatable), `--no-schema`, and `--no-data` narrow it, and one dump
+  carries at most 32 MiB. Export is operator-only: stub RPC to a D1 scope
+  answers only the binding's `__d1Query`/`__d1Batch`/`__d1Exec`, and the
+  export, migrate, and exec-with-rows fetch branches demand a host-set
+  operator-ingress marker that only the signed `/runtime/` path sets. The
+  dump streams schema and rows against the budget incrementally, skips
+  generated columns, carries NUL and invalid-UTF-8 TEXT byte-exact,
+  rebuilds fts5/fts5vocab/vec0 virtual tables without their shadows, and
+  parses the virtual-table module instead of matching a DDL prefix.
 
 ## Releases
 

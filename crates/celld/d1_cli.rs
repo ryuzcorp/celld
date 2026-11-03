@@ -1,4 +1,5 @@
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
+// Modified by ryuzcorp (ryuzcorp/celld): d1 export.
 
 // The D1 CLI reads operator input and migration files outside node storage.
 #![allow(clippy::disallowed_methods)]
@@ -201,6 +202,37 @@ pub async fn run(arguments: Vec<String>) -> anyhow::Result<()> {
             };
             note!("Executed {count} statement(s) in {took}");
         }
+        Action::Export {
+            output,
+            tables,
+            no_schema,
+            no_data,
+        } => {
+            let result = database.export(&tables, no_schema, no_data).await?;
+            let sql = result
+                .get("sql")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow!("the database reply carried no dump"))?;
+            let count = result
+                .get("tables")
+                .and_then(Value::as_array)
+                .map(Vec::len)
+                .unwrap_or_default();
+            match output {
+                Some(path) => {
+                    std::fs::write(&path, sql)
+                        .with_context(|| format!("write {}", path.display()))?;
+                    note!(
+                        "Exported {count} table(s), {} bytes, to {}",
+                        sql.len(),
+                        path.display()
+                    );
+                }
+                // One opaque payload, like every other stdout answer: the
+                // summary above stays on stderr so the dump pipes cleanly.
+                None => return out.bytes(sql.as_bytes()),
+            }
+        }
         Action::MigrationsList => {
             let pending = database.pending(declaration).await?;
             if pending.is_empty() {
@@ -246,6 +278,21 @@ impl Reachable {
         // exec(): the operator asked to see the result, not only the count.
         self.call(serde_json::json!({ "exec": { "sql": source, "rows": true } }))
             .await
+    }
+
+    /// The database as SQL, read under one transaction on the owner: schema
+    /// beside data in creation order, a single snapshot even while the
+    /// database takes writes.
+    async fn export(
+        &self,
+        tables: &[String],
+        no_schema: bool,
+        no_data: bool,
+    ) -> anyhow::Result<Value> {
+        self.call(serde_json::json!({
+            "export": { "tables": tables, "no_schema": no_schema, "no_data": no_data },
+        }))
+        .await
     }
 
     /// Rows for one statement, as `all()` would shape them.
@@ -413,6 +460,14 @@ enum Action {
         command: Option<String>,
         file: Option<PathBuf>,
     },
+    /// A SQL dump of the live database. `tables` empty means every table;
+    /// `output` missing means stdout.
+    Export {
+        output: Option<PathBuf>,
+        tables: Vec<String>,
+        no_schema: bool,
+        no_data: bool,
+    },
     MigrationsList,
     MigrationsApply,
 }
@@ -432,9 +487,14 @@ impl Command {
         let Some(first) = arguments.next() else {
             return Ok(None);
         };
+        let mut is_export = false;
         let action = match first.as_str() {
             "--help" | "-h" | "help" => return Ok(None),
             "execute" => None,
+            "export" => {
+                is_export = true;
+                None
+            }
             // An option in the subcommand slot means the subcommand is
             // missing, not that the option names one. Reporting `--bucket` as
             // an unknown subcommand would send an operator looking for a
@@ -456,6 +516,10 @@ impl Command {
 
         let mut sql = None;
         let mut file = None;
+        let mut output = None;
+        let mut tables = Vec::new();
+        let mut no_schema = false;
+        let mut no_data = false;
         let mut project = None;
         let mut fleet = FleetFlags::default();
         let mut json = false;
@@ -469,6 +533,10 @@ impl Command {
             match argument.as_str() {
                 "--command" => sql = Some(value("--command")?),
                 "--file" => file = Some(PathBuf::from(value("--file")?)),
+                "--output" => output = Some(PathBuf::from(value("--output")?)),
+                "--table" => tables.push(value("--table")?),
+                "--no-schema" => no_schema = true,
+                "--no-data" => no_data = true,
                 "--json" => json = true,
                 "--unsafe-public-advertise" => unsafe_public_advertise = true,
                 "--help" | "-h" => return Ok(None),
@@ -486,19 +554,42 @@ impl Command {
                 }
             }
         }
+        let export_options = output.is_some() || !tables.is_empty() || no_schema || no_data;
         let action = match action {
             Some(action) => {
                 // Accepting the flag and ignoring it would tell an operator
                 // their SQL ran when nothing read it.
-                if sql.is_some() || file.is_some() {
+                if sql.is_some() || file.is_some() || export_options {
                     bail!(
-                        "`celld d1 migrations` takes no --command or --file; \
+                        "`celld d1 migrations` takes no --command, --file, or export options; \
                          migrations come from the migrations directory"
                     );
                 }
                 action
             }
+            None if is_export => {
+                if sql.is_some() || file.is_some() {
+                    bail!("`celld d1 export` takes no --command or --file; it dumps the live database");
+                }
+                if json {
+                    bail!("`celld d1 export` writes SQL text, so --json does not apply");
+                }
+                if no_schema && no_data {
+                    bail!("`celld d1 export` with --no-schema and --no-data selects nothing");
+                }
+                Action::Export {
+                    output,
+                    tables,
+                    no_schema,
+                    no_data,
+                }
+            }
             None => {
+                if export_options {
+                    bail!(
+                        "--output, --table, --no-schema, and --no-data belong to `celld d1 export`"
+                    );
+                }
                 if sql.is_some() == file.is_some() {
                     bail!("celld d1 execute requires exactly one of --command or --file");
                 }
@@ -520,10 +611,11 @@ impl Command {
 
 pub fn print_help() {
     let text = format!(
-        r#"celld d1 — run SQL and migrations against a deployed D1 database
+        r#"celld d1 — run SQL, migrations, and exports against a deployed D1 database
 
 USAGE:
   celld d1 execute DATABASE (--command SQL | --file PATH) [PROJECT] --bucket NAME
+  celld d1 export DATABASE [--output PATH] [--table NAME]... [PROJECT] --bucket NAME
   celld d1 migrations apply DATABASE [PROJECT] --bucket NAME
   celld d1 migrations list  DATABASE [PROJECT] --bucket NAME
 
@@ -549,14 +641,128 @@ bookkeeping table. celld records applied migrations in that table
 `execute` prints a table, and every message goes to stderr, so its stdout
 carries only result rows. Pass --json for one JSON object per row.
 
+`export` writes the database as SQL — schema beside data in creation order —
+read under one transaction on the owning node, so the dump is a single
+snapshot even while the database takes writes. It prints to stdout, or to
+--output. Import a dump with `celld d1 execute DATABASE --file dump.sql`,
+which replays it in one transaction, as `wrangler d1 execute --file` does.
+
 OPTIONS:
   --command SQL       SQL to run; several statements are permitted
   --file PATH         Read the SQL from a file instead
   --json              Print one JSON object per row instead of a table
+  --output PATH       Write the export to a file instead of stdout
+  --table NAME        Export only this table, its indexes, and its triggers;
+                      repeat for several; views are left out of a filtered export
+  --no-schema         Export data only, no CREATE statements
+  --no-data           Export schema only, no INSERTs
 {FLEET_HELP}
   --unsafe-public-advertise
                       Permit a node whose advertised address is a public IP
   -h, --help          Show this help"#
     );
     let _ = Output::new(Format::Text).help(&text);
+}
+
+#[cfg(test)]
+mod d1_export_cli_tests {
+    use super::*;
+
+    fn parse(arguments: &[&str]) -> anyhow::Result<Option<Command>> {
+        Command::parse(arguments.iter().map(ToString::to_string).collect())
+    }
+
+    #[test]
+    fn export_parses_with_all_options() {
+        let command = parse(&[
+            "export",
+            "mydb",
+            "--output",
+            "dump.sql",
+            "--table",
+            "a",
+            "--table",
+            "b",
+            "--no-schema",
+            "--bucket",
+            "s3://fleet",
+        ])
+        .expect("parse")
+        .expect("command");
+        assert_eq!(command.database, "mydb");
+        assert!(!command.json);
+        match command.action {
+            Action::Export {
+                output,
+                tables,
+                no_schema,
+                no_data,
+            } => {
+                assert_eq!(output, Some(PathBuf::from("dump.sql")));
+                assert_eq!(tables, ["a", "b"].map(str::to_string));
+                assert!(no_schema);
+                assert!(!no_data);
+            }
+            _ => panic!("wrong action"),
+        }
+    }
+
+    #[test]
+    fn export_defaults_to_a_full_dump_on_stdout() {
+        let command = parse(&["export", "mydb"]).expect("parse").expect("command");
+        match command.action {
+            Action::Export {
+                output,
+                tables,
+                no_schema,
+                no_data,
+            } => {
+                assert_eq!(output, None);
+                assert!(tables.is_empty());
+                assert!(!no_schema);
+                assert!(!no_data);
+            }
+            _ => panic!("wrong action"),
+        }
+    }
+
+    #[test]
+    fn export_and_execute_refuse_each_others_options() {
+        for (arguments, fragment) in [
+            (
+                ["export", "db", "--command", "SELECT 1"].as_slice(),
+                "takes no --command or --file",
+            ),
+            (
+                ["export", "db", "--file", "q.sql"].as_slice(),
+                "takes no --command or --file",
+            ),
+            (
+                ["export", "db", "--json"].as_slice(),
+                "--json does not apply",
+            ),
+            (
+                ["export", "db", "--no-schema", "--no-data"].as_slice(),
+                "selects nothing",
+            ),
+            (
+                ["execute", "db", "--command", "SELECT 1", "--table", "a"].as_slice(),
+                "belong to `celld d1 export`",
+            ),
+            (
+                ["execute", "db", "--command", "SELECT 1", "--no-data"].as_slice(),
+                "belong to `celld d1 export`",
+            ),
+            (
+                ["migrations", "apply", "db", "--table", "a"].as_slice(),
+                "or export options",
+            ),
+        ] {
+            let error = match parse(arguments) {
+                Err(error) => error.to_string(),
+                Ok(_) => panic!("accepted {arguments:?}"),
+            };
+            assert!(error.contains(fragment), "arguments {arguments:?}: {error}");
+        }
+    }
 }

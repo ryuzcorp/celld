@@ -1,4 +1,5 @@
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
+// Modified by ryuzcorp (ryuzcorp/celld): D1 export; D1 export hardening.
 
 // This is V8-thread SQLite plumbing outside the Actor execution domain.
 #![allow(clippy::disallowed_methods)]
@@ -2212,6 +2213,19 @@ pub const D1_MAX_ROWS: usize = 100_000;
 /// 100,000 rows of TEXT or BLOB would otherwise not.
 pub const D1_MAX_RESULT_BYTES: usize = 32 * 1024 * 1024;
 
+/// Bytes one D1 export may emit. The dump crosses to the operator as one
+/// response, so it carries its own budget beside the result-set one: the
+/// same 32 MiB, because the dump exists twice at once (the Rust string and
+/// its JSON serialization) inside the same 128 MiB isolate heap.
+pub const D1_MAX_EXPORT_BYTES: usize = 32 * 1024 * 1024;
+
+/// One exported INSERT stays this far under the engine's SQL text limit, so
+/// the dump replays through `d1 execute`, whose statements the same limit
+/// bounds. A single row wider than the budget still goes out alone rather
+/// than not at all: up to the 100,000-byte limit it replays, and past it
+/// the import fails with SQLite's own error instead of silently truncating.
+const D1_EXPORT_INSERT_BUDGET: usize = 90_000;
+
 /// One D1 request. The modes are explicit because their contracts differ:
 /// a prepared statement is exactly one statement with binds, an exec is many
 /// statements with none, and a migration is an exec plus its bookkeeping row
@@ -2248,6 +2262,19 @@ pub enum D1Request {
         /// (`migrations_table`). Joined into SQL as an identifier, so it is
         /// refused unless it is a plain identifier.
         table: String,
+    },
+    /// `celld d1 export`: the database as SQL, read under one transaction.
+    Export {
+        /// Empty means every user table. Each name must match a table that
+        /// exists; matching is case-insensitive, as SQLite resolves names.
+        #[serde(default)]
+        tables: Vec<String>,
+        /// Data only: no CREATE statements.
+        #[serde(default)]
+        no_schema: bool,
+        /// Schema only: no INSERTs and no sequence reset.
+        #[serde(default)]
+        no_data: bool,
     },
 }
 
@@ -2307,6 +2334,12 @@ pub enum D1Response {
     Migrate {
         count: u64,
         duration: f64,
+    },
+    Export {
+        sql: String,
+        /// The tables whose schema and/or data the dump holds, in emission
+        /// order: every user table, or the requested subset.
+        tables: Vec<String>,
     },
 }
 
@@ -2830,6 +2863,9 @@ unsafe fn d1_run_prepared(
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum D1TransactionOperation {
     Begin,
+    /// A read bracket: in WAL mode readers hold a stable snapshot without
+    /// blocking writers, so an export never stalls the database it reads.
+    BeginDeferred,
     Commit,
     Rollback,
 }
@@ -2838,6 +2874,7 @@ impl D1TransactionOperation {
     fn sql(self) -> &'static str {
         match self {
             Self::Begin => "BEGIN IMMEDIATE",
+            Self::BeginDeferred => "BEGIN DEFERRED",
             Self::Commit => "COMMIT",
             Self::Rollback => "ROLLBACK",
         }
@@ -2906,7 +2943,14 @@ fn d1_transaction_control(
 
     result.map_err(|(result_code, error)| {
         let message = match error {
-            Some(error) if operation == D1TransactionOperation::Begin => error.to_string(),
+            Some(error)
+                if matches!(
+                    operation,
+                    D1TransactionOperation::Begin | D1TransactionOperation::BeginDeferred
+                ) =>
+            {
+                error.to_string()
+            }
             Some(error) if !matches!(error, rusqlite::Error::SqliteFailure(_, _)) => {
                 error.to_string()
             }
@@ -2974,6 +3018,824 @@ pub fn set_d1_commit_fault_for_test(result_code: i32) {
 #[cfg(celld_internal_tests)]
 pub fn set_d1_rollback_fault_for_test(result_code: i32) {
     D1_ROLLBACK_FAULT.with(|fault| fault.set(Some(result_code)));
+}
+
+/// True for the names a dump must not carry: SQLite's own (`sqlite_%`,
+/// which applications cannot create), the engine's (`_cf_%`, the same
+/// reservation the authorizer enforces), and the replicator's control
+/// tables. `sqlite_sequence` is reserved here too; its rows replay
+/// separately (see `d1_export_sequence`), because its schema is implicit.
+fn d1_export_reserved(name: &str) -> bool {
+    name.get(..7)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("sqlite_"))
+        || name
+            .get(..4)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("_cf_"))
+        || celld_ltx::db::is_control_table(name)
+}
+
+/// One virtual parent: its table name and its lowercased module (`fts5`,
+/// `fts5vocab`, `vec0`). Shadow suffixes differ per module, so the name
+/// alone cannot tell a shadow from a user table.
+type D1ExportParent = (String, String);
+
+/// The shadow suffixes an FTS5 virtual table derives from its own name. The
+/// shadows are ordinary tables in sqlite_schema, so a dump that carried
+/// their CREATEs would fail on import: creating the virtual table already
+/// recreates them.
+const D1_EXPORT_FTS_SHADOWS: [&str; 5] = ["_data", "_idx", "_content", "_docsize", "_config"];
+
+/// The fixed shadow suffixes a vec0 virtual table derives from its own name
+/// (pinned sqlite-vec 0.1.9 `VEC0_SHADOW_*_NAME`). The chunked families
+/// (`_vector_chunksNN`, `_metadatachunksNN`, `_metadatatextNN`) match below
+/// as a prefix plus digits.
+const D1_EXPORT_VEC_SHADOWS: [&str; 4] = ["_info", "_chunks", "_rowids", "_auxiliary"];
+const D1_EXPORT_VEC_CHUNKED: [&str; 3] = ["_vector_chunks", "_metadatachunks", "_metadatatext"];
+
+/// True when `name` is a shadow table of one of the `parents`: a virtual
+/// table recreates its shadows itself, so the dump skips them and replays
+/// the virtual table's own CREATE plus its rows. The slicing is fallible on
+/// purpose: a parent length that splits a character in `name` is not a
+/// prefix, not a panic.
+fn d1_export_is_shadow(name: &str, parents: &[D1ExportParent]) -> bool {
+    parents.iter().any(|(parent, module)| {
+        name.len() > parent.len()
+            && name
+                .get(..parent.len())
+                .is_some_and(|head| head.eq_ignore_ascii_case(parent))
+            && name
+                .get(parent.len()..)
+                .is_some_and(|tail| d1_export_is_shadow_tail(tail, module))
+    })
+}
+
+/// True when the tail past a parent's name is one of that module's shadows.
+/// An unknown module matches nothing: its shadows are unknowable, and
+/// skipping nothing keeps the failure loud (a duplicate CREATE on import)
+/// rather than silently dropping a user table that shares a suffix.
+fn d1_export_is_shadow_tail(tail: &str, module: &str) -> bool {
+    match module {
+        "fts5" | "fts5vocab" => D1_EXPORT_FTS_SHADOWS
+            .iter()
+            .any(|suffix| tail.eq_ignore_ascii_case(suffix)),
+        "vec0" => {
+            D1_EXPORT_VEC_SHADOWS
+                .iter()
+                .any(|suffix| tail.eq_ignore_ascii_case(suffix))
+                || D1_EXPORT_VEC_CHUNKED.iter().any(|prefix| {
+                    tail.len() > prefix.len()
+                        && tail
+                            .get(..prefix.len())
+                            .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+                        && tail.get(prefix.len()..).is_some_and(|digits| {
+                            !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
+                        })
+                })
+        }
+        _ => false,
+    }
+}
+
+/// Skip whitespace and SQL comments (`--` to end of line, `/* … */`).
+fn d1_export_skip_trivia(bytes: &[u8], mut index: usize) -> Option<usize> {
+    loop {
+        while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+            index += 1;
+        }
+        if bytes.get(index) == Some(&b'-') && bytes.get(index + 1) == Some(&b'-') {
+            index += 2;
+            while index < bytes.len() && bytes[index] != b'\n' {
+                index += 1;
+            }
+            continue;
+        }
+        if bytes.get(index) == Some(&b'/') && bytes.get(index + 1) == Some(&b'*') {
+            index += 2;
+            while index + 1 < bytes.len() && !(bytes[index] == b'*' && bytes[index + 1] == b'/') {
+                index += 1;
+            }
+            if index + 1 >= bytes.len() {
+                return None;
+            }
+            index += 2;
+            continue;
+        }
+        return Some(index);
+    }
+}
+
+/// Read one ASCII word (`[A-Za-z0-9_$]+`): keywords are ASCII, and a longer
+/// word never equals a keyword by prefix.
+fn d1_export_read_word(bytes: &[u8], index: usize) -> Option<(&str, usize)> {
+    let mut end = index;
+    while end < bytes.len()
+        && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_' || bytes[end] == b'$')
+    {
+        end += 1;
+    }
+    if end == index {
+        return None;
+    }
+    Some((std::str::from_utf8(&bytes[index..end]).ok()?, end))
+}
+
+/// Skip one identifier, bare or quoted (`"…"`, `` `…` ``, `[…]`, `'…'`),
+/// returning the index past it. A bare name is any run outside the delimiter
+/// set, so non-ASCII names skip whole rather than ending the parse.
+fn d1_export_skip_name(bytes: &[u8], index: usize) -> Option<usize> {
+    let (_, end) = d1_export_read_name(bytes, index)?;
+    Some(end)
+}
+
+/// Read one identifier, unescaping quotes. Brackets end at the first `]`,
+/// as SQLite reads them.
+fn d1_export_read_name(bytes: &[u8], index: usize) -> Option<(String, usize)> {
+    let quote = *bytes.get(index)?;
+    if quote == b'"' || quote == b'`' || quote == b'\'' {
+        let mut name: Vec<u8> = Vec::new();
+        let mut cursor = index + 1;
+        loop {
+            if cursor >= bytes.len() {
+                return None;
+            }
+            if bytes[cursor] == quote {
+                if bytes.get(cursor + 1) == Some(&quote) {
+                    name.push(quote);
+                    cursor += 2;
+                } else {
+                    return Some((String::from_utf8(name).ok()?, cursor + 1));
+                }
+            } else {
+                name.push(bytes[cursor]);
+                cursor += 1;
+            }
+        }
+    }
+    if quote == b'[' {
+        let mut cursor = index + 1;
+        while cursor < bytes.len() && bytes[cursor] != b']' {
+            cursor += 1;
+        }
+        if cursor >= bytes.len() {
+            return None;
+        }
+        return Some((
+            std::str::from_utf8(&bytes[index + 1..cursor])
+                .ok()?
+                .to_string(),
+            cursor + 1,
+        ));
+    }
+    let mut end = index;
+    while end < bytes.len()
+        && !matches!(
+            bytes[end],
+            b' ' | b'\t'
+                | b'\n'
+                | b'\r'
+                | b'\x0c'
+                | b'\x0b'
+                | b'('
+                | b')'
+                | b','
+                | b';'
+                | b'.'
+                | b'"'
+                | b'\''
+                | b'`'
+                | b'['
+                | b']'
+        )
+    {
+        end += 1;
+    }
+    if end == index {
+        return None;
+    }
+    Some((
+        std::str::from_utf8(&bytes[index..end]).ok()?.to_string(),
+        end,
+    ))
+}
+
+/// Consume `IF NOT EXISTS` when the whole trio is present, else `None` — a
+/// table named `if` is otherwise the table name, not the clause.
+fn d1_export_try_if_not_exists(bytes: &[u8], index: usize) -> Option<usize> {
+    let (word, next) = d1_export_read_word(bytes, index)?;
+    if !word.eq_ignore_ascii_case("if") {
+        return None;
+    }
+    let next = d1_export_skip_trivia(bytes, next)?;
+    let (word, next) = d1_export_read_word(bytes, next)?;
+    if !word.eq_ignore_ascii_case("not") {
+        return None;
+    }
+    let next = d1_export_skip_trivia(bytes, next)?;
+    let (word, next) = d1_export_read_word(bytes, next)?;
+    if !word.eq_ignore_ascii_case("exists") {
+        return None;
+    }
+    d1_export_skip_trivia(bytes, next)
+}
+
+/// The virtual-table module of a CREATE statement, lowercased (`fts5`,
+/// `fts5vocab`, `vec0`), or `None` for an ordinary table. Parses
+/// `CREATE [TEMP|TEMPORARY] VIRTUAL TABLE [IF NOT EXISTS] [schema.]name
+/// USING module(…)`: the stored text keeps the author's spacing, quoting,
+/// comments, and case, so a prefix match misclassifies legal spellings. A
+/// statement that fails to parse reads as an ordinary table — the shadows,
+/// if any, then fail the import loudly rather than vanishing silently.
+fn d1_export_virtual_module(sql: &str) -> Option<String> {
+    let bytes = sql.as_bytes();
+    let mut index = d1_export_skip_trivia(bytes, 0)?;
+    let (word, next) = d1_export_read_word(bytes, index)?;
+    if !word.eq_ignore_ascii_case("create") {
+        return None;
+    }
+    index = d1_export_skip_trivia(bytes, next)?;
+    let (word, next) = d1_export_read_word(bytes, index)?;
+    if word.eq_ignore_ascii_case("temp") || word.eq_ignore_ascii_case("temporary") {
+        index = d1_export_skip_trivia(bytes, next)?;
+        let (word, next) = d1_export_read_word(bytes, index)?;
+        if !word.eq_ignore_ascii_case("virtual") {
+            return None;
+        }
+        index = d1_export_skip_trivia(bytes, next)?;
+    } else if word.eq_ignore_ascii_case("virtual") {
+        index = d1_export_skip_trivia(bytes, next)?;
+    } else {
+        return None;
+    }
+    let (word, next) = d1_export_read_word(bytes, index)?;
+    if !word.eq_ignore_ascii_case("table") {
+        return None;
+    }
+    index = d1_export_skip_trivia(bytes, next)?;
+    if let Some(after) = d1_export_try_if_not_exists(bytes, index) {
+        index = after;
+    }
+    index = d1_export_skip_name(bytes, index)?;
+    index = d1_export_skip_trivia(bytes, index)?;
+    if bytes.get(index) == Some(&b'.') {
+        index = d1_export_skip_trivia(bytes, index + 1)?;
+        index = d1_export_skip_name(bytes, index)?;
+        index = d1_export_skip_trivia(bytes, index)?;
+    }
+    let (word, next) = d1_export_read_word(bytes, index)?;
+    if !word.eq_ignore_ascii_case("using") {
+        return None;
+    }
+    index = d1_export_skip_trivia(bytes, next)?;
+    let (module, _) = d1_export_read_name(bytes, index)?;
+    Some(module.to_ascii_lowercase())
+}
+
+/// One identifier as SQL text: double-quoted, with embedded quotes doubled.
+/// Table and column names reach INSERTs only through this function, so a
+/// hostile name cannot break out of its statement.
+fn d1_export_ident(name: &str) -> String {
+    let mut quoted = String::with_capacity(name.len() + 2);
+    quoted.push('"');
+    for ch in name.chars() {
+        if ch == '"' {
+            quoted.push('"');
+        }
+        quoted.push(ch);
+    }
+    quoted.push('"');
+    quoted
+}
+
+/// One string as a SQL literal: single-quoted, with embedded quotes doubled.
+fn d1_export_string(text: &str) -> String {
+    let mut literal = String::with_capacity(text.len() + 2);
+    literal.push('\'');
+    for ch in text.chars() {
+        if ch == '\'' {
+            literal.push('\'');
+        }
+        literal.push(ch);
+    }
+    literal.push('\'');
+    literal
+}
+
+/// Raw bytes as a SQL blob literal: hex, so NUL-safe and empty-safe.
+fn d1_export_blob(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut literal = String::with_capacity(bytes.len() * 2 + 3);
+    literal.push_str("X'");
+    for byte in bytes {
+        literal.push(HEX[(byte >> 4) as usize] as char);
+        literal.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    literal.push('\'');
+    literal
+}
+
+/// One cell as a SQL literal. TEXT decodes lossily -- the same U+FFFD the
+/// binding itself decodes with -- except when it holds a NUL byte or invalid
+/// UTF-8: a quoted literal cannot carry either (every import path funnels
+/// through `CString::new`, and lossy decoding is not byte-exact), so those
+/// ride `CAST(X'…' AS TEXT)` and replay byte-exact. REAL renders through
+/// Debug, which is SQLite-parseable and round-trips; infinities have no
+/// literal, so they ride the overflow spellings that parse back to
+/// themselves.
+fn d1_export_literal(value: rusqlite::types::ValueRef<'_>) -> String {
+    use rusqlite::types::ValueRef;
+    match value {
+        ValueRef::Null => "NULL".to_string(),
+        ValueRef::Integer(number) => number.to_string(),
+        ValueRef::Real(float) => {
+            if float.is_nan() {
+                // SQLite stores NaN as NULL, so this is unreachable from a
+                // real row; refusing to emit the unparseable `NaN` anyway.
+                "NULL".to_string()
+            } else if float.is_finite() {
+                format!("{float:?}")
+            } else if float.is_sign_positive() {
+                "9e999".to_string()
+            } else {
+                "-9e999".to_string()
+            }
+        }
+        ValueRef::Text(bytes) => {
+            if bytes.contains(&0) || std::str::from_utf8(bytes).is_err() {
+                format!("CAST({} AS TEXT)", d1_export_blob(bytes))
+            } else {
+                d1_export_string(&sql_text(bytes))
+            }
+        }
+        ValueRef::Blob(bytes) => d1_export_blob(bytes),
+    }
+}
+
+fn d1_export_too_large() -> D1Failure {
+    d1_error(format!(
+        "the export exceeds {D1_MAX_EXPORT_BYTES} bytes, which is more than one dump can \
+         carry; export fewer tables with --table"
+    ))
+}
+
+/// A thread-local allocation window for the export spike test: while counting
+/// is on for this thread, every allocation and free on it moves a live total,
+/// and the peak is what the test asserts. Other threads — the other tests
+/// running beside it — never opt in, so their allocations cost one
+/// thread-local read and are never counted.
+#[cfg(test)]
+mod test_alloc {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::cell::Cell;
+
+    thread_local! {
+        static COUNTING: Cell<bool> = const { Cell::new(false) };
+        static LIVE: Cell<usize> = const { Cell::new(0) };
+        static PEAK: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub struct Counting;
+
+    // SAFETY: counting reads and writes thread-local cells only, which
+    // allocate nothing, so the hooks cannot re-enter the allocator.
+    unsafe impl GlobalAlloc for Counting {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            // SAFETY: by the GlobalAlloc contract the caller guarantees the
+            // layout fits what System accepts.
+            let ptr = unsafe { System.alloc(layout) };
+            if !ptr.is_null() && COUNTING.with(|counting| counting.get()) {
+                LIVE.with(|live| {
+                    let now = live.get().saturating_add(layout.size());
+                    live.set(now);
+                    PEAK.with(|peak| peak.set(peak.get().max(now)));
+                });
+            }
+            ptr
+        }
+
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            if COUNTING.with(|counting| counting.get()) {
+                LIVE.with(|live| live.set(live.get().saturating_sub(layout.size())));
+            }
+            // SAFETY: the pointer and layout are what a paired alloc handed
+            // out, by the GlobalAlloc contract.
+            unsafe { System.dealloc(ptr, layout) };
+        }
+    }
+
+    pub fn counting(on: bool) {
+        COUNTING.with(|counting| counting.set(on));
+    }
+
+    pub fn reset() {
+        LIVE.with(|live| live.set(0));
+        PEAK.with(|peak| peak.set(0));
+    }
+
+    pub fn peak() -> usize {
+        PEAK.with(|peak| peak.get())
+    }
+}
+
+// The unit-test binary only: the library itself leaves the allocator alone,
+// and the node binary keeps its own.
+#[cfg(test)]
+#[global_allocator]
+static TEST_ALLOC: test_alloc::Counting = test_alloc::Counting;
+
+#[cfg(test)]
+thread_local! {
+    /// Bytes of cell literals one export encoded on this thread. The wide-row
+    /// test resets it around the export and asserts the refusal came before
+    /// the dump buffered far past the budget — a timing-free bound on the
+    /// transient the budget check itself cannot see.
+    static D1_EXPORT_ENCODED_BYTES: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Charge one encoded cell against the test counter. A no-op outside tests.
+fn d1_export_note_encoded(bytes: usize) {
+    #[cfg(test)]
+    D1_EXPORT_ENCODED_BYTES.with(|counter| counter.set(counter.get().saturating_add(bytes)));
+    #[cfg(not(test))]
+    let _ = bytes;
+}
+
+#[cfg(test)]
+fn d1_export_reset_encoded_bytes() {
+    D1_EXPORT_ENCODED_BYTES.with(|counter| counter.set(0));
+}
+
+#[cfg(test)]
+fn d1_export_encoded_bytes() -> usize {
+    D1_EXPORT_ENCODED_BYTES.with(|counter| counter.get())
+}
+
+/// Refuse once the dump plus its in-progress statements exceed the budget.
+/// Runs after each encoded cell: one cell is bounded by SQLITE_LIMIT_LENGTH,
+/// so the transient past the cap stays one cell rather than one row, one
+/// table, or the whole schema.
+fn d1_export_check(sql: &str, current: &str, tuple: &str) -> Result<(), D1Failure> {
+    if sql
+        .len()
+        .saturating_add(current.len())
+        .saturating_add(tuple.len())
+        > D1_MAX_EXPORT_BYTES
+    {
+        return Err(d1_export_too_large());
+    }
+    Ok(())
+}
+
+/// Append one finished statement to the dump, enforcing the export budget.
+/// The row loops refuse earlier, per cell as the statement is built; this is
+/// the backstop for schema text. A single row wider than the INSERT budget
+/// still goes out alone (see `D1_EXPORT_INSERT_BUDGET`); only the dump as a
+/// whole is capped.
+fn d1_export_push(sql: &mut String, text: &str) -> Result<(), D1Failure> {
+    if sql.len().saturating_add(text.len()) > D1_MAX_EXPORT_BYTES {
+        return Err(d1_export_too_large());
+    }
+    sql.push_str(text);
+    Ok(())
+}
+
+/// One table's rows as chunked multi-row INSERTs. Each statement stays under
+/// `D1_EXPORT_INSERT_BUDGET` so the dump replays through the SQL text limit
+/// the engine enforces; a row wider than the budget goes out alone rather
+/// than not at all.
+fn d1_export_rows(connection: &Connection, sql: &mut String, table: &str) -> Result<(), D1Failure> {
+    // Storable columns only: SQLite refuses an INSERT that names a generated
+    // column (hidden 2/3 in table_xinfo), and hidden virtual-table columns
+    // (hidden 1) are not part of SELECT * either. Selecting the list
+    // explicitly keeps the positions aligned whatever the table hides.
+    let mut xinfo = connection
+        .prepare("SELECT name, hidden FROM pragma_table_xinfo(?)")
+        .map_err(|error| d1_error(error.to_string()))?;
+    let columns: Vec<String> = xinfo
+        .query_map([table], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })
+        .map_err(|error| d1_error(error.to_string()))?
+        .collect::<rusqlite::Result<Vec<(String, i64)>>>()
+        .map_err(|error| d1_error(error.to_string()))?
+        .into_iter()
+        .filter(|(_, hidden)| *hidden == 0)
+        .map(|(name, _)| name)
+        .collect();
+    if columns.is_empty() {
+        // Unreachable through DDL: SQLite refuses a table without a stored
+        // column. Refusing loudly beats emitting a row-less dump that reads
+        // as empty.
+        return Err(d1_error(format!(
+            "table {table:?} has no stored columns to export"
+        )));
+    }
+    let head = format!(
+        "INSERT INTO {} ({}) VALUES ",
+        d1_export_ident(table),
+        columns
+            .iter()
+            .map(|column| d1_export_ident(column))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    let mut statement = connection
+        .prepare(&format!(
+            "SELECT {} FROM {}",
+            columns
+                .iter()
+                .map(|column| d1_export_ident(column))
+                .collect::<Vec<_>>()
+                .join(","),
+            d1_export_ident(table)
+        ))
+        .map_err(|error| d1_error(error.to_string()))?;
+    let mut rows = statement
+        .query([])
+        .map_err(|error| d1_error(error.to_string()))?;
+    let mut current = String::new();
+    while let Some(row) = rows.next().map_err(|error| d1_error(error.to_string()))? {
+        let mut tuple = String::from("(");
+        for (index, _) in columns.iter().enumerate() {
+            if index > 0 {
+                tuple.push(',');
+            }
+            let literal = d1_export_literal(
+                row.get_ref(index)
+                    .map_err(|error| d1_error(error.to_string()))?,
+            );
+            d1_export_note_encoded(literal.len());
+            tuple.push_str(&literal);
+            d1_export_check(sql, &current, &tuple)?;
+        }
+        tuple.push(')');
+        if current.is_empty() {
+            current.push_str(&head);
+            current.push_str(&tuple);
+        } else if current.len() + tuple.len() + 1 > D1_EXPORT_INSERT_BUDGET {
+            current.push_str(";\n");
+            d1_export_push(sql, &current)?;
+            current.clear();
+            current.push_str(&head);
+            current.push_str(&tuple);
+        } else {
+            current.push(',');
+            current.push_str(&tuple);
+        }
+    }
+    if !current.is_empty() {
+        current.push_str(";\n");
+        d1_export_push(sql, &current)?;
+    }
+    Ok(())
+}
+
+/// The AUTOINCREMENT counters, without which a replayed database reissues
+/// ids. `sqlite_sequence` itself is never exported as a table -- its schema
+/// is implicit -- so its rows replay as a reset plus INSERTs, the way the
+/// sqlite3 shell dumps it. Under a table filter only the chosen tables'
+/// counters replay. Streams: the reset goes out when the first kept counter
+/// arrives, so an empty selection emits nothing at all.
+fn d1_export_sequence(
+    connection: &Connection,
+    sql: &mut String,
+    chosen: &[String],
+    filtered: bool,
+) -> Result<(), D1Failure> {
+    let exists = connection
+        .query_row(
+            "SELECT 1 FROM sqlite_schema WHERE name = 'sqlite_sequence'",
+            [],
+            |_| Ok(true),
+        )
+        .optional()
+        .map_err(|error| d1_error(error.to_string()))?
+        .unwrap_or(false);
+    if !exists {
+        return Ok(());
+    }
+    let mut statement = connection
+        .prepare("SELECT name, seq FROM sqlite_sequence")
+        .map_err(|error| d1_error(error.to_string()))?;
+    let mut rows = statement
+        .query([])
+        .map_err(|error| d1_error(error.to_string()))?;
+    let head = "INSERT INTO \"sqlite_sequence\" (\"name\",\"seq\") VALUES ";
+    let mut current = String::from(head);
+    let mut first = true;
+    let mut any = false;
+    while let Some(row) = rows.next().map_err(|error| d1_error(error.to_string()))? {
+        let name: String = row.get(0).map_err(|error| d1_error(error.to_string()))?;
+        let seq: i64 = row.get(1).map_err(|error| d1_error(error.to_string()))?;
+        if filtered && !chosen.iter().any(|table| table.eq_ignore_ascii_case(&name)) {
+            continue;
+        }
+        if !any {
+            d1_export_push(sql, "DELETE FROM \"sqlite_sequence\";\n")?;
+            any = true;
+        }
+        let tuple = format!("({}, {seq})", d1_export_string(&name));
+        if first {
+            first = false;
+        } else if current.len() + tuple.len() + 1 > D1_EXPORT_INSERT_BUDGET {
+            current.push_str(";\n");
+            d1_export_push(sql, &current)?;
+            current = String::from(head);
+        } else {
+            current.push(',');
+        }
+        current.push_str(&tuple);
+    }
+    if any {
+        current.push_str(";\n");
+        d1_export_push(sql, &current)?;
+    }
+    Ok(())
+}
+
+/// Emit one table's CREATE beside its rows. An fts5vocab table emits schema
+/// only: it is read-only, and rows would refuse on import.
+fn d1_export_emit_table(
+    connection: &Connection,
+    sql: &mut String,
+    name: &str,
+    create: &str,
+    module: Option<&str>,
+    no_schema: bool,
+    no_data: bool,
+) -> Result<(), D1Failure> {
+    if !no_schema {
+        d1_export_push(sql, create)?;
+        d1_export_push(sql, ";\n")?;
+    }
+    if !no_data && module != Some("fts5vocab") {
+        d1_export_rows(connection, sql, name)?;
+    }
+    Ok(())
+}
+
+/// Read the whole dump under the caller's transaction: each table's CREATE
+/// beside its rows in creation order, then the sequence reset, then the
+/// indexes, triggers, and views. One transaction for all of it is what
+/// makes the dump a single snapshot; the caller holds the bracket. The
+/// reads run as the engine's own, past the authorizer: reserved names are
+/// excluded here in code instead, and a name the filter cannot see cannot
+/// reach the SQL text either way.
+///
+/// Every pass streams: the schema is never collected whole, so a pathological
+/// schema (many tables of near-limit CREATEs) refuses at the budget rather
+/// than spiking beside the dump.
+fn d1_export_dump(
+    connection: &Connection,
+    selected: &[String],
+    no_schema: bool,
+    no_data: bool,
+) -> Result<(String, Vec<String>), D1Failure> {
+    without_sql_authorizer(connection, || {
+        // First pass: the virtual parents, names and modules only. Shadows
+        // need the full parent list before any table filters.
+        let mut parents: Vec<D1ExportParent> = Vec::new();
+        {
+            let mut master = connection
+                .prepare(
+                    "SELECT name, sql FROM sqlite_schema \
+                     WHERE type = 'table' AND sql IS NOT NULL",
+                )
+                .map_err(|error| d1_error(error.to_string()))?;
+            let mut rows = master
+                .query([])
+                .map_err(|error| d1_error(error.to_string()))?;
+            while let Some(row) = rows.next().map_err(|error| d1_error(error.to_string()))? {
+                let name: String = row.get(0).map_err(|error| d1_error(error.to_string()))?;
+                let create: String = row.get(1).map_err(|error| d1_error(error.to_string()))?;
+                if let Some(module) = d1_export_virtual_module(&create) {
+                    parents.push((name, module));
+                }
+            }
+        }
+        let mut sql = String::new();
+        let mut chosen: Vec<String> = Vec::new();
+        if selected.is_empty() {
+            // Unfiltered: stream the tables in creation order, emitting each
+            // table's CREATE beside its rows as the cursor reaches it. A
+            // virtual table is never anyone's shadow, whatever it is named.
+            let mut master = connection
+                .prepare(
+                    "SELECT name, sql FROM sqlite_schema \
+                     WHERE type = 'table' AND sql IS NOT NULL ORDER BY rowid",
+                )
+                .map_err(|error| d1_error(error.to_string()))?;
+            let mut rows = master
+                .query([])
+                .map_err(|error| d1_error(error.to_string()))?;
+            while let Some(row) = rows.next().map_err(|error| d1_error(error.to_string()))? {
+                let name: String = row.get(0).map_err(|error| d1_error(error.to_string()))?;
+                let create: String = row.get(1).map_err(|error| d1_error(error.to_string()))?;
+                if d1_export_reserved(&name) {
+                    continue;
+                }
+                let module = d1_export_virtual_module(&create);
+                if module.is_none() && d1_export_is_shadow(&name, &parents) {
+                    continue;
+                }
+                d1_export_emit_table(
+                    connection,
+                    &mut sql,
+                    &name,
+                    &create,
+                    module.as_deref(),
+                    no_schema,
+                    no_data,
+                )?;
+                chosen.push(name);
+            }
+        } else {
+            // Filtered: fetch each requested table by name, one row at a
+            // time; the match is case-insensitive, as SQLite resolves names.
+            // Reserved, shadow, and non-table names are unknown tables, and a
+            // repeated --table names its table once: emitting the CREATE
+            // twice would fail the import, and silently running it twice is
+            // worse.
+            for requested in selected {
+                let found: Option<(String, String)> = connection
+                    .query_row(
+                        "SELECT name, sql FROM sqlite_schema \
+                         WHERE type = 'table' AND sql IS NOT NULL \
+                         AND name = ?1 COLLATE NOCASE",
+                        [requested],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .optional()
+                    .map_err(|error| d1_error(error.to_string()))?;
+                let unknown = || d1_error(format!("unknown table {requested:?}"));
+                let Some((name, create)) = found else {
+                    return Err(unknown());
+                };
+                if d1_export_reserved(&name) {
+                    return Err(unknown());
+                }
+                let module = d1_export_virtual_module(&create);
+                if module.is_none() && d1_export_is_shadow(&name, &parents) {
+                    return Err(unknown());
+                }
+                if chosen.iter().any(|known| known == &name) {
+                    continue;
+                }
+                d1_export_emit_table(
+                    connection,
+                    &mut sql,
+                    &name,
+                    &create,
+                    module.as_deref(),
+                    no_schema,
+                    no_data,
+                )?;
+                chosen.push(name);
+            }
+        }
+        let filtered = !selected.is_empty();
+        if !no_data {
+            d1_export_sequence(connection, &mut sql, &chosen, filtered)?;
+        }
+        if !no_schema {
+            // Indexes, triggers, and views stream in creation order. Indexes
+            // and triggers follow their table under a filter; a view belongs
+            // to no table, so a filtered export leaves all views out rather
+            // than replaying some against missing bases.
+            let mut master = connection
+                .prepare(
+                    "SELECT type, name, tbl_name, sql FROM sqlite_schema \
+                     WHERE sql IS NOT NULL AND type IN ('index', 'trigger', 'view') \
+                     ORDER BY rowid",
+                )
+                .map_err(|error| d1_error(error.to_string()))?;
+            let mut rows = master
+                .query([])
+                .map_err(|error| d1_error(error.to_string()))?;
+            while let Some(row) = rows.next().map_err(|error| d1_error(error.to_string()))? {
+                let kind: String = row.get(0).map_err(|error| d1_error(error.to_string()))?;
+                let name: String = row.get(1).map_err(|error| d1_error(error.to_string()))?;
+                let table: String = row.get(2).map_err(|error| d1_error(error.to_string()))?;
+                let create: String = row.get(3).map_err(|error| d1_error(error.to_string()))?;
+                if d1_export_reserved(&name) {
+                    continue;
+                }
+                let wanted = if kind == "view" {
+                    !filtered
+                } else {
+                    !filtered
+                        || chosen
+                            .iter()
+                            .any(|chosen| chosen.eq_ignore_ascii_case(&table))
+                };
+                if wanted {
+                    d1_export_push(&mut sql, &create)?;
+                    d1_export_push(&mut sql, ";\n")?;
+                }
+            }
+        }
+        Ok((sql, chosen))
+    })
 }
 
 /// Run one D1 request against a cell's SQLite: the binding's single seam
@@ -3185,6 +4047,46 @@ pub fn d1_run(scope: &str, request: &D1Request) -> Result<D1Response, D1Failure>
                         Err(failure)
                     }
                 }
+            })
+            .unwrap_or_else(|| Err(d1_error(format!("no db for {scope}"))))
+        }
+        D1Request::Export {
+            tables,
+            no_schema,
+            no_data,
+        } => {
+            if *no_schema && *no_data {
+                return Err(d1_error(
+                    "nothing to export: --no-schema and --no-data together select nothing",
+                ));
+            }
+            with(scope, |connection| {
+                // The bracket is the snapshot: every read below runs inside
+                // this one deferred transaction, so concurrent writers commit
+                // around it without ever appearing halfway through the dump.
+                if !connection.is_autocommit() {
+                    return Err(d1_error(
+                        "an export cannot start inside an open transaction",
+                    ));
+                }
+                d1_transaction_control(
+                    scope,
+                    connection,
+                    D1TransactionOperation::BeginDeferred,
+                    d1_error,
+                )?;
+                let dumped = d1_export_dump(connection, tables, *no_schema, *no_data);
+                // A read transaction has nothing to commit; rolling back
+                // releases the snapshot either way, including on failure.
+                if !connection.is_autocommit() {
+                    let _ = d1_transaction_control(
+                        scope,
+                        connection,
+                        D1TransactionOperation::Rollback,
+                        d1_error,
+                    );
+                }
+                dumped.map(|(sql, tables)| D1Response::Export { sql, tables })
             })
             .unwrap_or_else(|| Err(d1_error(format!("no db for {scope}"))))
         }
@@ -4468,3 +5370,837 @@ pub fn bump_alarm_with_policy(scope: &str, now_ms: i64, counts_against_limit: bo
 
 #[cfg(celld_internal_tests)]
 include!(env!("CELLD_INTERNAL_STORAGE_OBSERVERS"));
+
+#[cfg(test)]
+mod d1_test_db {
+    use super::*;
+
+    /// One scratch cell database: its own isolate state, installed for the
+    /// test's thread, over a temp file. The `Cells` leaks -- one per test --
+    /// because the installed guard borrows it for the whole test.
+    pub(crate) struct TestDb {
+        _installed: Installed,
+        pub(crate) scope: String,
+        _dir: tempfile::TempDir,
+    }
+
+    impl TestDb {
+        pub(crate) fn open(name: &str) -> Self {
+            Self::open_inner(name, false)
+        }
+
+        /// A scratch cell with the sqlite-vec extension registered, for vec0
+        /// tables. Ordinary cells open without it, as production cells do
+        /// unless the deployment enables the compat flag.
+        pub(crate) fn open_with_vec(name: &str) -> Self {
+            Self::open_inner(name, true)
+        }
+
+        fn open_inner(name: &str, sqlite_vec: bool) -> Self {
+            let cells: &'static Cells = Box::leak(Box::new(Cells::default()));
+            let installed = cells.install();
+            let dir = tempfile::tempdir().expect("temp dir");
+            let scope = format!("d1-test-{name}");
+            let path = dir.path().join("cell.sqlite3");
+            open_with_compat(&scope, path.to_str().expect("utf-8 path"), sqlite_vec)
+                .expect("open cell");
+            Self {
+                _installed: installed,
+                scope,
+                _dir: dir,
+            }
+        }
+
+        pub(crate) fn exec(&self, sql: &str) {
+            match d1_run(
+                &self.scope,
+                &D1Request::Exec {
+                    sql: sql.to_string(),
+                    rows: false,
+                },
+            ) {
+                Ok(_) => {}
+                Err(failure) => panic!("exec failed: {}: {sql}", failure.message),
+            }
+        }
+
+        /// The cell file, for a second connection writing beside the test's:
+        /// the engine's own registry is single-threaded, so concurrency with
+        /// the export bracket needs a connection outside it.
+        pub(crate) fn path(&self) -> std::path::PathBuf {
+            self._dir.path().join("cell.sqlite3")
+        }
+    }
+
+    impl Drop for TestDb {
+        fn drop(&mut self) {
+            close(&self.scope);
+        }
+    }
+}
+
+#[cfg(test)]
+mod d1_export_tests {
+    use super::d1_test_db::TestDb;
+    use super::*;
+
+    /// The user-visible schema plus every user table's rows, for round-trip
+    /// comparison.
+    type ExportSnapshot = (
+        Vec<(String, String, String, String)>,
+        Vec<(String, Vec<String>)>,
+    );
+
+    impl TestDb {
+        fn export(
+            &self,
+            tables: Vec<String>,
+            no_schema: bool,
+            no_data: bool,
+        ) -> (String, Vec<String>) {
+            match d1_run(
+                &self.scope,
+                &D1Request::Export {
+                    tables,
+                    no_schema,
+                    no_data,
+                },
+            ) {
+                Ok(D1Response::Export { sql, tables }) => (sql, tables),
+                Ok(_) => panic!("export answered the wrong shape"),
+                Err(failure) => panic!("export failed: {}", failure.message),
+            }
+        }
+
+        /// The user-visible schema plus every user table's rows, rendered
+        /// the way the dump renders them, for round-trip comparison.
+        /// Engine tables and FTS shadows are excluded on both sides, exactly
+        /// as the dump excludes them.
+        fn snapshot(&self) -> ExportSnapshot {
+            with(&self.scope, |connection| {
+                without_sql_authorizer(connection, || {
+                    let mut master = connection
+                        .prepare(
+                            "SELECT type, name, tbl_name, sql FROM sqlite_schema \
+                             WHERE sql IS NOT NULL ORDER BY rowid",
+                        )
+                        .expect("schema");
+                    let objects: Vec<(String, String, String, String)> = master
+                        .query_map([], |row| {
+                            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                        })
+                        .expect("map")
+                        .collect::<rusqlite::Result<_>>()
+                        .expect("rows");
+                    // Sorted by name: the dump emits tables first and the
+                    // indexes, triggers, and views after them, so creation
+                    // order legitimately differs after a replay.
+                    let mut user: Vec<_> = objects
+                        .into_iter()
+                        .filter(|(_, name, _, _)| !d1_export_reserved(name))
+                        .collect();
+                    user.sort_by(|left, right| left.1.cmp(&right.1));
+                    let parents: Vec<D1ExportParent> = user
+                        .iter()
+                        .filter(|(kind, _, _, _)| kind == "table")
+                        .filter_map(|(_, name, _, sql)| {
+                            d1_export_virtual_module(sql).map(|module| (name.clone(), module))
+                        })
+                        .collect();
+                    let mut data = Vec::new();
+                    for (kind, name, _, _) in &user {
+                        if kind != "table" || d1_export_is_shadow(name, &parents) {
+                            continue;
+                        }
+                        let mut statement = connection
+                            .prepare(&format!("SELECT * FROM {}", d1_export_ident(name)))
+                            .expect("select");
+                        let width = statement.column_count();
+                        let mut rows = statement.query([]).expect("query");
+                        let mut rendered = Vec::new();
+                        while let Some(row) = rows.next().expect("next") {
+                            let mut cells = Vec::with_capacity(width);
+                            for index in 0..width {
+                                cells.push(d1_export_literal(row.get_ref(index).expect("cell")));
+                            }
+                            rendered.push(cells.join("|"));
+                        }
+                        data.push((name.clone(), rendered));
+                    }
+                    // The AUTOINCREMENT counters ride the dump as data, so
+                    // they compare as data.
+                    if let Ok(mut statement) =
+                        connection.prepare("SELECT name, seq FROM sqlite_sequence")
+                    {
+                        let mut rows = statement.query([]).expect("query");
+                        let mut counters = Vec::new();
+                        while let Some(row) = rows.next().expect("next") {
+                            counters.push(format!(
+                                "{}={}",
+                                row.get::<_, String>(0).expect("name"),
+                                row.get::<_, i64>(1).expect("seq")
+                            ));
+                        }
+                        data.push(("sqlite_sequence".to_string(), counters));
+                    }
+                    (user, data)
+                })
+            })
+            .expect("db present")
+        }
+    }
+
+    #[test]
+    fn export_round_trip_reproduces_schema_and_rows() {
+        let source = TestDb::open("round-trip");
+        source.exec(
+            "CREATE TABLE users (\
+               id INTEGER PRIMARY KEY AUTOINCREMENT, \
+               name TEXT NOT NULL UNIQUE, \
+               score REAL DEFAULT 1.5, \
+               avatar BLOB, \
+               note TEXT); \
+             CREATE TABLE posts (\
+               id INTEGER PRIMARY KEY, \
+               user_id INTEGER NOT NULL REFERENCES users(id), \
+               title TEXT); \
+             CREATE INDEX posts_by_user ON posts(user_id); \
+             CREATE VIEW titles AS SELECT title FROM posts; \
+             CREATE TRIGGER posts_touch AFTER UPDATE ON posts \
+               BEGIN UPDATE posts SET title = title WHERE id = NEW.id; END; \
+             CREATE TABLE \"odd \"\"name\"\"\" (\"col one\" TEXT); \
+             CREATE TABLE packed (id INTEGER PRIMARY KEY) WITHOUT ROWID;",
+        );
+        source.exec(
+            "INSERT INTO users (name, score, avatar, note) VALUES \
+               ('ada', 1.0, X'00ff', 'it''s
+              multiline ✓'), \
+               ('bob', 1e300, X'', NULL), \
+               ('inf', 9e999, NULL, ''); \
+             INSERT INTO posts (user_id, title) VALUES (1, 'hello'), (3, 'world'); \
+             INSERT INTO \"odd \"\"name\"\"\" VALUES ('quoted'); \
+             INSERT INTO packed VALUES (7);",
+        );
+        let (dump, tables) = source.export(vec![], false, false);
+        assert_eq!(
+            tables,
+            ["users", "posts", "odd \"name\"", "packed"].map(str::to_string)
+        );
+        let before = source.snapshot();
+
+        let target = TestDb::open("round-trip-target");
+        target.exec(&dump);
+        assert_eq!(target.snapshot(), before);
+    }
+
+    #[test]
+    fn export_carries_fts_tables_without_their_shadows() {
+        let source = TestDb::open("fts");
+        source.exec(
+            "CREATE VIRTUAL TABLE docs USING fts5(title, body); \
+             INSERT INTO docs (title, body) VALUES \
+               ('hello', 'a greeting'), ('bye', 'a farewell');",
+        );
+        let (dump, tables) = source.export(vec![], false, false);
+        assert_eq!(tables, vec!["docs".to_string()]);
+        assert_eq!(dump.matches("CREATE VIRTUAL TABLE").count(), 1);
+        assert!(!dump.contains("docs_data"), "shadow leaked: {dump}");
+        assert!(!dump.contains("docs_idx"), "shadow leaked: {dump}");
+
+        let target = TestDb::open("fts-target");
+        target.exec(&dump);
+        match d1_run(
+            &target.scope,
+            &D1Request::Exec {
+                sql: "SELECT title FROM docs WHERE docs MATCH 'greeting'".to_string(),
+                rows: true,
+            },
+        ) {
+            Ok(D1Response::Exec { results, .. }) => {
+                assert_eq!(results.len(), 1);
+                assert_eq!(results[0].rows.len(), 1);
+            }
+            Ok(_) => panic!("match answered the wrong shape"),
+            Err(failure) => panic!("match failed: {}", failure.message),
+        }
+    }
+
+    #[test]
+    fn export_refuses_an_open_transaction() {
+        let db = TestDb::open("open-txn");
+        db.exec("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT); INSERT INTO t VALUES (1, 'a');");
+        with(&db.scope, |connection| {
+            without_sql_authorizer(connection, || {
+                connection.execute_batch("BEGIN IMMEDIATE").expect("begin");
+            })
+        });
+        let error = match d1_run(
+            &db.scope,
+            &D1Request::Export {
+                tables: vec![],
+                no_schema: false,
+                no_data: false,
+            },
+        ) {
+            Ok(_) => panic!("export ran inside an open transaction"),
+            Err(failure) => failure.message,
+        };
+        assert!(
+            error.contains("open transaction"),
+            "unexpected error: {error}"
+        );
+        with(&db.scope, |connection| {
+            without_sql_authorizer(connection, || {
+                connection.execute_batch("ROLLBACK").expect("rollback");
+            })
+        });
+        // The refusal opened no bracket of its own: a later export works.
+        let (sql, tables) = db.export(vec![], false, false);
+        assert!(sql.contains("CREATE TABLE t"), "dump: {sql}");
+        assert_eq!(tables, vec!["t".to_string()]);
+    }
+
+    /// The row ids one table's INSERTs in a dump carry, in dump order. Each
+    /// statement is one line, so the table's statements select by prefix and
+    /// the tuples split on their joins; every value must match its id.
+    fn dump_ids(dump: &str, table: &str) -> Vec<i64> {
+        let head = format!("INSERT INTO \"{table}\" ");
+        let mut ids = Vec::new();
+        for line in dump.lines() {
+            let Some(rest) = line.strip_prefix(&head) else {
+                continue;
+            };
+            let values = rest
+                .split_once(" VALUES ")
+                .map(|(_, values)| values)
+                .expect("VALUES");
+            let values = values.strip_suffix(';').expect("terminator");
+            for tuple in values.split("),(") {
+                let tuple = tuple.strip_prefix('(').unwrap_or(tuple);
+                let tuple = tuple.strip_suffix(')').unwrap_or(tuple);
+                let (id, value) = tuple.split_once(',').expect("pair");
+                let id: i64 = id.parse().expect("id");
+                assert_eq!(value, &format!("'v{id}'"), "value matches its id");
+                ids.push(id);
+            }
+        }
+        ids
+    }
+
+    #[test]
+    fn export_during_concurrent_writes_is_a_single_snapshot() {
+        // A writer commits one row per table per transaction from a second
+        // connection while the test exports again and again. Every dump must
+        // show both tables at the same commit: the same gap-free id prefix
+        // on each side, never one table ahead of the other. The seed rows
+        // make each table's scan slow beside the writer's commit rate, so an
+        // export that read outside one transaction would straddle commits
+        // and fail; the bracketed export cannot, on any timing. No sleeps:
+        // the writer runs a fixed count and joins, and every assertion holds
+        // for any interleaving.
+        const SEED: i64 = 3000;
+        const WRITES: i64 = 1000;
+        const EXPORTS: usize = 30;
+        let db = TestDb::open("export-concurrent");
+        db.exec("CREATE TABLE t1 (id INTEGER PRIMARY KEY, v TEXT); CREATE TABLE t2 (id INTEGER PRIMARY KEY, v TEXT);");
+        // Chunked: one exec call carries at most the engine's SQL text limit.
+        let seed: Vec<String> = (1..=SEED)
+            .map(|id| {
+                format!(
+                    "INSERT INTO t1 VALUES ({id}, 'v{id}'); INSERT INTO t2 VALUES ({id}, 'v{id}');"
+                )
+            })
+            .collect();
+        for chunk in seed.chunks(400) {
+            db.exec(&chunk.join(" "));
+        }
+        let writer = std::thread::spawn({
+            let path = db.path();
+            move || {
+                let connection = rusqlite::Connection::open(&path).expect("writer open");
+                // NORMAL, like the cell's own connections: durability across
+                // a crash is meaningless for a scratch file, and FULL would
+                // fsync every one of these thousand commits.
+                connection
+                    .pragma_update(None, "synchronous", "NORMAL")
+                    .expect("synchronous");
+                for id in SEED + 1..=SEED + WRITES {
+                    connection
+                        .execute_batch(&format!(
+                            "BEGIN IMMEDIATE; \
+                             INSERT INTO t1 VALUES ({id}, 'v{id}'); \
+                             INSERT INTO t2 VALUES ({id}, 'v{id}'); \
+                             COMMIT;"
+                        ))
+                        .expect("writer commit");
+                }
+            }
+        });
+        for _ in 0..EXPORTS {
+            let (dump, _) = db.export(vec![], false, false);
+            let t1 = dump_ids(&dump, "t1");
+            let t2 = dump_ids(&dump, "t2");
+            assert_eq!(t1, t2, "both tables show the same snapshot");
+            assert_eq!(
+                t1,
+                (1..=t1.len() as i64).collect::<Vec<_>>(),
+                "a gap-free prefix, never a torn mix"
+            );
+            assert!(
+                t1.len() as i64 >= SEED && t1.len() as i64 <= SEED + WRITES,
+                "seeded rows always present, future commits never: {}",
+                t1.len()
+            );
+        }
+        writer.join().expect("writer done");
+    }
+
+    #[test]
+    fn export_flags_select_schema_data_and_tables() {
+        let db = TestDb::open("flags");
+        db.exec(
+            "CREATE TABLE a (id INTEGER PRIMARY KEY, v TEXT); \
+             CREATE TABLE b (id INTEGER PRIMARY KEY, v TEXT); \
+             CREATE INDEX b_v ON b(v); \
+             INSERT INTO a VALUES (1, 'x'); INSERT INTO b VALUES (2, 'y');",
+        );
+        let (schema_only, tables) = db.export(vec![], false, true);
+        assert!(
+            schema_only.contains("CREATE TABLE a"),
+            "dump: {schema_only}"
+        );
+        assert!(
+            schema_only.contains("CREATE TABLE b"),
+            "dump: {schema_only}"
+        );
+        assert!(
+            schema_only.contains("CREATE INDEX b_v"),
+            "dump: {schema_only}"
+        );
+        assert!(!schema_only.contains("INSERT"), "dump: {schema_only}");
+        assert_eq!(tables, vec!["a".to_string(), "b".to_string()]);
+
+        let (data_only, _) = db.export(vec![], true, false);
+        assert!(!data_only.contains("CREATE"), "dump: {data_only}");
+        assert!(data_only.contains("INSERT INTO \"a\""), "dump: {data_only}");
+        assert!(data_only.contains("INSERT INTO \"b\""), "dump: {data_only}");
+
+        // Case-insensitive, and a repeated --table names its table once.
+        let (subset, tables) = db.export(vec!["B".to_string(), "b".to_string()], false, false);
+        assert!(!subset.contains("CREATE TABLE a"), "dump: {subset}");
+        assert!(subset.contains("CREATE TABLE b"), "dump: {subset}");
+        assert!(subset.contains("CREATE INDEX b_v"), "dump: {subset}");
+        assert!(!subset.contains("INSERT INTO \"a\""), "dump: {subset}");
+        assert!(subset.contains("INSERT INTO \"b\""), "dump: {subset}");
+        assert_eq!(tables, vec!["b".to_string()]);
+
+        match d1_run(
+            &db.scope,
+            &D1Request::Export {
+                tables: vec!["nope".to_string()],
+                no_schema: false,
+                no_data: false,
+            },
+        ) {
+            Err(failure) => assert!(
+                failure.message.contains("unknown table"),
+                "error: {}",
+                failure.message
+            ),
+            Ok(_) => panic!("export accepted an unknown table"),
+        }
+        match d1_run(
+            &db.scope,
+            &D1Request::Export {
+                tables: vec![],
+                no_schema: true,
+                no_data: true,
+            },
+        ) {
+            Err(failure) => assert!(
+                failure.message.contains("nothing to export"),
+                "error: {}",
+                failure.message
+            ),
+            Ok(_) => panic!("export accepted --no-schema with --no-data"),
+        }
+    }
+
+    #[test]
+    fn export_empty_database_is_empty() {
+        // The cell holds engine tables, which the dump excludes: an empty
+        // database exports to nothing at all.
+        let db = TestDb::open("empty");
+        let (sql, tables) = db.export(vec![], false, false);
+        assert!(sql.is_empty(), "dump: {sql}");
+        assert!(tables.is_empty());
+    }
+
+    #[test]
+    fn export_refuses_an_over_budget_schema_without_buffering_it() {
+        // 500 tables of ~90 KiB CREATEs: every statement is under the SQL
+        // text limit, and together they far exceed the 32 MiB dump budget.
+        // The export must refuse with the cap error, and it must refuse
+        // without materializing the schema beside the dump: the counting
+        // allocator bounds live bytes on this thread during the export. The
+        // dump itself grows toward the cap with doubling reallocations, so
+        // the bound is twice the cap — a schema buffered whole beside it
+        // exceeds that by tens of megabytes.
+        const TABLES: usize = 500;
+        let db = TestDb::open("export-wide-schema");
+        for table in 0..TABLES {
+            let columns = (0..100)
+                .map(|column| format!("c{column}_{} TEXT", "x".repeat(840)))
+                .collect::<Vec<_>>()
+                .join(",");
+            db.exec(&format!("CREATE TABLE wide_{table} ({columns})"));
+        }
+        test_alloc::counting(true);
+        test_alloc::reset();
+        let refused = d1_run(
+            &db.scope,
+            &D1Request::Export {
+                tables: vec![],
+                no_schema: false,
+                no_data: false,
+            },
+        );
+        test_alloc::counting(false);
+        let peak = test_alloc::peak();
+        let error = match refused {
+            Err(failure) => failure.message,
+            Ok(_) => panic!("export carried a schema far past the budget"),
+        };
+        assert!(
+            error.contains("export fewer tables"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            peak < 2 * D1_MAX_EXPORT_BYTES,
+            "export peaked at {peak} live bytes before refusing"
+        );
+    }
+
+    #[test]
+    fn export_carries_a_maximum_size_row() {
+        // One 40 KiB blob: wide, and the widest that still round-trips (its
+        // hex literal stays under the SQL text limit on import). The
+        // incremental budget check must not mistake a wide row for an
+        // over-budget dump: the export succeeds and round-trips byte-exact.
+        let db = TestDb::open("export-max-row");
+        db.exec("CREATE TABLE wide (blob BLOB)");
+        let blob = vec![0xABu8; 40_000];
+        with(&db.scope, |connection| {
+            connection
+                .execute("INSERT INTO wide VALUES (?)", [blob.as_slice()])
+                .expect("wide insert runs");
+        })
+        .expect("db present");
+        d1_export_reset_encoded_bytes();
+        let (dump, tables) = db.export(vec![], false, false);
+        assert_eq!(tables, vec!["wide".to_string()]);
+        let encoded = d1_export_encoded_bytes();
+        assert!(
+            encoded < D1_MAX_EXPORT_BYTES,
+            "export encoded {encoded} bytes for one row"
+        );
+        let target = TestDb::open("export-max-row-target");
+        target.exec(&dump);
+        let round_tripped: Vec<u8> = with(&target.scope, |connection| {
+            connection
+                .query_row("SELECT CAST(blob AS BLOB) FROM wide", [], |row| row.get(0))
+                .expect("read back")
+        })
+        .expect("db present");
+        assert_eq!(round_tripped, blob);
+    }
+
+    #[test]
+    fn export_refuses_accumulated_rows_before_buffering_past_the_budget() {
+        // 25 rows of ~2 MiB each: every row is storable on its own (under
+        // SQLITE_LIMIT_LENGTH's 2.2 MiB row record), but together they far
+        // exceed the 32 MiB dump budget. The per-cell accumulation check must
+        // refuse with the cap error, and it must refuse before encoding far
+        // past the budget: the encoded-literal counter bounds what the dump
+        // check itself cannot see. The bound is twice the cap — the dump
+        // grows toward the cap with doubling reallocations, and the transient
+        // past it stays one cell.
+        const ROWS: usize = 25;
+        let db = TestDb::open("export-wide-rows");
+        db.exec("CREATE TABLE wide (blob BLOB)");
+        let blob = vec![0xABu8; 2_000_000];
+        with(&db.scope, |connection| {
+            for _ in 0..ROWS {
+                connection
+                    .execute("INSERT INTO wide VALUES (?)", [blob.as_slice()])
+                    .expect("wide insert runs");
+            }
+        })
+        .expect("db present");
+        d1_export_reset_encoded_bytes();
+        let error = match d1_run(
+            &db.scope,
+            &D1Request::Export {
+                tables: vec![],
+                no_schema: false,
+                no_data: false,
+            },
+        ) {
+            Err(failure) => failure.message,
+            Ok(_) => panic!("export carried rows far past the budget"),
+        };
+        assert!(
+            error.contains("export fewer tables"),
+            "unexpected error: {error}"
+        );
+        let encoded = d1_export_encoded_bytes();
+        assert!(
+            encoded < 2 * D1_MAX_EXPORT_BYTES,
+            "export encoded {encoded} bytes before refusing"
+        );
+    }
+
+    #[test]
+    fn export_round_trips_generated_columns() {
+        // SQLite refuses an INSERT that names a generated column, so the dump
+        // lists only the stored ones; the generated values recompute on
+        // import. (A table of only generated columns is refused at CREATE,
+        // so every table here keeps a stored one.)
+        let source = TestDb::open("generated");
+        source.exec(
+            "CREATE TABLE calc (\
+               a INTEGER, \
+               b INTEGER GENERATED ALWAYS AS (a * 2) VIRTUAL, \
+               c INTEGER GENERATED ALWAYS AS (a * 3) STORED); \
+             INSERT INTO calc (a) VALUES (21), (22);",
+        );
+        let (dump, _) = source.export(vec![], false, false);
+        assert!(
+            !dump.contains("\"b\"") && !dump.contains("\"c\""),
+            "generated columns leaked into the dump: {dump}"
+        );
+        let before = source.snapshot();
+        let target = TestDb::open("generated-target");
+        target.exec(&dump);
+        assert_eq!(target.snapshot(), before);
+    }
+
+    #[test]
+    fn export_round_trips_nul_and_invalid_utf8_text_byte_exact() {
+        // TEXT can hold NUL bytes and invalid UTF-8; a quoted literal carries
+        // neither (the import funnels through CString, and lossy decoding is
+        // not byte-exact), so the dump carries them as CAST(X'..' AS TEXT).
+        // The comparison reads raw bytes: rendering through the lossy decoder
+        // would hide the corruption this test pins.
+        let source = TestDb::open("text-bytes");
+        source.exec(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT); \
+             INSERT INTO t VALUES (1, CAST(X'610042FF' AS TEXT)), (2, 'plain ✓');",
+        );
+        let (dump, _) = source.export(vec![], false, false);
+        // Read the source bytes before the target opens: opening a second
+        // scratch cell shadows the first on this thread.
+        let expected = with(&source.scope, |connection| {
+            let mut statement = connection
+                .prepare("SELECT id, CAST(v AS BLOB) FROM t ORDER BY id")
+                .expect("select");
+            statement
+                .query_map([], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
+                })
+                .expect("map")
+                .collect::<rusqlite::Result<Vec<(i64, Vec<u8>)>>>()
+                .expect("rows")
+        })
+        .expect("db present");
+        let target = TestDb::open("text-bytes-target");
+        target.exec(&dump);
+        let round_tripped = with(&target.scope, |connection| {
+            let mut statement = connection
+                .prepare("SELECT id, CAST(v AS BLOB) FROM t ORDER BY id")
+                .expect("select");
+            statement
+                .query_map([], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
+                })
+                .expect("map")
+                .collect::<rusqlite::Result<Vec<(i64, Vec<u8>)>>>()
+                .expect("rows")
+        })
+        .expect("db present");
+        assert_eq!(round_tripped, expected);
+        assert_eq!(
+            round_tripped[0].1,
+            vec![0x61, 0x00, 0x42, 0xFF],
+            "NUL and invalid UTF-8 survive byte-exact"
+        );
+    }
+
+    #[test]
+    fn export_carries_fts5vocab_schema_without_rows() {
+        // An fts5vocab table is read-only: the dump carries its CREATE so the
+        // index rebuilds against the imported FTS table, but no INSERTs,
+        // which the import would refuse wholesale.
+        let source = TestDb::open("vocab");
+        source.exec(
+            "CREATE VIRTUAL TABLE docs USING fts5(title); \
+             INSERT INTO docs VALUES ('hello'); \
+             CREATE VIRTUAL TABLE vocab USING fts5vocab(docs, 'row');",
+        );
+        let (dump, tables) = source.export(vec![], false, false);
+        assert!(tables.contains(&"vocab".to_string()), "{tables:?}");
+        assert!(dump.contains("CREATE VIRTUAL TABLE vocab"), "dump: {dump}");
+        assert!(
+            !dump.contains("INSERT INTO \"vocab\""),
+            "vocab rows leaked: {dump}"
+        );
+        let target = TestDb::open("vocab-target");
+        target.exec(&dump);
+        let terms: Vec<String> = with(&target.scope, |connection| {
+            let mut statement = connection
+                .prepare("SELECT term FROM vocab ORDER BY term")
+                .expect("select");
+            statement
+                .query_map([], |row| row.get(0))
+                .expect("map")
+                .collect::<rusqlite::Result<Vec<String>>>()
+                .expect("rows")
+        })
+        .expect("db present");
+        assert_eq!(terms, vec!["hello".to_string()]);
+    }
+
+    #[test]
+    fn export_carries_vec0_tables_without_their_shadows() {
+        // A vec0 table recreates its shadow tables itself; a dump carrying
+        // their CREATEs fails on import with "already exists" and rolls back.
+        let source = TestDb::open_with_vec("vec");
+        source.exec(
+            "CREATE VIRTUAL TABLE items USING vec0(embedding float[3]); \
+             INSERT INTO items (rowid, embedding) VALUES (1, '[1.0, 2.0, 3.0]');",
+        );
+        let shadows: Vec<String> = with(&source.scope, |connection| {
+            without_sql_authorizer(connection, || {
+                let mut statement = connection
+                    .prepare(
+                        "SELECT name FROM sqlite_schema WHERE type = 'table' \
+                         AND name LIKE 'items\\_%' ESCAPE '\\' ORDER BY name",
+                    )
+                    .expect("shadows");
+                statement
+                    .query_map([], |row| row.get(0))
+                    .expect("map")
+                    .collect::<rusqlite::Result<Vec<String>>>()
+                    .expect("rows")
+            })
+        })
+        .expect("db present");
+        assert!(!shadows.is_empty(), "vec0 created no shadows");
+        let (dump, tables) = source.export(vec![], false, false);
+        assert_eq!(tables, vec!["items".to_string()]);
+        // Quoted occurrences only: the sqlite_sequence reset names shadow
+        // counters as string literals, which is not a leak.
+        for shadow in &shadows {
+            let quoted = format!("\"{shadow}\"");
+            assert!(!dump.contains(&quoted), "shadow {shadow} leaked: {dump}");
+        }
+        let target = TestDb::open_with_vec("vec-target");
+        target.exec(&dump);
+        let distance: f64 = with(&target.scope, |connection| {
+            connection
+                .query_row(
+                    "SELECT distance FROM items WHERE embedding MATCH '[1.0, 2.0, 3.0]' LIMIT 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("vec query")
+        })
+        .expect("db present");
+        assert_eq!(distance, 0.0);
+    }
+
+    #[test]
+    fn export_detects_virtual_tables_despite_odd_spellings() {
+        // The stored text keeps the author's spacing, quoting, comments, and
+        // case, so virtual-table detection parses the statement rather than
+        // matching a prefix.
+        for sql in [
+            "CREATE VIRTUAL TABLE t USING fts5(x)",
+            "CREATE  VIRTUAL  TABLE t USING fts5(x)",
+            "CREATE\tVIRTUAL\nTABLE t USING fts5(x)",
+            "-- a leading comment\nCREATE VIRTUAL TABLE t USING fts5(x)",
+            "/* a leading comment */ CREATE VIRTUAL TABLE t USING fts5(x)",
+            "create virtual table t using fts5(x)",
+            "CREATE VIRTUAL TABLE IF NOT EXISTS t USING fts5(x)",
+            "CREATE VIRTUAL TABLE \"t\" USING \"fts5\"(x)",
+            "CREATE VIRTUAL TABLE main.t USING fts5(x)",
+            "CREATE VIRTUAL TABLE \"if\" USING fts5(x)",
+        ] {
+            assert!(d1_export_virtual_module(sql).is_some(), "missed: {sql}");
+        }
+        for sql in [
+            "CREATE TABLE t (x)",
+            "CREATE  TABLE t (x)",
+            "CREATE TABLE virtual_tab (x)",
+            "CREATE TABLE t (using_)",
+            "CREATE INDEX i ON t(x)",
+            "CREATE VIEW v AS SELECT 1",
+            "CREATE TRIGGER trg AFTER INSERT ON t BEGIN SELECT 1; END",
+        ] {
+            assert!(d1_export_virtual_module(sql).is_none(), "false hit: {sql}");
+        }
+        // The module rides the same parse, lowercased and unquoted: shadow
+        // detection and the fts5vocab schema-only rule read it from here.
+        for (sql, module) in [
+            ("CREATE VIRTUAL TABLE d USING fts5(x)", "fts5"),
+            (
+                "CREATE VIRTUAL TABLE v USING fts5vocab(docs, 'row')",
+                "fts5vocab",
+            ),
+            ("CREATE VIRTUAL TABLE v USING vec0(x float[2])", "vec0"),
+            ("CREATE VIRTUAL TABLE v USING \"FTS5\"(x)", "fts5"),
+            ("create virtual table v using Vec0(x float[2])", "vec0"),
+        ] {
+            assert_eq!(
+                d1_export_virtual_module(sql).as_deref(),
+                Some(module),
+                "{sql}"
+            );
+        }
+        assert_eq!(d1_export_virtual_module("CREATE TABLE t (x)"), None);
+    }
+
+    #[test]
+    fn export_of_a_large_database_completes() {
+        // A database of several megabytes exports whole: a hundred wide rows
+        // to ~8 MiB of dump, every row carried and replayable. The export
+        // builds the dump inside one cell call — see the stall note in
+        // docs/services/d1.md — so this pins completion, not latency.
+        let db = TestDb::open("export-large");
+        db.exec("CREATE TABLE big (id INTEGER PRIMARY KEY, payload BLOB)");
+        let payload = vec![0x5Au8; 40_000];
+        with(&db.scope, |connection| {
+            let mut insert = connection
+                .prepare("INSERT INTO big VALUES (?, ?)")
+                .expect("insert prepares");
+            for id in 1..=100_i64 {
+                insert
+                    .execute(rusqlite::params![id, payload.as_slice()])
+                    .expect("insert runs");
+            }
+        })
+        .expect("db present");
+        let (dump, tables) = db.export(vec![], false, false);
+        assert_eq!(tables, vec!["big".to_string()]);
+        assert!(dump.len() > 7 * 1024 * 1024, "dump is {} bytes", dump.len());
+        let target = TestDb::open("export-large-target");
+        target.exec(&dump);
+        let count: i64 = with(&target.scope, |connection| {
+            connection
+                .query_row("SELECT COUNT(*) FROM big", [], |row| row.get(0))
+                .expect("count")
+        })
+        .expect("db present");
+        assert_eq!(count, 100);
+    }
+}
