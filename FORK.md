@@ -9,7 +9,7 @@ README below is kept intact; this file documents the fork.
 
 - `main` mirrors upstream `main` and carries no patches.
 - `ryuzcorp/v<version>` is a line branch: the upstream tag `v<version>`
-  plus our patches as commits, one commit per patch, in `0001`-`0031`
+  plus our patches as commits, one commit per patch, in `0001`-`0032`
   order. Each patch commit is self-contained and carries its own tests.
 
 Upstream's `.github/workflows/release.yml` targets `ghcr.io/denoland` and
@@ -330,6 +330,11 @@ push to `ghcr.io/denoland`, but still. Pushing a branch named
   hibernatable socket's events wait for the restarted runtime
   on a quiescing cell, fixing the swap deadlock. Adds scripted
   reproductions for both.
+- `0032` (sha TBD at merge) port of meln1k/celld@01522b3 (sim file
+  not ported): a takeover from an expired lease that never opened
+  a log waits for recovery, which CAS-seals the absent log so a
+  stale session cannot open one through a renewal and ack into
+  the superseded epoch; the seal refuses a lease that reads live.
 
 ## Releases
 
