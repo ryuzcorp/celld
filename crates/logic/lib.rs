@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): ported from meln1k/celld: coordination-core fixes (ea471ee, e46a685, 6d61462, 18d3bf9, 9d4c163, 468b456, 01522b3, b026226).
+// Modified by ryuzcorp (ryuzcorp/celld): ported from meln1k/celld: coordination-core fixes (ea471ee, e46a685, 6d61462, 18d3bf9, 9d4c163, 468b456, 01522b3, b026226, 65fdb13).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! Clean-sheet celld decision core.
@@ -454,6 +454,14 @@ struct Cell {
     alarm_wake: bool,
     /// Startup, rather than a request or alarm, demands this activation.
     resume_demand: bool,
+    /// The cell's last restore here failed, and none has succeeded since.
+    /// A restore folds the tail an earlier epoch of this node's log left,
+    /// and a failed fold leaves it unfolded: acknowledged writes that only
+    /// this node's followers and bundles hold, and only this node folds.
+    /// Such a cell keeps its owner record. A peer that claimed it after a
+    /// release would restore from the bucket alone and lose them; one that
+    /// takes it over from this node recovers this node's log first.
+    restore_failed: bool,
     /// A restarted process is reading this cell's record to confirm what it
     /// owns. Like startup demand it keeps the read queued, but it wakes
     /// nothing: the read settles the cell to dormant or inactive.
@@ -612,6 +620,7 @@ impl Default for Cell {
             alarm_source: None,
             alarm_wake: false,
             resume_demand: false,
+            restore_failed: false,
             confirming: false,
             isolate: None,
             generation: 0,
@@ -4839,6 +4848,7 @@ impl State {
         let mut resume_failed = false;
         match result {
             Ok(outcome) => {
+                cell.restore_failed = false;
                 if outcome.restored {
                     self.activity.restored = self.activity.restored.saturating_add(1);
                 }
@@ -4885,6 +4895,7 @@ impl State {
             }
             Err(_) => {
                 self.probe(Probe::RestoreFailed);
+                cell.restore_failed = true;
                 set_phase(&mut self.occupied, &mut cell, Phase::Dormant { epoch });
                 self.finish_requests(&id, &mut cell, Err(RequestError::RestoreFailed), effects);
                 resume_failed = cell.resume_demand;
@@ -5743,7 +5754,9 @@ impl State {
             .cells
             .iter()
             .filter_map(|(id, cell)| match cell.phase {
-                Phase::Dormant { epoch } if cell.releasing.is_none() && is_queue_broker(id) => {
+                Phase::Dormant { epoch }
+                    if cell.releasing.is_none() && !cell.restore_failed && is_queue_broker(id) =>
+                {
                     Some((id.clone(), epoch))
                 }
                 _ => None,
@@ -5846,10 +5859,17 @@ impl State {
             .cells
             .iter()
             .filter_map(|(id, cell)| match cell.phase {
-                Phase::Dormant { epoch } if cell.releasing.is_none() => Some((id.clone(), epoch)),
+                Phase::Dormant { epoch } if cell.releasing.is_none() && !cell.restore_failed => {
+                    Some((id.clone(), epoch))
+                }
                 _ => None,
             })
             .collect();
+        if (self.cells.values())
+            .any(|cell| cell.restore_failed && matches!(cell.phase, Phase::Dormant { .. }))
+        {
+            self.probe(Probe::DormantKeptUnfolded);
+        }
         for (id, epoch) in dormant {
             if self.handoffs_in_flight() >= self.config.max_releases {
                 return;
@@ -5924,6 +5944,7 @@ impl State {
             .filter_map(|(id, cell)| match cell.phase {
                 Phase::Dormant { epoch }
                     if cell.releasing.is_none()
+                        && !cell.restore_failed
                         && cell.requests.is_empty()
                         && !self.alarm_is_imminent(cell) =>
                 {
@@ -5932,6 +5953,11 @@ impl State {
                 _ => None,
             })
             .collect();
+        if (self.cells.values())
+            .any(|cell| cell.restore_failed && matches!(cell.phase, Phase::Dormant { .. }))
+        {
+            self.probe(Probe::DormantKeptUnfolded);
+        }
         dormant.sort_by(|left, right| (left.2, &left.0).cmp(&(right.2, &right.0)));
         for (id, epoch, _) in dormant.into_iter().take(budget) {
             self.release_dormant(&id, epoch, effects);

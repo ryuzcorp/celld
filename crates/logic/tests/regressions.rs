@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): ported from meln1k/celld: scripted core-bug reproductions (ea471ee, e46a685, 6d61462, 18d3bf9, 9d4c163, 468b456, 01522b3).
+// Modified by ryuzcorp (ryuzcorp/celld): ported from meln1k/celld: scripted core-bug reproductions (ea471ee, e46a685, 6d61462, 18d3bf9, 9d4c163, 468b456, 01522b3, 65fdb13).
 //! Scripted reproductions of core bugs the deterministic simulator
 //! (`crates/sim`) found. Each drives the core through a minimal shell that
 //! answers every effect at once, except the ones a test holds back to
@@ -11,7 +11,7 @@
 use celld_logic::wake::{AlarmSnapshot, AlarmSource, PublicationId};
 use celld_logic::{
     on_event, pressure, CasOutcome, Channel, Config, Effect, Event, Failure, LeaseCasOutcome,
-    LocalCell, NodeLeaseRecord, NodeLeaseSpec, OwnerRecord, OwnershipOnEvict, ProofSource,
+    LocalCell, NodeLeaseRecord, NodeLeaseSpec, OwnerRecord, OwnershipOnEvict, Probe, ProofSource,
     RestoreOutcome, State, Timer, WakeHintScope, WebSocketKind,
 };
 use std::collections::{BTreeMap, VecDeque};
@@ -637,6 +637,64 @@ fn a_preserve_settles_a_confirming_read() {
 
     shell.send(Event::BeginPreserve);
     assert!(shell.state.ownership_confirmed());
+    shell.state.validate().expect("state invariant");
+}
+
+/// Two cells' restores fail, so their folds never run and the acknowledged
+/// tail stays unfolded on this node alone. The balancer and the drain used
+/// to release such dormant records anyway, and the peer that claimed one
+/// next restored from the bucket alone: the writes were gone. Both walks
+/// now keep a cell whose last restore failed, and count the keep.
+#[test]
+fn a_drain_and_the_balancer_keep_a_cell_whose_fold_failed() {
+    let mut shell = Shell::new(4, |_| false);
+    shell.start();
+    shell.serve(1, "a");
+    shell.hold = |effect| matches!(effect, Effect::Restore { .. } | Effect::ReleaseOwner { .. });
+    for (request, cell) in [(2, "b"), (3, "__Queue:q")] {
+        shell.send(Event::RequestAt {
+            request,
+            cell: cell.into(),
+            now_mono_ms: MONO_MS,
+        });
+    }
+    for cell in ["b", "__Queue:q"] {
+        let op = shell
+            .held
+            .iter()
+            .find_map(|effect| match effect {
+                Effect::Restore { op, cell: c, .. } if c == cell => Some(*op),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("{cell} waits for its restore"));
+        shell.send(Event::RestoreCompleted {
+            op,
+            result: Err(Failure::Ambiguous),
+        });
+    }
+
+    let effects = shell.send(Event::Rebalance { cells: 2 });
+    assert!(
+        !effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::ReleaseOwner { .. })),
+        "the balancer keeps cells whose fold failed: {effects:?}"
+    );
+    let kept = shell
+        .state
+        .probes()
+        .find(|(probe, _)| *probe == Probe::DormantKeptUnfolded)
+        .map(|(_, count)| count);
+    assert_eq!(kept, Some(1), "the keep is counted");
+
+    let effects = shell.send(Event::ReleaseAll);
+    assert!(
+        !effects.iter().any(|effect| matches!(
+            effect,
+            Effect::ReleaseOwner { cell, .. } if cell == "b" || cell == "__Queue:q"
+        )),
+        "the drain keeps cells whose fold failed: {effects:?}"
+    );
     shell.state.validate().expect("state invariant");
 }
 
