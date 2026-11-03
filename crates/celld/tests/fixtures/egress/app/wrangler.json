@@ -1,0 +1,7 @@
+{
+  "name": "egress-app",
+  "main": "worker.js",
+  "compatibility_date": "2026-02-12",
+  "no_bundle": true,
+  "vars": { "ECHO_PORT": "@ECHO_PORT@" }
+}

@@ -1,3 +1,4 @@
+// Modified by ryuzcorp (ryuzcorp/celld): tenant egress policy.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 // Managed control-plane sessions execute outside the Actor execution domain.
@@ -895,7 +896,9 @@ async fn presence_session(
         &runtime.listen,
         hostname,
     )?;
-    let socket = match crate::ws_client::connect(&url, headers).await {
+    // The node's own control traffic: never subject to the tenant
+    // egress policy, which only judges Worker-initiated dials.
+    let socket = match crate::ws_client::connect_internal(&url, headers).await {
         Ok(connection) => connection.socket,
         Err(crate::ws_client::Error::Declined(declined))
             if matches!(declined.status.as_u16(), 401 | 403) =>

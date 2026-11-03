@@ -1,3 +1,4 @@
+// Modified by ryuzcorp (ryuzcorp/celld): tenant egress policy.
 //! Outbound TCP host ops for `cloudflare:sockets` `connect()`.
 //!
 //! A socket is a split tokio stream in a process-global registry: the
@@ -161,33 +162,46 @@ pub(super) fn op_tcp_connect(
     let id = next_id();
     current_context().tcp_sockets.lock().unwrap().push(id);
     let gate = egress_gate_request(&event_context(scope), celld_logic::Channel::Tcp);
-    let async_id = asyncrt::enqueue(async move {
-        await_egress_gate(gate).await?;
-        let stream = tokio::net::TcpStream::connect((request.hostname.as_str(), request.port))
-            .await
-            .map_err(|error| {
-                format!(
-                    "connection to {}:{} failed: {error}",
-                    request.hostname, request.port
-                )
-            })?;
-        let remote = stream.peer_addr().map(|a| a.to_string()).ok();
-        let local = stream.local_addr().map(|a| a.to_string()).ok();
-        let mut stream: Duplex = Box::new(stream);
-        if request.secure {
-            let host = request.expected_host.unwrap_or(request.hostname);
-            stream = handshake(stream, host).await?;
-        }
-        insert(id, stream);
-        Ok::<String, String>(
-            serde_json::json!({
-                "id": id,
-                "remoteAddress": remote,
-                "localAddress": local,
-            })
-            .to_string(),
-        )
-    });
+    let async_id =
+        asyncrt::enqueue(async move {
+            await_egress_gate(gate).await?;
+            // The tenant egress policy judges the resolved address before
+            // the dial; open mode dials exactly as before.
+            let policy = crate::egress::EgressPolicy::global();
+            let stream =
+                match crate::egress::policed_tcp_connect(&policy, &request.hostname, request.port)
+                    .await
+                {
+                    Ok(stream) => stream,
+                    Err(error) => {
+                        let detail = match error {
+                            crate::egress::DialError::Refused(refusal) => refusal.to_string(),
+                            crate::egress::DialError::Resolve(error) => error,
+                            crate::egress::DialError::Tcp(error) => error,
+                        };
+                        return Err(format!(
+                            "connection to {}:{} failed: {detail}",
+                            request.hostname, request.port
+                        ));
+                    }
+                };
+            let remote = stream.peer_addr().map(|a| a.to_string()).ok();
+            let local = stream.local_addr().map(|a| a.to_string()).ok();
+            let mut stream: Duplex = Box::new(stream);
+            if request.secure {
+                let host = request.expected_host.unwrap_or(request.hostname);
+                stream = handshake(stream, host).await?;
+            }
+            insert(id, stream);
+            Ok::<String, String>(
+                serde_json::json!({
+                    "id": id,
+                    "remoteAddress": remote,
+                    "localAddress": local,
+                })
+                .to_string(),
+            )
+        });
     rv.set(promise_for(scope, async_id));
 }
 

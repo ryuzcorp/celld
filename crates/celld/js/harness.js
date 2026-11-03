@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): ctx.container.images; clone() of streaming and disturbed bodies; __celld$do on the service-binding RPC path; container exec pty/resize; cross-isolate RPC stubs and streams; container exec AbortSignal; test-only fake kill completion; exec reads survive their subscribing event; context end aborts finished uploads.
+// Modified by ryuzcorp (ryuzcorp/celld): ctx.container.images; clone() of streaming and disturbed bodies; __celld$do on the service-binding RPC path; container exec pty/resize; cross-isolate RPC stubs and streams; container exec AbortSignal; test-only fake kill completion; exec reads survive their subscribing event; context end aborts finished uploads; tenant egress policy.
 // The DO object model and the Cloudflare-compatible runtime surface, run
 // once per isolate by `js.rs::install_harness` after the Web-API prelude.
 // Lived as a 4,000-line raw string inside js.rs until 2026-07-29; it is a
@@ -659,6 +659,8 @@ const __dataUrlResponse = (url) => {
     headers: { "content-type": meta || "text/plain;charset=US-ASCII" },
   });
 };
+// Must match the host's `egress::FETCH_REFUSAL_MARKER` exactly.
+const __EGRESS_REFUSAL_MARKER = "CELLD_EGRESS_REFUSED:";
 globalThis.fetch = async (input, init) => {
   const rawUrl = typeof input === "string" ? input : input?.url;
   if (typeof rawUrl === "string" && rawUrl.startsWith("data:")) {
@@ -706,6 +708,13 @@ globalThis.fetch = async (input, init) => {
     // An abort is the caller's reason, not a network error, so it skips
     // every translation below.
     if (signal?.aborted && error === signal.reason) throw error;
+    // A tenant-egress refusal rejects as TypeError, the way workerd
+    // surfaces a network failure. The marker comes from the host
+    // (`egress::FETCH_REFUSAL_MARKER`); only the detail crosses to JS.
+    const refusal = error?.message ?? String(error);
+    if (typeof refusal === "string" && refusal.startsWith(__EGRESS_REFUSAL_MARKER)) {
+      throw new TypeError(refusal.slice(__EGRESS_REFUSAL_MARKER.length));
+    }
     // The Fetch API represents a redirect refusal as a network error, which
     // rejects with TypeError. Keep the host message for diagnostics.
     if (req.redirect === "error") {
