@@ -1,0 +1,54 @@
+# ryuzcorp/celld: upstream denoland/celld plus our patches, one commit per
+# patch, on `ryuzcorp/v<version>` line branches (see FORK.md). Upstream's own
+# Dockerfile builds the tree, so its full test suite and clippy run in the
+# image's `test` stage on every build.
+#
+#   pull_request / `ryuzcorp/**` push   `test`: build and test both
+#                                         architectures with a read-only token,
+#                                         push nothing
+#   `v*-ryuzcorp.*` tag push            publish.yml: verify, build, and push
+#                                         ghcr.io/ryuzcorp/celld:<version>-ryuzcorp.<n>
+name: ci
+
+on:
+  push:
+    branches: [ryuzcorp/**]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  test:
+    name: Test and build (${{ matrix.suffix }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: ubuntu-latest, platform: linux/amd64, suffix: amd64 }
+          - { runner: ubuntu-24.04-arm, platform: linux/arm64, suffix: arm64 }
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+      - name: Test and build
+        run: |
+          set -euo pipefail
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' crates/celld/Cargo.toml | head -1)
+          docker buildx build \
+            --platform "${{ matrix.platform }}" \
+            --build-arg "CELLD_COMMIT=$GITHUB_SHA" \
+            --build-arg "CELLD_VERSION=$version-ryuzcorp.ci" \
+            --label "org.opencontainers.image.source=https://github.com/ryuzcorp/celld" \
+            --label "org.opencontainers.image.version=$version-ryuzcorp.ci" \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            .

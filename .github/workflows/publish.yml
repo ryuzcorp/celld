@@ -1,0 +1,167 @@
+# Publish ryuzcorp/celld images from annotated tags. A tag
+# `v<version>-ryuzcorp.<n>` on a `ryuzcorp/v<version>` line branch publishes the
+# multi-arch image `ghcr.io/ryuzcorp/celld:<version>-ryuzcorp.<n>`;
+# consumers pin it by digest (see FORK.md).
+#
+#   `verify`   the tag names a `<version>`/`<n>` pair, the tree's
+#              Cargo.toml agrees on `<version>`, and the tagged commit
+#              is contained in the matching `ryuzcorp/v<version>` branch
+#   `push`     per architecture: refuse an already-published tag (only
+#              a confirmed "not found" lets it publish), then run the
+#              Dockerfile's test stage and push the arch image
+#   `publish`  stitch the multi-arch tag, print the index digest and
+#              the Dockerfile pin lines to the step summary
+#
+# A level that is already published is never overwritten: cut a new tag.
+name: publish
+
+on:
+  push:
+    tags: [v*-ryuzcorp.*]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    name: Verify the tag
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+          fetch-tags: true
+      - name: Check the tag against its line branch
+        run: |
+          set -euo pipefail
+          # The tag names the release: v<version>-ryuzcorp.<n>.
+          if [[ ${GITHUB_REF_NAME} =~ ^v([0-9]+\.[0-9]+\.[0-9]+)-ryuzcorp\.([1-9][0-9]*)$ ]]; then
+            base="${BASH_REMATCH[1]}"
+          else
+            echo "refusing tag $GITHUB_REF_NAME: want v<version>-ryuzcorp.<n>" >&2
+            exit 1
+          fi
+          sha=$(git rev-parse "$GITHUB_REF_NAME^{commit}")
+          # The tree must agree it is this line's version.
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' crates/celld/Cargo.toml | head -1)
+          if [ "$version" != "$base" ]; then
+            echo "refusing tag $GITHUB_REF_NAME: Cargo.toml says $version" >&2
+            exit 1
+          fi
+          # The upstream tag the line branch builds on must exist: its
+          # commit becomes the now.ryuzcorp.celld.upstream label.
+          git rev-parse "v$base^{commit}" > /dev/null
+          # The tagged commit must sit on the matching line branch, so a
+          # tag on main or on another line can never publish this name.
+          if ! git fetch --quiet origin "ryuzcorp/v$base"; then
+            echo "refusing tag $GITHUB_REF_NAME: no ryuzcorp/v$base branch" >&2
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "$sha" FETCH_HEAD; then
+            echo "refusing tag $GITHUB_REF_NAME: $sha is not on ryuzcorp/v$base" >&2
+            exit 1
+          fi
+          echo "tag $GITHUB_REF_NAME is $sha on ryuzcorp/v$base"
+
+  push:
+    name: Test, build and push (${{ matrix.suffix }})
+    needs: verify
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: ubuntu-latest, platform: linux/amd64, suffix: amd64 }
+          - { runner: ubuntu-24.04-arm, platform: linux/arm64, suffix: arm64 }
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+          fetch-tags: true
+      # Registry cache export needs the docker-container driver.
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+      - name: Log in to GHCR
+        env:
+          GHCR_TOKEN: ${{ github.token }}
+        run: |
+          printf '%s' "$GHCR_TOKEN" |
+            docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+      - name: Test, build and push
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME#v}"
+          base="${tag%-ryuzcorp.*}"
+          image="ghcr.io/ryuzcorp/celld"
+          sha=$(git rev-parse "$GITHUB_REF_NAME^{commit}")
+          upstream=$(git rev-parse "v$base^{commit}")
+          # Only a confirmed "not found" lets a level publish: any other
+          # inspect failure (auth, registry outage) stops the run.
+          if found=$(docker buildx imagetools inspect "$image:$tag" 2>&1); then
+            echo "$image:$tag is already published; cut a new tag" >&2
+            exit 1
+          elif ! grep -qiE 'not found|manifest unknown' <<<"$found"; then
+            echo "cannot tell whether $image:$tag is published:" >&2
+            echo "$found" >&2
+            exit 1
+          fi
+          cache="$image:buildcache-${{ matrix.suffix }}"
+          docker buildx build \
+            --platform "${{ matrix.platform }}" \
+            --build-arg "CELLD_COMMIT=$sha" \
+            --build-arg "CELLD_VERSION=$tag" \
+            --label "org.opencontainers.image.source=https://github.com/ryuzcorp/celld" \
+            --label "org.opencontainers.image.version=$tag" \
+            --label "org.opencontainers.image.revision=$sha" \
+            --label "now.ryuzcorp.celld.upstream=$upstream" \
+            --cache-from "type=registry,ref=$cache" \
+            --cache-to "type=registry,ref=$cache,mode=max" \
+            --tag "$image:$tag-${{ matrix.suffix }}" \
+            --push \
+            .
+
+  publish:
+    name: Publish multi-arch image
+    needs: push
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Log in to GHCR
+        env:
+          GHCR_TOKEN: ${{ github.token }}
+        run: |
+          printf '%s' "$GHCR_TOKEN" |
+            docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+      - name: Publish
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME#v}"
+          image="ghcr.io/ryuzcorp/celld"
+          docker buildx imagetools create --tag "$image:$tag" \
+            "$image:$tag-amd64" "$image:$tag-arm64"
+          digest=$(docker buildx imagetools inspect "$image:$tag" \
+            --format '{{json .Manifest.Digest}}' | tr -d '"')
+          {
+            echo "## celld $tag"
+            echo "index digest: \`$digest\`"
+            echo "Pin lines for the consumer Dockerfile:"
+            echo '```dockerfile'
+            echo "ARG CELLD_VERSION=$tag"
+            echo "ARG CELLD_DIGEST=$digest"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
