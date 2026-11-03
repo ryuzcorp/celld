@@ -169,6 +169,11 @@ push to `ghcr.io/denoland`, but still. Pushing a branch named
   a retained wait re-subscribes in each later event instead of hanging
   on the first event's dropped op; awaiting in its own event still
   resolves through its own subscription.
+- `0009` (sha TBD at merge) `celld deploy` treats a lost content-tag
+  race as success: when tagging the built image fails with
+  `AlreadyExists`, the tag is re-inspected and the deploy continues if
+  it names the same content; a different image under the tag still
+  fails.
 
 ## Releases
 
