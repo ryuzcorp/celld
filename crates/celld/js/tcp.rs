@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): tenant egress policy; reaction-aware request resources.
+// Modified by ryuzcorp (ryuzcorp/celld): tenant egress policy; reaction-aware request resources; TCP socket ownership.
 //! Outbound TCP host ops for `cloudflare:sockets` `connect()`.
 //!
 //! A socket is a split tokio stream in a process-global registry: the
@@ -13,14 +13,18 @@
 //! WebSocket, a TCP socket never outlives the event that created it
 //! (the request context frees it at retirement), so nothing has to
 //! survive the request driver.
+//!
+//! Script names sockets by number (`Socket._id` is a public mutable field),
+//! so the ids are unguessable and each entry records its owning event
+//! context: every op answers a foreign id exactly as a missing one.
 
 use super::*;
+use rand::RngCore;
 use std::collections::HashMap;
-use std::sync::atomic::AtomicU64;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
+use std::sync::Weak;
 use tokio::io::AsyncRead;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWrite;
@@ -36,6 +40,9 @@ type WriteHalf = tokio::io::WriteHalf<Duplex>;
 struct TcpSocket {
     read: Arc<tokio::sync::Mutex<Option<ReadHalf>>>,
     write: Arc<tokio::sync::Mutex<Option<WriteHalf>>>,
+    /// The event context that opened the socket, held weakly so ownership
+    /// never extends the event. A retired event owns nothing.
+    owner: Weak<IoContext>,
 }
 
 fn registry() -> &'static Mutex<HashMap<u64, TcpSocket>> {
@@ -44,8 +51,15 @@ fn registry() -> &'static Mutex<HashMap<u64, TcpSocket>> {
 }
 
 fn next_id() -> u64 {
-    static NEXT: AtomicU64 = AtomicU64::new(1);
-    NEXT.fetch_add(1, Ordering::Relaxed)
+    // Unguessable ids in the same f64-safe nonzero space as WebSocket ids:
+    // a sequential counter lets any event drive any socket by reassignment.
+    const F64_SAFE: u64 = 0x1FFF_FFFF_FFFF; // 2^53 - 1
+    loop {
+        let id = rand::rngs::OsRng.next_u64() & F64_SAFE;
+        if id != 0 && !registry().lock().unwrap().contains_key(&id) {
+            return id;
+        }
+    }
 }
 
 /// Drop one socket's registry entry, which closes the connection. The
@@ -55,15 +69,25 @@ pub(super) fn free(id: u64) {
     registry().lock().unwrap().remove(&id);
 }
 
-fn insert(id: u64, stream: Duplex) {
+fn insert(id: u64, stream: Duplex, owner: Weak<IoContext>) {
     let (read, write) = tokio::io::split(stream);
     registry().lock().unwrap().insert(
         id,
         TcpSocket {
             read: Arc::new(tokio::sync::Mutex::new(Some(read))),
             write: Arc::new(tokio::sync::Mutex::new(Some(write))),
+            owner,
         },
     );
+}
+
+/// Whether `owner` still names the running event's context: a live weak
+/// reference to exactly this event. Anything else — another event, a retired
+/// event — owns nothing here.
+fn owns(owner: &Weak<IoContext>, context: &Arc<IoContext>) -> bool {
+    owner
+        .upgrade()
+        .is_some_and(|owner| Arc::ptr_eq(&owner, context))
 }
 
 /// Mozilla's roots, the same choice `ws_client` makes and for the same
@@ -169,6 +193,7 @@ pub(super) fn op_tcp_connect(
     // can own the socket even if the event ends mid-connect.
     let id = next_id();
     event.tcp_sockets.lock().unwrap().push(id);
+    let owner = Arc::downgrade(&event);
     let gate = egress_gate_request(&event, celld_logic::Channel::Tcp);
     let async_id =
         asyncrt::enqueue(async move {
@@ -200,7 +225,7 @@ pub(super) fn op_tcp_connect(
                 let host = request.expected_host.unwrap_or(request.hostname);
                 stream = handshake(stream, host).await?;
             }
-            insert(id, stream);
+            insert(id, stream, owner);
             Ok::<String, String>(
                 serde_json::json!({
                     "id": id,
@@ -219,7 +244,18 @@ pub(super) fn op_tcp_read(
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
     let id = args.get(0).integer_value(scope).unwrap_or(0) as u64;
-    let half = registry().lock().unwrap().get(&id).map(|s| s.read.clone());
+    // The owner is checked under the same lock hold as the lookup, so the
+    // entry cannot be freed and its id reused between the two. A foreign id
+    // resolves as no half at all: "socket is closed", exactly as missing.
+    let Some(event) = event_context(scope) else {
+        return retired_event_throw(scope);
+    };
+    let half = registry()
+        .lock()
+        .unwrap()
+        .get(&id)
+        .filter(|s| owns(&s.owner, &event))
+        .map(|s| s.read.clone());
     let async_id = asyncrt::enqueue(async move {
         let half = half.ok_or("socket is closed")?;
         let mut guard = half.lock().await;
@@ -244,10 +280,15 @@ pub(super) fn op_tcp_write(
     let Some(bytes) = view_bytes(args.get(1)) else {
         return loader_throw(scope, "socket write needs bytes");
     };
-    let half = registry().lock().unwrap().get(&id).map(|s| s.write.clone());
     let Some(event) = event_context(scope) else {
         return retired_event_throw(scope);
     };
+    let half = registry()
+        .lock()
+        .unwrap()
+        .get(&id)
+        .filter(|s| owns(&s.owner, &event))
+        .map(|s| s.write.clone());
     let gate = egress_gate_request(&event, celld_logic::Channel::Tcp);
     let async_id = asyncrt::enqueue(async move {
         await_egress_gate(gate).await?;
@@ -273,10 +314,15 @@ pub(super) fn op_tcp_shutdown(
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
     let id = args.get(0).integer_value(scope).unwrap_or(0) as u64;
-    let half = registry().lock().unwrap().get(&id).map(|s| s.write.clone());
     let Some(event) = event_context(scope) else {
         return retired_event_throw(scope);
     };
+    let half = registry()
+        .lock()
+        .unwrap()
+        .get(&id)
+        .filter(|s| owns(&s.owner, &event))
+        .map(|s| s.write.clone());
     let gate = egress_gate_request(&event, celld_logic::Channel::Tcp);
     let async_id = asyncrt::enqueue(async move {
         await_egress_gate(gate).await?;
@@ -298,7 +344,15 @@ pub(super) fn op_tcp_close(
     _rv: v8::ReturnValue<v8::Value>,
 ) {
     let id = args.get(0).integer_value(scope).unwrap_or(0) as u64;
-    free(id);
+    // A foreign id is left alone — closing it would drop another event's
+    // connection — and a missing id was already gone. Both are silent.
+    let Some(event) = event_context(scope) else {
+        return retired_event_throw(scope);
+    };
+    let mut registry = registry().lock().unwrap();
+    if registry.get(&id).is_some_and(|s| owns(&s.owner, &event)) {
+        registry.remove(&id);
+    }
 }
 
 #[derive(serde::Deserialize)]
@@ -324,19 +378,36 @@ pub(super) fn op_tcp_starttls(
     };
     let new_id = next_id();
     event.tcp_sockets.lock().unwrap().push(new_id);
+    let owner = Arc::downgrade(&event);
     let gate = egress_gate_request(&event, celld_logic::Channel::Tcp);
     let async_id = asyncrt::enqueue(async move {
         await_egress_gate(gate).await?;
         // The plaintext socket remains registered while the gate waits so the
         // event cleanup can close it. Consume it only when the TLS handshake can
-        // start, and make every later operation on the old id fail.
-        let taken = registry().lock().unwrap().remove(&request.id);
+        // start, and make every later operation on the old id fail. The owner
+        // is checked under the same lock hold as the removal, so a foreign
+        // id is refused exactly as a missing one — and can never be consumed.
+        let taken = {
+            let mut registry = registry().lock().unwrap();
+            let owned = registry.get(&request.id).is_some_and(|socket| {
+                socket.owner.upgrade().is_some_and(|held| {
+                    owner
+                        .upgrade()
+                        .is_some_and(|mine| Arc::ptr_eq(&held, &mine))
+                })
+            });
+            if owned {
+                registry.remove(&request.id)
+            } else {
+                None
+            }
+        };
         let socket = taken.ok_or("socket is closed")?;
         let read = socket.read.lock().await.take().ok_or("socket is closed")?;
         let write = socket.write.lock().await.take().ok_or("socket is closed")?;
         let stream = read.unsplit(write);
         let stream = handshake(stream, request.host).await?;
-        insert(new_id, stream);
+        insert(new_id, stream, owner);
         Ok::<String, String>(serde_json::json!({ "id": new_id }).to_string())
     });
     rv.set(promise_for(scope, async_id));

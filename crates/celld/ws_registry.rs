@@ -1,12 +1,21 @@
+// Modified by ryuzcorp (ryuzcorp/celld): WebSocket ownership and join tokens. Apache-2.0.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! The WebSocket registry: the sockets an instance holds, the frames waiting
 //! to leave, and the isolate-polled input queues. Engine-neutral; the V8 ops
 //! stay in `crate::js::websocket`, which re-exports every item at its old
 //! path.
+//!
+//! Every socket has an owner, and every op that takes a socket id from script
+//! answers only for it. Script names sockets by number (`new WebSocket(id)`),
+//! so the ids are unguessable and the ownership is host-side: a cell socket
+//! belongs to its scope (which a reloaded cell still holds after hibernation),
+//! and an isolate-polled socket belongs to the request context that opened it.
 use crate::asyncrt;
 use crate::engine_api::WsTarget;
+use crate::js::IoContext;
 use anyhow::Result;
+use rand::RngCore;
 use std::collections::HashMap;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
@@ -423,18 +432,29 @@ mod input_queue_private {
 /// One socket's inbound queue. Shared so an op can await it without holding
 /// the registry lock; one isolate polls a given socket serially.
 type WsPullQueue = Arc<tokio::sync::Mutex<WsPullReceiver>>;
-type WsPullRegistry = std::sync::Mutex<HashMap<u64, WsPullQueue>>;
+
+/// An isolate-polled queue and the owner whose `__ws_next` may drain it.
+/// The queue and the owner are one entry so neither can outlive the other.
+#[doc(hidden)]
+pub struct WsPullEntry {
+    pub queue: WsPullQueue,
+    pub owner: WsOwner,
+}
+type WsPullRegistry = std::sync::Mutex<HashMap<u64, WsPullEntry>>;
 
 /// Inbound queues for isolate-polled sockets, keyed by wsId.
 pub(crate) fn ws_pull() -> Arc<WsPullRegistry> {
     asyncrt::services().websockets().pull.clone()
 }
 
-pub fn ws_pull_register(id: u64, rx: WsPullReceiver) {
-    ws_pull()
-        .lock()
-        .unwrap()
-        .insert(id, Arc::new(tokio::sync::Mutex::new(rx)));
+pub fn ws_pull_register(id: u64, rx: WsPullReceiver, owner: WsOwner) {
+    ws_pull().lock().unwrap().insert(
+        id,
+        WsPullEntry {
+            queue: Arc::new(tokio::sync::Mutex::new(rx)),
+            owner,
+        },
+    );
 }
 
 pub fn ws_pull_unregister(id: u64) {
@@ -494,6 +514,32 @@ impl From<WsIn> for WsPull {
     }
 }
 
+/// Who may name a socket id from script. A cell socket belongs to its scope,
+/// compared against the executing cell event — a scope, not an isolate, so
+/// a cell reloaded after hibernation still owns its sockets. An
+/// isolate-polled socket belongs to the request context that opened it, held
+/// weakly so ownership never extends the request: a retired request owns
+/// nothing, and its sockets are already closed by retirement anyway.
+#[derive(Clone)]
+#[doc(hidden)]
+pub enum WsOwner {
+    Cell(String),
+    Request(std::sync::Weak<IoContext>),
+}
+
+impl WsOwner {
+    /// Whether the running event — executing cell `cell`, if it runs in one,
+    /// with request context `context` — may use a socket this owner holds.
+    pub(crate) fn allows(&self, cell: Option<&str>, context: &Arc<IoContext>) -> bool {
+        match self {
+            WsOwner::Cell(scope) => cell.is_some_and(|cell| cell == scope),
+            WsOwner::Request(owner) => owner
+                .upgrade()
+                .is_some_and(|owner| Arc::ptr_eq(&owner, context)),
+        }
+    }
+}
+
 #[doc(hidden)]
 pub struct WsMeta {
     pub scope: String,
@@ -511,6 +557,13 @@ pub struct WsMeta {
     /// facet accepted, dialed, or bound. `None` for a socket of an ordinary
     /// cell. `scope` then names the facet.
     pub facet: Option<FacetSocket>,
+    /// Who may name this socket's id from script. Never serialized to script:
+    /// `__ws_list` answers ids, tags, and attachments only.
+    pub owner: WsOwner,
+    /// The outstanding join token for this socket's target, minted when a 101
+    /// carrying it is serialized for a caller and consumed by the join (or by
+    /// the next mint). `None` while no join is in flight.
+    pub bind_token: Option<u64>,
 }
 
 /// Where the events of a facet's socket go, and what proves their output.
@@ -582,7 +635,6 @@ impl WsRegistry {
 pub(crate) struct WebSocketService {
     registry: Arc<std::sync::Mutex<WsRegistry>>,
     regular_counts: Arc<std::sync::Mutex<HashMap<String, usize>>>,
-    next_id: AtomicU64,
     auto_responses: Arc<std::sync::Mutex<HashMap<String, (String, String)>>>,
     pull: Arc<WsPullRegistry>,
     flush: Arc<WsFlushState>,
@@ -593,7 +645,6 @@ impl Default for WebSocketService {
         Self {
             registry: Arc::new(std::sync::Mutex::new(WsRegistry::default())),
             regular_counts: Arc::new(std::sync::Mutex::new(HashMap::new())),
-            next_id: AtomicU64::new(1),
             auto_responses: Arc::new(std::sync::Mutex::new(HashMap::new())),
             pull: Arc::new(std::sync::Mutex::new(HashMap::new())),
             flush: Arc::new(WsFlushState::default()),
@@ -742,11 +793,110 @@ pub fn ws_register_facet_for_test(
     ws_attach_facet(id, scope, facet);
 }
 
+/// One unguessable socket number: nonzero, and exactly representable as the
+/// f64 it crosses V8 and JSON as. Script names sockets by number, so a
+/// sequential counter lets any script adopt any socket; randomness closes
+/// the guessing, and per-socket ownership closes the replay of a leaked id.
+fn random_socket_number() -> u64 {
+    const F64_SAFE: u64 = 0x1FFF_FFFF_FFFF; // 2^53 - 1
+    loop {
+        let id = rand::rngs::OsRng.next_u64() & F64_SAFE;
+        if id != 0 {
+            return id;
+        }
+    }
+}
+
 pub fn ws_next_id() -> u64 {
-    asyncrt::services()
-        .websockets()
-        .next_id
-        .fetch_add(1, Ordering::Relaxed)
+    loop {
+        let id = random_socket_number();
+        if !ws_id_registered(id) {
+            return id;
+        }
+    }
+}
+
+/// Whether `id` is registered anywhere script can reach: metadata, outputs,
+/// an isolate-polled queue, or a Worker handoff. Registration ops refuse an
+/// id another owner holds, so a guessed id cannot be adopted or re-scoped.
+pub(crate) fn ws_id_registered(id: u64) -> bool {
+    let registry = ws_registry();
+    let registry = registry.lock().unwrap();
+    registry.outputs.contains_key(&id)
+        || registry.metadata.contains_key(&id)
+        || registry.worker_handoffs.contains_key(&id)
+        || ws_pull().lock().unwrap().contains_key(&id)
+}
+
+/// The owner of `id`: its metadata first, else its isolate-polled queue.
+/// `None` for an id nothing registered, which the ops answer exactly as a
+/// missing socket — a dropped frame, a 1006, a null — with no check and no
+/// oracle distinguishing a foreign socket from a closed one.
+pub(crate) fn ws_owner(id: u64) -> Option<WsOwner> {
+    if let Some(owner) = ws_registry()
+        .lock()
+        .unwrap()
+        .metadata
+        .get(&id)
+        .map(|meta| meta.owner.clone())
+    {
+        return Some(owner);
+    }
+    ws_pull()
+        .lock()
+        .unwrap()
+        .get(&id)
+        .map(|entry| entry.owner.clone())
+}
+
+/// Whether `id` names a socket the cell `scope` owns: registered metadata
+/// held by exactly that scope. The 101 check and the accept check share it.
+pub(crate) fn ws_owned_by_cell(id: u64, scope: &str) -> bool {
+    ws_registry()
+        .lock()
+        .unwrap()
+        .metadata
+        .get(&id)
+        .is_some_and(|meta| matches!(&meta.owner, WsOwner::Cell(owner) if owner == scope))
+}
+
+/// The scope `id` is registered under, if it is registered at all. The join
+/// checks the target's scope against this, so a valid token cannot be
+/// retargeted at another scope by rewriting the target JSON.
+pub(crate) fn ws_registered_scope(id: u64) -> Option<String> {
+    ws_registry()
+        .lock()
+        .unwrap()
+        .metadata
+        .get(&id)
+        .map(|meta| meta.scope.clone())
+}
+
+/// Mint the single-use join token for `id`, for a 101 serialized for a
+/// caller that may join it. `None` when `id` holds no metadata — an already
+/// released socket — and the join then fails closed.
+pub(crate) fn ws_mint_bind_token(id: u64) -> Option<u64> {
+    let token = random_socket_number();
+    let registry = ws_registry();
+    let mut registry = registry.lock().unwrap();
+    let meta = registry.metadata.get_mut(&id)?;
+    meta.bind_token = Some(token);
+    Some(token)
+}
+
+/// Consume `token` against `id`: true only when it matches the outstanding
+/// mint. Every join verification consumes; every 101 serialization mints.
+pub(crate) fn ws_consume_bind_token(id: u64, token: u64) -> bool {
+    let registry = ws_registry();
+    let mut registry = registry.lock().unwrap();
+    let Some(meta) = registry.metadata.get_mut(&id) else {
+        return false;
+    };
+    if meta.bind_token != Some(token) {
+        return false;
+    }
+    meta.bind_token = None;
+    true
 }
 pub fn ws_register(id: u64, tx: tokio::sync::mpsc::UnboundedSender<WsOut>) {
     ws_registry().lock().unwrap().register(id, tx);
@@ -772,13 +922,15 @@ pub(crate) fn ws_register_hibernatable_for_test(
             pending: Vec::new(),
             auto_response_at: None,
             facet: None,
+            owner: WsOwner::Cell(scope.to_string()),
+            bind_token: None,
         },
     );
 }
-/// Register an outbound socket of `scope`. A socket that a facet opened
-/// takes its facet record in the same insertion, so no event, close, or
-/// `ws_close_facet` can find the entry without it.
-pub fn ws_register_outbound(id: u64, scope: &str, facet: Option<FacetSocket>) {
+/// Register an outbound socket of `scope`, held by `owner`. A socket that a
+/// facet opened takes its facet record in the same insertion, so no event,
+/// close, or `ws_close_facet` can find the entry without it.
+pub fn ws_register_outbound(id: u64, scope: &str, facet: Option<FacetSocket>, owner: WsOwner) {
     let inserted = {
         let registry = ws_registry();
         let mut registry = registry.lock().unwrap();
@@ -791,6 +943,8 @@ pub fn ws_register_outbound(id: u64, scope: &str, facet: Option<FacetSocket>) {
                 pending: Vec::new(),
                 auto_response_at: None,
                 facet,
+                owner,
+                bind_token: None,
             });
             true
         } else {

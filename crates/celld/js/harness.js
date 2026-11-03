@@ -2994,12 +2994,13 @@ class DurableObjectState {
       throw new Error(
         "the isolate is near its V8 heap limit, so it refused a " +
         "WebSocket (see CELLD_V8_HEAP_LIMIT_MB)");
+    const acceptedTags = Array.from(tags, String);
+    __ws_accept(ws._id, this._scope, JSON.stringify(acceptedTags));
     ws._target = { id: ws._id, scope: this._scope };
     if (ws._peer) ws._peer._target = ws._target;
     ws._hibernatable = true;
     if (ws._peer) ws._peer._hibernatable = true;
-    ws._tags = Array.from(tags, String);
-    __ws_accept(ws._id, this._scope, JSON.stringify(ws._tags));
+    ws._tags = acceptedTags;
     __sockets.set(ws._id, ws);
   }
   _socket(id) {

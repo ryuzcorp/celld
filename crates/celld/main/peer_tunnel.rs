@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): operator token for the internal listener; D1 export operator-ingress marker; trusted cell RPC; marker-aware tunnel negotiation; trusted-header control strip.
+// Modified by ryuzcorp (ryuzcorp/celld): operator token for the internal listener; D1 export operator-ingress marker; trusted cell RPC; marker-aware tunnel negotiation; trusted-header control strip; unguessable tunneled-upgrade park ids.
 // Copyright 2026 Deno Land Inc. All rights reserved.
 
 //! The peer tunnel: an upgraded stream per peer, plain HTTP inside.
@@ -34,6 +34,7 @@ use hyper::Request;
 use hyper::Response;
 use hyper::StatusCode;
 use hyper_util::rt::TokioIo;
+use rand::RngCore;
 
 use super::*;
 use celld::js::HttpChunkStream;
@@ -711,16 +712,27 @@ pub(crate) async fn rpc(
 static TUNNEL_UPGRADES: std::sync::OnceLock<
     std::sync::Mutex<HashMap<u64, hyper::upgrade::OnUpgrade>>,
 > = std::sync::OnceLock::new();
-static NEXT_TUNNEL_UPGRADE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-
 pub(crate) fn park_upgrade(upgrade: hyper::upgrade::OnUpgrade) -> u64 {
-    let id = NEXT_TUNNEL_UPGRADE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    TUNNEL_UPGRADES
-        .get_or_init(Default::default)
-        .lock()
-        .unwrap()
-        .insert(id, upgrade);
-    id
+    // Unguessable park numbers: the id round-trips through caller script
+    // (WsTarget.tunnel) before `claim_upgrade`, so a sequential counter lets
+    // any script splice its own client onto another upgrade's owner half.
+    // The single-use consume at claim already defeats replay; randomness
+    // defeats guessing. Same f64-safe nonzero space as socket ids.
+    loop {
+        let id = rand::rngs::OsRng.next_u64() & 0x1FFF_FFFF_FFFF;
+        if id == 0 {
+            continue;
+        }
+        let mut parked = TUNNEL_UPGRADES
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap();
+        if parked.contains_key(&id) {
+            continue;
+        }
+        parked.insert(id, upgrade);
+        return id;
+    }
 }
 
 fn remove_upgrade(parked: u64) -> Option<hyper::upgrade::OnUpgrade> {

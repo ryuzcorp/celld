@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): node:crypto scrypt; container exec resize op; cross-isolate RPC stubs and streams; test-only fake exec ops; fake kill completion op; exec reads survive their subscribing event; per-node Workers Cache API ops; tenant egress policy; D1 export operator-ingress marker; stateless attribution tokens; reaction-aware request resources; fake close/signal completion ops; binding-forgery enforcement; trusted cell RPC; Queue DLQ forward host op; DLQ forward caller identity.
+// Modified by ryuzcorp (ryuzcorp/celld): node:crypto scrypt; container exec resize op; cross-isolate RPC stubs and streams; test-only fake exec ops; fake kill completion op; exec reads survive their subscribing event; per-node Workers Cache API ops; tenant egress policy; D1 export operator-ingress marker; stateless attribution tokens; reaction-aware request resources; fake close/signal completion ops; binding-forgery enforcement; trusted cell RPC; Queue DLQ forward host op; DLQ forward caller identity; WebSocket and TCP socket ownership.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 // The raw V8 adapter and its child modules remain outside the Actor execution
@@ -3563,6 +3563,18 @@ impl InFlight {
                             response.write_position = write_position;
                             response.observed_position = observed_position;
                             response
+                        })
+                        .and_then(|response| {
+                            // A 101 names its socket from script; verify the
+                            // responder may present it before the host attaches
+                            // a client to it.
+                            if let Some(HttpResponseWebSocket::Cell(target)) =
+                                response.websocket.as_ref()
+                            {
+                                websocket::verify_response_target(self.scope.as_deref(), target)
+                                    .map_err(|error| anyhow!(error))?;
+                            }
+                            Ok(response)
                         })
                         .map_err(|error| fail_in_turn_error(error, positions))
                 });
@@ -13984,7 +13996,11 @@ fn read_response(scope: &mut v8::PinScope, ret: v8::Local<v8::Value>) -> Result<
         )
     };
     if status == 101 {
-        tracing::info!(%ws_json, has_target = ws.is_some(), "JS WebSocket response");
+        tracing::info!(
+            has_target = ws.is_some(),
+            worker_id,
+            "JS WebSocket response"
+        );
     }
     let websocket = match (ws, worker_ws) {
         (Some(target), None) => Some(HttpResponseWebSocket::Cell(target)),

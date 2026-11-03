@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): reaction-aware request resources; unrefed websocket bind wait; binding-forgery enforcement.
+// Modified by ryuzcorp (ryuzcorp/celld): reaction-aware request resources; unrefed websocket bind wait; binding-forgery enforcement; WebSocket ownership.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! WebSockets inside the isolate: the registry, the ops JS calls, and the
@@ -8,6 +8,12 @@
 //! connects the two — JS holds an id, and this module knows what that id
 //! is attached to. Frames emitted inside an output-gate region are held
 //! until the gate opens, which is why emitting is not simply a send.
+//!
+//! Script names sockets by number, so every op that takes an id checks the
+//! running event against the socket's host-side owner: use-ops (send, close,
+//! next, attachment, timestamp) answer a foreign id exactly as a missing one,
+//! and registration-ops (accept, connect, upgrade, bind, handoff) refuse an
+//! id another owner holds.
 use super::*;
 pub use crate::ws_registry::*;
 
@@ -20,6 +26,50 @@ fn own_cell_socket(scope: &mut v8::PinScope, operation: &str, cell: String) -> R
         return Err(());
     }
     Ok(cell)
+}
+
+/// Whether the running event — the cell `context` runs in, if it runs in
+/// one — may use `id`: an unknown id is nobody's — the op answers exactly
+/// as for a missing socket — and a known id is its owner's only. Unknown
+/// and foreign share one answer, so the refusal is not a liveness oracle
+/// for a guessed id.
+fn ws_may_use(context: &Arc<IoContext>, id: u64) -> bool {
+    let Some(owner) = ws_owner(id) else {
+        return false;
+    };
+    let cell = current_cell_event(context).map(|frame| frame.storage);
+    owner.allows(cell.as_deref(), context)
+}
+
+/// The owner a registration op records for a socket of `cell`: the cell
+/// itself, or — for a Worker socket, which belongs to no cell — the running
+/// request context.
+fn ws_recording_owner(cell: &str, context: &Arc<IoContext>) -> WsOwner {
+    if cell.is_empty() {
+        WsOwner::Request(Arc::downgrade(context))
+    } else {
+        WsOwner::Cell(cell.to_string())
+    }
+}
+
+/// Refuse an id another owner holds: registration adopts only an id nobody
+/// registered, or one this same event may already use (a re-accept after
+/// wake, a retry on an owned id). Anything else is another owner's socket.
+/// Id 0 is the host's "no socket" sentinel and is never claimable.
+fn ws_claim_id(
+    op_scope: &mut v8::PinScope,
+    operation: &str,
+    id: u64,
+    context: &Arc<IoContext>,
+) -> Result<(), ()> {
+    if id == 0 || (ws_id_registered(id) && !ws_may_use(context, id)) {
+        loader_throw(
+            op_scope,
+            &format!("{operation}: socket {id} is not bound to the calling cell or request"),
+        );
+        return Err(());
+    }
+    Ok(())
 }
 
 #[derive(Default)]
@@ -36,9 +86,10 @@ fn prepare_worker_websocket_handoff(scope: &mut v8::PinScope, id: u64) -> Option
     // retirement frees an unanswered handoff. Resolve before registering:
     // a retired owner throws with no queue and no push.
     let owner = reaction_or_current_context(scope)?;
+    let recording = ws_recording_owner("", &owner);
     let (inbound, receiver) = ws_pull_channel();
-    ws_pull_register(id, receiver);
-    ws_register_outbound(id, "", None);
+    ws_pull_register(id, receiver, recording.clone());
+    ws_register_outbound(id, "", None, recording);
     owner.sockets.lock().unwrap().push(id);
     let registry = ws_registry();
     let replaced = registry.lock().unwrap().worker_handoffs.insert(id, inbound);
@@ -50,16 +101,18 @@ pub(super) fn transfer_worker_websocket_handoff(
     scope: &mut v8::PinScope,
     id: u64,
 ) -> Option<WorkerWebSocket> {
+    // Only the request that prepared the handoff may return it: the id
+    // arrives from the script's Response, so another request's pending
+    // handoff answers exactly like a missing one. A retired owner is
+    // unreachable here -- its retirement already drained the handoff above.
+    let owner = reaction_or_current_context(scope)?;
+    if !ws_may_use(&owner, id) {
+        return None;
+    }
     let inbound = ws_registry().lock().unwrap().worker_handoffs.remove(&id)?;
     // The response now owns cleanup. Transfer the frame channel and request
     // ownership together so request retirement cannot close a returned socket.
-    // The owner is the responder the handoff was tracked to at prepare time,
-    // never the ambient turn owner. A retired owner is unreachable here — its
-    // retirement already drained the handoff above — so there is nothing to
-    // remove from.
-    if let Some(owner) = reaction_or_current_context(scope) {
-        owner.sockets.lock().unwrap().retain(|opened| *opened != id);
-    }
+    owner.sockets.lock().unwrap().retain(|opened| *opened != id);
     Some(WorkerWebSocket { id, inbound })
 }
 
@@ -277,6 +330,11 @@ pub(super) fn op_ws_send(
     let Some(event) = event_context(scope) else {
         return retired_event_throw(scope);
     };
+    // A foreign id is answered exactly as a missing one: the frame is dropped
+    // with no error, as `emit` already does for an unknown id.
+    if !ws_may_use(&event, id) {
+        return;
+    }
     ws_emit(&event, id, WsOut::Text(data));
 }
 pub(super) fn op_ws_send_binary(
@@ -293,6 +351,9 @@ pub(super) fn op_ws_send_binary(
     let Some(event) = event_context(scope) else {
         return retired_event_throw(scope);
     };
+    if !ws_may_use(&event, id) {
+        return;
+    }
     ws_emit(&event, id, WsOut::Binary(data));
 }
 pub(super) fn op_ws_close(
@@ -310,6 +371,9 @@ pub(super) fn op_ws_close(
     let Some(event) = event_context(scope) else {
         return retired_event_throw(scope);
     };
+    if !ws_may_use(&event, id) {
+        return;
+    }
     ws_emit(&event, id, WsOut::Close(code, reason));
 }
 pub(super) fn op_ws_alloc(
@@ -330,6 +394,12 @@ pub(super) fn op_ws_prepare_worker_handoff(
         .to_integer(scope)
         .map(|n| n.value() as u64)
         .unwrap_or(0);
+    let Some(owner) = reaction_or_current_context(scope) else {
+        return retired_event_throw(scope);
+    };
+    if ws_claim_id(scope, "WebSocket handoff", id, &owner).is_err() {
+        return;
+    }
     if prepare_worker_websocket_handoff(scope, id).is_none() {
         retired_event_throw(scope);
     }
@@ -342,11 +412,15 @@ pub(super) fn op_ws_prepare_worker_handoff(
 /// fails with `RuntimeFailed`. The socket must route, register, and gate
 /// through the facet's root instead. The record comes from the frame that
 /// the host installed when the event started, not from `cell`, because the
-/// scope crosses application JavaScript.
+/// scope crosses application JavaScript. For the same reason a named `cell`
+/// must be the executing cell: the connector routes the socket's frames by
+/// it, so a foreign scope would hand another cell this socket.
 fn dialing_facet(scope: &mut v8::PinScope, cell: &str) -> Result<Option<FacetSocket>, String> {
     if cell.is_empty() {
         return Ok(None);
     }
+    super::binding_policy::require_executing_cell(scope, cell)
+        .map_err(|error| format!("websocket: {error}"))?;
     let Some(EgressFrame {
         storage,
         root: Some(root),
@@ -429,9 +503,13 @@ pub(super) fn op_ws_upgrade(
     let Some(owner) = reaction_or_current_context(scope) else {
         return retired_event_throw(scope);
     };
+    if ws_claim_id(scope, "WebSocket upgrade", id, &owner).is_err() {
+        return;
+    }
     let pull = cell.is_empty().then(|| {
+        let recording = ws_recording_owner("", &owner);
         let (pull_tx, pull_rx) = ws_pull_channel();
-        ws_pull_register(id, pull_rx);
+        ws_pull_register(id, pull_rx, recording);
         owner.sockets.lock().unwrap().push(id);
         pull_tx
     });
@@ -492,7 +570,20 @@ pub(super) fn op_ws_next(
         .to_integer(scope)
         .map(|n| n.value() as u64)
         .unwrap_or(0);
-    let queue = ws_pull().lock().unwrap().get(&id).cloned();
+    let Some(event) = event_context(scope) else {
+        return retired_event_throw(scope);
+    };
+    // A foreign id resolves as no queue at all: the pump below then reports
+    // the socket as not registered, exactly as for an id that never existed.
+    let queue = ws_may_use(&event, id)
+        .then(|| {
+            ws_pull()
+                .lock()
+                .unwrap()
+                .get(&id)
+                .map(|entry| entry.queue.clone())
+        })
+        .flatten();
     let async_id = asyncrt::enqueue_io_context(async move {
         let Some(queue) = queue else {
             return Ok(WsPull::Close(1006, "socket is not registered".into(), false).encode());
@@ -553,11 +644,15 @@ pub(super) fn op_ws_connect(
     let Some(owner) = reaction_or_current_context(scope) else {
         return retired_event_throw(scope);
     };
+    if ws_claim_id(scope, "WebSocket connect", id, &owner).is_err() {
+        return;
+    }
     // No cell means a Worker socket: the isolate polls it, so register the
     // queue here on the JS thread and track it against the running request.
     let pull = cell.is_empty().then(|| {
+        let recording = ws_recording_owner("", &owner);
         let (pull_tx, pull_rx) = ws_pull_channel();
-        ws_pull_register(id, pull_rx);
+        ws_pull_register(id, pull_rx, recording);
         owner.sockets.lock().unwrap().push(id);
         pull_tx
     });
@@ -631,8 +726,37 @@ pub(super) fn op_ws_bind_target(
     let Some(owner) = reaction_or_current_context(scope) else {
         return retired_event_throw(scope);
     };
+    if ws_claim_id(scope, "WebSocket bind", id, &owner).is_err() {
+        return;
+    }
+    // The target names another cell's socket, so ownership cannot prove the
+    // join: the single-use token the 101 serialization minted does. It is
+    // verified — and consumed — before anything is registered, and the
+    // target's scope must match the registry, so a valid token cannot be
+    // retargeted by rewriting the target JSON. A tunneled target has no
+    // local socket to join; it only passes through to an external client.
+    if target.tunnel.is_some() {
+        return loader_throw(
+            scope,
+            "WebSocket bind: a tunneled upgrade cannot be kept, only passed through",
+        );
+    }
+    let joined = target.bind.is_some_and(|token| {
+        ws_registered_scope(target.id).as_deref() == Some(target.scope.as_str())
+            && ws_consume_bind_token(target.id, token)
+    });
+    if !joined {
+        return loader_throw(
+            scope,
+            &format!(
+                "WebSocket bind: socket {} is not bound to the calling cell or request",
+                target.id
+            ),
+        );
+    }
+    let recording = ws_recording_owner(&cell, &owner);
     let (pull_tx, pull_rx) = ws_pull_channel();
-    ws_pull_register(id, pull_rx);
+    ws_pull_register(id, pull_rx, recording.clone());
     if cell.is_empty() {
         owner.sockets.lock().unwrap().push(id);
     }
@@ -640,7 +764,7 @@ pub(super) fn op_ws_bind_target(
     // the pipe task buffers as a pending frame instead of being dropped for
     // a socket the registry has never heard of. `accept()` opens the socket
     // synchronously, so that window is reachable by an ordinary `send()`.
-    ws_register_outbound(id, &cell, facet);
+    ws_register_outbound(id, &cell, facet, recording);
     let (tx, rx) = tokio::sync::oneshot::channel();
     let sent = outbound_ws_tx().is_some_and(|sender| {
         sender
@@ -704,6 +828,14 @@ pub(super) fn op_ws_accept(
     let Ok(cell) = own_cell_socket(scope, "acceptWebSocket", cell) else {
         return;
     };
+    // Accepting another owner's id would re-scope their socket into this
+    // cell; only a fresh id or this cell's own may be accepted.
+    let Some(event) = event_context(scope) else {
+        return retired_event_throw(scope);
+    };
+    if ws_claim_id(scope, "acceptWebSocket", id, &event).is_err() {
+        return;
+    }
     let replaced_regular_scope = {
         let registry = ws_registry();
         let mut registry = registry.lock().unwrap();
@@ -727,6 +859,8 @@ pub(super) fn op_ws_accept(
                 pending: Vec::new(),
                 auto_response_at: None,
                 facet: None,
+                owner: WsOwner::Cell(cell.clone()),
+                bind_token: None,
             });
         replaced_regular_scope
     };
@@ -749,6 +883,12 @@ pub(super) fn op_ws_accept_regular(
     let Ok(cell) = own_cell_socket(scope, "acceptWebSocket", cell) else {
         return;
     };
+    let Some(event) = event_context(scope) else {
+        return retired_event_throw(scope);
+    };
+    if ws_claim_id(scope, "acceptWebSocket", id, &event).is_err() {
+        return;
+    }
     let inserted = {
         let registry = ws_registry();
         let mut registry = registry.lock().unwrap();
@@ -762,6 +902,8 @@ pub(super) fn op_ws_accept_regular(
                 pending: Vec::new(),
                 auto_response_at: None,
                 facet: None,
+                owner: WsOwner::Cell(cell.clone()),
+                bind_token: None,
             });
             true
         } else {
@@ -825,6 +967,13 @@ pub(super) fn op_ws_attachment_set(
         scope.throw_exception(exception);
         return;
     };
+    let Some(event) = event_context(scope) else {
+        return retired_event_throw(scope);
+    };
+    // A foreign id is a silent no-op, exactly as an unknown one.
+    if !ws_may_use(&event, id) {
+        return;
+    }
     if let Some(meta) = ws_registry().lock().unwrap().metadata.get_mut(&id) {
         meta.attachment = Some(attachment.to_vec());
     }
@@ -836,6 +985,9 @@ pub(super) fn op_ws_auto_response_set(
     _rv: v8::ReturnValue<v8::Value>,
 ) {
     let cell = args.get(0).to_rust_string_lossy(scope);
+    let Ok(cell) = own_cell_socket(scope, "setWebSocketAutoResponse", cell) else {
+        return;
+    };
     let request = args.get(1);
     if request.is_null() || request.is_undefined() {
         ws_auto_responses().lock().unwrap().remove(&cell);
@@ -854,6 +1006,9 @@ pub(super) fn op_ws_auto_response_get(
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
     let cell = args.get(0).to_rust_string_lossy(scope);
+    let Ok(cell) = own_cell_socket(scope, "getWebSocketAutoResponse", cell) else {
+        return;
+    };
     let pair = ws_auto_responses().lock().unwrap().get(&cell).cloned();
     let json = match pair {
         Some((request, response)) => serde_json::to_string(&[request, response]).unwrap(),
@@ -871,14 +1026,52 @@ pub(super) fn op_ws_auto_response_ts(
         .to_integer(scope)
         .map(|n| n.value() as u64)
         .unwrap_or(0);
-    let stamped = ws_registry()
-        .lock()
-        .unwrap()
-        .metadata
-        .get(&id)
-        .and_then(|meta| meta.auto_response_at);
+    let Some(event) = event_context(scope) else {
+        return retired_event_throw(scope);
+    };
+    // A foreign id answers null, exactly as a socket with no timestamp.
+    let stamped = ws_may_use(&event, id)
+        .then(|| {
+            ws_registry()
+                .lock()
+                .unwrap()
+                .metadata
+                .get(&id)
+                .and_then(|meta| meta.auto_response_at)
+        })
+        .flatten();
     match stamped {
         Some(ms) => rv.set(v8::Number::new(scope, ms).into()),
         None => rv.set(v8::null(scope).into()),
     }
+}
+
+/// Verify a fetch response's WebSocket target before the host can attach a
+/// client to it. `cell` is the responding scope (`None` for a Worker). The
+/// target comes from script (`Response._wsTarget`), so a responder may only
+/// present its own accepted socket — by registry ownership — or a target it
+/// was itself given, proven by the single-use token the 101 serialization
+/// minted (consumed here; the next serialization mints again). A tunneled
+/// target carries no local socket: its park id is unguessable and its claim
+/// single-use, so there is nothing further to prove here.
+pub(super) fn verify_response_target(cell: Option<&str>, target: &WsTarget) -> Result<(), String> {
+    if target.tunnel.is_some() {
+        return Ok(());
+    }
+    if let Some(cell) = cell {
+        if target.scope == cell && ws_owned_by_cell(target.id, cell) {
+            return Ok(());
+        }
+    }
+    let joined = target.bind.is_some_and(|token| {
+        ws_registered_scope(target.id).as_deref() == Some(target.scope.as_str())
+            && ws_consume_bind_token(target.id, token)
+    });
+    if joined {
+        return Ok(());
+    }
+    Err(format!(
+        "WebSocket target {} is not bound to the responding cell or request",
+        target.id
+    ))
 }

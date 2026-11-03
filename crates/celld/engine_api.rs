@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): D1 export operator-ingress marker; ported from meln1k/celld: report wake coverage after maintenance (e6cb9a3); shared-cell compat union.
+// Modified by ryuzcorp (ryuzcorp/celld): D1 export operator-ingress marker; ported from meln1k/celld: report wake coverage after maintenance (e6cb9a3); shared-cell compat union; WebSocket join tokens.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! Engine-neutral types and helpers that the cell runtimes and the host
@@ -109,6 +109,12 @@ pub struct WsTarget {
     /// survive the isolate round trip, so it serializes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tunnel: Option<u64>,
+    /// The single-use token that proves the holder may join this target:
+    /// minted by the host when a 101 carrying it is serialized for a caller,
+    /// consumed by the join (or by the next serialization). Absent on targets
+    /// the responder accepted itself, which ownership alone proves.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bind: Option<u64>,
 }
 
 pub enum HttpResponseWebSocket {
