@@ -768,17 +768,12 @@ fn engine_cli() -> String {
     std::env::var("CELLD_DOCKER").unwrap_or_else(|_| "docker".to_string())
 }
 
-fn run_engine(args: &[&str], what: &str) -> anyhow::Result<String> {
-    let output = Command::new(engine_cli())
+fn run_engine_cli(cli: &str, args: &[&str], what: &str) -> anyhow::Result<String> {
+    let output = Command::new(cli)
         .args(args)
         .stdin(std::process::Stdio::null())
         .output()
-        .with_context(|| {
-            format!(
-                "{what}: run `{}`; is a Docker or Podman CLI on PATH?",
-                engine_cli()
-            )
-        })?;
+        .with_context(|| format!("{what}: run `{cli}`; is a Docker or Podman CLI on PATH?"))?;
     if !output.status.success() {
         bail!(
             "{what} failed:\n{}",
@@ -801,6 +796,17 @@ fn run_engine(args: &[&str], what: &str) -> anyhow::Result<String> {
 /// builds, so their hash names the image everywhere: in the manifest, in
 /// the bucket key, and as the tag every engine holds it under.
 fn resolve_image(root: &Path, image: &str, platform: Option<&str>) -> anyhow::Result<String> {
+    resolve_image_cli(&engine_cli(), root, image, platform)
+}
+
+/// `resolve_image` against an explicit engine CLI.
+fn resolve_image_cli(
+    cli: &str,
+    root: &Path,
+    image: &str,
+    platform: Option<&str>,
+) -> anyhow::Result<String> {
+    let run_engine = |args: &[&str], what: &str| run_engine_cli(cli, args, what);
     let platform_args = platform
         .map(|platform| vec!["--platform", platform])
         .unwrap_or_default();
@@ -3076,36 +3082,6 @@ mod deploy_contract {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
-    use std::sync::{Mutex, OnceLock};
-
-    /// `resolve_image` reaches the engine through the `CELLD_DOCKER` CLI,
-    /// which is process-global, so the fake-engine tests serialize here.
-    fn engine_cli_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-    }
-
-    /// Point `CELLD_DOCKER` at `cli` until the guard drops.
-    struct EngineCliGuard {
-        previous: Option<String>,
-    }
-
-    impl EngineCliGuard {
-        fn install(cli: &Path) -> Self {
-            let previous = std::env::var("CELLD_DOCKER").ok();
-            std::env::set_var("CELLD_DOCKER", cli);
-            Self { previous }
-        }
-    }
-
-    impl Drop for EngineCliGuard {
-        fn drop(&mut self) {
-            match self.previous.take() {
-                Some(previous) => std::env::set_var("CELLD_DOCKER", previous),
-                None => std::env::remove_var("CELLD_DOCKER"),
-            }
-        }
-    }
 
     /// A fake engine CLI: builds answer with `built_id`, inspects of that
     /// id answer with `built_content`, inspects of anything else (the
@@ -3147,15 +3123,17 @@ fi
         std::fs::write(dir.join("Dockerfile"), "FROM scratch\n").unwrap();
     }
 
+    fn cli_str(cli: &Path) -> &str {
+        cli.to_str().unwrap()
+    }
+
     #[test]
     fn tag_race_against_identical_image_succeeds() {
-        let _guard = engine_cli_lock().lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
         dockerfile_project(dir.path());
         let content = "[layer-a]{config-a}";
         let cli = fake_engine(dir.path(), "fake-built-id", content, content);
-        let _env = EngineCliGuard::install(&cli);
-        let reference = resolve_image(dir.path(), "Dockerfile", None)
+        let reference = resolve_image_cli(cli_str(&cli), dir.path(), "Dockerfile", None)
             .expect("an identical image under the tag is the lost race's winner");
         assert_eq!(
             reference,
@@ -3165,7 +3143,6 @@ fi
 
     #[test]
     fn tag_race_against_different_image_fails() {
-        let _guard = engine_cli_lock().lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
         dockerfile_project(dir.path());
         let cli = fake_engine(
@@ -3174,8 +3151,7 @@ fi
             "[layer-a]{config-a}",
             "[layer-b]{config-b}",
         );
-        let _env = EngineCliGuard::install(&cli);
-        let error = resolve_image(dir.path(), "Dockerfile", None)
+        let error = resolve_image_cli(cli_str(&cli), dir.path(), "Dockerfile", None)
             .expect_err("a different image under the tag must still fail");
         let message = format!("{error:?}");
         assert!(
