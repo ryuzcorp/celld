@@ -1,3 +1,4 @@
+// Modified by ryuzcorp (ryuzcorp/celld): shared runtime cells run in a dedicated runtime isolate pool; runtime compat is the union over declaring scripts.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! One application deployment as the running process holds it.
@@ -24,7 +25,7 @@ use anyhow::{anyhow, Context};
 use crate::assets::AssetResolver;
 use crate::bucket::Bucket;
 use crate::fleet::{self, LoadedDeployment};
-use crate::js::{WorkerConfig, WorkerConfigOptions};
+use crate::js::{Compat, WorkerConfig, WorkerConfigOptions};
 
 /// Which generation, within this process. Monotonic from one at boot; never
 /// reused, never persisted, and never compared across nodes — the fleet-wide
@@ -290,6 +291,8 @@ pub struct Generation {
     /// stateless path admits into, because an isolate is an isolate. Cells
     /// of one script share them, so cells of one class share module scope
     /// exactly when they are colocated, which is what Durable Objects do.
+    /// The shared reserved classes live under `RUNTIME_SCRIPT` instead: a
+    /// runtime-only pool whose isolates evaluate no tenant bundle.
     pub(crate) cell_isolates: HashMap<String, Arc<crate::pool::Pool>>,
     pub(crate) default_do_class: Option<Arc<str>>,
     pub(crate) assets: HashMap<String, AssetResolver>,
@@ -437,7 +440,9 @@ pub struct IsolateCensus {
     pub stateless: crate::pool::PoolCensus,
     /// The pools of the named services, by service name.
     pub services: BTreeMap<String, crate::pool::PoolCensus>,
-    /// The pools the cells live in, by Worker script.
+    /// The pools the cells live in, by Worker script — plus the runtime
+    /// pool under its reserved name when the deployment declares a shared
+    /// reserved class.
     pub cells: BTreeMap<String, crate::pool::PoolCensus>,
 }
 
@@ -448,6 +453,26 @@ pub struct IsolateCensus {
 /// current when the call lands.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GenerationTag(pub GenerationId);
+
+/// The script name of the runtime isolate pool: the isolates that host the
+/// shared reserved classes (`__D1Database`, `__KvNamespace`, `__Queue`).
+///
+/// Not a deployable script name. `deploy::valid_script_name` accepts only
+/// lowercase ASCII, digits, and `-`, so no deployment can claim this name
+/// and no tenant pool can collide with the runtime pool in `cell_isolates`.
+/// The shared classes address fleet-wide namespace keys, so their cells
+/// resolve identically whichever script name hosts them.
+pub(crate) const RUNTIME_SCRIPT: &str = "__celld-runtime";
+
+/// The entry module of a runtime isolate. The harness plus this fixed inert
+/// module is the whole realm: no tenant bundle is compiled or evaluated, so
+/// no tenant's top level shares globals or primordials with a shared cell.
+///
+/// `load_config` still requires a default export with a `fetch` handler,
+/// which this provides. It never runs: the runtime pool serves cells only,
+/// and no stateless pool, service binding, or loader targets this script.
+const RUNTIME_MODULE: &str = "export default {\n  fetch() {\n    return new Response(\"runtime isolate\", { status: 500 });\n  },\n};\n";
+
 impl Generation {
     /// Build a deployment into a generation that can serve.
     ///
@@ -534,19 +559,90 @@ impl Generation {
         // `__D1Database` is deliberately shared. Its namespace is fleet-wide so
         // that several Workers can bind one database and a rename cannot rename
         // it, so two scripts declaring `d1_databases` address the same cells on
-        // purpose. A D1 cell runs SQL and reads no user code, binding or var,
-        // so whichever config serves it is immaterial and the first wins.
-        // Refusing the second made the node exit instead of start.
+        // purpose. Refusing the second made the node exit instead of start.
         //
         // A workflow class is script-scoped (`deploy::workflow_class`), so two
         // scripts produce two distinct names and never reach this branch. If
         // one ever did, it would be a real collision and must still be refused.
         let mut cell_configs: HashMap<String, Arc<WorkerConfig>> = HashMap::new();
+        // The shared reserved classes (`__D1Database`, `__KvNamespace`,
+        // `__Queue`) run in the runtime isolate pool, not in any tenant
+        // script's pool. Their cells serve every script in the fleet, so
+        // hosting them beside one script's bundle would let that script's
+        // top level tamper with the globals and primordials their gates
+        // and data paths use. The runtime config carries no tenant code,
+        // bindings, vars, services, loaders, or schedule — only the
+        // deployment-wide queue catalog (so shared queue cells dispatch
+        // to the declaring consumer), this node's routing identity, the
+        // generation tag (so dispatches resolve against this graph), and
+        // the union of every declaring script's compatibility switches
+        // (`Compat::union` — the one config the shared cells' storage
+        // behavior still follows).
+        //
+        // Pre-registered here, so the per-script loop below keeps this
+        // config for every shared class (`register_cell_class` keeps the
+        // first). Workflow classes and `.cron` stay in their own script's
+        // pool on purpose: a workflow cell executes its script's `run()`
+        // and a cron cell its script's `scheduled()`, with that script's
+        // bindings, so moving them would move the tenant code they run.
+        // The runtime config's compat is the union over every script that
+        // declares a shared class — not the primary's alone, which would
+        // drop a storage capability (e.g. `sqlite_vec`) that only a
+        // cohosted declaring script opts into. A script that declares no
+        // shared class contributes nothing: its switches govern cells it
+        // never touches.
+        let (shared_classes, runtime_compat): (Vec<String>, Option<Compat>) = {
+            let mut seen = BTreeSet::new();
+            let mut compat: Option<Compat> = None;
+            for options in std::iter::once(&primary.options)
+                .chain(cohosted.iter().map(|target| &target.options))
+            {
+                let mut declares = false;
+                for class in &options.do_classes {
+                    if crate::deploy::is_shared_reserved_class(class) {
+                        seen.insert(class.clone());
+                        declares = true;
+                    }
+                }
+                if declares {
+                    compat = Some(match compat {
+                        None => options.compat,
+                        Some(acc) => acc.union(options.compat),
+                    });
+                }
+            }
+            (seen.into_iter().collect(), compat)
+        };
+        if !shared_classes.is_empty() {
+            let runtime = Arc::new(
+                WorkerConfig::new(WorkerConfigOptions {
+                    src: RUNTIME_MODULE.to_string(),
+                    script_name: RUNTIME_SCRIPT.to_string(),
+                    do_classes: shared_classes.clone(),
+                    bindings: Vec::new(),
+                    r2_bindings: Vec::new(),
+                    d1_bindings: Vec::new(),
+                    kv_bindings: Vec::new(),
+                    queue_bindings: Vec::new(),
+                    queue_consumers: Vec::new(),
+                    workflow_bindings: Vec::new(),
+                    vars: Vec::new(),
+                    node: node.to_string(),
+                    modules: Vec::new(),
+                    compat: runtime_compat.expect("a shared class implies a declaring script"),
+                })
+                .with_queue_consumers(queue_catalog.clone())
+                .with_generation(id),
+            );
+            for class in &shared_classes {
+                cell_configs.insert(class.clone(), runtime.clone());
+            }
+        }
         let mut service_pools = HashMap::new();
         let mut assets = HashMap::new();
-        // Primary first: shared reserved classes retain the first script's
-        // config. Only this script owns ingress and the node's cron schedule;
-        // bindings and runtime construction follow the same path for all scripts.
+        // Primary first: only this script owns ingress and the node's cron
+        // schedule; bindings and runtime construction follow the same path
+        // for all scripts.
         for (index, deployment) in std::iter::once(primary).chain(cohosted).enumerate() {
             let is_primary = index == 0;
             let crate::fleet::LoadedDeployment {
@@ -633,8 +729,11 @@ impl Generation {
 /// A duplicate is an error for a user class, because `start_cell` resolves a
 /// cell from the class its scope names and two exports of one name are
 /// genuinely ambiguous. A duplicate of a *shared* reserved class is not: see
-/// `deploy::is_shared_reserved_class`. The caller supplies the error so the
-/// message can say whether the collision was inside one script or across two.
+/// `deploy::is_shared_reserved_class`. `Generation::build` pre-registers the
+/// shared classes with the runtime config, so this branch is what keeps that
+/// config when each tenant script declares them. The caller supplies the
+/// error so the message can say whether the collision was inside one script
+/// or across two.
 fn register_cell_class(
     configs: &mut HashMap<String, Arc<WorkerConfig>>,
     class: String,

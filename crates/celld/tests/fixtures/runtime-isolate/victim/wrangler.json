@@ -1,0 +1,13 @@
+{
+  "name": "rtiso-victim",
+  "main": "worker.js",
+  "compatibility_date": "2026-02-12",
+  "compatibility_flags": ["sqlite_vec"],
+  "no_bundle": true,
+  "d1_databases": [{ "binding": "DB", "database_name": "rtiso-db" }],
+  "kv_namespaces": [{ "binding": "NS", "id": "rtiso-ns" }],
+  "queues": {
+    "producers": [{ "binding": "Q", "queue": "rtiso-queue" }],
+    "consumers": [{ "queue": "rtiso-queue", "max_batch_size": 1, "max_batch_timeout": 1 }]
+  }
+}

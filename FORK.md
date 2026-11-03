@@ -9,7 +9,7 @@ README below is kept intact; this file documents the fork.
 
 - `main` mirrors upstream `main` and carries no patches.
 - `ryuzcorp/v<version>` is a line branch: the upstream tag `v<version>`
-  plus our patches as commits, one commit per patch, in `0001`-`0036`
+  plus our patches as commits, one commit per patch, in `0001`-`0037`
   order. Each patch commit is self-contained and carries its own tests.
 
 Upstream's `.github/workflows/release.yml` targets `ghcr.io/denoland` and
@@ -357,7 +357,7 @@ push to `ghcr.io/denoland`, but still. Pushing a branch named
   the execution domain through the same shared test runtime,
   since a second `set_host_handle` would trip its
   exactly-once assert in one test binary.
-- `0036` (sha TBD at merge) concurrent requests share one isolate
+- `0036` (`ff1d424`) concurrent requests share one isolate
   without stalling or borrowing each other's request: stateless entries
   carry continuation tokens so a shared promise's waiter keeps its own
   ops, the first turn installs its token for settling work, and event
@@ -366,6 +366,24 @@ push to `ghcr.io/denoland`, but still. Pushing a branch named
   sockets, WebSockets, HTMLRewriters and stream tees are accounted to
   the owning request, and a retired owner throws with nothing
   registered.
+- `0037` (sha TBD at merge) shared runtime cells run in a dedicated
+  runtime isolate pool: cells of `__D1Database`, `__KvNamespace`, and
+  `__Queue` build their isolates from the harness plus a fixed inert
+  entry module, with no tenant bundle loaded — previously they ran in
+  the first declaring script's pool beside that script's code. The pool
+  reuses the cell-pool limits and memory accounting, carries the
+  deployment-wide queue catalog, the node's routing identity, the
+  generation tag, and the union of every declaring script's
+  compatibility switches (so a storage capability only a cohosted
+  script opts into, e.g. `sqlite_vec`, still applies to the shared
+  cells it uses), and holds no tenant bindings, vars, services,
+  loaders, or schedule. Deploy refuses a service binding whose target
+  is not a valid script name, instead of failing at boot.
+  Workflow cells and `.cron` stay in their own script's pool: they
+  execute that script's `run()` and `scheduled()` with its bindings.
+  Per-cell placement and ownership are unchanged — state stays in the
+  cells' SQLite, so a rolling upgrade moves cells on restart with no
+  migration — and `/state` reports the pool under its reserved name.
 
 Patches `0025`–`0034` are ported fixes from
 [meln1k/celld](https://github.com/meln1k/celld) by Nikita

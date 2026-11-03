@@ -1,0 +1,12 @@
+{
+  "name": "rtiso-host",
+  "main": "worker.js",
+  "compatibility_date": "2026-02-12",
+  "no_bundle": true,
+  "services": [{ "binding": "SB", "service": "rtiso-victim" }],
+  "d1_databases": [{ "binding": "DB", "database_name": "rtiso-db" }],
+  "kv_namespaces": [{ "binding": "NS", "id": "rtiso-ns" }],
+  "queues": {
+    "producers": [{ "binding": "Q", "queue": "rtiso-queue" }]
+  }
+}
