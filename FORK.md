@@ -9,7 +9,7 @@ README below is kept intact; this file documents the fork.
 
 - `main` mirrors upstream `main` and carries no patches.
 - `ryuzcorp/v<version>` is a line branch: the upstream tag `v<version>`
-  plus our patches as commits, one commit per patch, in `0001`-`0028`
+  plus our patches as commits, one commit per patch, in `0001`-`0029`
   order. Each patch commit is self-contained and carries its own tests.
 
 Upstream's `.github/workflows/release.yml` targets `ghcr.io/denoland` and
@@ -312,6 +312,10 @@ push to `ghcr.io/denoland`, but still. Pushing a branch named
   settles an alarm handler still running without a barrier as a
   failed handler (re-armed, op retired, wake entry kept), fixing
   the `firing an alarm while not resident` panic on failed proofs.
+- `0029` (sha TBD at merge) port of meln1k/celld@18d3bf9: the
+  near-alarm eviction refusal applies only when the node has room
+  to spare (no shedding, draining, or waiters), so a full node
+  sheds instead of parking a waiter until its deadline.
 
 ## Releases
 
