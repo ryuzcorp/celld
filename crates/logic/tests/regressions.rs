@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): ported from meln1k/celld: scripted core-bug reproductions (ea471ee).
+// Modified by ryuzcorp (ryuzcorp/celld): ported from meln1k/celld: scripted core-bug reproductions (ea471ee, e46a685).
 //! Scripted reproductions of core bugs the deterministic simulator
 //! (`crates/sim`) found. Each drives the core through a minimal shell that
 //! answers every effect at once, except the ones a test holds back to
@@ -259,4 +259,37 @@ fn a_second_release_supersedes_one_still_in_flight() {
     shell.state.validate().expect("state invariant");
     assert_eq!(shell.owners["a"].node, None);
     assert_eq!(shell.owners["a"].epoch, 2);
+}
+
+/// A restarted node reads the ownership record of every cell on its disk.
+/// If the node lease fences while one of those reads is in flight, the fence
+/// used to leave the cell marked as confirming in `Fenced`, and `validate`
+/// failed on the very event that halts the node.
+#[test]
+fn a_fence_settles_startup_confirmation_reads() {
+    let mut shell = Shell::new(4, |effect| matches!(effect, Effect::ReadOwner { .. }));
+    shell.local_cells = vec![LocalCell {
+        id: "c".into(),
+        epoch: 3,
+        live: false,
+    }];
+    shell.start();
+    assert_eq!(shell.held.len(), 1, "the confirmation read is in flight");
+    assert!(!shell.state.ownership_confirmed());
+
+    let fence = shell
+        .timers
+        .iter()
+        .find(|timer| matches!(timer, Timer::NodeLeaseFence { .. }))
+        .cloned()
+        .expect("the held lease arms its fence");
+    let effects = shell.send(Event::TimerFired {
+        timer: fence,
+        now_ms: NOW_MS + TTL_MS,
+        now_mono_ms: MONO_MS + TTL_MS,
+    });
+    assert!(effects
+        .iter()
+        .any(|effect| matches!(effect, Effect::Halt { .. })));
+    shell.state.validate().expect("state invariant");
 }

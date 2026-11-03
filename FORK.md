@@ -9,7 +9,7 @@ README below is kept intact; this file documents the fork.
 
 - `main` mirrors upstream `main` and carries no patches.
 - `ryuzcorp/v<version>` is a line branch: the upstream tag `v<version>`
-  plus our patches as commits, one commit per patch, in `0001`-`0025`
+  plus our patches as commits, one commit per patch, in `0001`-`0026`
   order. Each patch commit is self-contained and carries its own tests.
 
 Upstream's `.github/workflows/release.yml` targets `ghcr.io/denoland` and
@@ -299,6 +299,10 @@ push to `ghcr.io/denoland`, but still. Pushing a branch named
   the debug `indexed cell op N has no owning slot` panic and the
   release-build `cell_ops` leak; adds the
   `crates/logic/tests/regressions.rs` scripted-reproduction harness.
+- `0026` (sha TBD at merge) port of meln1k/celld@e46a685: fence
+  settles startup confirmation reads, fixing the debug
+  `confirming cell left the owner read in Fenced` panic on the
+  halting event.
 
 ## Releases
 
