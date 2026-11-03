@@ -1,5 +1,5 @@
+// Modified by ryuzcorp (ryuzcorp/celld): D1 export operator-ingress marker; ported from meln1k/celld: report wake coverage after maintenance (e6cb9a3).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
-// Modified by ryuzcorp (ryuzcorp/celld): D1 export operator-ingress marker.
 
 //! Engine-neutral types and helpers that the cell runtimes and the host
 //! share. Nothing here touches V8; `crate::js`, `crate::runtime` and
@@ -625,7 +625,18 @@ pub(crate) fn decode_durable_object_id(value: &str) -> Option<[u8; 32]> {
     }
     Some(output)
 }
-pub type AlarmObserver = Arc<dyn Fn(String, celld_logic::wake::AlarmSnapshot) + Send + Sync>;
+/// Whether a wake entry is known to cover a reported alarm.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WakeCoverage {
+    /// A new installation, whose entry may not exist yet.
+    Unconfirmed,
+    /// Wake maintenance confirmed the entry for this installation.
+    Confirmed,
+}
+
+/// Reports an alarm installation to the core.
+pub type AlarmObserver =
+    Arc<dyn Fn(String, celld_logic::wake::AlarmSnapshot, WakeCoverage) + Send + Sync>;
 
 #[derive(Clone)]
 pub(crate) enum StopMode {

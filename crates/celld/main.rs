@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): cross-isolate RPC stubs and streams; operator token for the internal listener; D1 export operator-ingress marker.
+// Modified by ryuzcorp (ryuzcorp/celld): cross-isolate RPC stubs and streams; operator token for the internal listener; D1 export operator-ingress marker; ported from meln1k/celld: report wake coverage after maintenance (e6cb9a3).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 // The binary contains connection, startup, shutdown, and V8 shell code. The
@@ -4058,11 +4058,11 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
     let (tx, rx) = mpsc::unbounded_channel();
     let sample_tx = tx.clone();
     let alarm_tx = tx.clone();
-    let alarm_observer: celld::runtime::AlarmObserver = Arc::new(move |cell, alarm| {
+    let alarm_observer: celld::runtime::AlarmObserver = Arc::new(move |cell, alarm, coverage| {
         let _ = alarm_tx.send(Message::AlarmObserved {
             cell,
             alarm,
-            covered: false,
+            covered: coverage == celld::runtime::WakeCoverage::Confirmed,
         });
     });
     let (fence_tx, mut fence_rx) = mpsc::unbounded_channel();

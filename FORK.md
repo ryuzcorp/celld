@@ -9,7 +9,7 @@ README below is kept intact; this file documents the fork.
 
 - `main` mirrors upstream `main` and carries no patches.
 - `ryuzcorp/v<version>` is a line branch: the upstream tag `v<version>`
-  plus our patches as commits, one commit per patch, in `0001`-`0026`
+  plus our patches as commits, one commit per patch, in `0001`-`0027`
   order. Each patch commit is self-contained and carries its own tests.
 
 Upstream's `.github/workflows/release.yml` targets `ghcr.io/denoland` and
@@ -303,6 +303,11 @@ push to `ghcr.io/denoland`, but still. Pushing a branch named
   settles startup confirmation reads, fixing the debug
   `confirming cell left the owner read in Fenced` panic on the
   halting event.
+- `0027` (sha TBD at merge) port of meln1k/celld@e6cb9a3: the alarm
+  observer carries `WakeCoverage`, and wake maintenance reports
+  `Confirmed` once the flusher says the current installation is
+  covered, so a restored alarm no longer pins its cell resident
+  forever.
 
 ## Releases
 

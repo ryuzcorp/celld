@@ -1,3 +1,4 @@
+// Modified by ryuzcorp (ryuzcorp/celld): ported from meln1k/celld: report wake coverage after maintenance (e6cb9a3).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! The Actor's one boundary to whichever engine runs cells.
@@ -213,6 +214,19 @@ impl CellHost {
             Self::Engine(runtime) => runtime.fire_alarm(op, cell, scheduled_ms).await,
             #[cfg(all(test, celld_internal_tests))]
             Self::Scripted(runtime) => runtime.fire_alarm(op, cell, scheduled_ms).await,
+        }
+    }
+
+    /// Report wake coverage that maintenance just established.
+    pub(crate) fn report_alarm_coverage(
+        &self,
+        cell: &str,
+        maintained: celld_logic::wake::AlarmSnapshot,
+    ) {
+        match self {
+            Self::Engine(runtime) => runtime.report_alarm_coverage(cell, maintained),
+            #[cfg(all(test, celld_internal_tests))]
+            Self::Scripted(_) => {}
         }
     }
 
