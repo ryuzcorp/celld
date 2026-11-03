@@ -9,7 +9,7 @@ README below is kept intact; this file documents the fork.
 
 - `main` mirrors upstream `main` and carries no patches.
 - `ryuzcorp/v<version>` is a line branch: the upstream tag `v<version>`
-  plus our patches as commits, one commit per patch, in `0001`-`0024`
+  plus our patches as commits, one commit per patch, in `0001`-`0025`
   order. Each patch commit is self-contained and carries its own tests.
 
 Upstream's `.github/workflows/release.yml` targets `ghcr.io/denoland` and
@@ -288,12 +288,17 @@ push to `ghcr.io/denoland`, but still. Pushing a branch named
   the cell runs the engine's own `batch()` behind a new fetch branch, so
   the CLI and the Worker binding share one implementation, and the CLI
   prints one JSON array shaped as the Worker's `batch()` shapes it.
-- `0024` (sha TBD at merge) `celld d1 export` scopes each
+- `0024` (`db25a35`) `celld d1 export` scopes each
   `sqlite_sequence` reset to its own counter: a filtered (`--table`) or
   data-only (`--no-schema`) dump replayed into an existing database no
   longer clears the AUTOINCREMENT counters of tables the dump does not
   name, so those tables cannot reissue the ids of deleted rows. A full
   dump still restores every counter exactly.
+- `0025` (sha TBD at merge) port of meln1k/celld@ea471ee: a newer
+  ownership release retires the in-flight one it supersedes, fixing
+  the debug `indexed cell op N has no owning slot` panic and the
+  release-build `cell_ops` leak; adds the
+  `crates/logic/tests/regressions.rs` scripted-reproduction harness.
 
 ## Releases
 
