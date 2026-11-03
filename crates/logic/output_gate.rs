@@ -1,3 +1,4 @@
+// Modified by ryuzcorp (ryuzcorp/celld): ported from meln1k/celld: 51 code probes on the core's rare branches (b026226).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! The output gate: one choke point every egress passes through.
@@ -104,6 +105,7 @@ impl State {
         // expired. Releasing then would reveal work a successor owner can
         // already have replaced.
         if !self.node_authoritative() {
+            self.probe(Probe::GateRefusedUnauthoritative);
             effects.push(Effect::Release {
                 request,
                 channel,
@@ -126,6 +128,7 @@ impl State {
                 .resident_cell(request)
                 .is_none_or(|(_, current)| current != sampled)
             {
+                self.probe(Probe::GateRefusedEpochMoved);
                 effects.push(Effect::Release {
                     request,
                     channel,
@@ -177,6 +180,7 @@ impl State {
         observed: u64,
         effects: &mut Vec<Effect>,
     ) {
+        self.probe(Probe::GateReadHeldOnObserved);
         if let Some((_, barrier)) = self.barriers.iter_mut().rev().find(|(_, barrier)| {
             barrier.cell == cell && barrier.epoch == epoch && barrier.position >= observed
         }) {
@@ -302,6 +306,11 @@ impl State {
             effects.push(Effect::VerifyOwnership { op, cell, epoch });
             return;
         }
+        self.probe(match result {
+            Err(_) => Probe::GateProofFailed,
+            Ok(_) if !proven => Probe::GateProofShort,
+            Ok(_) => Probe::GateProvenByFleet,
+        });
         self.settle_gate(op, proven, effects);
     }
 
@@ -318,6 +327,10 @@ impl State {
         if !self.barriers.contains_key(&op) {
             return;
         }
+        self.probe(match result {
+            Ok(()) => Probe::GateProvenByBucket,
+            Err(_) => Probe::GateOwnershipRefused,
+        });
         self.settle_gate(op, result.is_ok(), effects);
     }
 

@@ -9,7 +9,7 @@ README below is kept intact; this file documents the fork.
 
 - `main` mirrors upstream `main` and carries no patches.
 - `ryuzcorp/v<version>` is a line branch: the upstream tag `v<version>`
-  plus our patches as commits, one commit per patch, in `0001`-`0032`
+  plus our patches as commits, one commit per patch, in `0001`-`0033`
   order. Each patch commit is self-contained and carries its own tests.
 
 Upstream's `.github/workflows/release.yml` targets `ghcr.io/denoland` and
@@ -335,6 +335,10 @@ push to `ghcr.io/denoland`, but still. Pushing a branch named
   a log waits for recovery, which CAS-seals the absent log so a
   stale session cannot open one through a renewal and ack into
   the superseded epoch; the seal refuses a lease that reads live.
+- `0033` (sha TBD at merge) port of meln1k/celld@b026226 (logic
+  files only; sim/docs files not ported): 51 behavior-neutral
+  code probes counting the core's rare branches, read through
+  `State::probes`; prerequisite instrumentation for `0034`.
 
 ## Releases
 
