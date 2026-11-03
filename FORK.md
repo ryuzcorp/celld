@@ -9,7 +9,7 @@ README below is kept intact; this file documents the fork.
 
 - `main` mirrors upstream `main` and carries no patches.
 - `ryuzcorp/v<version>` is a line branch: the upstream tag `v<version>`
-  plus our patches as commits, one commit per patch, in `0001`-`0013`
+  plus our patches as commits, one commit per patch, in `0001`-`0014`
   order. Each patch commit is self-contained and carries its own tests.
 
 Upstream's `.github/workflows/release.yml` targets `ghcr.io/denoland` and
@@ -196,7 +196,7 @@ push to `ghcr.io/denoland`, but still. Pushing a branch named
   `no_bundle`, and Python projects warn and write nothing. The Docker
   test stage installs esbuild, pinned by sha512, so the bundling tests
   run in CI.
-- `0013` (sha TBD at merge) `CELLD_OPERATOR_TOKEN` guards the internal
+- `0013` (`176a0e3`) `CELLD_OPERATOR_TOKEN` guards the internal
   listener: when set, every internal route requires
   `Authorization: Bearer <token>` (constant-time compare, 401 without
   it, no exempt routes — probes use the public health endpoint) and the
@@ -205,6 +205,14 @@ push to `ghcr.io/denoland`, but still. Pushing a branch named
   client (peer forwarding, handoff, abort, log tier, probe,
   `d1`/`kv`/`queue` CLIs, `diagnose`, `dev` shutdown) sends the token
   from its environment.
+- `0014` (sha TBD at merge) container fence admits replies to a node in
+  a container netns: `CELLD_FENCE_NODE_NETNS=auto` (default `off`,
+  byte-identical) cuts an `established,related` exception for the
+  node's own addresses, discovered on Linux or pinned with
+  `CELLD_FENCE_NODE_ADDRS` (a pin listing no address refuses). Replies
+  only — a container still cannot open a connection to the node — and no
+  per-container ownership: a hoster with untrusting tenants on one engine
+  still enforces which containers a node may dial above celld.
 
 ## Releases
 
