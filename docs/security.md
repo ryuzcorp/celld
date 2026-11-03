@@ -1,4 +1,4 @@
-<!-- Modified by ryuzcorp (ryuzcorp/celld): operator token for the internal listener; tenant egress policy. -->
+<!-- Modified by ryuzcorp (ryuzcorp/celld): operator token for the internal listener; tenant egress policy; runtime cell isolation. -->
 # Security
 
 celld v0.6.3 is a beta release. It is not safe for hostile multi-tenant use.
@@ -18,6 +18,21 @@ therefore reaches the host only through the capabilities in its `env`.
 
 celld depends on two external boundaries: a trusted private network protects
 the internal listener, and object storage credentials control the fleet.
+
+## Runtime cell isolation
+
+Cells of the shared runtime classes — D1 databases, KV namespaces, and Queue
+brokers — serve every script in the fleet, so they run in a dedicated runtime
+isolate pool whose isolates evaluate no tenant bundle: the harness plus a
+fixed inert entry module. No script's top level shares a realm with them, and
+the pool holds no tenant bindings, vars, services, loaders, or schedule —
+only the deployment-wide queue catalog, the node's routing identity, the
+generation tag, and the union of every declaring script's compatibility
+switches. Workflow
+cells and the cron cell stay in their own script's pool: they execute that
+script's `run()` and `scheduled()` handlers with its bindings, so isolating
+them from their own script would isolate them from the code they run.
+Per-cell placement and ownership are unchanged.
 
 ## Separate the listeners
 

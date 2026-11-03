@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): D1 export operator-ingress marker; ported from meln1k/celld: report wake coverage after maintenance (e6cb9a3).
+// Modified by ryuzcorp (ryuzcorp/celld): D1 export operator-ingress marker; ported from meln1k/celld: report wake coverage after maintenance (e6cb9a3); shared-cell compat union.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! Engine-neutral types and helpers that the cell runtimes and the host
@@ -264,6 +264,58 @@ pub struct Compat {
     /// Queue bodies default to JSON on compatibility dates after 2024-03-18;
     /// older deployments retain the V8 structured-clone default.
     pub queue_json_messages: bool,
+}
+
+impl Compat {
+    /// The union of two scripts' switches, for the shared runtime cells.
+    ///
+    /// The runtime isolate pool hosts the shared classes for every script
+    /// in the fleet, but each script declares its own compat, so the
+    /// runtime config carries the OR over every declaring script's
+    /// switches: a capability one declaring script opts into applies to
+    /// the shared cells it uses whichever script is primary. Per-field
+    /// audit of what the shared cells actually read:
+    ///
+    /// - `sqlite_vec` is the one behavior-changing field: the host opens
+    ///   each shared cell's SQLite with the hosting isolate's flag, and
+    ///   the flag loads the sqlite-vec extension. Enabling an extension
+    ///   is additive-safe — it adds the `vec0` module and the vector
+    ///   functions while every other query runs byte-identical — so the
+    ///   union never changes semantics for a script that did not declare
+    ///   it.
+    /// - `queue_json_messages` is read only in `__queueEncode`, which runs
+    ///   in the producer's isolate with the producer's config, so each
+    ///   producer keeps its own script's default; delivery decodes from
+    ///   the stored per-message content type, never from compat.
+    /// - `js_rpc` is already granted for every shared class via
+    ///   `doExports`, so shared-cell RPC allows regardless of the flag.
+    /// - `delete_all_deletes_alarm` is read only by
+    ///   `DurableObjectStorage.deleteAll`, which no shared-cell path
+    ///   calls; the shared cells cross to storage through host ops and
+    ///   set no alarms.
+    /// - `fetcher_get_put_delete` gates helpers on stubs created in the
+    ///   isolate; the runtime isolate creates no tenant-reachable stubs,
+    ///   and its internal queue stubs call fetch/RPC, never the helpers.
+    /// - `websocket_standard_binary_type` is read only when constructing
+    ///   a `WebSocket`; the shared cells construct none.
+    ///
+    /// No tenant code runs in the runtime isolate, so the reflected
+    /// `Cloudflare.compatibilityFlags` there is unread too. A future
+    /// compat field that would change shared-cell semantics per script
+    /// must extend this audit — and refuse the generation on conflict —
+    /// instead of silently joining the union.
+    pub fn union(self, other: Self) -> Self {
+        Self {
+            delete_all_deletes_alarm: self.delete_all_deletes_alarm
+                || other.delete_all_deletes_alarm,
+            js_rpc: self.js_rpc || other.js_rpc,
+            fetcher_get_put_delete: self.fetcher_get_put_delete || other.fetcher_get_put_delete,
+            sqlite_vec: self.sqlite_vec || other.sqlite_vec,
+            websocket_standard_binary_type: self.websocket_standard_binary_type
+                || other.websocket_standard_binary_type,
+            queue_json_messages: self.queue_json_messages || other.queue_json_messages,
+        }
+    }
 }
 
 /// A non-main module the worker's main module may import, tagged by how the

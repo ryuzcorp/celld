@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): idempotent content-tagged image create; tag-race tests run the fake engine through sh; deploy --sourcemap writes the bundle's external map.
+// Modified by ryuzcorp (ryuzcorp/celld): idempotent content-tagged image create; tag-race tests run the fake engine through sh; deploy --sourcemap writes the bundle's external map; service binding targets validated at deploy.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 // Deployment is an operator control-plane path outside the Actor execution
@@ -1530,6 +1530,12 @@ fn read_project(path: &Path, root: &Path, overrides: &VarOverrides) -> anyhow::R
             .get("service")
             .and_then(Value::as_str)
             .ok_or_else(|| anyhow!("service binding {binding} has no `service`"))?;
+        if !valid_script_name(target) {
+            bail!(
+                "service binding {binding} `service` must contain 1 to {MAX_SCRIPT_NAME_BYTES} bytes of lowercase \
+                 ASCII letters, digits, or internal hyphens: {target:?}"
+            );
+        }
         let entrypoint = service
             .get("entrypoint")
             .map(|value| {
@@ -3604,6 +3610,26 @@ mod sourcemap_tests {
         assert_eq!(built.sourcemap, None);
         write_sourcemap(&options, &built).unwrap();
         assert!(!map_path.exists());
+    }
+
+    #[test]
+    fn service_binding_with_invalid_target_name_fails_at_deploy() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("wrangler.json"),
+            r#"{"name": "svctest", "main": "entry.js", "no_bundle": true, "services": [{"binding": "SB", "service": "__celld-runtime"}]}"#,
+        )
+        .unwrap();
+        std::fs::write(root.path().join("entry.js"), "export default {};\n").unwrap();
+        let error = match build(&test_options(&root.path().join("wrangler.json"), None)) {
+            Ok(_) => panic!("an undeployable service target must fail the deploy, not the boot"),
+            Err(error) => error,
+        };
+        let message = format!("{error:?}");
+        assert!(
+            message.contains("__celld-runtime"),
+            "the refusal must name the bad target: {message}"
+        );
     }
 
     #[test]
