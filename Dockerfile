@@ -1,4 +1,5 @@
 # syntax=docker/dockerfile:1.7
+# Modified by ryuzcorp (ryuzcorp/celld): the test stage's clippy loads the workspace clippy.toml.
 
 ARG RUST_VERSION=1.98.1
 ARG CELLD_COMMIT=unknown
@@ -27,6 +28,8 @@ RUN rustup component add clippy
 RUN apt-get update && \
     apt-get install -y --no-install-recommends sqlite3 && \
     rm -rf /var/lib/apt/lists/*
+# clippy reads the workspace's disallowed methods, types and macros from here.
+COPY clippy.toml ./
 RUN --mount=type=cache,id=celld-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=celld-cargo-git,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,id=celld-target-${TARGETARCH},target=/src/target,sharing=locked \
