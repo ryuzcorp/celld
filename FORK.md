@@ -9,7 +9,7 @@ README below is kept intact; this file documents the fork.
 
 - `main` mirrors upstream `main` and carries no patches.
 - `ryuzcorp/v<version>` is a line branch: the upstream tag `v<version>`
-  plus our patches as commits, one commit per patch, in `0001`-`0009`
+  plus our patches as commits, one commit per patch, in `0001`-`0010`
   order. Each patch commit is self-contained and carries its own tests.
 
 Upstream's `.github/workflows/release.yml` targets `ghcr.io/denoland` and
@@ -169,11 +169,16 @@ push to `ghcr.io/denoland`, but still. Pushing a branch named
   a retained wait re-subscribes in each later event instead of hanging
   on the first event's dropped op; awaiting in its own event still
   resolves through its own subscription.
-- `0009` (sha TBD at merge) `celld deploy` treats a lost content-tag
-  race as success: when tagging the built image fails with
-  `AlreadyExists`, the tag is re-inspected and the deploy continues if
-  it names the same content; a different image under the tag still
+- `0009` (`d4215ef`, test fix-up `145d8e9`) `celld deploy` treats a
+  lost content-tag race as success: when tagging the built image fails
+  with `AlreadyExists`, the tag is re-inspected and the deploy continues
+  if it names the same content; a different image under the tag still
   fails.
+- `0010` (sha TBD at merge) container exec honors `options.signal`
+  (AbortSignal): an already-aborted signal refuses with its reason
+  before spawning, aborting later sends SIGKILL through the existing
+  exec kill path, and the abort listener is removed when the process
+  exits.
 
 ## Releases
 

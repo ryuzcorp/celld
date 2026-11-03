@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): exec() waits for start(); exec pty/resize.
+// Modified by ryuzcorp (ryuzcorp/celld): exec() waits for start(); exec pty/resize; test-only fake exec engine.
 //! Host ops behind `ctx.container`.
 //!
 //! JavaScript owns the surface and every validation message, copied from
@@ -9,6 +9,8 @@
 
 use super::*;
 use crate::container::{self, CellContainer, ContainerEngine, ExecParams, StartGuard, StartParams};
+use std::collections::{HashMap, HashSet};
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 async fn cell_for(scope: &str) -> Result<(Arc<ContainerEngine>, Arc<CellContainer>), String> {
@@ -39,6 +41,10 @@ pub(super) fn op_container_running(
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
     let cell = string_arg(scope, &args, 0);
+    if test_wait_enabled() && test_execs().lock().unwrap().scopes.contains(&cell) {
+        rv.set(v8::Boolean::new(scope, true).into());
+        return;
+    }
     let running = container::engine_if_ready()
         .and_then(|engine| engine.cell(&cell))
         .is_some_and(|cell| cell.running());
@@ -240,6 +246,43 @@ pub(super) fn op_container_exec(
         (true, Some(cols), Some(rows)) if cols != 0 && rows != 0 => (Some(cols), Some(rows)),
         _ => return loader_throw(scope, "exec(): pty size must be positive cols and rows"),
     };
+    // Past validation, like the engine path: invalid params still throw.
+    if test_wait_enabled() {
+        let mut execs = test_execs().lock().unwrap();
+        if execs.scopes.contains(&cell) {
+            if execs.processes.len() >= TEST_EXEC_CAP {
+                return loader_throw(scope, "too many test execs");
+            }
+            let id = execs.next_id;
+            execs.next_id += 1;
+            let pid = execs.next_pid;
+            execs.next_pid += 1;
+            execs.processes.insert(
+                id,
+                TestExecProcess {
+                    scope: cell.clone(),
+                    params: raw.clone(),
+                    kills: Vec::new(),
+                    exit: None,
+                    waiters: Vec::new(),
+                },
+            );
+            let response = serde_json::json!({
+                "id": id,
+                "pid": pid,
+                "isPty": request.pty,
+            })
+            .to_string();
+            let value = v8::String::new(scope, &response)
+                .map(v8::Local::<v8::Value>::from)
+                .unwrap_or_else(|| v8::undefined(scope).into());
+            match resolved_promise(scope, value) {
+                Ok(promise) => rv.set(promise.into()),
+                Err(_) => loader_throw(scope, "could not create exec promise"),
+            }
+            return;
+        }
+    }
     let async_id = asyncrt::enqueue(async move {
         let (engine, cell) = cell_for(&cell).await?;
         let process = engine
@@ -287,6 +330,12 @@ pub(super) fn op_container_exec_read(
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
+    if test_exec_hit(number_arg(scope, &args, 0)) {
+        // A fake process has no output: reads end at once.
+        let async_id = asyncrt::enqueue_unrefed(async move { Ok::<Vec<u8>, String>(Vec::new()) });
+        rv.set(promise_for(scope, async_id));
+        return;
+    }
     let process = process_arg(scope, &args);
     let which = number_arg(scope, &args, 1) as u8;
     let async_id = asyncrt::enqueue_unrefed(async move {
@@ -301,6 +350,13 @@ pub(super) fn op_container_exec_write(
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
+    if test_exec_hit(number_arg(scope, &args, 0)) {
+        if view_bytes(args.get(1)).is_none() {
+            return loader_throw(scope, "stdin write needs bytes");
+        }
+        test_exec_ok(scope, rv);
+        return;
+    }
     let process = process_arg(scope, &args);
     let Some(bytes) = view_bytes(args.get(1)) else {
         return loader_throw(scope, "stdin write needs bytes");
@@ -317,6 +373,10 @@ pub(super) fn op_container_exec_close(
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
+    if test_exec_hit(number_arg(scope, &args, 0)) {
+        test_exec_ok(scope, rv);
+        return;
+    }
     let process = process_arg(scope, &args);
     let async_id = asyncrt::enqueue_unrefed(async move {
         process?.close_stdin().await;
@@ -330,6 +390,39 @@ pub(super) fn op_container_exec_wait(
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
+    let id = number_arg(scope, &args, 0);
+    if test_exec_hit(id) {
+        // A fired exit stored like an engine exit code, so a subscriber
+        // arriving after the fire resolves at once.
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let immediate = {
+            let mut execs = test_execs().lock().unwrap();
+            match execs.processes.get_mut(&id) {
+                Some(process) if process.exit.is_some() => process.exit.clone(),
+                Some(process) => {
+                    process.waiters.push(tx);
+                    None
+                }
+                None => return loader_throw(scope, "the process is closed"),
+            }
+        };
+        if let Some(code) = immediate {
+            let value = v8::String::new(scope, &code)
+                .map(v8::Local::<v8::Value>::from)
+                .unwrap_or_else(|| v8::undefined(scope).into());
+            match resolved_promise(scope, value) {
+                Ok(promise) => rv.set(promise.into()),
+                Err(_) => loader_throw(scope, "could not create wait promise"),
+            }
+            return;
+        }
+        let async_id = asyncrt::enqueue_unrefed(async move {
+            let _guard = TestExecWaitGuard { id };
+            Ok(rx.await.unwrap_or_default())
+        });
+        rv.set(promise_for(scope, async_id));
+        return;
+    }
     let process = process_arg(scope, &args);
     let async_id = asyncrt::enqueue_unrefed(async move {
         let code = process?
@@ -346,8 +439,19 @@ pub(super) fn op_container_exec_kill(
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
-    let process = process_arg(scope, &args);
+    let id = number_arg(scope, &args, 0);
     let signal = number_arg(scope, &args, 1) as u32;
+    if test_exec_hit(id) {
+        // Recorded synchronously: the abort dispatch and the op run on
+        // the same thread, so the suite observes the kill without
+        // yielding.
+        if let Some(process) = test_execs().lock().unwrap().processes.get_mut(&id) {
+            process.kills.push(signal);
+        }
+        test_exec_ok(scope, rv);
+        return;
+    }
+    let process = process_arg(scope, &args);
     let async_id = asyncrt::enqueue_unrefed(async move {
         process?
             .kill(signal)
@@ -372,6 +476,10 @@ pub(super) fn op_container_exec_resize(
     if cols == 0 || rows == 0 {
         return loader_throw(scope, "resize(): cols and rows must be 1..=65535");
     }
+    if test_exec_hit(number_arg(scope, &args, 0)) {
+        test_exec_ok(scope, rv);
+        return;
+    }
     let async_id = asyncrt::enqueue_unrefed(async move {
         process?
             .resize(cols, rows)
@@ -388,5 +496,196 @@ pub(super) fn op_container_exec_drop(
     _rv: v8::ReturnValue<v8::Value>,
 ) {
     let id = number_arg(scope, &args, 0);
+    if test_exec_hit(id) {
+        test_execs().lock().unwrap().processes.remove(&id);
+        return;
+    }
     container::drop_process(id);
+}
+
+// ---- Test-only fake exec engine ------------------------------------------
+// `CELLD_TEST_WAIT=1` only (the exec-signal conformance suite): the test
+// environment has no container engine -- image resolution needs Docker,
+// so a fixture cannot even declare `containers[]` -- and this table
+// stands in for it beneath the real `Container.prototype.exec` path. A
+// scope the suite attaches reports running, and its execs mint fake
+// processes whose kills, params, and exit the suite drives. Fake ids
+// start at 2^40: exactly representable through the JSON round trip, and
+// unreachable by the engine's sequential ids. Every branch above throws
+// or stays dark unless the flag is set, so production tenants cannot
+// reach the fake.
+const TEST_EXEC_ID_BASE: u64 = 1 << 40;
+const TEST_EXEC_CAP: usize = 64;
+
+struct TestExecProcess {
+    scope: String,
+    /// The params JSON as the op received it; the suite asserts the
+    /// AbortSignal never crosses into it.
+    params: String,
+    kills: Vec<u32>,
+    exit: Option<String>,
+    waiters: Vec<tokio::sync::oneshot::Sender<String>>,
+}
+
+struct TestExecs {
+    scopes: HashSet<String>,
+    next_id: u64,
+    next_pid: i64,
+    processes: HashMap<u64, TestExecProcess>,
+}
+
+fn test_execs() -> &'static Mutex<TestExecs> {
+    static TEST_EXECS: OnceLock<Mutex<TestExecs>> = OnceLock::new();
+    TEST_EXECS.get_or_init(|| {
+        Mutex::new(TestExecs {
+            scopes: HashSet::new(),
+            next_id: TEST_EXEC_ID_BASE,
+            next_pid: 1000,
+            processes: HashMap::new(),
+        })
+    })
+}
+
+/// Whether an exec id serves from the fake table. Dark unless the flag
+/// is set; anything else falls through to the engine registry.
+fn test_exec_hit(id: u64) -> bool {
+    test_wait_enabled() && test_execs().lock().unwrap().processes.contains_key(&id)
+}
+
+/// Resolve a fake exec op with the empty string its engine twin answers.
+fn test_exec_ok(scope: &mut v8::PinScope, mut rv: v8::ReturnValue<v8::Value>) {
+    let value = v8::String::new(scope, "")
+        .map(v8::Local::<v8::Value>::from)
+        .unwrap_or_else(|| v8::undefined(scope).into());
+    match resolved_promise(scope, value) {
+        Ok(promise) => rv.set(promise.into()),
+        Err(_) => loader_throw(scope, "could not create test exec promise"),
+    }
+}
+
+/// Drop one fake-exec waiter when its op is dropped (event retirement
+/// cancels the future), so a fired exit is not sent into a dead channel
+/// and the waiter list cannot grow without bound.
+struct TestExecWaitGuard {
+    id: u64,
+}
+
+impl Drop for TestExecWaitGuard {
+    fn drop(&mut self) {
+        if let Some(process) = test_execs().lock().unwrap().processes.get_mut(&self.id) {
+            process.waiters.retain(|waiter| !waiter.is_closed());
+        }
+    }
+}
+
+/// `__testexec_attach(scope)`; mark one scope as fake-running, so the
+/// real exec path runs against the fake table. Throws unless
+/// `CELLD_TEST_WAIT=1`.
+pub(super) fn op_testexec_attach(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue<v8::Value>,
+) {
+    if !test_wait_enabled() {
+        return loader_throw(scope, "test execs are disabled on this node");
+    }
+    let cell = string_arg(scope, &args, 0);
+    if cell.is_empty() || cell.len() > 256 {
+        return loader_throw(scope, "test exec scope must be 1..=256 bytes");
+    }
+    let mut execs = test_execs().lock().unwrap();
+    if execs.scopes.len() >= TEST_EXEC_CAP && !execs.scopes.contains(&cell) {
+        return loader_throw(scope, "too many test exec scopes");
+    }
+    execs.scopes.insert(cell);
+}
+
+/// `__testexec_ids(scope)` -> JSON array of the scope's fake exec ids, in
+/// spawn order. Throws unless `CELLD_TEST_WAIT=1`.
+pub(super) fn op_testexec_ids(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    if !test_wait_enabled() {
+        return loader_throw(scope, "test execs are disabled on this node");
+    }
+    let cell = string_arg(scope, &args, 0);
+    let execs = test_execs().lock().unwrap();
+    let mut ids: Vec<u64> = execs
+        .processes
+        .iter()
+        .filter(|(_, process)| process.scope == cell)
+        .map(|(id, _)| *id)
+        .collect();
+    ids.sort_unstable();
+    let ids = serde_json::json!(ids).to_string();
+    rv.set(v8::String::new(scope, &ids).unwrap().into());
+}
+
+/// `__testexec_exit(id, code)`; fire one fake exit, resolving its current
+/// subscribers and storing the code for late ones (first fire wins, like
+/// a stored engine exit code). Throws unless `CELLD_TEST_WAIT=1`.
+pub(super) fn op_testexec_exit(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue<v8::Value>,
+) {
+    if !test_wait_enabled() {
+        return loader_throw(scope, "test execs are disabled on this node");
+    }
+    let id = number_arg(scope, &args, 0);
+    let code = number_arg(scope, &args, 1);
+    if code > 255 {
+        return loader_throw(scope, "test exec exit code must be 0..=255");
+    }
+    let mut execs = test_execs().lock().unwrap();
+    let Some(process) = execs.processes.get_mut(&id) else {
+        return loader_throw(scope, "unknown test exec");
+    };
+    if process.exit.is_some() {
+        return;
+    }
+    let code = code.to_string();
+    process.exit = Some(code.clone());
+    for waiter in process.waiters.drain(..) {
+        let _ = waiter.send(code.clone());
+    }
+}
+
+/// `__testexec_kills(id)` -> JSON array of the signals the fake process
+/// received, in order. Throws unless `CELLD_TEST_WAIT=1`.
+pub(super) fn op_testexec_kills(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    if !test_wait_enabled() {
+        return loader_throw(scope, "test execs are disabled on this node");
+    }
+    let id = number_arg(scope, &args, 0);
+    let execs = test_execs().lock().unwrap();
+    let Some(process) = execs.processes.get(&id) else {
+        return loader_throw(scope, "unknown test exec");
+    };
+    let kills = serde_json::json!(process.kills).to_string();
+    rv.set(v8::String::new(scope, &kills).unwrap().into());
+}
+
+/// `__testexec_params(id)` -> the params JSON the fake exec received.
+/// Throws unless `CELLD_TEST_WAIT=1`.
+pub(super) fn op_testexec_params(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    if !test_wait_enabled() {
+        return loader_throw(scope, "test execs are disabled on this node");
+    }
+    let id = number_arg(scope, &args, 0);
+    let execs = test_execs().lock().unwrap();
+    let Some(process) = execs.processes.get(&id) else {
+        return loader_throw(scope, "unknown test exec");
+    };
+    rv.set(v8::String::new(scope, &process.params).unwrap().into());
 }
