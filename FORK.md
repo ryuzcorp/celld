@@ -9,7 +9,7 @@ README below is kept intact; this file documents the fork.
 
 - `main` mirrors upstream `main` and carries no patches.
 - `ryuzcorp/v<version>` is a line branch: the upstream tag `v<version>`
-  plus our patches as commits, one commit per patch, in `0001`-`0033`
+  plus our patches as commits, one commit per patch, in `0001`-`0034`
   order. Each patch commit is self-contained and carries its own tests.
 
 Upstream's `.github/workflows/release.yml` targets `ghcr.io/denoland` and
@@ -339,6 +339,20 @@ push to `ghcr.io/denoland`, but still. Pushing a branch named
   files only; sim/docs files not ported): 51 behavior-neutral
   code probes counting the core's rare branches, read through
   `State::probes`; prerequisite instrumentation for `0034`.
+- `0034` (sha TBD at merge) port of meln1k/celld@65fdb13 (logic
+  files only; sim/docs files not ported): a cell whose last
+  restore failed keeps its owner record — the drain and the
+  balancer skip it — so no peer restores it from the bucket
+  alone and loses the acknowledged tail; counted by the new
+  `DormantKeptUnfolded` probe. Adds a scripted reproduction.
+
+Patches `0025`–`0034` are ported fixes from
+[meln1k/celld](https://github.com/meln1k/celld) by Nikita
+Melkozerov (Apache-2.0, like upstream): coordination-core
+correctness fixes the author's deterministic simulator found,
+ported without the simulator itself. Each entry above names its
+source commit; the commits keep the original author with a
+`Ported-from` trailer.
 
 ## Releases
 
