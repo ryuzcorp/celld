@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): r2 list --delimiter, a binding-shape --page, and --cursor continuation.
+// Modified by ryuzcorp (ryuzcorp/celld): r2 list --delimiter, a binding-shape --page, and --cursor continuation; r2 head/get --json answers an absent key with a not_found error object.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 // The R2 CLI reads operator input and object bodies outside node storage.
@@ -213,15 +213,17 @@ pub async fn run(arguments: Vec<String>) -> anyhow::Result<()> {
                 // An unconditional read cannot be refused, so the only
                 // other answer is an absent key.
                 crate::bucket::BlobRead::Missing | crate::bucket::BlobRead::Unmet(_) => {
-                    bail!("no object {key:?} in r2 bucket {bucket:?}")
+                    return absent_key(bucket, &key, command.json);
                 }
             }
         }
         Action::Head { key } => {
-            let meta = crate::js::r2_ops::head(bucket, &key)
+            let Some(meta) = crate::js::r2_ops::head(bucket, &key)
                 .await
                 .map_err(anyhow::Error::msg)?
-                .ok_or_else(|| anyhow!("no object {key:?} in r2 bucket {bucket:?}"))?;
+            else {
+                return absent_key(bucket, &key, command.json);
+            };
             let mut out = Output::new(if command.json {
                 Format::Json
             } else {
@@ -367,6 +369,28 @@ async fn fetch_text_page(
         rows,
         next: page.cursor,
     })
+}
+
+/// The machine-readable absent-key answer: a `--json` read prints this
+/// on stdout, so its caller matches the `error` field instead of
+/// substring-matching the English message on stderr.
+fn not_found_error(bucket: &str, key: &str) -> Value {
+    json!({
+        "error": "not_found",
+        "bucket": bucket,
+        "key": key,
+    })
+}
+
+/// Fail an absent key. `--json` prints the [`not_found_error`] object on
+/// stdout first; the failure itself keeps the human message and the exit
+/// code it always had, so only `--json` readers see anything new.
+/// `delete` never comes here: removing an absent key succeeds, as on R2.
+fn absent_key(bucket: &str, key: &str, json: bool) -> anyhow::Result<()> {
+    if json {
+        Output::new(Format::Json).line(format_args!("{}", not_found_error(bucket, key)))?;
+    }
+    bail!("no object {key:?} in r2 bucket {bucket:?}")
 }
 
 /// One listed object in the binding's shape: the key, size, etag and
@@ -788,7 +812,7 @@ pub fn print_help() {
         "celld r2 — read and write the objects behind an `r2_buckets` binding
 
 USAGE
-  celld r2 get    <bucket-name> <key>    [fleet options]
+  celld r2 get    <bucket-name> <key>    [--json] [fleet options]
   celld r2 head   <bucket-name> <key>    [--json] [fleet options]
   celld r2 put    <bucket-name> <key>    --path FILE | --pipe [put options]
   celld r2 delete <bucket-name> <key>... [fleet options]
@@ -797,6 +821,11 @@ USAGE
 The bucket name is the `bucket_name` from the project's `r2_buckets` entry,
 not the binding name. `get` writes the object to stdout as bytes, so an
 artifact comes back byte for byte.
+
+A get or head of an absent key fails with `no object ...` on stderr.
+With --json it also prints {{\"error\":\"not_found\",...}} on stdout
+first, so a caller matches the error field instead of the English
+message. `delete` of an absent key succeeds, as on R2.
 
 This command reads the fleet bucket directly and needs no running node, so
 a release pipeline can publish an object before it deploys the Worker.
@@ -1528,6 +1557,36 @@ mod tests {
                 _ => vec![verb, "bucket", "key", "--cursor", "a/2"],
             };
             assert!(parse(&arguments).is_err(), "{verb} accepted --cursor");
+        }
+    }
+
+    /// The machine-readable absent-key answer: `--json` readers match the
+    /// `error` field instead of substring-matching the English message.
+    #[test]
+    fn not_found_error_names_the_bucket_and_key() {
+        assert_eq!(
+            not_found_error("photos", "a/1"),
+            json!({
+                "error": "not_found",
+                "bucket": "photos",
+                "key": "a/1",
+            })
+        );
+    }
+
+    /// An absent key fails with the message it always had, with or without
+    /// `--json` — the error object is additive signal, not a new failure.
+    #[test]
+    fn absent_key_keeps_the_human_message() {
+        for json in [false, true] {
+            let error = match absent_key("photos", "a/1", json) {
+                Ok(()) => panic!("an absent key must fail (json: {json})"),
+                Err(error) => error,
+            };
+            assert_eq!(
+                format!("{error:#}"),
+                "no object \"a/1\" in r2 bucket \"photos\""
+            );
         }
     }
 }
