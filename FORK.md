@@ -9,7 +9,7 @@ README below is kept intact; this file documents the fork.
 
 - `main` mirrors upstream `main` and carries no patches.
 - `ryuzcorp/v<version>` is a line branch: the upstream tag `v<version>`
-  plus our patches as commits, one commit per patch, in `0001`-`0049`
+  plus our patches as commits, one commit per patch, in `0001`-`0050`
   order. Each patch commit is self-contained and carries its own tests.
 
 Upstream's `.github/workflows/release.yml` targets `ghcr.io/denoland` and
@@ -512,12 +512,41 @@ push to `ghcr.io/denoland`, but still. Pushing a branch named
   internal listener requires the operator token plus the fleet HMAC; a
   shadow generation serves staged pins overlaid on the live map in
   fresh pools and retires after the request. Nothing serving moves.
-- `0049` (sha TBD at merge) `celld invoke --header-env NAME=VAR` sends
+- `0049` (`3730834`) `celld invoke --header-env NAME=VAR` sends
   header NAME with the value of environment variable VAR, so a secret
   header (a proxy or migration token) never sits on argv, which every
   local user reads through `/proc/<pid>/cmdline`; the environment is
   readable only by the same user. An unset variable is refused without
   echoing anything, and the `--header` name and value checks apply.
+- `0050` (sha TBD at merge) `celld deploy` and `celld d1` read the
+  project tree only inside the project's own directory: every
+  project path is canonicalized and refused with an error naming
+  its config key when it resolves elsewhere, while a link that
+  resolves inside the tree keeps working (a link as the final `main`
+  or assets-directory component stays refused, as before). Contained reads: the
+  config file itself, the `main` entry (validation and every build
+  path: pre-bundled, esbuild, Python), the unbundled-wasm scan, the
+  Python sources and `python_modules/`, the `assets.directory` tree
+  and its `_headers`/`_redirects`, `containers[].image` Dockerfiles
+  and their build contexts, and `migrations_dir` for `celld d1`
+  (whose entries must now be regular files, never links). A
+  `containers[].image` that is an absolute or `..` path is refused
+  rather than built; other non-project values stay image references.
+  esbuild is contained too. Unlike Wrangler, the deploy may run with
+  more privilege than the project's author, and esbuild reads whatever
+  the sources point at: imports and `rules` modules through `..`,
+  absolute paths or directory links, an input's `sourceMappingURL`, a
+  `tsconfig.json` `extends` chain, the parent directories it searches,
+  and it quotes a failing file's source line in its error output. On
+  Linux it therefore runs under Landlock with reads confined to the
+  project, its two output directories and its own executable (which must
+  be the self-contained release binary), so an outside read fails like a
+  missing file and reaches no bundle, map or error. Every run also writes
+  a metafile, and the build fails unless every file esbuild read
+  resolves inside the project: the whole guarantee for bundled files on
+  a kernel without Landlock, where celld warns that esbuild runs
+  unconfined. The Python SDK probe follows no link, so it cannot answer
+  whether a host path exists.
 
 Patches `0025`–`0034` are ported fixes from
 [meln1k/celld](https://github.com/meln1k/celld) by Nikita

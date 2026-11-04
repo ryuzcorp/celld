@@ -1,4 +1,4 @@
-<!-- Modified by ryuzcorp (ryuzcorp/celld): CELLD_MEMORY_SCOPE; deploy --sourcemap writes the bundle's external map; operator token for the internal listener; r2 list --delimiter, the --page shape, and --cursor continuation; Workers Cache API page; deployment cache scope; deploy --sourcemap collects the no_bundle sibling map; staged invoke docs. -->
+<!-- Modified by ryuzcorp (ryuzcorp/celld): CELLD_MEMORY_SCOPE; deploy --sourcemap writes the bundle's external map; operator token for the internal listener; r2 list --delimiter, the --page shape, and --cursor continuation; Workers Cache API page; deployment cache scope; deploy --sourcemap collects the no_bundle sibling map; staged invoke docs; deploy confines esbuild reads to the project. -->
 # celld
 
 celld is a stateful distributed system. It runs server-side JavaScript on
@@ -227,7 +227,13 @@ RELEASE.2025-09-06T17-38-46Z, which rejects the first deploy
 ## Deploy an application
 
 Install `esbuild` on `PATH` if the project contains Worker code. Then run
-`celld deploy` in a Wrangler project:
+`celld deploy` in a Wrangler project. On Linux, esbuild runs under
+Landlock with reads confined to the project directory, so an import,
+input source map, or `tsconfig.json` `extends` outside it fails like a
+missing file (whether an outside directory exists can still show in the
+error). It must be the self-contained release binary, not a wrapper
+script. A kernel without Landlock runs it unconfined, with a warning:
+bundled files are still checked against the project directory.
 
 ```sh
 git clone https://github.com/denoland/celld
@@ -684,7 +690,7 @@ unset variable selects its default. A Boolean variable accepts only `0` or
 | `CELLD_OPERATOR_TOKEN` | A bearer token the whole fleet shares. When set, every internal-listener route requires `Authorization: Bearer <token>` (compared in constant time) and answers 401 without it; `celld d1`, `celld kv`, `celld queue`, `celld diagnose`, and `celld invoke` read it from the environment and send it. Unset: the internal listener stays open. Set but empty: the node refuses to start. See [security](security.md) |
 | `CELLD_NODE` | An explicit node-session ID: 1 to 128 ASCII letters, numbers, dots, dashes, or underscores, but not `.` or `..` |
 | `CELLD_WATCH` | The local work directory for SQLite and replication |
-| `CELLD_ESBUILD` | The path of the esbuild executable |
+| `CELLD_ESBUILD` | The path of the esbuild executable: the self-contained release binary, since on Linux it runs with reads confined to the project |
 | `CELLD_ACTIVATIONS` | Concurrent cold-cell activations (default: 8 per CPU, at least 16, at most 128) |
 | `CELLD_DEPLOY_POLL_S` | The deployment pointer poll interval in seconds (default: 30) |
 | `CELLD_DEPLOY_MAX_AGE_S` | Seconds before celld forces a resident Durable Object onto a new deployment (default: 60; 0 forces at once) |

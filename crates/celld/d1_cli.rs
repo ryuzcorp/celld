@@ -1,5 +1,5 @@
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
-// Modified by ryuzcorp (ryuzcorp/celld): d1 export; d1 execute --batch.
+// Modified by ryuzcorp (ryuzcorp/celld): d1 export; d1 execute --batch; deploy reads stay inside the project.
 
 // The D1 CLI reads operator input and migration files outside node storage.
 #![allow(clippy::disallowed_methods)]
@@ -513,15 +513,35 @@ fn read_migrations(directory: &std::path::Path) -> anyhow::Result<Vec<Migration>
             directory.display()
         );
     }
+    // The declaration's directory is contained when it is parsed, but the
+    // read must not follow a link wherever the path came from.
+    if std::fs::symlink_metadata(directory).is_ok_and(|metadata| metadata.file_type().is_symlink())
+    {
+        bail!(
+            "migrations directory {} is a symbolic link; point `migrations_dir` \
+             at a regular directory",
+            directory.display()
+        );
+    }
     let mut migrations = Vec::new();
     for entry in
         std::fs::read_dir(directory).with_context(|| format!("read {}", directory.display()))?
     {
-        let path = entry?.path();
+        let entry = entry?;
+        // Never follow a link out of the migrations directory: the entry is
+        // inspected without following, like the asset and wasm walks.
+        let file_type = entry.file_type()?;
+        let path = entry.path();
+        if file_type.is_symlink() {
+            bail!(
+                "migration {} is a symbolic link; vendor migrations as regular files",
+                path.display()
+            );
+        }
         // A directory is never a migration, whatever it is named — but a
         // directory HOLDING migrations is a layout this command does not
         // read, and skipping it silently would apply half a schema.
-        if path.is_dir() {
+        if file_type.is_dir() {
             let nested = std::fs::read_dir(&path)
                 .map(|entries| {
                     entries
@@ -541,6 +561,11 @@ fn read_migrations(directory: &std::path::Path) -> anyhow::Result<Vec<Migration>
         }
         if !has_sql_extension(&path) {
             continue;
+        }
+        // A FIFO or device here would block the command or read nonsense;
+        // links are refused above, so only a regular file is left to read.
+        if !file_type.is_file() {
+            bail!("migration {} is not a regular file", path.display());
         }
         let name = path
             .file_name()
@@ -1078,5 +1103,67 @@ mod d1_batch_cli_tests {
             let error = parse_batch_input(input).expect_err("accepted").to_string();
             assert!(error.contains(fragment), "input {input}: {error}");
         }
+    }
+}
+
+#[cfg(test)]
+mod d1_migrations_tests {
+    use super::*;
+
+    #[test]
+    fn migrations_do_not_follow_symlinks() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("evil.sql"), "OUTSIDE\n").unwrap();
+        let directory = root.path().join("migrations");
+        std::fs::create_dir(&directory).unwrap();
+        std::os::unix::fs::symlink(
+            outside.path().join("evil.sql"),
+            directory.join("0001_evil.sql"),
+        )
+        .unwrap();
+        let error = match read_migrations(&directory) {
+            Ok(_) => panic!("a symlinked migration must be refused, not read"),
+            Err(error) => error,
+        };
+        let message = format!("{error:?}");
+        assert!(
+            message.contains("symbolic link"),
+            "the refusal must name the link: {message}"
+        );
+    }
+
+    #[test]
+    fn migrations_do_not_follow_a_linked_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("0001_evil.sql"), "OUTSIDE\n").unwrap();
+        let linked = root.path().join("migrations");
+        std::os::unix::fs::symlink(outside.path(), &linked).unwrap();
+        let error = match read_migrations(&linked) {
+            Ok(_) => panic!("a symlinked migrations directory must be refused, not read"),
+            Err(error) => error,
+        };
+        let message = format!("{error:?}");
+        assert!(
+            message.contains("symbolic link"),
+            "the refusal must name the link: {message}"
+        );
+    }
+
+    #[test]
+    fn migrations_still_read_regular_files() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("migrations");
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::write(
+            directory.join("0001_init.sql"),
+            "CREATE TABLE t (id INTEGER);\n",
+        )
+        .unwrap();
+        let migrations = read_migrations(&directory).unwrap();
+        assert_eq!(migrations.len(), 1);
+        assert_eq!(migrations[0].name, "0001_init.sql");
+        assert_eq!(migrations[0].sql, "CREATE TABLE t (id INTEGER);\n");
     }
 }
