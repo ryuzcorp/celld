@@ -246,7 +246,6 @@ push to `ghcr.io/denoland`, but still. Pushing a branch named
   `no-store`/`private`/`Set-Cookie` never cached, `Vary` ignored,
   conditional and range answers, `CF-Cache-Status: HIT` on hits,
   `CELLD_CACHE_MAX_BYTES` cap (64 MiB default) with LRU eviction.
-  Release note: default 64 MiB per node of new memory; set CELLD_CACHE_MAX_BYTES=0 to disable.
 - `0019` (`856dba1`) context end aborts finished uploads: the
   caller runtime used to abort only pumps still registered at context
   end, so an upload whose pump already finished lingered sender-alive
@@ -442,7 +441,7 @@ push to `ghcr.io/denoland`, but still. Pushing a branch named
   ways (an old forward refuses against the new allowlist, a new
   forward errors against an old accept) and the alarm retries after
   convergence.
-- `0042` (sha TBD at merge) socket ids answer only their owner: a
+- `0042` (`75c73e7`) socket ids answer only their owner: a
   WebSocket id is usable only by the cell scope or request context
   that holds it (send, close, accept, hibernation list/tags,
   attachments, auto-response, isolate-pulled reads, and the
@@ -465,6 +464,43 @@ source commit; the commits keep the original author with a
 - `v0.6.3-ryuzcorp.4` (`65419c6`): patches `0001`–`0006`; first
   release published by this fork.
 - `v0.6.3-ryuzcorp.5` (`750e18a`): adds `0007`–`0008` (PR #2).
+- `v0.6.3-ryuzcorp.6` (the commit that adds this entry): adds
+  `0009`–`0042`. Upgrade notes:
+  - Upgrade every node of a fleet together. A rolling upgrade moves
+    cells with no migration (`0037`), but cross-version traffic fails
+    until every node runs this release: operator calls through an old
+    node fail closed on new nodes, Queue DLQ and redrive forwards fail
+    in both directions, and stubs sent from an old node revive as plain
+    data on a new one (`0040`, `0041`). The Queue alarm replays the
+    durable DLQ and redrive marks once the fleet converges.
+  - Storage rows holding stubs written before the upgrade read back as
+    plain data (Durable Object stubs as null). Get each stub again from
+    its namespace or binding and store it again to write the new
+    envelope (`0040`); storing the read-back value does not restore a
+    stub.
+  - Workers now fail when they reach a resource their script never
+    bound, touch another cell's storage, call D1, KV, or Queue
+    operator methods through stubs, or use a socket id outside its
+    owning cell or request (`0022`, `0040`, `0041`, `0042`). Declare
+    every binding a Worker uses, and run operator actions through the
+    `celld` CLIs.
+  - The Workers Cache API takes up to 64 MiB of memory per node by
+    default; `CELLD_CACHE_MAX_BYTES=0` turns it off (`0018`).
+  - Shared D1, KV, and Queue cells move to a runtime pool that
+    `/state` reports as `__celld-runtime` (`0037`).
+  - Opt-in hardening stays off by default: `CELLD_EGRESS` is `open`
+    (`0021`), `CELLD_FENCE_NODE_NETNS` is `off` (`0014`),
+    `CELLD_MEMORY_SCOPE` is `container` (`0011`), and
+    `CELLD_OPERATOR_TOKEN` is unset (`0013`).
+  - Set `CELLD_OPERATOR_TOKEN` only once every node runs this
+    release: older nodes send no token, so a mixed fleet with the
+    token set fails internal calls with 401 (`0013`). Set it in the
+    environment of every `celld` CLI too; liveness and readiness
+    probes use the public health endpoint.
+  - Queue rows whose dead-letter source was forged before the
+    upgrade can still be redriven to the name they carry; planting
+    such rows is closed by `0041`, redrive is operator-only, and
+    retention ages them out.
 
 ## License
 
