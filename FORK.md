@@ -9,7 +9,7 @@ README below is kept intact; this file documents the fork.
 
 - `main` mirrors upstream `main` and carries no patches.
 - `ryuzcorp/v<version>` is a line branch: the upstream tag `v<version>`
-  plus our patches as commits, one commit per patch, in `0001`-`0047`
+  plus our patches as commits, one commit per patch, in `0001`-`0048`
   order. Each patch commit is self-contained and carries its own tests.
 
 Upstream's `.github/workflows/release.yml` targets `ghcr.io/denoland` and
@@ -491,7 +491,7 @@ push to `ghcr.io/denoland`, but still. Pushing a branch named
   stage, and a plain `cargo build` without it reports the crate
   version. The build fails on any byte outside `[0-9A-Za-z._+-]`, so
   the value cannot inject cargo directives of its own.
-- `0047` (sha TBD at merge) `celld deploy --sourcemap PATH` collects
+- `0047` (`141cd5b`) `celld deploy --sourcemap PATH` collects
   the `no_bundle` entry's sibling `<entry>.map`: the entry deploys as
   written, so its caller-toolchain map still describes the deployed
   module. The deployed bytes are untouched. The sibling comes from a
@@ -505,6 +505,13 @@ push to `ghcr.io/denoland`, but still. Pushing a branch named
   project-root-relative paths lexically, never resolved on the host, so
   the map cannot probe which host files exist; absolute and URL sources
   keep their file name.
+- `0048` (sha TBD at merge) `celld invoke` sends one HTTP request to a
+  staged script version on one node, served by that version's code with
+  its declared bindings against the real data, so a migration endpoint
+  runs before the activation that would serve it. `POST /invoke` on the
+  internal listener requires the operator token plus the fleet HMAC; a
+  shadow generation serves staged pins overlaid on the live map in
+  fresh pools and retires after the request. Nothing serving moves.
 
 Patches `0025`–`0034` are ported fixes from
 [meln1k/celld](https://github.com/meln1k/celld) by Nikita

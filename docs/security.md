@@ -1,4 +1,4 @@
-<!-- Modified by ryuzcorp (ryuzcorp/celld): operator token for the internal listener; tenant egress policy; runtime cell isolation; deployment cache scope trade-off. -->
+<!-- Modified by ryuzcorp (ryuzcorp/celld): operator token for the internal listener; tenant egress policy; runtime cell isolation; deployment cache scope trade-off; staged invoke. -->
 # Security
 
 celld v0.6.3 is a beta release. It is not safe for hostile multi-tenant use.
@@ -99,8 +99,8 @@ open listener above.
 Every in-tree client of the internal listener reads the variable from its
 own environment and sends the token: node-to-node peer forwarding,
 handoff, abort, the log tier, and the signed probe, as well as
-`celld d1`, `celld kv`, `celld queue`, `celld diagnose`, and the `celld
-dev` supervisor's shutdown. A caller outside the fleet — a deployment
+`celld d1`, `celld kv`, `celld queue`, `celld diagnose`, `celld invoke`,
+and the `celld dev` supervisor's shutdown. A caller outside the fleet — a deployment
 script that posts `/reload`, a monitor that reads `/state` — must send
 the header itself. Roll the token out only after every node runs a celld
 that knows the variable: a node that never sends the header is refused
@@ -134,6 +134,21 @@ response formats. Without the token, these routes do not authenticate the caller
 `/do/<ID>` refuses every reserved runtime class, such as D1, Workflows, KV,
 and Queues, because their protocols can access application data. Use the
 HMAC-authenticated `/runtime/<SCOPE>` route for these classes.
+
+`POST /invoke` serves one request from staged, not yet activated, script
+versions (`celld invoke`), so a migration endpoint runs before the
+activation that would serve it. Like `/runtime/`, it requires the
+per-request fleet HMAC plus the operator token when one is set; without
+the token it still requires the HMAC, which a tenant cannot mint. No
+public route and no peer tunnel reaches a non-activated version: the
+public listener has no such path, and tunnels carry cell calls, never
+this route. The invoke writes nothing to the bucket, moves no pointer,
+and serves staged code in fresh isolate pools that share nothing with
+live traffic and are retired after the request; cells resolve from the
+live generation, so bindings reach the real data. It runs to completion
+server-side even if the caller disconnects, so stopping the wait cannot
+leave a half-applied migration, and it answers only after `waitUntil`
+settles. See [Invoke a staged version](staged-invoke.md).
 
 `/peer/probe` returns a signed diagnostic response. Do not call the other
 reserved peer paths directly.

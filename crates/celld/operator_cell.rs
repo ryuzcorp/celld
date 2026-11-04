@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): operator token for the internal listener.
+// Modified by ryuzcorp (ryuzcorp/celld): operator token for the internal listener; staged invoke reuses the signed entrance.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! Reaching a reserved-class cell from outside the fleet.
@@ -71,6 +71,31 @@ impl Reachable {
         scope: String,
         name: Option<&str>,
     ) -> anyhow::Result<Self> {
+        let mut path = format!("/runtime/{scope}");
+        if let Some(name) = name {
+            // An operator command can be the first request to construct a
+            // reserved cell. A later named binding call cannot repair the
+            // identity that the existing JavaScript instance already cached.
+            path.push('?');
+            path.push_str(
+                &url::form_urlencoded::Serializer::new(String::new())
+                    .append_pair("name", name)
+                    .finish(),
+            );
+        }
+        Self::open_path(fleet, subject, path).await
+    }
+
+    /// The same signed entrance behind another operator route: the live
+    /// nodes, the fleet secret, and the per-entrance signature are about
+    /// the fleet, not about `/runtime/`. `celld invoke` reaches `/invoke`
+    /// through this and answers the same `{result}`/`{error}` shape, so
+    /// [`Reachable::call`] serves both unchanged.
+    pub(crate) async fn open_path(
+        fleet: Fleet<'_>,
+        subject: Subject,
+        path: String,
+    ) -> anyhow::Result<Self> {
         let bucket = crate::fleet::bucket_client(fleet.bucket, fleet.endpoint, fleet.region)?;
         let nodes = live_nodes(&bucket, fleet.unsafe_public_advertise, subject.source).await?;
         // The same secret and the same source shape `celld diagnose` uses.
@@ -85,18 +110,6 @@ impl Reachable {
             .timeout(subject.timeout)
             .build()
             .with_context(|| format!("build the {} client", subject.noun))?;
-        let mut path = format!("/runtime/{scope}");
-        if let Some(name) = name {
-            // An operator command can be the first request to construct a
-            // reserved cell. A later named binding call cannot repair the
-            // identity that the existing JavaScript instance already cached.
-            path.push('?');
-            path.push_str(
-                &url::form_urlencoded::Serializer::new(String::new())
-                    .append_pair("name", name)
-                    .finish(),
-            );
-        }
         Ok(Self {
             http,
             auth,
@@ -171,6 +184,16 @@ impl Reachable {
                 && !last
             {
                 refused.push(format!("{url}: the node's dispatcher is unavailable"));
+                continue;
+            }
+            // `/invoke` sheds past its permits before starting anything,
+            // so the request provably did not run and the next entrance
+            // is safe to try.
+            if status == reqwest::StatusCode::SERVICE_UNAVAILABLE
+                && text.contains("invoke overloaded")
+                && !last
+            {
+                refused.push(format!("{url}: the node is overloaded with invokes"));
                 continue;
             }
             let value: Value = serde_json::from_str(&text)
