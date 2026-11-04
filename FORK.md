@@ -9,7 +9,7 @@ README below is kept intact; this file documents the fork.
 
 - `main` mirrors upstream `main` and carries no patches.
 - `ryuzcorp/v<version>` is a line branch: the upstream tag `v<version>`
-  plus our patches as commits, one commit per patch, in `0001`-`0044`
+  plus our patches as commits, one commit per patch, in `0001`-`0045`
   order. Each patch commit is self-contained and carries its own tests.
 
 Upstream's `.github/workflows/release.yml` targets `ghcr.io/denoland` and
@@ -462,12 +462,29 @@ push to `ghcr.io/denoland`, but still. Pushing a branch named
   invocation end still terminates the channel. Previously the
   receiving call's return cancelled a held abort carrier, so every
   signal-carrying exec aborted spuriously.
-- `0044` (sha TBD at merge) `celld r2 head` and `celld r2 get` with
+- `0044` (`db0c206`) `celld r2 head` and `celld r2 get` with
   `--json` print `{"error":"not_found","bucket":...,"key":...}` on
   stdout for an absent key, so callers match the `error` field instead
   of substring-matching the English message. The human message on stderr
   and the exit code are unchanged; `delete` of an absent key still
   succeeds, as on R2.
+- `0045` (sha TBD at merge) `CELLD_CACHE_SCOPE=deployment` shares
+  one Workers Cache API scope across every script of the serving
+  deployment: one `caches.default` and one set of `caches.open(name)`
+  namespaces, like one Cloudflare zone. The default `script` scope
+  keeps today's per-script entries byte-identical. The scope key is
+  the fleet's bucket identity plus the serving deployment's identity,
+  rendered by the host at build and stamped into tenant deployment
+  scripts' isolate state only — the runtime pool (no tenant fetch
+  handlers, not a script the pointer names) and dynamically loaded
+  workers carry no key and stay script-scoped — so script input can
+  never name another scope's entries. The scope comes only from the
+  node's process environment, and an unknown value refuses the boot.
+  Each scope carries its own size cap and LRU; a redeploy starts with
+  an empty scope, a forced reload of the same deployment keeps its
+  entries, and the old scope is dropped once its last serving
+  generation drains. Sharing is total within a deployment (read,
+  overwrite, purge), which is why it is opt-in.
 
 Patches `0025`–`0034` are ported fixes from
 [meln1k/celld](https://github.com/meln1k/celld) by Nikita

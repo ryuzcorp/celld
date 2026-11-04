@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): shared runtime cells run in a dedicated runtime isolate pool; runtime compat is the union over declaring scripts; staged activation.
+// Modified by ryuzcorp (ryuzcorp/celld): shared runtime cells run in a dedicated runtime isolate pool; runtime compat is the union over declaring scripts; staged activation; deployment cache scope key.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! One application deployment as the running process holds it.
@@ -118,6 +118,13 @@ pub struct DeploymentGraph {
     /// component-only activation — same primary version and prefix, new
     /// map — is adopted instead of mistaken for the serving generation.
     pub identity: ServingIdentity,
+    /// The fleet identity this graph was loaded from: the bucket's
+    /// scheme, name, and key prefix. Part of the deployment cache scope
+    /// key, so two fleets serving deployments with the same versions
+    /// never share cache entries, even if the store outlives its
+    /// process one day. Local-script mode has no bucket and carries
+    /// `local` instead; its identity already names the script path.
+    pub fleet: String,
     pub primary: LoadedDeployment,
     pub cohosted: Vec<LoadedDeployment>,
 }
@@ -152,6 +159,50 @@ impl ServingIdentity {
     pub fn names(&self, pointer: &DeployPointer) -> bool {
         *self == Self::of_pointer(pointer)
     }
+
+    /// The deployment cache scope key: a deterministic rendering of the
+    /// fleet identity plus this identity, the same for every generation
+    /// adopted from them. Every field is length-prefixed and the
+    /// components map iterates in `BTreeMap` order, so distinct
+    /// (fleet, identity) pairs render distinct keys and no two fields can
+    /// blur into each other. Two fleets serving the same versions still
+    /// differ in fleet and never share entries. The host stamps the key
+    /// into each tenant script's isolate state at build; script input
+    /// never names it, so no script can reach another deployment's
+    /// entries. A rollout percentage is not part of the identity and
+    /// changes no key, matching [`names`](Self::names).
+    pub fn cache_scope_key(&self, fleet: &str) -> String {
+        fn push_field(key: &mut String, value: &str) {
+            key.push_str(&value.len().to_string());
+            key.push(':');
+            key.push_str(value);
+        }
+        let mut key = String::from("deployment:");
+        push_field(&mut key, fleet);
+        match &self.script_name {
+            Some(script) => {
+                key.push('1');
+                push_field(&mut key, script);
+            }
+            None => key.push('0'),
+        }
+        push_field(&mut key, &self.version);
+        push_field(&mut key, &self.prefix);
+        match &self.components {
+            Some(components) => {
+                key.push('1');
+                key.push_str(&components.len().to_string());
+                key.push(':');
+                for (script, component) in components {
+                    push_field(&mut key, script);
+                    push_field(&mut key, &component.version);
+                    push_field(&mut key, &component.prefix);
+                }
+            }
+            None => key.push('0'),
+        }
+        key
+    }
 }
 
 impl DeploymentGraph {
@@ -167,6 +218,7 @@ impl DeploymentGraph {
         };
         Self {
             identity,
+            fleet: "local".to_string(),
             primary,
             cohosted: Vec::new(),
         }
@@ -349,6 +401,10 @@ impl DeploymentGraph {
         }
         Ok(Self {
             identity: ServingIdentity::of_pointer(&pointer),
+            // The bucket this graph was read from is the fleet: same
+            // versions under another scheme, bucket, or key prefix are
+            // another fleet and must never share cache entries.
+            fleet: fleet_identity(bucket.scheme(), &bucket.name, &bucket.prefix),
             primary,
             cohosted,
         })
@@ -404,6 +460,11 @@ pub struct Generation {
     pub(crate) prefix: String,
     pub(crate) script_name: String,
     pub(crate) serving: ServingIdentity,
+    /// The deployment cache scope key stamped into this generation's
+    /// tenant isolates: the fleet's bucket identity plus the serving
+    /// deployment's identity. The reaper drops the scope once no live
+    /// generation carries it.
+    pub(crate) cache_scope: String,
     pub(crate) stateless: crate::runtime::StatelessRuntime,
     pub(crate) services: HashMap<String, crate::runtime::StatelessRuntime>,
     pub(crate) cell_configs: HashMap<String, Arc<WorkerConfig>>,
@@ -619,9 +680,19 @@ impl Generation {
         let GenerationOptions { node, region } = options;
         let DeploymentGraph {
             identity,
+            fleet,
             primary,
             cohosted,
         } = graph;
+        // One deployment cache scope key for the whole generation: the
+        // fleet's bucket identity plus the serving deployment's identity.
+        // Every tenant script's isolates carry it, so in deployment scope
+        // they all share one `caches.default` and one set of named
+        // namespaces. The runtime config below is deliberately unstamped —
+        // it runs no tenant fetch handlers and is not a script the pointer
+        // names, so its isolates stay script-scoped under their reserved
+        // name.
+        let cache_scope = identity.cache_scope_key(&fleet);
         crate::runtime::init_engine();
 
         // A Queue class is shared by every co-hosted script, but its broker
@@ -801,7 +872,8 @@ impl Generation {
                     .with_queue_consumers(queue_catalog.clone())
                     .with_crons(if is_primary { crons } else { Vec::new() })
                     .with_containers(containers)
-                    .with_generation(id),
+                    .with_generation(id)
+                    .with_cache_scope(cache_scope.clone()),
             );
             let pool = crate::runtime::StatelessRuntime::start(
                 config.clone(),
@@ -844,6 +916,7 @@ impl Generation {
             prefix,
             script_name: primary_script,
             serving: identity,
+            cache_scope,
             stateless,
             services: service_pools,
             cell_configs,
@@ -878,5 +951,141 @@ fn register_cell_class(
         }
         Entry::Occupied(slot) if crate::deploy::is_shared_reserved_class(slot.key()) => Ok(()),
         Entry::Occupied(slot) => Err(duplicate(slot.key())),
+    }
+}
+
+/// The fleet part of a cache scope key: scheme, bucket name, and key
+/// prefix, with `/` between name and prefix. A bucket name holds no `/`
+/// (`bucket::split_spec`), so the first `/` after `://` ends it, and
+/// `ab` + `c/` never renders like `a` + `bc/`.
+fn fleet_identity(scheme: &str, name: &str, prefix: &str) -> String {
+    format!("{scheme}://{name}/{prefix}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn identity() -> ServingIdentity {
+        ServingIdentity {
+            script_name: Some("app".to_string()),
+            version: "abc123".to_string(),
+            prefix: "deploy/app/abc123".to_string(),
+            components: None,
+        }
+    }
+
+    #[test]
+    fn fleet_identity_keeps_name_and_prefix_apart() {
+        assert_ne!(
+            fleet_identity("s3", "ab", "c/"),
+            fleet_identity("s3", "a", "bc/")
+        );
+        assert_ne!(fleet_identity("s3", "a", ""), fleet_identity("gs", "a", ""));
+        assert_eq!(
+            fleet_identity("s3", "noite", "fleets/app/"),
+            "s3://noite/fleets/app/"
+        );
+    }
+
+    #[test]
+    fn cache_scope_key_is_stable_but_identity_bound() {
+        // The same fleet and identity render the same key across
+        // generations, so a forced reload of one deployment keeps its
+        // deployment scope.
+        assert_eq!(
+            identity().cache_scope_key("s3://one/fleet-a/"),
+            identity().cache_scope_key("s3://one/fleet-a/")
+        );
+        // Any identity difference renders a different key, so a redeploy
+        // starts with an empty scope and never reads the old one.
+        let mut version = identity();
+        version.version = "def456".to_string();
+        assert_ne!(
+            identity().cache_scope_key("s3://one/fleet-a/"),
+            version.cache_scope_key("s3://one/fleet-a/")
+        );
+        let mut script = identity();
+        script.script_name = Some("other".to_string());
+        assert_ne!(
+            identity().cache_scope_key("s3://one/fleet-a/"),
+            script.cache_scope_key("s3://one/fleet-a/")
+        );
+        let mut absent = identity();
+        absent.script_name = None;
+        assert_ne!(
+            identity().cache_scope_key("s3://one/fleet-a/"),
+            absent.cache_scope_key("s3://one/fleet-a/")
+        );
+        let mut prefix = identity();
+        prefix.prefix = "deploy/app/def456".to_string();
+        assert_ne!(
+            identity().cache_scope_key("s3://one/fleet-a/"),
+            prefix.cache_scope_key("s3://one/fleet-a/")
+        );
+        // Length-prefixing keeps field boundaries unambiguous: moving one
+        // character across the version/prefix boundary changes the key.
+        let mut blurred = identity();
+        blurred.version = "abc12".to_string();
+        blurred.prefix = "3deploy/app/abc123".to_string();
+        assert_ne!(
+            identity().cache_scope_key("s3://one/fleet-a/"),
+            blurred.cache_scope_key("s3://one/fleet-a/")
+        );
+        // Two fleets serving the same versions still differ in fleet, so
+        // they never share entries — not just a deployment name two
+        // fleets could share.
+        assert_ne!(
+            identity().cache_scope_key("s3://one/fleet-a/"),
+            identity().cache_scope_key("s3://one/fleet-b/")
+        );
+        assert_ne!(
+            identity().cache_scope_key("s3://one/fleet-a/"),
+            identity().cache_scope_key("s3://two/fleet-a/")
+        );
+    }
+
+    #[test]
+    fn cache_scope_key_covers_activated_components() {
+        let mut with_components = identity();
+        with_components.components = Some(BTreeMap::from([(
+            "app".to_string(),
+            ComponentRef {
+                version: "abc123".to_string(),
+                prefix: "deploy/app/abc123".to_string(),
+            },
+        )]));
+        // A component-only activation names a new deployment.
+        assert_ne!(
+            identity().cache_scope_key("s3://one/fleet-a/"),
+            with_components.cache_scope_key("s3://one/fleet-a/")
+        );
+        // Map order cannot smuggle one generation's components into
+        // another's key: iteration is ordered, so insertion order is
+        // invisible.
+        let mut reordered = with_components.clone();
+        reordered.components = Some(BTreeMap::from([(
+            "app".to_string(),
+            ComponentRef {
+                version: "abc123".to_string(),
+                prefix: "deploy/app/abc123".to_string(),
+            },
+        )]));
+        assert_eq!(
+            with_components.cache_scope_key("s3://one/fleet-a/"),
+            reordered.cache_scope_key("s3://one/fleet-a/")
+        );
+        let mut changed = with_components.clone();
+        changed.components = Some(BTreeMap::from([(
+            "app".to_string(),
+            ComponentRef {
+                version: "def456".to_string(),
+                prefix: "deploy/app/abc123".to_string(),
+            },
+        )]));
+        assert_ne!(
+            with_components.cache_scope_key("s3://one/fleet-a/"),
+            changed.cache_scope_key("s3://one/fleet-a/")
+        );
     }
 }
