@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): cross-isolate RPC stubs and streams; worker-less residency for registry tests.
+// Modified by ryuzcorp (ryuzcorp/celld): cross-isolate RPC stubs and streams; worker-less residency for registry tests; receiver-held stream lifetime.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 // Isolate admission and deadlines are in the V8 arm outside the Actor execution
@@ -945,17 +945,20 @@ impl Pool {
 
 /// The stub backstop: a freed heap is provably gone (drained, no turns,
 /// nothing can enter it again), so every RPC stub hold and every upload
-/// it still owned is released here. Stub orphans route their dispose to
-/// the owner through the normal release path, exactly like an invocation
-/// end that disposed them; uploads terminate, and their receivers
-/// observe the disconnect. Holds of live heaps are untouched: the
-/// backstop never fires on a stub whose holder is alive.
+/// it still owned or held the receiving end of is released here. Stub
+/// orphans route their dispose to the owner through the normal release
+/// path, exactly like an invocation end that disposed them; owned
+/// uploads terminate, and their receivers observe the disconnect, while
+/// held receiving ends cancel, so the sender's pump stops. Holds of
+/// live heaps are untouched: the backstop never fires on a stub whose
+/// holder is alive.
 ///
 /// Runs on the maintenance pass that frees the heap. The release sends
 /// are non-blocking (unbounded channel, reply dropped); ids stay out of
 /// the log.
 fn release_retired_heap_holds(heap: HeapId) {
     crate::upload_table::terminate_upload_owner(heap);
+    crate::upload_table::terminate_upload_receiver(heap);
     let orphaned = crate::stub_table::release_stub_holder(heap);
     if orphaned.is_empty() {
         return;

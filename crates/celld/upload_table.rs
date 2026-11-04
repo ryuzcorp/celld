@@ -1,7 +1,7 @@
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 //
 // Modified by ryuzcorp (ryuzcorp/celld): cross-isolate RPC
-// stubs and streams. Apache-2.0.
+// stubs and streams; receiver-held stream lifetime. Apache-2.0.
 
 //! Host-side channels for caller-pushed byte streams (Worker to Durable
 //! Object).
@@ -17,11 +17,14 @@
 //! sender's context end or abort terminates it (the pump stops and the
 //! receiver observes EOF or a disconnect), the receiver's cancel stops
 //! the pump, and sender-isolate retirement terminates whatever the freed
-//! heap still owned. Both sides are tracked: an entry both left removes
-//! itself whatever its terminal, so a partial read (touched, no EOF) or
-//! a sender-abort-first ordering cannot strand it. There is no
-//! wall-clock expiry: a quiet-but-open carrier (a caller's abort stream,
-//! held for a whole `exec`) stays usable however long nothing flows.
+//! heap still owned. The receiver holds its end past the receiving call
+//! (a quiet-but-open carrier stays usable however long nothing flows),
+//! so the current receiving heap is tracked too, and receiver-isolate
+//! retirement cancels whatever the freed heap still held. Both sides
+//! are tracked: an entry both left removes itself whatever its
+//! terminal, so a partial read (touched, no EOF) or a
+//! sender-abort-first ordering cannot strand it. There is no
+//! wall-clock expiry.
 //!
 //! Flow control: the buffer holds at most [`UPLOAD_CHUNK_CAP`] chunks and
 //! [`UPLOAD_BYTE_CAP`] bytes; a push beyond either waits for the receiver
@@ -118,6 +121,11 @@ struct UploadInner {
     /// Whether a pull resolved EOF. The reader is done then: when the
     /// sender goes too, nothing remains for either side.
     eof_observed: bool,
+    /// The heap currently holding the receiving end, recorded when the
+    /// stream revives there (a forward re-records). The retirement
+    /// backstop cancels whatever a freed heap still held, so a stream
+    /// the receiver kept past its call cannot strand its entry.
+    receiver: Option<HeapId>,
 }
 
 /// One caller-pushed stream: its owning sender heap plus the buffered
@@ -191,6 +199,7 @@ impl UploadTable {
                     receiver_gone: false,
                     touched: false,
                     eof_observed: false,
+                    receiver: None,
                 }),
                 changed: tokio::sync::Notify::new(),
             }),
@@ -335,6 +344,35 @@ impl UploadTable {
             .collect();
         for id in owned {
             self.abort(&id);
+        }
+    }
+
+    /// Record the heap currently holding the receiving end. The revive
+    /// runs in the holder's isolate, so its heap is the holder; a
+    /// forward re-records when the reference moves. Unknown ids are
+    /// ignored: a retired channel needs no holder.
+    pub(crate) fn acquire_receiver(&self, id: &str, heap: HeapId) {
+        let Some(upload) = self.get(id) else {
+            return;
+        };
+        upload.inner.lock().expect("upload state poisoned").receiver = Some(heap);
+    }
+
+    /// The retirement backstop: cancel every upload the freed heap still
+    /// held the receiving end of. The sender's next push is rejected so
+    /// its pump stops, and an entry the sender already left removes
+    /// itself; any other heap's holds are untouched.
+    pub(crate) fn terminate_receiver(&mut self, heap: HeapId) {
+        let held: Vec<String> = self
+            .uploads
+            .iter()
+            .filter(|(_, upload)| {
+                upload.inner.lock().expect("upload state poisoned").receiver == Some(heap)
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in held {
+            self.cancel(&id);
         }
     }
 
@@ -519,6 +557,23 @@ pub fn terminate_upload_owner(owner: HeapId) {
         .terminate_owner(owner);
 }
 
+/// Record the heap holding an upload's receiving end.
+pub fn acquire_upload_receiver(id: &str, heap: HeapId) {
+    uploads()
+        .lock()
+        .expect("upload table poisoned")
+        .acquire_receiver(id, heap);
+}
+
+/// The retirement backstop: cancel every upload the freed heap still
+/// held the receiving end of.
+pub fn terminate_upload_receiver(heap: HeapId) {
+    uploads()
+        .lock()
+        .expect("upload table poisoned")
+        .terminate_receiver(heap);
+}
+
 /// How many uploads the table holds, for `/state` and leak tests.
 pub fn upload_count() -> usize {
     uploads().lock().expect("upload table poisoned").len()
@@ -601,6 +656,37 @@ mod upload_table_tests {
             table.push(ID, chunk("late")).await,
             Err("the upload is no longer live".to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn receiver_retirement_cancels_only_what_the_heap_held() {
+        let mut table = table();
+        table.create(ID.to_string(), owner(1)).expect("create");
+        table.acquire_receiver(ID, owner(2));
+        let other = "ffffffffffffffffffffffffffffffff";
+        table.create(other.to_string(), owner(1)).expect("create");
+        table.acquire_receiver(other, owner(3));
+        // A forward moves the hold: the old heap's retirement must not
+        // touch the channel anymore.
+        table.acquire_receiver(other, owner(4));
+        table.terminate_receiver(owner(2));
+        assert_eq!(table.len(), 2, "a live sender keeps a cancelled entry");
+        assert_eq!(
+            table.push(ID, chunk("late")).await,
+            Err("the receiver cancelled the upload".to_string())
+        );
+        // The forwarded channel is untouched by either heap's retirement.
+        table.terminate_receiver(owner(3));
+        table
+            .push(other, chunk("one"))
+            .await
+            .expect("unheld push still buffers");
+        let first = table.pull(other).await.expect("pull one");
+        assert_eq!(first.bytes, chunk("one"));
+        table.abort(other);
+        assert_eq!(table.len(), 2, "failed entries stay for their readers");
+        table.terminate_receiver(owner(4));
+        assert_eq!(table.len(), 1, "sender gone plus receiver gone reaps");
     }
 
     #[tokio::test]
