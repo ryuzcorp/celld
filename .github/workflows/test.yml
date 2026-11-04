@@ -8,7 +8,7 @@
 #                                         push nothing
 #   `v*-ryuzcorp.*` tag push            publish.yml: verify, build, and push
 #                                         ghcr.io/ryuzcorp/celld:<version>-ryuzcorp.<n>
-name: ci
+name: test
 
 on:
   push:
@@ -19,7 +19,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.ref }}
+  group: test-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:

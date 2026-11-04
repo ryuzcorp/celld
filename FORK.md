@@ -14,7 +14,7 @@ README below is kept intact; this file documents the fork.
 
 Upstream's `.github/workflows/release.yml` targets `ghcr.io/denoland` and
 an upstream candidate branch, so the line branches replace it with our
-own `ci.yml` (build and test both architectures, push nothing) and
+own `test.yml` (build and test both architectures, push nothing) and
 `publish.yml` (publish release tags); `main` keeps upstream's file
 (see "Upstream release pipeline" below).
 
@@ -51,14 +51,14 @@ names `0.6.3-noite.1..3`; they are the same commits as `ryuzcorp.1..3`.
 Open a pull request into the line branch: one commit, self-contained,
 with tests. Nothing lands without passing the merge gate:
 
-- the required `ci.yml` checks are green: `Test and build (amd64)`
+- the required `test.yml` checks are green: `Test and build (amd64)`
   and `Test and build (arm64)`;
 - an independent security review of the PR is recorded, with every
   High and Medium finding fixed and re-verified before merge.
 
 This fork is agent-run: there is no human backstop. The security
 review must explicitly diff `.github/` and `Dockerfile` on every PR —
-a PR runs its own `ci.yml`, so a patch that neuters its own tests
+a PR runs its own `test.yml`, so a patch that neuters its own tests
 still shows green checks (accepted risk, see below).
 
 ## Cutting a release
@@ -127,7 +127,7 @@ push to `ghcr.io/denoland`, but still. Pushing a branch named
 
 ## Accepted risks
 
-- Self-graded CI: a patch PR runs its own `ci.yml`, so required
+- Self-graded CI: a patch PR runs its own `test.yml`, so required
   checks alone cannot prove the tests ran. Control: the merge gate
   above — an independent security review on every PR that explicitly
   diffs `.github/` and `Dockerfile`, with all High/Medium findings
