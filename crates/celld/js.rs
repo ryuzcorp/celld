@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): node:crypto scrypt; container exec resize op; cross-isolate RPC stubs and streams; test-only fake exec ops; fake kill completion op; exec reads survive their subscribing event; per-node Workers Cache API ops; tenant egress policy; D1 export operator-ingress marker; stateless attribution tokens; reaction-aware request resources; fake close/signal completion ops; binding-forgery enforcement; trusted cell RPC; Queue DLQ forward host op; DLQ forward caller identity; WebSocket and TCP socket ownership; receiver-held stream lifetime.
+// Modified by ryuzcorp (ryuzcorp/celld): node:crypto scrypt; container exec resize op; cross-isolate RPC stubs and streams; test-only fake exec ops; fake kill completion op; exec reads survive their subscribing event; per-node Workers Cache API ops; tenant egress policy; D1 export operator-ingress marker; stateless attribution tokens; reaction-aware request resources; fake close/signal completion ops; binding-forgery enforcement; trusted cell RPC; Queue DLQ forward host op; DLQ forward caller identity; WebSocket and TCP socket ownership; receiver-held stream lifetime; deployment cache scope key.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 // The raw V8 adapter and its child modules remain outside the Actor execution
@@ -2104,6 +2104,13 @@ pub struct WorkerConfig {
     /// isolate built from it carries the value as a slot, so its host calls
     /// resolve against the deployment graph it was built with.
     pub generation: crate::generation::GenerationId,
+    /// The deployment cache scope key: the fleet's bucket identity plus
+    /// the serving deployment's identity, rendered by the host at build.
+    /// Present only for tenant deployment scripts, whose isolates share
+    /// one cache scope in deployment mode; the runtime pool, dynamic
+    /// workers, and test isolates keep `None` and stay script-scoped in
+    /// every mode.
+    cache_scope: Option<String>,
     /// The external (`node:*`/`cloudflare:*`) imports of `src`.
     ///
     /// The scan walks the whole bundle, which an esbuild artifact makes
@@ -2237,6 +2244,7 @@ impl WorkerConfig {
             crons: Vec::new(),
             containers: Vec::new(),
             generation: 0,
+            cache_scope: None,
             main_imports,
             module_imports,
         }
@@ -2255,6 +2263,15 @@ impl WorkerConfig {
     /// Stamp this Worker with the application generation it serves.
     pub fn with_generation(mut self, generation: crate::generation::GenerationId) -> Self {
         self.generation = generation;
+        self
+    }
+
+    /// Stamp this Worker with its deployment's cache scope key. Only
+    /// `Generation::build` calls this, and only for tenant deployment
+    /// scripts — the runtime pool, dynamic workers, and test isolates
+    /// keep `None` and stay script-scoped in every mode.
+    pub fn with_cache_scope(mut self, cache_scope: String) -> Self {
+        self.cache_scope = Some(cache_scope);
         self
     }
 
@@ -2640,6 +2657,10 @@ struct ActorRuntimeState {
     /// released. One lock for both, so no lock ordering can deadlock.
     do_grants: Mutex<binding_policy::GrantSet>,
     script_name: String,
+    /// The deployment cache scope key from the worker config, if this
+    /// isolate belongs to a tenant deployment script. Host-held: the
+    /// cache ops read it from here, never from script input.
+    cache_scope: Option<String>,
     event_hooks: OnceLock<EventHooks>,
     /// See [`internals`].
     internals: OnceLock<v8::Global<v8::Object>>,
@@ -6139,6 +6160,7 @@ impl Worker {
             resource_limits: config.resource_limits,
             tail_reporting: config.tail_reporting,
             script_name: script_name.to_string(),
+            cache_scope: config.cache_scope.clone(),
             ..Default::default()
         });
         let loader_owner = LoaderOwner::fresh(script_name, config.generation);

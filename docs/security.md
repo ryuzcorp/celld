@@ -1,4 +1,4 @@
-<!-- Modified by ryuzcorp (ryuzcorp/celld): operator token for the internal listener; tenant egress policy; runtime cell isolation. -->
+<!-- Modified by ryuzcorp (ryuzcorp/celld): operator token for the internal listener; tenant egress policy; runtime cell isolation; deployment cache scope trade-off. -->
 # Security
 
 celld v0.6.3 is a beta release. It is not safe for hostile multi-tenant use.
@@ -33,6 +33,23 @@ cells and the cron cell stay in their own script's pool: they execute that
 script's `run()` and `scheduled()` handlers with its bindings, so isolating
 them from their own script would isolate them from the code they run.
 Per-cell placement and ownership are unchanged.
+
+## Cache scope and co-hosted scripts
+
+The Workers Cache API is per script by default: no script can read,
+overwrite, or purge another script's entries. `CELLD_CACHE_SCOPE=deployment`
+lifts that boundary for scripts of one deployment, like one Cloudflare
+zone: every script of the serving deployment shares one `caches.default`
+and one set of `caches.open(name)` namespaces, so a co-hosted script can
+read entries holding another script's session or personalized bodies,
+overwrite them, and purge them. Turn it on only when every script of the
+deployment is mutually trusted. The scope is an operator setting read
+from the node's process environment at startup; no binding, Worker var,
+or JS API can change it, and an unknown value refuses the boot rather
+than silently sharing. Sharing stays bounded: a different deployment or
+fleet still sees nothing, the runtime pool and dynamically loaded
+workers keep their own entries, and each scope carries its own size cap
+and recency (see [cache](services/cache.md#cache-scope)).
 
 ## Separate the listeners
 

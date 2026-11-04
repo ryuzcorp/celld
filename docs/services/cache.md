@@ -1,12 +1,13 @@
-<!-- Modified by ryuzcorp (ryuzcorp/celld): Workers Cache API page. -->
+<!-- Modified by ryuzcorp (ryuzcorp/celld): Workers Cache API page; deployment cache scope. -->
 # Cache
 
 The [Workers Cache API](https://developers.cloudflare.com/workers/runtime-apis/cache/)
 is a per-node in-memory cache: `caches.default` plus one namespace per
 `caches.open(name)`. Every isolate of a script on the node shares it, so a
-response one request stores is visible to the next, and no script can read
-another script's entries. `caches` is a global; there is no binding to
-declare and no configuration beyond the size cap. Read the
+response one request stores is visible to the next. By default no script
+can read another script's entries; `CELLD_CACHE_SCOPE=deployment` shares
+the cache across the deployment instead (see Cache scope). `caches` is a
+global; there is no binding to declare. Read the
 [Cloudflare Cache documentation](https://developers.cloudflare.com/workers/runtime-apis/cache/)
 for the API.
 
@@ -66,15 +67,61 @@ response with its `Set-Cookie` headers removed.
 throws for `Vary: *`, as Cloudflare's does. Request `Cache-Control` is
 ignored. Answers carry no `Age` header.
 
+## Cache scope
+
+`CELLD_CACHE_SCOPE` selects whose entries a Worker sees. `script` (the
+default) keeps one script's entries apart from every other script's, as
+above. `deployment` shares one `caches.default` and one set of
+`caches.open(name)` namespaces across every script of the serving
+deployment — the primary script plus every co-hosted script — like one
+Cloudflare zone. Named namespaces scope exactly like the default
+namespace: in deployment scope every script of the deployment shares
+each name, and in script scope every name stays per script.
+
+The scope is a process-wide operator setting taken from the node's
+environment at startup. Workers cannot read or change it: no binding,
+no Worker var, and no JS API names the scope, and the deployment key —
+the fleet's bucket identity plus the serving deployment's versions —
+is rendered by the host at build and stamped into tenant deployment
+scripts' isolate state only. An unknown or malformed value fails
+closed: the node refuses to start rather than silently sharing entries
+across scripts.
+
+Sharing is total: in deployment scope every script of the deployment can
+read, overwrite, and purge every other script's entries, which is why the
+scope is opt-in (see [security](../security.md#cache-scope-and-co-hosted-scripts)).
+A different deployment — a redeploy with a new version, or another fleet —
+starts with an empty scope and never sees these entries; the old scope is
+dropped once its last serving generation drains. A forced reload of the
+same deployment keeps its entries.
+
+The store is process-local per node: entries never leave the node that
+wrote them. The fleet's bucket identity (scheme, bucket name, and key
+prefix) is part of the key anyway, so two fleets serving the same
+versions in different buckets or prefixes never share entries even if
+the store is ever shared beyond one process. The endpoint and storage
+account are not part of it: one node serves one fleet from one
+endpoint.
+
+Isolates outside any deployment share nothing. The runtime pool that
+hosts the shared D1, KV, and Queue cells runs no tenant fetch handlers
+and keeps its own entries under its reserved name, as does each
+dynamically loaded worker, which is not a script the deployment names.
+
+Each scope carries its own `CELLD_CACHE_MAX_BYTES` budget and recency:
+in deployment scope one deployment's writes never evict another's. In
+script scope all scripts still share the one node budget below.
+
 ## Configuration and limits
 
-`CELLD_CACHE_MAX_BYTES` caps the whole node cache at 64 MiB by default;
+`CELLD_CACHE_MAX_BYTES` caps each cache scope at 64 MiB by default;
 `0` disables the cache, and a malformed value refuses the boot. One entry
 can never exceed 16 MiB, body plus headers plus key. Past the cap the
 least-recently-used entries go first; a `match` counts as use, so hot
-entries stay. The cache is not persisted: a restart drops it, and a
-deployment keeps a script's entries, as cached responses outlive deploys
-at Cloudflare too — version the URLs or `delete` to purge.
+entries stay. The cache is not persisted: a restart drops it, and in
+script scope a deployment keeps a script's entries, as cached responses
+outlive deploys at Cloudflare too — version the URLs or `delete` to
+purge. In deployment scope a new deployment starts empty instead.
 
 Scripts share the one node budget: there is no per-script partition or
 quota, so one script's writes can evict another script's entries. This

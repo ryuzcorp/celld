@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): validate CELLD_MEMORY_SCOPE; CELLD_CACHE_MAX_BYTES validation; tenant egress policy.
+// Modified by ryuzcorp (ryuzcorp/celld): validate CELLD_MEMORY_SCOPE; CELLD_CACHE_MAX_BYTES validation; tenant egress policy; CELLD_CACHE_SCOPE validation.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! Strict runtime environment parsing.
@@ -326,6 +326,11 @@ pub fn validate() -> anyhow::Result<()> {
     if let Some(value) = value("CELLD_MEMORY_SCOPE")? {
         if !matches!(value.as_str(), "container" | "self") {
             bail!("CELLD_MEMORY_SCOPE must be container or self, not {value:?}");
+        }
+    }
+    if let Some(value) = value("CELLD_CACHE_SCOPE")? {
+        if !matches!(value.as_str(), "script" | "deployment") {
+            bail!("CELLD_CACHE_SCOPE must be script or deployment, not {value:?}");
         }
     }
     if let Some(node) = value("CELLD_NODE")? {

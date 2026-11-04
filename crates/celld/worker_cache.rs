@@ -1,6 +1,6 @@
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 //
-// Modified by ryuzcorp (ryuzcorp/celld): per-node Workers Cache API store.
+// Modified by ryuzcorp (ryuzcorp/celld): per-node Workers Cache API store; deployment cache scope.
 // Apache-2.0.
 
 //! The process-local backing store for the Workers Cache API.
@@ -16,11 +16,17 @@
 //!
 //! Three boundaries matter here:
 //!
-//! - Isolation: the key starts with the script name the host read from
-//!   isolate state, never from script input, so no script can name another
-//!   script's entries. A node serves one fleet from one process, which
-//!   makes the script name the whole tenant boundary.
-//! - Memory: the total is capped by `CELLD_CACHE_MAX_BYTES` (64 MiB by
+//! - Isolation: the key starts with a scope the host read from isolate
+//!   state, never from script input, so no script can name another scope's
+//!   entries. `CELLD_CACHE_SCOPE=script` (the default) scopes by script
+//!   name: a node serves one fleet from one process, which makes the
+//!   script name the whole tenant boundary. `CELLD_CACHE_SCOPE=deployment`
+//!   scopes by the serving deployment's identity instead, so every script
+//!   of the deployment shares one `caches.default` and one set of
+//!   `caches.open(name)` namespaces, like one Cloudflare zone — and every
+//!   script of the deployment can read, overwrite, and purge every other
+//!   script's entries, which is why the scope is opt-in.
+//! - Memory: each scope is capped by `CELLD_CACHE_MAX_BYTES` (64 MiB by
 //!   default, 0 disables the cache) with least-recently-used eviction, and
 //!   one entry can never exceed `MAX_ENTRY_BYTES`. Every byte an entry
 //!   accounts is measured from the stored key, headers, and body plus a
@@ -80,6 +86,41 @@ fn parse_max_bytes(value: Option<String>) -> Result<u64, String> {
         .map_err(|error| format!("CELLD_CACHE_MAX_BYTES has invalid value {value:?}: {error}"))
 }
 
+/// Which entries a cache op addresses: one script's, or the serving
+/// deployment's. Read from `CELLD_CACHE_SCOPE`, resolved once per process.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CacheScope {
+    Script,
+    Deployment,
+}
+
+/// Resolve the process-wide scope once: an unset variable selects
+/// per-script entries, a supplied one must name a scope, so a typo cannot
+/// silently share a running node's cache across scripts. Loud on garbage
+/// even without the startup `validate()` pass, so no caller can observe a
+/// silent default.
+pub fn cache_scope() -> CacheScope {
+    static SCOPE: OnceLock<Result<CacheScope, String>> = OnceLock::new();
+    SCOPE
+        .get_or_init(|| parse_cache_scope(std::env::var("CELLD_CACHE_SCOPE").ok()))
+        .as_ref()
+        .copied()
+        .unwrap_or_else(|error| panic!("{error}"))
+}
+
+fn parse_cache_scope(value: Option<String>) -> Result<CacheScope, String> {
+    let Some(value) = value else {
+        return Ok(CacheScope::Script);
+    };
+    match value.as_str() {
+        "script" => Ok(CacheScope::Script),
+        "deployment" => Ok(CacheScope::Deployment),
+        _ => Err(format!(
+            "CELLD_CACHE_SCOPE must be script or deployment, not {value:?}"
+        )),
+    }
+}
+
 /// Which cache a key belongs to. `Default` is `caches.default` and `Named`
 /// is one `caches.open(name)` namespace; the two never share entries, so
 /// `open("default")` is a different cache from `caches.default`, as in
@@ -103,13 +144,15 @@ impl Namespace {
     }
 }
 
-/// A cache key: the owning script, the namespace, and the request URL.
-/// The method is always GET by the time a key is built — `put` refuses any
-/// other method, and `match`/`delete` only look up non-GET keys when
-/// `ignoreMethod` rewrites them to GET.
+/// A cache key: the owning scope, the namespace, and the request URL.
+/// The scope is the script name in script scope, or the serving
+/// deployment's identity in deployment scope — always host-held, never
+/// script input. The method is always GET by the time a key is built —
+/// `put` refuses any other method, and `match`/`delete` only look up
+/// non-GET keys when `ignoreMethod` rewrites them to GET.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct Key {
-    script: String,
+    scope: String,
     namespace: Namespace,
     url: String,
 }
@@ -183,7 +226,7 @@ pub enum MatchOutcome {
     },
 }
 
-/// The Workers cache of one node: entries keyed by script, namespace, and
+/// The Workers cache of one scope: entries keyed by scope, namespace, and
 /// URL, with recency in a sequence-ordered map so eviction drops the
 /// least-recently-used entry first.
 pub struct WorkerCache {
@@ -227,7 +270,7 @@ impl WorkerCache {
     /// staleness, size — resolves `NotStored` without an error.
     pub fn put(
         &mut self,
-        script: &str,
+        scope: &str,
         namespace: &Namespace,
         request: &PutRequest,
         now_ms: i64,
@@ -250,12 +293,12 @@ impl WorkerCache {
         else {
             return Ok(PutOutcome::NotStored);
         };
-        let bytes = entry_bytes(script, namespace, request.url, &headers, request.body);
+        let bytes = entry_bytes(scope, namespace, request.url, &headers, request.body);
         if bytes > MAX_ENTRY_BYTES || bytes > self.cap_bytes {
             return Ok(PutOutcome::NotStored);
         }
         let key = Key {
-            script: script.to_string(),
+            scope: scope.to_string(),
             namespace: namespace.clone(),
             url: request.url.to_string(),
         };
@@ -288,7 +331,7 @@ impl WorkerCache {
     /// is removed and reads as a miss.
     pub fn lookup(
         &mut self,
-        script: &str,
+        scope: &str,
         namespace: &Namespace,
         request: &LookupRequest,
         now_ms: i64,
@@ -297,7 +340,7 @@ impl WorkerCache {
             return MatchOutcome::Miss;
         }
         let key = Key {
-            script: script.to_string(),
+            scope: scope.to_string(),
             namespace: namespace.clone(),
             url: request.url.to_string(),
         };
@@ -325,7 +368,7 @@ impl WorkerCache {
     /// it was already gone as far as any reader could tell.
     pub fn delete(
         &mut self,
-        script: &str,
+        scope: &str,
         namespace: &Namespace,
         url: &str,
         method: &str,
@@ -336,7 +379,7 @@ impl WorkerCache {
             return false;
         }
         let key = Key {
-            script: script.to_string(),
+            scope: scope.to_string(),
             namespace: namespace.clone(),
             url: url.to_string(),
         };
@@ -357,7 +400,7 @@ impl WorkerCache {
 /// term errs toward over-counting, so `used_bytes` bounds real memory
 /// instead of reporting a fraction of it.
 fn entry_bytes(
-    script: &str,
+    scope: &str,
     namespace: &Namespace,
     url: &str,
     headers: &[(String, String)],
@@ -367,7 +410,7 @@ fn entry_bytes(
         Namespace::Default => 0,
         Namespace::Named(name) => name.len() as u64,
     };
-    let key = script.len() as u64 + namespace + url.len() as u64;
+    let key = scope.len() as u64 + namespace + url.len() as u64;
     let headers: u64 = headers
         .iter()
         .map(|(name, value)| name.len() as u64 + value.len() as u64 + HEADER_OVERHEAD_BYTES)
@@ -838,39 +881,162 @@ fn parse_ranges(header: &str, len: u64) -> RangeOutcome {
     }
 }
 
+/// The node's cache: the script-scoped store plus one store per fleet
+/// deployment — the fleet's bucket identity plus the serving deployment's
+/// identity. Script scope keeps today's single node budget with per-script
+/// entry keys, byte for byte; each deployment scope carries its own
+/// `CELLD_CACHE_MAX_BYTES` budget and recency, so one deployment's writes
+/// never evict another's and a drained deployment's entries leave with it
+/// (see `purge_deployment_scope`).
+struct Store {
+    cap_bytes: u64,
+    script: WorkerCache,
+    deployments: HashMap<String, WorkerCache>,
+}
+
+/// Which scope's entries one op addresses. `script` and `deployment`
+/// both come from isolate state, never from script input. `deployment`
+/// is the fleet deployment key — the fleet's bucket identity plus the
+/// serving deployment's identity — present only for tenant deployment
+/// scripts: the runtime pool, a loaded worker, and a test isolate carry
+/// none and stay script-scoped in every mode.
+#[derive(Clone, Copy)]
+struct OpScope<'a> {
+    scope: CacheScope,
+    script: &'a str,
+    deployment: Option<&'a str>,
+}
+
+impl Store {
+    fn new(cap_bytes: u64) -> Self {
+        Self {
+            cap_bytes,
+            script: WorkerCache::new(cap_bytes),
+            deployments: HashMap::new(),
+        }
+    }
+
+    /// Route one op to its scope's store and entry scope.
+    fn select<'a, 'b>(&'b mut self, op: OpScope<'a>) -> (&'a str, &'b mut WorkerCache) {
+        match (op.scope, op.deployment) {
+            (CacheScope::Deployment, Some(key)) => {
+                let cap_bytes = self.cap_bytes;
+                let store = self
+                    .deployments
+                    .entry(key.to_owned())
+                    .or_insert_with(|| WorkerCache::new(cap_bytes));
+                (key, store)
+            }
+            _ => (op.script, &mut self.script),
+        }
+    }
+
+    fn put(
+        &mut self,
+        op: OpScope<'_>,
+        namespace: &Namespace,
+        request: &PutRequest,
+        now_ms: i64,
+    ) -> Result<PutOutcome, PutRejection> {
+        let (entry_scope, store) = self.select(op);
+        store.put(entry_scope, namespace, request, now_ms)
+    }
+
+    fn lookup(
+        &mut self,
+        op: OpScope<'_>,
+        namespace: &Namespace,
+        request: &LookupRequest,
+        now_ms: i64,
+    ) -> MatchOutcome {
+        let (entry_scope, store) = self.select(op);
+        store.lookup(entry_scope, namespace, request, now_ms)
+    }
+
+    fn delete(
+        &mut self,
+        op: OpScope<'_>,
+        namespace: &Namespace,
+        url: &str,
+        method: &str,
+        ignore_method: bool,
+        now_ms: i64,
+    ) -> bool {
+        let (entry_scope, store) = self.select(op);
+        store.delete(entry_scope, namespace, url, method, ignore_method, now_ms)
+    }
+
+    /// Drop every entry in every scope. The node calls this when memory
+    /// pressure starts shedding load: best-effort cache bytes go before
+    /// billable cells.
+    fn shed(&mut self) {
+        self.script.shed();
+        for store in self.deployments.values_mut() {
+            store.shed();
+        }
+    }
+
+    /// Drop one deployment's entries. The node calls this when the
+    /// deployment's last live generation is freed, so a redeployed fleet
+    /// never pays a dead deployment's budget.
+    fn purge_deployment(&mut self, key: &str) {
+        self.deployments.remove(key);
+    }
+}
+
 /// The node's cache: one store for the process, first sized from the
 /// environment. The mutex only guards short map operations — no I/O, no
 /// awaits — so an op never blocks an isolate on anything but a memcpy.
-static STORE: OnceLock<Mutex<WorkerCache>> = OnceLock::new();
+static STORE: OnceLock<Mutex<Store>> = OnceLock::new();
 
-fn store() -> &'static Mutex<WorkerCache> {
-    STORE.get_or_init(|| Mutex::new(WorkerCache::new(max_bytes())))
+fn store() -> &'static Mutex<Store> {
+    STORE.get_or_init(|| Mutex::new(Store::new(max_bytes())))
 }
 
-fn lock() -> std::sync::MutexGuard<'static, WorkerCache> {
+fn lock() -> std::sync::MutexGuard<'static, Store> {
     store().lock().unwrap_or_else(|poison| poison.into_inner())
 }
 
-/// Store one response. `script` must come from isolate state, never from
-/// script input: it is the tenant boundary.
+/// Store one response. `script` and `deployment` must come from isolate
+/// state, never from script input: together they are the tenant boundary.
 pub fn cache_put(
     script: &str,
+    deployment: Option<&str>,
     namespace: &Namespace,
     request: &PutRequest,
     now_ms: i64,
 ) -> Result<PutOutcome, PutRejection> {
-    lock().put(script, namespace, request, now_ms)
+    lock().put(
+        OpScope {
+            scope: cache_scope(),
+            script,
+            deployment,
+        },
+        namespace,
+        request,
+        now_ms,
+    )
 }
 
-/// Look up one request. `script` must come from isolate state, never from
-/// script input: it is the tenant boundary.
+/// Look up one request. `script` and `deployment` must come from isolate
+/// state, never from script input: together they are the tenant boundary.
 pub fn cache_lookup(
     script: &str,
+    deployment: Option<&str>,
     namespace: &Namespace,
     request: &LookupRequest,
     now_ms: i64,
 ) -> MatchOutcome {
-    lock().lookup(script, namespace, request, now_ms)
+    lock().lookup(
+        OpScope {
+            scope: cache_scope(),
+            script,
+            deployment,
+        },
+        namespace,
+        request,
+        now_ms,
+    )
 }
 
 /// Drop the node's cache when memory pressure starts shedding load:
@@ -880,17 +1046,36 @@ pub fn shed_cache() {
     lock().shed();
 }
 
-/// Delete one entry. `script` must come from isolate state, never from
-/// script input: it is the tenant boundary.
+/// Drop one deployment's entries once its last live generation is freed.
+/// `key` is the deployment identity the host stamped at build, compared
+/// by value: an unknown key is a no-op, never an error.
+pub fn purge_deployment_scope(key: &str) {
+    lock().purge_deployment(key);
+}
+
+/// Delete one entry. `script` and `deployment` must come from isolate
+/// state, never from script input: together they are the tenant boundary.
 pub fn cache_delete(
     script: &str,
+    deployment: Option<&str>,
     namespace: &Namespace,
     url: &str,
     method: &str,
     ignore_method: bool,
     now_ms: i64,
 ) -> bool {
-    lock().delete(script, namespace, url, method, ignore_method, now_ms)
+    lock().delete(
+        OpScope {
+            scope: cache_scope(),
+            script,
+            deployment,
+        },
+        namespace,
+        url,
+        method,
+        ignore_method,
+        now_ms,
+    )
 }
 
 fn multipart_boundary() -> String {
@@ -2057,7 +2242,7 @@ mod tests {
     /// shares, `Vec` growth slack, and allocator rounding are all positive
     /// and all omitted, so real memory is always at or above this floor.
     fn honest_floor(
-        script: &str,
+        scope: &str,
         namespace: &Namespace,
         url: &str,
         headers: &[(String, String)],
@@ -2067,7 +2252,7 @@ mod tests {
             Namespace::Default => 0,
             Namespace::Named(name) => name.len() as u64,
         };
-        let key_heap = script.len() as u64 + namespace + url.len() as u64;
+        let key_heap = scope.len() as u64 + namespace + url.len() as u64;
         let header_heap: u64 = headers
             .iter()
             .map(|(name, value)| name.len() as u64 + value.len() as u64)
@@ -2215,6 +2400,401 @@ mod tests {
         assert!(parse_max_bytes(Some("abc".to_string())).is_err());
         assert!(parse_max_bytes(Some(String::new())).is_err());
         assert!(parse_max_bytes(Some("-1".to_string())).is_err());
+    }
+
+    #[test]
+    fn cache_scope_parses() {
+        assert_eq!(parse_cache_scope(None), Ok(CacheScope::Script));
+        assert_eq!(
+            parse_cache_scope(Some("script".to_string())),
+            Ok(CacheScope::Script)
+        );
+        assert_eq!(
+            parse_cache_scope(Some("deployment".to_string())),
+            Ok(CacheScope::Deployment)
+        );
+        assert!(parse_cache_scope(Some(String::new())).is_err());
+        assert!(parse_cache_scope(Some("Script".to_string())).is_err());
+        assert!(parse_cache_scope(Some("zone".to_string())).is_err());
+    }
+
+    fn scoped_put(
+        store: &mut Store,
+        scope: CacheScope,
+        script: &str,
+        deployment: Option<&str>,
+        url: &str,
+        body: &[u8],
+    ) -> Result<PutOutcome, PutRejection> {
+        let held = headers(&[("cache-control", "max-age=60")]);
+        let op = OpScope {
+            scope,
+            script,
+            deployment,
+        };
+        store.put(
+            op,
+            &Namespace::Default,
+            &PutRequest {
+                method: "GET",
+                url,
+                status: 200,
+                headers: &held,
+                body,
+            },
+            NOW,
+        )
+    }
+
+    fn scoped_lookup(
+        store: &mut Store,
+        scope: CacheScope,
+        script: &str,
+        deployment: Option<&str>,
+        url: &str,
+    ) -> MatchOutcome {
+        let held: Vec<(String, String)> = Vec::new();
+        let op = OpScope {
+            scope,
+            script,
+            deployment,
+        };
+        store.lookup(
+            op,
+            &Namespace::Default,
+            &LookupRequest {
+                url,
+                method: "GET",
+                ignore_method: false,
+                request_headers: &held,
+            },
+            NOW,
+        )
+    }
+
+    #[test]
+    fn deployment_scope_shares_across_scripts() {
+        let mut store = Store::new(DEFAULT_MAX_BYTES);
+        assert_eq!(
+            scoped_put(
+                &mut store,
+                CacheScope::Deployment,
+                "app",
+                Some("dep-1"),
+                URL,
+                b"shared"
+            ),
+            Ok(PutOutcome::Stored)
+        );
+        // Another script of the same deployment matches the entry.
+        let found = scoped_lookup(
+            &mut store,
+            CacheScope::Deployment,
+            "probe",
+            Some("dep-1"),
+            URL,
+        );
+        assert_eq!(hit_body(&found), b"shared");
+        // And deletes it: the purge lands in the shared scope.
+        assert!(store.delete(
+            OpScope {
+                scope: CacheScope::Deployment,
+                script: "probe",
+                deployment: Some("dep-1"),
+            },
+            &Namespace::Default,
+            URL,
+            "GET",
+            false,
+            NOW
+        ));
+        assert_eq!(
+            scoped_lookup(
+                &mut store,
+                CacheScope::Deployment,
+                "app",
+                Some("dep-1"),
+                URL
+            ),
+            MatchOutcome::Miss
+        );
+    }
+
+    #[test]
+    fn deployment_scopes_are_isolated_from_each_other_and_script() {
+        let mut store = Store::new(DEFAULT_MAX_BYTES);
+        assert_eq!(
+            scoped_put(
+                &mut store,
+                CacheScope::Deployment,
+                "app",
+                Some("dep-1"),
+                URL,
+                b"one"
+            ),
+            Ok(PutOutcome::Stored)
+        );
+        // A different deployment never sees the entry, and neither does
+        // the script store, even for the same script and URL.
+        assert_eq!(
+            scoped_lookup(
+                &mut store,
+                CacheScope::Deployment,
+                "app",
+                Some("dep-2"),
+                URL
+            ),
+            MatchOutcome::Miss
+        );
+        assert_eq!(
+            scoped_lookup(&mut store, CacheScope::Script, "app", None, URL),
+            MatchOutcome::Miss
+        );
+        // The reverse direction holds too.
+        let other = "https://cache.test/other-scope";
+        assert_eq!(
+            scoped_put(
+                &mut store,
+                CacheScope::Script,
+                "app",
+                Some("dep-1"),
+                other,
+                b"two"
+            ),
+            Ok(PutOutcome::Stored)
+        );
+        assert_eq!(
+            scoped_lookup(
+                &mut store,
+                CacheScope::Deployment,
+                "app",
+                Some("dep-1"),
+                other
+            ),
+            MatchOutcome::Miss
+        );
+    }
+
+    #[test]
+    fn missing_deployment_key_stays_script_scoped() {
+        let mut store = Store::new(DEFAULT_MAX_BYTES);
+        // The runtime pool, a loaded worker, and a test isolate carry no
+        // deployment key: their entries land in the script store whatever
+        // the mode, so no deployment script can read them.
+        assert_eq!(
+            scoped_put(
+                &mut store,
+                CacheScope::Deployment,
+                "runtime",
+                None,
+                URL,
+                b"r"
+            ),
+            Ok(PutOutcome::Stored)
+        );
+        assert_eq!(
+            hit_body(&scoped_lookup(
+                &mut store,
+                CacheScope::Script,
+                "runtime",
+                None,
+                URL
+            )),
+            b"r"
+        );
+        assert_eq!(
+            scoped_lookup(
+                &mut store,
+                CacheScope::Deployment,
+                "runtime",
+                Some("dep-1"),
+                URL
+            ),
+            MatchOutcome::Miss
+        );
+    }
+
+    #[test]
+    fn deployment_scopes_have_independent_budgets() {
+        // Each entry below charges about 1.3 KiB, so a 2000-byte cap
+        // holds one entry per scope: the second put in a scope evicts the
+        // first, while the other scope's entry is untouched.
+        let mut store = Store::new(2000);
+        let body = vec![b'v'; 500];
+        assert_eq!(
+            scoped_put(
+                &mut store,
+                CacheScope::Deployment,
+                "app",
+                Some("dep-1"),
+                "https://cache.test/budget/0",
+                &body
+            ),
+            Ok(PutOutcome::Stored)
+        );
+        assert_eq!(
+            scoped_put(
+                &mut store,
+                CacheScope::Deployment,
+                "app",
+                Some("dep-1"),
+                "https://cache.test/budget/1",
+                &body
+            ),
+            Ok(PutOutcome::Stored)
+        );
+        assert_eq!(
+            scoped_lookup(
+                &mut store,
+                CacheScope::Deployment,
+                "app",
+                Some("dep-1"),
+                "https://cache.test/budget/0"
+            ),
+            MatchOutcome::Miss
+        );
+        assert_eq!(
+            hit_body(&scoped_lookup(
+                &mut store,
+                CacheScope::Deployment,
+                "app",
+                Some("dep-1"),
+                "https://cache.test/budget/1"
+            ))
+            .len(),
+            500
+        );
+        assert_eq!(
+            scoped_put(
+                &mut store,
+                CacheScope::Deployment,
+                "app",
+                Some("dep-2"),
+                "https://cache.test/budget/0",
+                &body
+            ),
+            Ok(PutOutcome::Stored)
+        );
+        let survived = scoped_lookup(
+            &mut store,
+            CacheScope::Deployment,
+            "app",
+            Some("dep-2"),
+            "https://cache.test/budget/0",
+        );
+        assert_eq!(hit_body(&survived).len(), 500);
+        // Filling the second scope evicted nothing from the first.
+        assert_eq!(
+            hit_body(&scoped_lookup(
+                &mut store,
+                CacheScope::Deployment,
+                "app",
+                Some("dep-1"),
+                "https://cache.test/budget/1"
+            ))
+            .len(),
+            500
+        );
+    }
+
+    #[test]
+    fn purge_deployment_scope_drops_only_that_scope() {
+        let mut store = Store::new(DEFAULT_MAX_BYTES);
+        assert_eq!(
+            scoped_put(
+                &mut store,
+                CacheScope::Deployment,
+                "app",
+                Some("dep-1"),
+                URL,
+                b"one"
+            ),
+            Ok(PutOutcome::Stored)
+        );
+        assert_eq!(
+            scoped_put(
+                &mut store,
+                CacheScope::Deployment,
+                "app",
+                Some("dep-2"),
+                URL,
+                b"two"
+            ),
+            Ok(PutOutcome::Stored)
+        );
+        assert_eq!(
+            scoped_put(&mut store, CacheScope::Script, "app", None, URL, b"three"),
+            Ok(PutOutcome::Stored)
+        );
+        store.purge_deployment("dep-1");
+        assert_eq!(
+            scoped_lookup(
+                &mut store,
+                CacheScope::Deployment,
+                "app",
+                Some("dep-1"),
+                URL
+            ),
+            MatchOutcome::Miss
+        );
+        assert_eq!(
+            hit_body(&scoped_lookup(
+                &mut store,
+                CacheScope::Deployment,
+                "app",
+                Some("dep-2"),
+                URL
+            )),
+            b"two"
+        );
+        assert_eq!(
+            hit_body(&scoped_lookup(
+                &mut store,
+                CacheScope::Script,
+                "app",
+                None,
+                URL
+            )),
+            b"three"
+        );
+        // An unknown key is a no-op, never an error.
+        store.purge_deployment("dep-1");
+        store.purge_deployment("never-existed");
+    }
+
+    #[test]
+    fn shedding_drops_deployment_scopes() {
+        let mut store = Store::new(DEFAULT_MAX_BYTES);
+        assert_eq!(
+            scoped_put(
+                &mut store,
+                CacheScope::Deployment,
+                "app",
+                Some("dep-1"),
+                URL,
+                b"one"
+            ),
+            Ok(PutOutcome::Stored)
+        );
+        assert_eq!(
+            scoped_put(&mut store, CacheScope::Script, "app", None, URL, b"two"),
+            Ok(PutOutcome::Stored)
+        );
+        store.shed();
+        assert_eq!(
+            scoped_lookup(
+                &mut store,
+                CacheScope::Deployment,
+                "app",
+                Some("dep-1"),
+                URL
+            ),
+            MatchOutcome::Miss
+        );
+        assert_eq!(
+            scoped_lookup(&mut store, CacheScope::Script, "app", None, URL),
+            MatchOutcome::Miss
+        );
     }
 
     #[test]

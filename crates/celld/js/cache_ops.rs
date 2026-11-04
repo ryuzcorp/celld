@@ -1,14 +1,15 @@
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 //
-// Modified by ryuzcorp (ryuzcorp/celld): per-node Workers Cache API ops.
+// Modified by ryuzcorp (ryuzcorp/celld): per-node Workers Cache API ops; deployment cache scope.
 // Apache-2.0.
 
 //! The V8 surface over `crate::worker_cache`.
 //!
 //! Each op converts V8 values to Rust, calls into the store, and converts
-//! the answer back. The script name always comes from isolate state, never
-//! from an argument: it is the tenant boundary, and script input must not
-//! be able to name another script's entries.
+//! the answer back. The script name and the deployment scope key always
+//! come from isolate state, never from an argument: together they are the
+//! tenant boundary, and script input must not be able to name another
+//! scope's entries.
 use super::storage_ops::actor_runtime_state;
 use super::*;
 use crate::worker_cache;
@@ -61,7 +62,9 @@ pub(super) fn op_cache_put(
         throw_cache_error(scope, "put", "body must be bytes");
         return;
     };
-    let script = actor_runtime_state(scope).script_name.clone();
+    let state = actor_runtime_state(scope);
+    let script = state.script_name.clone();
+    let deployment = state.cache_scope.clone();
     let request = worker_cache::PutRequest {
         method: &method,
         url: &url,
@@ -69,7 +72,13 @@ pub(super) fn op_cache_put(
         headers: &headers,
         body: &body,
     };
-    match worker_cache::cache_put(&script, &namespace, &request, asyncrt::wall_ms()) {
+    match worker_cache::cache_put(
+        &script,
+        deployment.as_deref(),
+        &namespace,
+        &request,
+        asyncrt::wall_ms(),
+    ) {
         Ok(worker_cache::PutOutcome::Stored) => rv.set(v8::Boolean::new(scope, true).into()),
         Ok(worker_cache::PutOutcome::NotStored) => rv.set(v8::Boolean::new(scope, false).into()),
         Err(rejection) => throw_cache_type_error(scope, rejection.message()),
@@ -97,14 +106,22 @@ pub(super) fn op_cache_match(
         throw_cache_error(scope, "match", "headers are malformed");
         return;
     };
-    let script = actor_runtime_state(scope).script_name.clone();
+    let state = actor_runtime_state(scope);
+    let script = state.script_name.clone();
+    let deployment = state.cache_scope.clone();
     let request = worker_cache::LookupRequest {
         url: &url,
         method: &method,
         ignore_method,
         request_headers: &request_headers,
     };
-    let outcome = worker_cache::cache_lookup(&script, &namespace, &request, asyncrt::wall_ms());
+    let outcome = worker_cache::cache_lookup(
+        &script,
+        deployment.as_deref(),
+        &namespace,
+        &request,
+        asyncrt::wall_ms(),
+    );
     let worker_cache::MatchOutcome::Hit {
         status,
         headers,
@@ -139,9 +156,12 @@ pub(super) fn op_cache_delete(
     let url = args.get(1).to_rust_string_lossy(scope);
     let method = args.get(2).to_rust_string_lossy(scope);
     let ignore_method = args.get(3).boolean_value(scope);
-    let script = actor_runtime_state(scope).script_name.clone();
+    let state = actor_runtime_state(scope);
+    let script = state.script_name.clone();
+    let deployment = state.cache_scope.clone();
     let deleted = worker_cache::cache_delete(
         &script,
+        deployment.as_deref(),
         &namespace,
         &url,
         &method,

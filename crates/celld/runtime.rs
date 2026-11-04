@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): cross-isolate RPC stubs and streams; D1 export operator-ingress marker; ported from meln1k/celld: report wake coverage after maintenance (e6cb9a3); wake coverage follow-ups: startup observation ordering, installation comparison; trusted cell RPC.
+// Modified by ryuzcorp (ryuzcorp/celld): cross-isolate RPC stubs and streams; D1 export operator-ingress marker; ported from meln1k/celld: report wake coverage after maintenance (e6cb9a3); wake coverage follow-ups: startup observation ordering, installation comparison; trusted cell RPC; deployment cache scope purge on generation free.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 // RuntimeManager is the V8 cell-host arm, so its executor and observability
@@ -900,6 +900,22 @@ impl RuntimeManager {
                         version = %generation.version,
                         "application generation freed"
                     );
+                    // The freed generation's deployment loses its cache
+                    // scope once no live generation carries it: a forced
+                    // reload of the same deployment keeps the scope (the
+                    // new generation carries the same key), while a
+                    // redeploy drops the old scope with its last reader.
+                    // The cache lock is a leaf — it guards short map
+                    // operations only — so taking it under the generation
+                    // lock cannot deadlock.
+                    let live = generations.current.cache_scope == generation.cache_scope
+                        || generations
+                            .draining
+                            .iter()
+                            .any(|candidate| candidate.cache_scope == generation.cache_scope);
+                    if !live {
+                        crate::worker_cache::purge_deployment_scope(&generation.cache_scope);
+                    }
                 }
             }
         });
@@ -3733,17 +3749,19 @@ export default { fetch() { return new Response('ok'); } };
             cell_configs.insert("ProbeDO".to_string(), config);
             cell_isolates.insert("coverage-test".to_string(), pool.clone());
         }
+        let serving = crate::generation::ServingIdentity {
+            script_name: Some("coverage-test".into()),
+            version: "test".into(),
+            prefix: String::new(),
+            components: None,
+        };
         Generation {
             id: crate::generation::FIRST_GENERATION,
             version: "test".into(),
             prefix: String::new(),
             script_name: "coverage-test".into(),
-            serving: crate::generation::ServingIdentity {
-                script_name: Some("coverage-test".into()),
-                version: "test".into(),
-                prefix: String::new(),
-                components: None,
-            },
+            serving: serving.clone(),
+            cache_scope: serving.cache_scope_key("test-fleet"),
             stateless: StatelessRuntime {
                 node: Arc::from("n0"),
                 region: Arc::from("test"),
