@@ -9,7 +9,7 @@ README below is kept intact; this file documents the fork.
 
 - `main` mirrors upstream `main` and carries no patches.
 - `ryuzcorp/v<version>` is a line branch: the upstream tag `v<version>`
-  plus our patches as commits, one commit per patch, in `0001`-`0043`
+  plus our patches as commits, one commit per patch, in `0001`-`0044`
   order. Each patch commit is self-contained and carries its own tests.
 
 Upstream's `.github/workflows/release.yml` targets `ghcr.io/denoland` and
@@ -450,7 +450,7 @@ push to `ghcr.io/denoland`, but still. Pushing a branch named
   cell's upgrade presents a single-use host-minted token, tunneled
   upgrade parks use unguessable numbers, and a reloaded cell still
   owns its sockets by scope after hibernation.
-- `0043` (sha TBD at merge) a stream received over RPC stays usable
+- `0043` (`852e15c`) a stream received over RPC stays usable
   while the receiver holds it: an active reader (or writer) keeps
   the stream past the receiving call and its invocation, the way a
   ReadableStream sent over RPC stays open until its writer closes
@@ -462,6 +462,12 @@ push to `ghcr.io/denoland`, but still. Pushing a branch named
   invocation end still terminates the channel. Previously the
   receiving call's return cancelled a held abort carrier, so every
   signal-carrying exec aborted spuriously.
+- `0044` (sha TBD at merge) `celld r2 head` and `celld r2 get` with
+  `--json` print `{"error":"not_found","bucket":...,"key":...}` on
+  stdout for an absent key, so callers match the `error` field instead
+  of substring-matching the English message. The human message on stderr
+  and the exit code are unchanged; `delete` of an absent key still
+  succeeds, as on R2.
 
 Patches `0025`–`0034` are ported fixes from
 [meln1k/celld](https://github.com/meln1k/celld) by Nikita
