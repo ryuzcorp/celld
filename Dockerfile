@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1.7
-# Modified by ryuzcorp (ryuzcorp/celld): the test stage's clippy loads the workspace clippy.toml; the test stage installs esbuild for the deploy --sourcemap tests.
+# Modified by ryuzcorp (ryuzcorp/celld): the test stage's clippy loads the workspace clippy.toml; the test stage installs esbuild for the deploy --sourcemap tests; the build stage bakes CELLD_VERSION into the binary for --version.
 
 ARG RUST_VERSION=1.98.1
 ARG CELLD_COMMIT=unknown
@@ -9,6 +9,10 @@ ARG TARGETARCH
 # `release` for shipped artifacts; a fast-loop caller passes `lab` to skip
 # the fat-LTO relink and keep incremental state in the target cache.
 ARG CELLD_PROFILE=release
+# The full build version the binary's --version reports
+# (`<version>-ryuzcorp.<n>`, `<version>-ryuzcorp.ci` in CI). Unset here,
+# build.rs falls back to the crate version.
+ARG CELLD_VERSION
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
@@ -16,7 +20,7 @@ RUN --mount=type=cache,id=celld-cargo-registry,target=/usr/local/cargo/registry,
     --mount=type=cache,id=celld-cargo-git,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,id=celld-target-${TARGETARCH},target=/src/target,sharing=locked \
     mkdir -p /out && \
-    cargo build --profile "${CELLD_PROFILE}" --locked -p celld && \
+    CELLD_VERSION="${CELLD_VERSION}" cargo build --profile "${CELLD_PROFILE}" --locked -p celld && \
     install -m 755 "target/${CELLD_PROFILE}/celld" /out/celld
 
 # The final image depends on this stage, so a break in the engine's tests or

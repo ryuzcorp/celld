@@ -9,7 +9,7 @@ README below is kept intact; this file documents the fork.
 
 - `main` mirrors upstream `main` and carries no patches.
 - `ryuzcorp/v<version>` is a line branch: the upstream tag `v<version>`
-  plus our patches as commits, one commit per patch, in `0001`-`0045`
+  plus our patches as commits, one commit per patch, in `0001`-`0046`
   order. Each patch commit is self-contained and carries its own tests.
 
 Upstream's `.github/workflows/release.yml` targets `ghcr.io/denoland` and
@@ -468,7 +468,7 @@ push to `ghcr.io/denoland`, but still. Pushing a branch named
   of substring-matching the English message. The human message on stderr
   and the exit code are unchanged; `delete` of an absent key still
   succeeds, as on R2.
-- `0045` (sha TBD at merge) `CELLD_CACHE_SCOPE=deployment` shares
+- `0045` (`4c8350c`) `CELLD_CACHE_SCOPE=deployment` shares
   one Workers Cache API scope across every script of the serving
   deployment: one `caches.default` and one set of `caches.open(name)`
   namespaces, like one Cloudflare zone. The default `script` scope
@@ -485,6 +485,12 @@ push to `ghcr.io/denoland`, but still. Pushing a branch named
   entries, and the old scope is dropped once its last serving
   generation drains. Sharing is total within a deployment (read,
   overwrite, purge), which is why it is opt-in.
+- `0046` (sha TBD at merge) `celld --version` reports the full build
+  version: `build.rs` bakes `CELLD_VERSION` (`<version>-ryuzcorp.<n>`,
+  `<version>-ryuzcorp.ci` in CI) into the binary from the Docker build
+  stage, and a plain `cargo build` without it reports the crate
+  version. The build fails on any byte outside `[0-9A-Za-z._+-]`, so
+  the value cannot inject cargo directives of its own.
 
 Patches `0025`–`0034` are ported fixes from
 [meln1k/celld](https://github.com/meln1k/celld) by Nikita
