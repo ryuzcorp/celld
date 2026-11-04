@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): idempotent content-tagged image create; tag-race tests run the fake engine through sh; deploy --sourcemap writes the bundle's external map; service binding targets validated at deploy; staged activation.
+// Modified by ryuzcorp (ryuzcorp/celld): idempotent content-tagged image create; tag-race tests run the fake engine through sh; deploy --sourcemap writes the bundle's external map; service binding targets validated at deploy; staged activation; deploy --sourcemap collects the no_bundle sibling map.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 // Deployment is an operator control-plane path outside the Actor execution
@@ -210,9 +210,10 @@ pub struct Options {
     /// the bucket. `celld dev` runs its node on the same engine that built
     /// them; a fleet needs the tar.
     pub local_images: bool,
-    /// Write the bundled Worker's external source map to this local path.
-    /// Only the esbuild bundle gets a map; anything else warns and writes
-    /// nothing. The deployed bytes are identical with or without the flag.
+    /// Write the Worker's source map to this local path: the esbuild bundle's
+    /// external map, or the `no_bundle` entry's sibling `<entry>.map`.
+    /// Anything else warns and writes nothing. The deployed bytes are
+    /// identical with or without the flag.
     pub sourcemap: Option<PathBuf>,
     /// Upload and validate the version without moving any pointer: the
     /// version is staged, invisible to serving, until `celld activate`
@@ -245,7 +246,7 @@ pub fn print_help() {
 USAGE:\n  celld deploy [PROJECT] --bucket [s3://|gs://|az://]NAME[/PREFIX] [OPTIONS]\n\n\
 PROJECT is a directory or a Wrangler config; it defaults to the working\n\
 directory, where celld looks for wrangler.jsonc or wrangler.json.\n\n\
-OPTIONS:\n  --sourcemap PATH       Write the bundled Worker's external source map to PATH.\n                         Only the bundled JS entry is mapped, never wasm siblings;\n                         asset-only, `no_bundle`, and Python projects warn and write\n                         nothing. The deployed bytes are identical with or without it\n  --config PATH          Same as passing PROJECT positionally\n  --bucket [s3://|gs://|az://]NAME[/PREFIX]\n                         Fleet bucket and prefix; defaults to CELLD_BUCKET.\n                         gs:// selects a Google Cloud Storage bucket, az://\n                         an Azure Blob Storage container with its account in\n                         AZURE_STORAGE_ACCOUNT_NAME; celld then rejects\n                         --endpoint and ignores --region\n  --endpoint URL         S3-compatible endpoint; defaults to S3_ENDPOINT\n  --region REGION        Storage region; defaults to AWS_REGION\n  --dry-run              Bundle and print the version without writing\n  --no-activate          Upload and validate without moving any pointer;\n                         the staged version serves only once `celld activate`\n                         names it\n  --json                 Print the deployment as one JSON object\n  -h, --help             Show this help\n\n\
+OPTIONS:\n  --sourcemap PATH       Write the Worker's source map to PATH: the bundled JS\n                         entry's external map, or the `no_bundle` entry's sibling\n                         `<entry>.map`; never wasm siblings. Asset-only and Python\n                         projects, and `no_bundle` entries without a sibling map,\n                         warn and write nothing. The deployed bytes are identical\n                         with or without it\n  --config PATH          Same as passing PROJECT positionally\n  --bucket [s3://|gs://|az://]NAME[/PREFIX]\n                         Fleet bucket and prefix; defaults to CELLD_BUCKET.\n                         gs:// selects a Google Cloud Storage bucket, az://\n                         an Azure Blob Storage container with its account in\n                         AZURE_STORAGE_ACCOUNT_NAME; celld then rejects\n                         --endpoint and ignores --region\n  --endpoint URL         S3-compatible endpoint; defaults to S3_ENDPOINT\n  --region REGION        Storage region; defaults to AWS_REGION\n  --dry-run              Bundle and print the version without writing\n  --no-activate          Upload and validate without moving any pointer;\n                         the staged version serves only once `celld activate`\n                         names it\n  --json                 Print the deployment as one JSON object\n  -h, --help             Show this help\n\n\
 Credentials come from the standard AWS credential chain, from Google\n\
 Application Default Credentials for a gs:// bucket, or from an Azure storage\n\
 account key, managed identity, or workload identity for an az:// bucket.\n\n\
@@ -583,17 +584,17 @@ pub struct Built {
     /// See `Manifest::fence_image`; saved beside `images`, reported apart.
     pub fence_image: Option<String>,
     pub upload_images: bool,
-    /// The entry bundle's external source map, when `--sourcemap` asked for
-    /// one and the project bundles through esbuild. Never part of the
-    /// deployment identity: the version hashes the modules only.
+    /// The entry's source map, when `--sourcemap` asked for one and the build
+    /// produced one: the esbuild bundle's external map, or the `no_bundle`
+    /// entry's sibling map. Never part of the deployment identity: the
+    /// version hashes the modules only.
     pub sourcemap: Option<Vec<u8>>,
 }
 
 /// Write the built map to the `--sourcemap` path. The deploy command calls
 /// this after a successful build, including dry runs, and before anything
 /// reaches the bucket, so a bad path fails the deploy without publishing.
-/// Warns and writes nothing when the deployment has no bundled JavaScript
-/// entry to map.
+/// Warns and writes nothing when the build produced no map.
 pub fn write_sourcemap(options: &Options, built: &Built) -> anyhow::Result<()> {
     let Some(path) = &options.sourcemap else {
         return Ok(());
@@ -605,8 +606,8 @@ pub fn write_sourcemap(options: &Options, built: &Built) -> anyhow::Result<()> {
             note!("Wrote source map to {}", path.display());
         }
         None => note!(
-            "--sourcemap: this deployment has no bundled JavaScript entry to map \
-             (asset-only, `no_bundle`, or Python); wrote nothing"
+            "--sourcemap: this deployment has no source map to write \
+             (asset-only, Python, or `no_bundle` without a sibling map); wrote nothing"
         ),
     }
     Ok(())
@@ -820,13 +821,19 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
                 )?;
                 // Directory iteration order must not change deployment identity.
                 wasm.sort_by(|a, b| a.0.cmp(&b.0));
-                // Pre-bundled: the caller's toolchain owns the bytes, so there
-                // is no map celld could honestly produce for them. A sibling
-                // `<entry>.map` stays the caller's to collect.
+                // Pre-bundled: the caller's toolchain owns the bytes, so
+                // celld produces no map for them — but the entry deploys as
+                // written, so its sibling `<entry>.map` still describes the
+                // deployed module, and `--sourcemap` collects it.
+                let sourcemap = options
+                    .sourcemap
+                    .is_some()
+                    .then(|| sibling_sourcemap(&path, &root))
+                    .flatten();
                 Ok(BundleOutput {
                     bundle,
                     wasm,
-                    sourcemap: None,
+                    sourcemap,
                 })
             } else {
                 run_esbuild(&root, entry, &project.bundle, options.sourcemap.is_some())
@@ -4268,8 +4275,9 @@ fn asset_content_type(path: &Path) -> Option<&'static str> {
 struct BundleOutput {
     bundle: Vec<u8>,
     wasm: Vec<(String, Vec<u8>)>,
-    /// The entry bundle's external source map, when the esbuild run produced
-    /// one. `None` for pre-bundled, Python, and asset-only projects.
+    /// The entry's source map, when the build produced one. `None` for
+    /// Python and asset-only projects, and for pre-bundled entries without
+    /// a sibling map.
     sourcemap: Option<Vec<u8>>,
 }
 
@@ -4500,15 +4508,18 @@ fn run_esbuild(
 
 /// Rewrite the map's `sources` to project-root-relative paths.
 ///
-/// esbuild records sources relative to its output directory, which here is a
-/// tempdir deleted right after the run: stored as-is, every source would
-/// dangle. A source inside the project root becomes a root-relative slash
-/// path, one outside it a `../` path from the root, and one that does not
-/// resolve its bare file name. No source names a directory above the
-/// common ancestor of the root and the file, so the map discloses nothing
-/// of the host's layout beyond what the project imports.
-fn rebase_map_sources(map: &[u8], outdir: &Path, root: &Path) -> anyhow::Result<Vec<u8>> {
-    let mut parsed: Value = serde_json::from_slice(map).context("parse esbuild source map")?;
+/// `base` is the directory relative sources resolve against: esbuild's
+/// output directory — a tempdir deleted right after the run, so stored
+/// as-is every source would dangle. esbuild, not the caller, writes these
+/// strings, so resolving them on the host is safe here; a caller-produced
+/// sibling map goes through [`rebase_sibling_map`] instead. A source inside the
+/// project root becomes a root-relative slash path, one outside it a
+/// `../` path from the root, and one that does not resolve its bare file
+/// name. No source names a directory above the common ancestor of the
+/// root and the file, so the map discloses nothing of the host's layout
+/// beyond what the project imports.
+fn rebase_map_sources(map: &[u8], base: &Path, root: &Path) -> anyhow::Result<Vec<u8>> {
+    let mut parsed: Value = serde_json::from_slice(map).context("parse source map")?;
     let Some(sources) = parsed.get_mut("sources").and_then(Value::as_array_mut) else {
         return Ok(map.to_vec());
     };
@@ -4517,17 +4528,182 @@ fn rebase_map_sources(map: &[u8], outdir: &Path, root: &Path) -> anyhow::Result<
         let Some(name) = source.as_str() else {
             continue;
         };
-        *source = Value::String(rebase_map_source(&root, outdir, name));
+        *source = Value::String(rebase_map_source(&root, base, name));
     }
     serde_json::to_vec_pretty(&parsed).context("encode rebased source map")
 }
 
-fn rebase_map_source(root: &Path, outdir: &Path, source: &str) -> String {
+/// Largest caller-produced sibling map `--sourcemap` collects. Worker maps
+/// past a few tens of MiB are already pathological; the cap keeps a
+/// tenant-planted file from driving the deploy's allocation.
+const SIBLING_MAP_MAX_BYTES: u64 = 64 * 1024 * 1024;
+
+/// The sibling `<entry>.map` of a `no_bundle` entry, rebased to
+/// project-root-relative sources, or `None`. The map comes from the
+/// project tree, which the caller (often a tenant) controls, while the
+/// deploy may run with more privilege, so nothing about it can fail the
+/// deploy or reach outside the tree: a missing sibling is `None`, and any
+/// other problem — the entry's directory resolving outside the root, a
+/// symlink, a FIFO or other non-regular file, an oversize file, invalid
+/// JSON, or JSON that is not a v3 source map — warns and is `None` too,
+/// the same "warns and writes nothing" contract as an unmappable project.
+fn sibling_sourcemap(entry: &Path, root: &Path) -> Option<Vec<u8>> {
+    match read_sibling_sourcemap(entry, root) {
+        Ok(map) => map,
+        Err(error) => {
+            note!("--sourcemap: skipping the `no_bundle` sibling map: {error:#}");
+            None
+        }
+    }
+}
+
+fn read_sibling_sourcemap(entry: &Path, root: &Path) -> anyhow::Result<Option<Vec<u8>>> {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    let root = root.canonicalize().context("resolve the project root")?;
+    // The whole resolution stays in the tree: a directory symlink anywhere
+    // on the entry's path would otherwise lead the read outside it.
+    let dir = entry
+        .parent()
+        .context("entry has no directory")?
+        .canonicalize()
+        .context("resolve the entry's directory")?;
+    let Ok(relative_dir) = dir.strip_prefix(&root) else {
+        bail!("the entry's directory resolves outside the project root");
+    };
+    let mut name = entry
+        .file_name()
+        .context("entry has no file name")?
+        .to_os_string();
+    name.push(".map");
+    let path = dir.join(name);
+    // The fd is the check: `O_NOFOLLOW` refuses a symlink at open,
+    // `O_NONBLOCK` keeps a FIFO from blocking the open, and the fstat
+    // below refuses everything that is not a regular file.
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(&path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("open {} (symlinks are not followed)", path.display()))
+        }
+    };
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("inspect {}", path.display()))?;
+    if !metadata.file_type().is_file() {
+        bail!("{} is not a regular file", path.display());
+    }
+    if metadata.len() > SIBLING_MAP_MAX_BYTES {
+        bail!(
+            "{} is larger than {SIBLING_MAP_MAX_BYTES} bytes",
+            path.display()
+        );
+    }
+    let mut map = Vec::new();
+    file.take(SIBLING_MAP_MAX_BYTES + 1)
+        .read_to_end(&mut map)
+        .with_context(|| format!("read {}", path.display()))?;
+    if map.len() as u64 > SIBLING_MAP_MAX_BYTES {
+        bail!(
+            "{} is larger than {SIBLING_MAP_MAX_BYTES} bytes",
+            path.display()
+        );
+    }
+    rebase_sibling_map(&map, relative_dir).map(Some)
+}
+
+/// Validate a caller-produced map as a v3 source map and rewrite its
+/// `sources` (with any `sourceRoot` folded in) to project-root-relative
+/// paths. Unlike the esbuild map's rebase, nothing here touches the
+/// filesystem: the strings are tenant-written, so resolving them on the
+/// host would answer which host paths exist.
+fn rebase_sibling_map(map: &[u8], relative_dir: &Path) -> anyhow::Result<Vec<u8>> {
+    let mut parsed: Value = serde_json::from_slice(map).context("parse source map")?;
+    let object = parsed
+        .as_object_mut()
+        .context("a source map is a JSON object")?;
+    if object.get("version").and_then(Value::as_u64) != Some(3) {
+        bail!("not a version 3 source map");
+    }
+    if !object.get("mappings").is_some_and(Value::is_string) {
+        bail!("the source map has no `mappings` string");
+    }
+    let source_root = match object.remove("sourceRoot") {
+        None | Some(Value::Null) => String::new(),
+        Some(Value::String(value)) => value,
+        Some(_) => bail!("the source map's `sourceRoot` is not a string"),
+    };
+    let sources = object
+        .get_mut("sources")
+        .and_then(Value::as_array_mut)
+        .context("the source map has no `sources` array")?;
+    for source in sources.iter_mut() {
+        let name = source
+            .as_str()
+            .context("a source map `sources` entry is not a string")?;
+        // An absolute or URL source ignores `sourceRoot`, as URL resolution
+        // would; either way it keeps only its file name below.
+        let joined =
+            if source_root.is_empty() || name.contains("://") || Path::new(name).is_absolute() {
+                name.to_string()
+            } else {
+                format!("{}/{name}", source_root.trim_end_matches('/'))
+            };
+        *source = Value::String(lexical_map_source(relative_dir, &joined));
+    }
+    serde_json::to_vec_pretty(&parsed).context("encode rebased source map")
+}
+
+/// `source`, relative to the entry's root-relative directory, as a
+/// root-relative slash path, resolved lexically. An absolute path or a
+/// URL keeps only its file name: relativizing it would need the root's
+/// host location, which the map must not reveal.
+fn lexical_map_source(relative_dir: &Path, source: &str) -> String {
+    use std::path::Component;
+    let candidate = Path::new(source);
+    let bare = || {
+        candidate
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    };
+    if source.contains("://") || candidate.is_absolute() {
+        return bare();
+    }
+    let mut parts: Vec<String> = relative_dir
+        .components()
+        .map(|part| part.as_os_str().to_string_lossy().into_owned())
+        .collect();
+    let mut up = 0usize;
+    for component in candidate.components() {
+        match component {
+            Component::Normal(part) => parts.push(part.to_string_lossy().into_owned()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if parts.pop().is_none() {
+                    up += 1;
+                }
+            }
+            Component::RootDir | Component::Prefix(_) => return bare(),
+        }
+    }
+    std::iter::repeat_n("..".to_string(), up)
+        .chain(parts)
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn rebase_map_source(root: &Path, base: &Path, source: &str) -> String {
     let candidate = Path::new(source);
     let resolved = if candidate.is_absolute() {
         candidate.canonicalize().ok()
     } else {
-        outdir.join(candidate).canonicalize().ok()
+        base.join(candidate).canonicalize().ok()
     };
     let Some(absolute) = resolved else {
         return candidate
@@ -5038,6 +5214,219 @@ mod sourcemap_tests {
         assert_eq!(built.sourcemap, None);
         write_sourcemap(&options, &built).unwrap();
         assert!(!map_path.exists());
+    }
+
+    /// A `no_bundle` entry deploys as written, so its sibling `<entry>.map`
+    /// — the caller's toolchain owns both — is collected and rebased like
+    /// the bundled map: relative sources resolve against the entry's own
+    /// directory.
+    #[test]
+    fn sourcemap_no_bundle_sibling_map_is_written_rebased() {
+        let tree = tempfile::tempdir().unwrap();
+        let base = tree.path().canonicalize().unwrap();
+        let root = base.join("project");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(base.join("shared")).unwrap();
+        std::fs::write(
+            root.join("wrangler.json"),
+            r#"{"name": "maptest", "main": "entry.js", "no_bundle": true}"#,
+        )
+        .unwrap();
+        std::fs::write(root.join("entry.js"), "export default {};\n").unwrap();
+        std::fs::write(root.join("src/app.ts"), "export {};\n").unwrap();
+        std::fs::write(base.join("shared/util.ts"), "export {};\n").unwrap();
+        std::fs::write(
+            root.join("entry.js.map"),
+            r#"{"version":3,"sources":["src/app.ts","../shared/util.ts","missing/gone.ts"],"mappings":"AAAA"}"#,
+        )
+        .unwrap();
+        let map_path = root.join("worker.js.map");
+        let options = test_options(&root.join("wrangler.json"), Some(map_path.clone()));
+        let built = build(&options).unwrap();
+        // The deployed module is the entry as written.
+        assert_eq!(built.modules[0].1, b"export default {};\n".to_vec());
+        let map = built
+            .sourcemap
+            .as_ref()
+            .expect("a no_bundle sibling map is collected");
+        write_sourcemap(&options, &built).unwrap();
+        let stored = std::fs::read(&map_path).unwrap();
+        assert_eq!(stored, *map);
+        let parsed: Value = serde_json::from_slice(&stored).unwrap();
+        assert_eq!(parsed.get("version").and_then(Value::as_u64), Some(3));
+        assert_eq!(parsed.get("mappings").and_then(Value::as_str), Some("AAAA"));
+        let sources = parsed
+            .get("sources")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let names: Vec<&str> = sources.iter().filter_map(Value::as_str).collect();
+        assert_eq!(
+            names,
+            ["src/app.ts", "../shared/util.ts", "missing/gone.ts"]
+        );
+    }
+
+    /// Collecting the sibling map changes nothing about the deployment: the
+    /// flag only adds the local file.
+    #[test]
+    fn sourcemap_no_bundle_leaves_deployed_bytes_identical() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("wrangler.json"),
+            r#"{"name": "maptest", "main": "entry.js", "no_bundle": true}"#,
+        )
+        .unwrap();
+        let entry = b"export default {};\n//# sourceMappingURL=entry.js.map\n".to_vec();
+        std::fs::write(root.path().join("entry.js"), &entry).unwrap();
+        std::fs::write(
+            root.path().join("entry.js.map"),
+            r#"{"version":3,"sources":["entry.ts"],"mappings":"AAAA"}"#,
+        )
+        .unwrap();
+        let config = root.path().join("wrangler.json");
+        let plain = build(&test_options(&config, None)).unwrap();
+        let mapped = build(&test_options(
+            &config,
+            Some(root.path().join("worker.js.map")),
+        ))
+        .unwrap();
+        assert_eq!(plain.modules, mapped.modules);
+        assert_eq!(plain.version, mapped.version);
+        // The caller's bytes deploy untouched, trailing comment included:
+        // celld never rewrites a pre-bundled entry.
+        assert_eq!(plain.modules[0].1, entry);
+        assert!(mapped.sourcemap.is_some());
+    }
+
+    /// A `no_bundle` project whose entry sits at `main`, built with
+    /// `--sourcemap`: the deploy must succeed and deploy the entry as
+    /// written, whatever the sibling map is. Returns the collected map.
+    fn build_no_bundle_with_map(root: &Path, main: &str) -> Option<Vec<u8>> {
+        std::fs::write(
+            root.join("wrangler.json"),
+            format!(r#"{{"name": "maptest", "main": "{main}", "no_bundle": true}}"#),
+        )
+        .unwrap();
+        let options = test_options(&root.join("wrangler.json"), Some(root.join("out.js.map")));
+        let built = build(&options).expect("a sibling map never fails the deploy");
+        assert_eq!(built.modules[0].1, b"export default {};\n".to_vec());
+        built.sourcemap
+    }
+
+    /// The sibling map comes from a tree the deploy's caller controls, so
+    /// nothing about it may fail the deploy or reach outside the tree: a
+    /// symlink (even to a valid map), a FIFO (which must not block the
+    /// open), an oversize file, invalid JSON, and JSON that is not a v3
+    /// map all warn and collect nothing.
+    #[test]
+    fn sourcemap_no_bundle_hostile_sibling_is_skipped() {
+        const VALID: &str = r#"{"version":3,"sources":["a.ts"],"mappings":"AAAA"}"#;
+        /// Plants the sibling at the map path; the second path is a
+        /// directory outside the project tree.
+        type Plant = fn(&Path, &Path);
+        let cases: [(&str, Plant); 7] = [
+            ("symlink to a valid map outside the tree", |map, outside| {
+                std::fs::write(outside.join("victim.map"), VALID).unwrap();
+                std::os::unix::fs::symlink(outside.join("victim.map"), map).unwrap();
+            }),
+            ("FIFO", |map, _| {
+                nix::unistd::mkfifo(map, nix::sys::stat::Mode::S_IRWXU).unwrap();
+            }),
+            ("directory", |map, _| std::fs::create_dir(map).unwrap()),
+            ("oversize", |map, _| {
+                let file = std::fs::File::create(map).unwrap();
+                file.set_len(SIBLING_MAP_MAX_BYTES + 1).unwrap();
+            }),
+            ("invalid JSON", |map, _| {
+                std::fs::write(map, b"\x00garbage").unwrap()
+            }),
+            ("JSON that is not a map", |map, _| {
+                std::fs::write(map, r#"{"secret":"x","sources":["a.ts"]}"#).unwrap();
+            }),
+            ("non-string sources", |map, _| {
+                std::fs::write(map, r#"{"version":3,"sources":[7],"mappings":""}"#).unwrap();
+            }),
+        ];
+        for (label, plant) in cases {
+            let tree = tempfile::tempdir().unwrap();
+            let (root, outside) = (tree.path().join("project"), tree.path().join("outside"));
+            std::fs::create_dir_all(&root).unwrap();
+            std::fs::create_dir_all(&outside).unwrap();
+            std::fs::write(root.join("entry.js"), "export default {};\n").unwrap();
+            plant(&root.join("entry.js.map"), &outside);
+            assert_eq!(
+                build_no_bundle_with_map(&root, "entry.js"),
+                None,
+                "{label}: the sibling must be skipped"
+            );
+        }
+    }
+
+    /// A directory symlink on the entry's path leads outside the project:
+    /// the sibling map there is never read, even though it is a regular
+    /// file and a valid map.
+    #[test]
+    fn sourcemap_no_bundle_sibling_outside_the_root_is_skipped() {
+        let tree = tempfile::tempdir().unwrap();
+        let (root, outside) = (tree.path().join("project"), tree.path().join("outside"));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("entry.js"), "export default {};\n").unwrap();
+        std::fs::write(
+            outside.join("entry.js.map"),
+            r#"{"version":3,"sources":["a.ts"],"mappings":"AAAA"}"#,
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("sub")).unwrap();
+        assert_eq!(build_no_bundle_with_map(&root, "sub/entry.js"), None);
+    }
+
+    /// Sibling sources resolve lexically against the entry's directory,
+    /// with `sourceRoot` folded in and dropped; absolute paths and URLs
+    /// keep only their file name, whether or not they exist on the host,
+    /// so the stored map answers nothing about the host's files.
+    #[test]
+    fn sibling_map_sources_resolve_without_touching_the_host() {
+        let existing = std::env::current_exe().unwrap();
+        let map = serde_json::to_vec(&json!({
+            "version": 3,
+            "sourceRoot": "../src/",
+            "sources": [
+                "app.ts",
+                "./lib/../util.ts",
+                "../../../outside.ts",
+                existing.to_str().unwrap(),
+                "/definitely/missing/gone.ts",
+                "webpack://pkg/./mod.ts",
+            ],
+            "mappings": "AAAA",
+        }))
+        .unwrap();
+        let rebased = rebase_sibling_map(&map, Path::new("dist/worker")).unwrap();
+        let parsed: Value = serde_json::from_slice(&rebased).unwrap();
+        assert!(
+            parsed.get("sourceRoot").is_none(),
+            "sourceRoot is folded in"
+        );
+        let sources: Vec<&str> = parsed["sources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        let exe_name = existing.file_name().unwrap().to_str().unwrap();
+        assert_eq!(
+            sources,
+            [
+                "dist/src/app.ts",
+                "dist/src/util.ts",
+                "../outside.ts",
+                exe_name,
+                "gone.ts",
+                "mod.ts",
+            ]
+        );
     }
 
     #[test]
