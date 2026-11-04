@@ -1,5 +1,5 @@
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
-// Modified by ryuzcorp (ryuzcorp/celld): deploy --sourcemap writes the bundle's external map.
+// Modified by ryuzcorp (ryuzcorp/celld): deploy --sourcemap writes the bundle's external map; deploy reads stay inside the project.
 
 //! The build path for a Worker whose `main` is a `.py` file.
 //!
@@ -265,10 +265,10 @@ pub fn build(
         .and_then(|stem| stem.to_str())
         .filter(|stem| is_identifier(stem))
         .ok_or_else(|| anyhow!("Python entry {entry} must be named as an importable module"))?;
-    let source_root = root.join(entry_path.parent().unwrap_or(Path::new("")));
+    let (source_root, modules_dir) = resolve_source_dirs(root, entry)?;
     let mut files = BTreeMap::new();
     collect_sources(&source_root, "", &mut files)?;
-    let sdk = collect_python_modules(&root.join("python_modules"), &mut files)?;
+    let sdk = collect_python_modules(&modules_dir, &mut files)?;
 
     let runtime = runtime_files()?;
     let directory = tempfile::tempdir().context("create Python build directory")?;
@@ -343,6 +343,28 @@ pub fn build(
     ))
 }
 
+/// The contained directories a Python build reads: the entry's directory
+/// and `python_modules/`, both resolved inside the canonical project root. A
+/// missing `python_modules/` stays missing so the build can report the
+/// helpful "run `pywrangler sync`" error when it reads.
+pub(crate) fn resolve_source_dirs(root: &Path, entry: &str) -> anyhow::Result<(PathBuf, PathBuf)> {
+    let root = super::canonical_project_root(root)?;
+    let entry_path = super::contained_entry(&root, entry)?;
+    let source_root = entry_path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| root.clone());
+    let joined = root.join("python_modules");
+    let modules_dir = match std::fs::symlink_metadata(&joined) {
+        Ok(_) => super::contain_path(&root, &joined, "`python_modules`")?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => joined,
+        Err(error) => {
+            return Err(error).with_context(|| format!("inspect {}", joined.display()));
+        }
+    };
+    Ok((source_root, modules_dir))
+}
+
 fn is_identifier(name: &str) -> bool {
     let mut chars = name.chars();
     chars
@@ -401,7 +423,17 @@ fn collect_python_modules(
     directory: &Path,
     files: &mut BTreeMap<String, Vec<u8>>,
 ) -> anyhow::Result<Value> {
-    if !directory.join("workers").join("__init__.py").is_file() {
+    // Neither component is followed: `is_file` through a planted link would
+    // answer whether an arbitrary host path exists. `__init__.py` is looked
+    // up only once `workers` is known to be a real directory, since its
+    // lookup resolves `workers` as a parent. A linked SDK fails like a
+    // missing one.
+    let workers = directory.join("workers");
+    let real_dir = std::fs::symlink_metadata(&workers).is_ok_and(|meta| meta.file_type().is_dir());
+    let real_init = real_dir
+        && std::fs::symlink_metadata(workers.join("__init__.py"))
+            .is_ok_and(|meta| meta.file_type().is_file());
+    if !real_init {
         bail!(
             "{} does not contain the Workers SDK (`workers-runtime-sdk`); run \
              `uv run pywrangler sync` to vendor the project's packages",
@@ -683,4 +715,122 @@ fn run_esbuild(directory: &Path) -> anyhow::Result<()> {
 #[cfg(all(test, celld_internal_tests))]
 mod internal_tests {
     include!(env!("CELLD_INTERNAL_PYTHON_DEPLOY_TESTS"));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn compat() -> PythonCompat {
+        PythonCompat {
+            process_pth_files: false,
+            request_headers_preserve_commas: false,
+            workflows_implicit_dependencies: false,
+        }
+    }
+
+    #[test]
+    fn python_entry_outside_the_project_is_refused_before_any_read() {
+        let project = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("entry.py"), "OUTSIDE\n").unwrap();
+        std::os::unix::fs::symlink(outside.path(), project.path().join("sub")).unwrap();
+        // No `python_modules/` and no runtime cache: the refusal must land
+        // before the build reads sources or reaches the network.
+        let error = match build(project.path(), "sub/entry.py", &compat()) {
+            Ok(_) => panic!("a Python entry outside the project must be refused"),
+            Err(error) => error,
+        };
+        let message = format!("{error:?}");
+        assert!(
+            message.contains("config `main`") && message.contains("escapes the project"),
+            "the refusal must name the config key: {message}"
+        );
+    }
+
+    #[test]
+    fn python_modules_outside_the_project_are_refused() {
+        let project = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(project.path().join("entry.py"), "INSIDE\n").unwrap();
+        std::os::unix::fs::symlink(outside.path(), project.path().join("python_modules")).unwrap();
+        let error = match resolve_source_dirs(project.path(), "entry.py") {
+            Ok(_) => panic!("`python_modules` outside the project must be refused"),
+            Err(error) => error,
+        };
+        let message = format!("{error:?}");
+        assert!(
+            message.contains("`python_modules`") && message.contains("escapes the project"),
+            "the refusal must name the directory: {message}"
+        );
+    }
+
+    #[test]
+    fn python_sources_through_in_tree_links_still_resolve() {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir(project.path().join("real")).unwrap();
+        std::fs::write(project.path().join("real/entry.py"), "INSIDE\n").unwrap();
+        std::fs::create_dir(project.path().join("vendored")).unwrap();
+        std::os::unix::fs::symlink(Path::new("real"), project.path().join("sub")).unwrap();
+        std::os::unix::fs::symlink(Path::new("vendored"), project.path().join("python_modules"))
+            .unwrap();
+        let (source_root, modules_dir) =
+            resolve_source_dirs(project.path(), "sub/entry.py").unwrap();
+        let canonical_root = project.path().canonicalize().unwrap();
+        assert_eq!(source_root, canonical_root.join("real"));
+        assert_eq!(modules_dir, canonical_root.join("vendored"));
+    }
+
+    /// The SDK probe follows no link: a planted `workers` directory link or
+    /// `__init__.py` link answers like a missing SDK, whether or not its
+    /// target exists, so the deploy cannot probe host paths. A real SDK
+    /// file still passes the probe.
+    #[test]
+    fn sdk_probe_follows_no_links() {
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir(outside.path().join("workers")).unwrap();
+        std::fs::write(outside.path().join("workers/__init__.py"), "").unwrap();
+        let sdk_error = |modules: &Path| {
+            let mut files = BTreeMap::new();
+            match collect_python_modules(modules, &mut files) {
+                Ok(_) => String::new(),
+                Err(error) => format!("{error:#}"),
+            }
+        };
+        let dir_link = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(
+            outside.path().join("workers"),
+            dir_link.path().join("workers"),
+        )
+        .unwrap();
+        let file_link = tempfile::tempdir().unwrap();
+        std::fs::create_dir(file_link.path().join("workers")).unwrap();
+        std::os::unix::fs::symlink(
+            outside.path().join("workers/__init__.py"),
+            file_link.path().join("workers/__init__.py"),
+        )
+        .unwrap();
+        for modules in [dir_link.path(), file_link.path()] {
+            assert!(
+                sdk_error(modules).contains("does not contain the Workers SDK"),
+                "a linked SDK reads as missing: {}",
+                modules.display()
+            );
+        }
+        assert!(
+            !sdk_error(outside.path()).contains("does not contain the Workers SDK"),
+            "a real SDK passes the probe"
+        );
+    }
+
+    #[test]
+    fn missing_python_modules_stay_missing_for_the_friendly_error() {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(project.path().join("entry.py"), "INSIDE\n").unwrap();
+        let (source_root, modules_dir) = resolve_source_dirs(project.path(), "entry.py").unwrap();
+        let canonical_root = project.path().canonicalize().unwrap();
+        assert_eq!(source_root, canonical_root);
+        assert_eq!(modules_dir, canonical_root.join("python_modules"));
+        assert!(!modules_dir.exists());
+    }
 }

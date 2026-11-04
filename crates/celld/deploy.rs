@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): idempotent content-tagged image create; tag-race tests run the fake engine through sh; deploy --sourcemap writes the bundle's external map; service binding targets validated at deploy; staged activation; deploy --sourcemap collects the no_bundle sibling map; staged invoke shares the version-ref parsing.
+// Modified by ryuzcorp (ryuzcorp/celld): idempotent content-tagged image create; tag-race tests run the fake engine through sh; deploy --sourcemap writes the bundle's external map; service binding targets validated at deploy; staged activation; deploy --sourcemap collects the no_bundle sibling map; staged invoke shares the version-ref parsing; deploy reads stay inside the project.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 // Deployment is an operator control-plane path outside the Actor execution
@@ -36,6 +36,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
+mod confine;
 mod python;
 
 /// Config keys we understand. Anything else is an error: refusing is
@@ -754,12 +755,7 @@ fn gzipped(modules: &[(String, Vec<u8>)]) -> usize {
 }
 
 pub fn build(options: &Options) -> anyhow::Result<Built> {
-    let config_path = resolve_config(options.config.clone())?;
-    let root = config_path
-        .parent()
-        .filter(|path| !path.as_os_str().is_empty())
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from("."));
+    let (config_path, root) = resolve_project_config(options.config.clone())?;
     let mut project = read_project(&config_path, &root, &options.vars)?;
     // Resolve every image before the version is computed: the id is part of
     // the deployment's identity, so a rebuilt image is a new deployment.
@@ -772,7 +768,15 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
     let images = project
         .containers
         .iter()
-        .map(|decl| resolve_image(&root, &decl.image, platform.as_deref()))
+        .enumerate()
+        .map(|(index, decl)| {
+            resolve_image(
+                &root,
+                &decl.image,
+                &format!("config `containers[{index}].image`"),
+                platform.as_deref(),
+            )
+        })
         .collect::<anyhow::Result<Vec<_>>>()?;
     let container_specs: Vec<ContainerSpec> = project
         .containers
@@ -809,7 +813,10 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
             } else if project.no_bundle {
                 // Already bundled by the caller's toolchain. Read it as it is;
                 // running esbuild over a Vite build is what corrupts it.
-                let path = root.join(entry);
+                // The read goes through the contained path, not the raw join:
+                // a directory link above the entry would otherwise redirect
+                // both this read and the wasm scan below out of the project.
+                let path = contained_entry(&root, entry)?;
                 let bundle = std::fs::read(&path)
                     .with_context(|| format!("read entry point {}", path.display()))?;
                 let mut wasm = Vec::new();
@@ -836,7 +843,10 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
                     sourcemap,
                 })
             } else {
-                run_esbuild(&root, entry, &project.bundle, options.sourcemap.is_some())
+                // esbuild resolves the entry itself, so it is handed the
+                // contained path rather than the raw config value.
+                let path = contained_entry(&root, entry)?;
+                run_esbuild(&root, &path, &project.bundle, options.sourcemap.is_some())
             }
         })
         .transpose()?;
@@ -954,10 +964,36 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
     })
 }
 
-/// Whether `image` names a Dockerfile in the project rather than an image
-/// reference: the file exists. Wrangler draws the same line.
-fn is_dockerfile(root: &Path, image: &str) -> bool {
-    std::fs::symlink_metadata(root.join(image)).is_ok_and(|metadata| metadata.is_file())
+/// The Dockerfile `image` names, when it names one rather than an image
+/// reference: a project-relative path to a regular file, resolved inside the
+/// project root. Wrangler draws the same line between a path and a reference.
+/// Anything else is a reference — including a symlink, which is never
+/// followed here. A value that is neither project-relative nor a reference
+/// (absolute, climbing with `..`) is refused without probing the filesystem:
+/// branching on whether such a path exists would leak host file existence
+/// one deploy error at a time.
+fn dockerfile_path(
+    canonical_root: &Path,
+    root: &Path,
+    image: &str,
+    what: &str,
+) -> anyhow::Result<Option<PathBuf>> {
+    let relative = match project_relative_path(image, what) {
+        Ok(relative) => relative,
+        Err(_) => bail!("{what} must be a project-relative path or an image reference: {image:?}"),
+    };
+    let path = root.join(relative);
+    let metadata = match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| format!("inspect {}", path.display()));
+        }
+    };
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+        return Ok(None);
+    }
+    contain_path(canonical_root, &path, what).map(Some)
 }
 
 fn engine_cli() -> String {
@@ -996,29 +1032,36 @@ fn run_engine_cli(cli: &[&str], args: &[&str], what: &str) -> anyhow::Result<Str
 /// bucket. The layer digests and the image config are stable across such
 /// builds, so their hash names the image everywhere: in the manifest, in
 /// the bucket key, and as the tag every engine holds it under.
-fn resolve_image(root: &Path, image: &str, platform: Option<&str>) -> anyhow::Result<String> {
-    resolve_image_cli(&[&engine_cli()], root, image, platform)
+fn resolve_image(
+    root: &Path,
+    image: &str,
+    what: &str,
+    platform: Option<&str>,
+) -> anyhow::Result<String> {
+    resolve_image_cli(&[&engine_cli()], root, image, what, platform)
 }
 
 /// `resolve_image` against an explicit engine CLI: the program and any
-/// leading arguments.
+/// leading arguments. `what` names the config value in the error when the
+/// value escapes the project.
 fn resolve_image_cli(
     cli: &[&str],
     root: &Path,
     image: &str,
+    what: &str,
     platform: Option<&str>,
 ) -> anyhow::Result<String> {
     let run_engine = |args: &[&str], what: &str| run_engine_cli(cli, args, what);
     let platform_args = platform
         .map(|platform| vec!["--platform", platform])
         .unwrap_or_default();
-    let id = if is_dockerfile(root, image) {
-        let path = root.join(image);
+    let canonical_root = canonical_project_root(root)?;
+    let id = if let Some(path) = dockerfile_path(&canonical_root, root, image, what)? {
         let context = path
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
             .map(Path::to_path_buf)
-            .unwrap_or_else(|| root.to_path_buf());
+            .unwrap_or_else(|| canonical_root.clone());
         let path = path.display().to_string();
         let context = context.display().to_string();
         let mut args = vec!["build", "-q"];
@@ -1091,7 +1134,13 @@ fn resolve_fence_image(platform: Option<&str>) -> anyhow::Result<String> {
     let context = tempfile::tempdir().context("fence image build context")?;
     std::fs::write(context.path().join("Dockerfile"), FENCE_DOCKERFILE)
         .context("write fence Dockerfile")?;
-    resolve_image(context.path(), "Dockerfile", platform).context("build the celld-fence image")
+    resolve_image(
+        context.path(),
+        "Dockerfile",
+        "the fence Dockerfile",
+        platform,
+    )
+    .context("build the celld-fence image")
 }
 
 /// Save the image to the bucket under its content key unless it is there.
@@ -2617,8 +2666,7 @@ pub struct D1Declaration {
 /// but it does not bundle: `celld d1` acts on a database that is already
 /// deployed, and a project that fails to build must still be migratable.
 pub fn read_d1_project(given: Option<PathBuf>) -> anyhow::Result<D1Project> {
-    let path = resolve_config(given)?;
-    let root = path.parent().unwrap_or(Path::new(".")).to_path_buf();
+    let (path, root) = resolve_project_config(given)?;
     let source =
         std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
     let config: Value = serde_json::from_str(&strip_jsonc(&source))
@@ -2676,6 +2724,21 @@ pub fn read_d1_project(given: Option<PathBuf>) -> anyhow::Result<D1Project> {
                     root.join(project_relative_path(directory, "migrations_dir")?)
                 }
                 Some(_) => bail!("d1 database {name:?} has a non-string `migrations_dir`"),
+            };
+            // The lexical check above cannot see directory links: the joined
+            // path must resolve inside the project. A missing directory stays
+            // missing so `celld d1` can report it when it reads.
+            let migrations_dir = match std::fs::symlink_metadata(&migrations_dir) {
+                Ok(_) => contain_path(
+                    &root,
+                    &migrations_dir,
+                    &format!("d1 database {name:?} `migrations_dir`"),
+                )?,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => migrations_dir,
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("inspect {}", migrations_dir.display()));
+                }
             };
             databases.push(D1Declaration {
                 database_name: name.to_string(),
@@ -2794,12 +2857,10 @@ fn read_project(path: &Path, root: &Path, overrides: &VarOverrides) -> anyhow::R
         })
         .transpose()?;
     if let Some(main) = &main {
-        let entry = root.join(main);
-        let metadata = std::fs::symlink_metadata(&entry)
-            .with_context(|| format!("inspect entry point {}", entry.display()))?;
-        if !metadata.file_type().is_file() {
-            bail!("entry point {} is not a regular file", entry.display());
-        }
+        // `symlink_metadata` sees only the final component: a directory link
+        // above the entry would still escape the project, so the whole
+        // resolution must stay inside the root.
+        contained_entry(root, main)?;
     }
     let no_bundle = match object.get("no_bundle") {
         None => false,
@@ -3923,6 +3984,10 @@ fn read_asset_project(
             directory.display()
         );
     }
+    // The check above sees only the final component: a directory link on the
+    // way there would still escape the project. Everything below — the
+    // directives, the walk, the reads — starts from the contained path.
+    let directory = contain_path(root, &directory, "config `assets.directory`")?;
 
     let binding = object
         .get("binding")
@@ -4037,6 +4102,66 @@ fn project_relative_path(value: &str, key: &str) -> anyhow::Result<String> {
         bail!("config `{key}` must be a path inside the project");
     }
     Ok(value.to_string())
+}
+
+/// The canonical project root: `root` with every link resolved. Every
+/// deploy-time read of the project tree must resolve inside it, and
+/// `contain_path` enforces that per path. Canonicalizing is portable across
+/// the Linux and macOS hosts this builds on, where `openat2` is not.
+fn canonical_project_root(root: &Path) -> anyhow::Result<PathBuf> {
+    root.canonicalize()
+        .with_context(|| format!("resolve project directory {}", root.display()))
+}
+
+/// Canonicalize `path` and refuse it when it resolves outside
+/// `canonical_root`. `what` names the config value in the error. A path that
+/// stays inside — including one that crosses a link to elsewhere in the
+/// tree — resolves to the path the read must go through. As with every
+/// metadata-then-read check in the deploy, the tree is assumed static while
+/// the deploy runs: a link swapped between this check and the read is out of
+/// model, as a hard link to the same bytes would be regardless.
+fn contain_path(canonical_root: &Path, path: &Path, what: &str) -> anyhow::Result<PathBuf> {
+    let canonical = path
+        .canonicalize()
+        .with_context(|| format!("resolve {what} {}", path.display()))?;
+    if !canonical.starts_with(canonical_root) {
+        bail!("{what} escapes the project directory: {}", path.display());
+    }
+    Ok(canonical)
+}
+
+/// The config file and the canonical project root: the config's directory,
+/// canonicalized, with the config itself required to resolve inside it. A
+/// config that is a link outside the tree would otherwise let another file's
+/// contents be read as this project's config.
+fn resolve_project_config(given: Option<PathBuf>) -> anyhow::Result<(PathBuf, PathBuf)> {
+    let config_path = resolve_config(given)?;
+    let root = config_path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let root = canonical_project_root(&root)?;
+    let name = config_path
+        .file_name()
+        .ok_or_else(|| anyhow!("config {} has no file name", config_path.display()))?;
+    let path = root.join(name);
+    let canonical = contain_path(&root, &path, "the project config")?;
+    Ok((canonical, root))
+}
+
+/// The contained path of the `main` entry: a regular file, not a link, that
+/// resolves inside the canonical root. Validation and every build path share
+/// it, so the checked file and the read file resolve the same way.
+fn contained_entry(root: &Path, entry: &str) -> anyhow::Result<PathBuf> {
+    let root = canonical_project_root(root)?;
+    let path = root.join(entry);
+    let metadata = std::fs::symlink_metadata(&path)
+        .with_context(|| format!("inspect entry point {}", path.display()))?;
+    if !metadata.file_type().is_file() {
+        bail!("entry point {} is not a regular file", path.display());
+    }
+    contain_path(&root, &path, "config `main`")
 }
 
 fn optional_asset_mode(
@@ -4371,7 +4496,7 @@ fn collect_unbundled_wasm(
 
 fn run_esbuild(
     root: &Path,
-    entry: &str,
+    entry: &Path,
     config: &BundleConfig,
     sourcemap: bool,
 ) -> anyhow::Result<BundleOutput> {
@@ -4380,6 +4505,11 @@ fn run_esbuild(
     // provides them.
     let binary = std::env::var("CELLD_ESBUILD").unwrap_or_else(|_| "esbuild".to_string());
     let outdir = tempfile::tempdir().context("create esbuild output directory")?;
+    // The metafile lives apart from the output directory, whose files are
+    // scanned for copied modules below: a `.json` copy rule must never pick
+    // it up as one.
+    let metadir = tempfile::tempdir().context("create esbuild metafile directory")?;
+    let metafile = metadir.path().join("meta.json");
     // esbuild leaves an external builtin from a CommonJS dependency behind
     // its synchronous __require helper. Workerd's Wrangler plugin rewrites
     // that call to an ESM import, but the esbuild CLI has no equivalent
@@ -4396,56 +4526,100 @@ fn run_esbuild(
   }
   return builtin;
 };"#;
-    let output =
-        Command::new(&binary)
-            .current_dir(root)
-            .arg(entry)
-            .arg("--bundle")
-            .arg("--format=esm")
-            .arg("--platform=browser")
-            .arg("--target=es2024")
-            .arg("--conditions=workerd,worker,browser")
-            .arg(format!("--banner:js={commonjs_builtin_bridge}"))
-            .arg("--external:node:*")
-            .arg("--external:cloudflare:*")
-            .args(
-                crate::js::BARE_NODE_BUILTINS
-                    .iter()
-                    .map(|specifier| format!("--external:{specifier}")),
-            )
-            .args(config.loaders.iter().map(|(extension, loader)| {
+    // esbuild may read only the project and its own two directories: an
+    // outside import, input source map, or tsconfig `extends` then fails
+    // like a missing file, before any of its bytes can reach the bundle,
+    // the map, or esbuild's error output (which quotes source lines).
+    let canonical_root = canonical_project_root(root)?;
+    let Some(program) = confine::locate_executable(&binary) else {
+        bail!(
+            "esbuild not found ({binary}).\n\
+             `celld deploy` bundles with esbuild; install it and retry,\n\
+             or set CELLD_ESBUILD to its path."
+        );
+    };
+    let confinement = confine::ReadConfinement::beneath(
+        &[canonical_root.as_path(), outdir.path(), metadir.path()],
+        &program,
+    )?;
+    #[cfg(target_os = "linux")]
+    if let confine::ReadConfinement::Unavailable(reason) = &confinement {
+        note!(
+            "warning: esbuild runs unconfined: {reason}. Bundled files are still \
+             checked against the project directory, but an outside input source map, \
+             tsconfig, or failing file can reach the source map or the error output."
+        );
+    }
+    let mut command = Command::new(&program);
+    command
+        .current_dir(root)
+        .arg(entry)
+        .arg("--bundle")
+        .arg("--format=esm")
+        .arg("--platform=browser")
+        .arg("--target=es2024")
+        .arg("--conditions=workerd,worker,browser")
+        .arg(format!("--banner:js={commonjs_builtin_bridge}"))
+        .arg("--external:node:*")
+        .arg("--external:cloudflare:*")
+        .args(
+            crate::js::BARE_NODE_BUILTINS
+                .iter()
+                .map(|specifier| format!("--external:{specifier}")),
+        )
+        .args(
+            config.loaders.iter().map(|(extension, loader)| {
                 format!("--loader:{extension}={}", loader.esbuild_name())
-            }))
-            .args(
-                config
-                    .define
-                    .iter()
-                    .map(|(key, value)| format!("--define:{key}={value}")),
-            )
-            .arg(format!("--outdir={}", outdir.path().display()))
-            .arg("--entry-names=index")
-            // `external` emits `index.js.map` without appending a
-            // `//# sourceMappingURL=` comment, so the bundle equals a run
-            // without the flag. The strip below still applies on top.
-            .args(sourcemap.then_some("--sourcemap=external"))
-            .output()
-            .map_err(|error| {
-                if error.kind() == std::io::ErrorKind::NotFound {
-                    anyhow!(
-                        "esbuild not found ({binary}).\n\
+            }),
+        )
+        .args(
+            config
+                .define
+                .iter()
+                .map(|(key, value)| format!("--define:{key}={value}")),
+        )
+        .arg(format!("--outdir={}", outdir.path().display()))
+        .arg(format!("--metafile={}", metafile.display()))
+        .arg("--entry-names=index")
+        // `external` emits `index.js.map` without appending a
+        // `//# sourceMappingURL=` comment, so the bundle equals a run
+        // without the flag. The strip below still applies on top.
+        .args(sourcemap.then_some("--sourcemap=external"));
+    confinement.apply(&mut command);
+    let output = command.output().map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            anyhow!(
+                "esbuild not found ({binary}).\n\
                      `celld deploy` bundles with esbuild; install it and retry,\n\
                      or set CELLD_ESBUILD to its path."
-                    )
-                } else {
-                    anyhow!("run esbuild: {error}")
-                }
-            })?;
+            )
+        } else if error.kind() == std::io::ErrorKind::PermissionDenied && confinement.confines() {
+            anyhow!(
+                "run esbuild {}: {error}. esbuild runs confined to reads of the \
+                 project; if this is a wrapper script, it cannot read its \
+                 interpreter, so point CELLD_ESBUILD at the self-contained \
+                 release binary.",
+                program.display()
+            )
+        } else {
+            anyhow!("run esbuild: {error}")
+        }
+    })?;
     if !output.status.success() {
         bail!(
             "esbuild failed:\n{}",
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }
+    // Before anything esbuild wrote is used: every file it read must lie in
+    // the project. esbuild follows `..` imports, absolute imports, and
+    // directory links wherever they lead, and the deploy may run with more
+    // privilege than the project's author, so an import must never pull a
+    // file from outside the tree into the deployed bundle or its map.
+    // The check stands on its own where the kernel offers no confinement,
+    // and backs it up where it does.
+    let meta = std::fs::read(&metafile).context("read esbuild metafile")?;
+    contain_bundle_inputs(&canonical_root, &meta)?;
     // The strip keeps the deployed module byte-identical to a run without
     // the flag even if an esbuild ever appends the comment despite `external`.
     let bundle = strip_sourcemap_comment(
@@ -4504,6 +4678,42 @@ fn run_esbuild(
         wasm,
         sourcemap,
     })
+}
+
+/// Refuse a bundle that read any file outside `canonical_root`. `meta` is
+/// the esbuild metafile from a run whose working directory was the project
+/// root, so each file input is named relative to it (or absolutely). Every
+/// input that names an existing path is checked, whatever it looks like;
+/// only one that names nothing and is spelled like another namespace
+/// (`(disabled):…`, `<data:…>`, `dataurl:…`) read no file and is skipped.
+/// Any other input fails closed.
+fn contain_bundle_inputs(canonical_root: &Path, meta: &[u8]) -> anyhow::Result<()> {
+    let meta: Value = serde_json::from_slice(meta).context("parse esbuild metafile")?;
+    let inputs = meta
+        .get("inputs")
+        .and_then(Value::as_object)
+        .context("esbuild metafile has no inputs")?;
+    for input in inputs.keys() {
+        let namespaced = input.starts_with('(')
+            || input.starts_with('<')
+            || input
+                .split_once(':')
+                .is_some_and(|(namespace, _)| !namespace.is_empty() && !namespace.contains('/'));
+        if namespaced && std::fs::symlink_metadata(canonical_root.join(input)).is_err() {
+            continue;
+        }
+        // The error names the input as esbuild keyed it, never the resolved
+        // target, so a refusal discloses nothing beyond the project's own
+        // spelling.
+        let canonical = canonical_root
+            .join(input)
+            .canonicalize()
+            .with_context(|| format!("resolve a bundled module {input}"))?;
+        if !canonical.starts_with(canonical_root) {
+            bail!("a bundled module escapes the project directory: {input}");
+        }
+    }
+    Ok(())
 }
 
 /// Rewrite the map's `sources` to project-root-relative paths.
@@ -4839,14 +5049,114 @@ fi
         ["/bin/sh", script.to_str().unwrap()]
     }
 
+    /// Link `link` to `target`: the suite already assumes a Unix host (the
+    /// fake engine runs through `/bin/sh`).
+    fn symlink_for_test(target: &Path, link: &Path) {
+        std::os::unix::fs::symlink(target, link).unwrap();
+    }
+
+    #[test]
+    fn dockerfile_outside_the_project_is_refused() {
+        let project = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("Dockerfile"), "FROM scratch\n").unwrap();
+        symlink_for_test(outside.path(), &project.path().join("sub"));
+        let cli = fake_engine(
+            project.path(),
+            "fake-built-id",
+            "[layer]{config}",
+            "[layer]{config}",
+        );
+        let error = resolve_image_cli(
+            &sh(&cli),
+            project.path(),
+            "sub/Dockerfile",
+            "config `containers[0].image`",
+            None,
+        )
+        .expect_err("a Dockerfile outside the project must be refused, not built");
+        let message = format!("{error:?}");
+        assert!(
+            message.contains("config `containers[0].image`")
+                && message.contains("escapes the project"),
+            "the refusal must name the config key: {message}"
+        );
+        // An absolute path is refused without looking at the filesystem,
+        // whether or not it names a file: branching on existence would leak
+        // host file existence one deploy error at a time.
+        for absolute in [
+            outside.path().join("Dockerfile"),
+            outside.path().join("no-such-dockerfile"),
+        ] {
+            let error = resolve_image_cli(
+                &sh(&cli),
+                project.path(),
+                absolute.to_str().unwrap(),
+                "config `containers[0].image`",
+                None,
+            )
+            .expect_err("an absolute image value must be refused, not built");
+            let message = format!("{error:?}");
+            assert!(
+                message.contains("config `containers[0].image`")
+                    && message.contains("must be a project-relative path or an image reference"),
+                "the refusal must name the key without probing: {message}"
+            );
+        }
+        // So is a `..` path that climbs out of the project.
+        std::fs::write(project.path().join("Dockerfile"), "FROM scratch\n").unwrap();
+        std::fs::create_dir(project.path().join("inner")).unwrap();
+        let error = resolve_image_cli(
+            &sh(&cli),
+            &project.path().join("inner"),
+            "../Dockerfile",
+            "config `containers[0].image`",
+            None,
+        )
+        .expect_err("a `..` image value must be refused, not built");
+        let message = format!("{error:?}");
+        assert!(
+            message.contains("must be a project-relative path or an image reference"),
+            "the refusal must say the value is neither: {message}"
+        );
+    }
+
+    #[test]
+    fn dockerfile_through_an_in_tree_link_still_builds() {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir(project.path().join("real")).unwrap();
+        std::fs::write(project.path().join("real/Dockerfile"), "FROM scratch\n").unwrap();
+        symlink_for_test(Path::new("real"), &project.path().join("sub"));
+        let content = "[layer]{config}";
+        let cli = fake_engine(project.path(), "fake-built-id", content, content);
+        let reference = resolve_image_cli(
+            &sh(&cli),
+            project.path(),
+            "sub/Dockerfile",
+            "config `containers[0].image`",
+            None,
+        )
+        .expect("a Dockerfile behind an in-tree link still builds");
+        assert_eq!(
+            reference,
+            crate::container::image_reference(&format!("{:x}", Sha256::digest(content)))
+        );
+    }
+
     #[test]
     fn tag_race_against_identical_image_succeeds() {
         let dir = tempfile::tempdir().unwrap();
         dockerfile_project(dir.path());
         let content = "[layer-a]{config-a}";
         let cli = fake_engine(dir.path(), "fake-built-id", content, content);
-        let reference = resolve_image_cli(&sh(&cli), dir.path(), "Dockerfile", None)
-            .expect("an identical image under the tag is the lost race's winner");
+        let reference = resolve_image_cli(
+            &sh(&cli),
+            dir.path(),
+            "Dockerfile",
+            "config `containers[0].image`",
+            None,
+        )
+        .expect("an identical image under the tag is the lost race's winner");
         assert_eq!(
             reference,
             crate::container::image_reference(&format!("{:x}", Sha256::digest(content)))
@@ -4863,8 +5173,14 @@ fi
             "[layer-a]{config-a}",
             "[layer-b]{config-b}",
         );
-        let error = resolve_image_cli(&sh(&cli), dir.path(), "Dockerfile", None)
-            .expect_err("a different image under the tag must still fail");
+        let error = resolve_image_cli(
+            &sh(&cli),
+            dir.path(),
+            "Dockerfile",
+            "config `containers[0].image`",
+            None,
+        )
+        .expect_err("a different image under the tag must still fail");
         let message = format!("{error:?}");
         assert!(
             message.contains("AlreadyExists"),
@@ -4989,6 +5305,12 @@ mod sourcemap_tests {
     /// Whether the esbuild binary `run_esbuild` would use answers. Tests that
     /// bundle return early without it, so a machine without esbuild still runs
     /// the suite; the Docker test stage installs esbuild, so CI runs them.
+    /// Whether this kernel confines esbuild's reads (Landlock).
+    fn esbuild_confined() -> bool {
+        confine::ReadConfinement::beneath(&[Path::new("/")], Path::new("/bin/sh"))
+            .is_ok_and(|confinement| confinement.confines())
+    }
+
     fn esbuild_available() -> bool {
         let binary = std::env::var("CELLD_ESBUILD").unwrap_or_else(|_| "esbuild".to_string());
         Command::new(binary)
@@ -5363,9 +5685,10 @@ mod sourcemap_tests {
         }
     }
 
-    /// A directory symlink on the entry's path leads outside the project:
-    /// the sibling map there is never read, even though it is a regular
-    /// file and a valid map.
+    /// A directory symlink on the entry's path leads outside the project.
+    /// The entry itself is refused before the sibling is ever considered;
+    /// the sibling reader's own containment is pinned directly below it,
+    /// as defense in depth.
     #[test]
     fn sourcemap_no_bundle_sibling_outside_the_root_is_skipped() {
         let tree = tempfile::tempdir().unwrap();
@@ -5379,7 +5702,28 @@ mod sourcemap_tests {
         )
         .unwrap();
         std::os::unix::fs::symlink(&outside, root.join("sub")).unwrap();
-        assert_eq!(build_no_bundle_with_map(&root, "sub/entry.js"), None);
+        std::fs::write(
+            root.join("wrangler.json"),
+            r#"{"name": "maptest", "main": "sub/entry.js", "no_bundle": true}"#,
+        )
+        .unwrap();
+        let error = refused(
+            build(&test_options(
+                &root.join("wrangler.json"),
+                Some(root.join("out.js.map")),
+            )),
+            "an entry outside the project must be refused with its sibling",
+        );
+        let message = format!("{error:?}");
+        assert!(
+            message.contains("config `main`") && message.contains("escapes the project"),
+            "the refusal must name the config key: {message}"
+        );
+        assert_eq!(
+            sibling_sourcemap(&outside.join("entry.js"), &root),
+            None,
+            "the sibling reader must skip an entry outside the root on its own"
+        );
     }
 
     /// Sibling sources resolve lexically against the entry's directory,
@@ -5446,6 +5790,550 @@ mod sourcemap_tests {
         assert!(
             message.contains("__celld-runtime"),
             "the refusal must name the bad target: {message}"
+        );
+    }
+
+    /// Link `link` to `target`: the suite already assumes a Unix host (the
+    /// fake engine runs through `/bin/sh`).
+    fn symlink_for_test(target: &Path, link: &Path) {
+        std::os::unix::fs::symlink(target, link).unwrap();
+    }
+
+    /// The error of a result that must be one, for success types without
+    /// `Debug` (`expect_err` needs it).
+    fn refused<T>(result: anyhow::Result<T>, message: &str) -> anyhow::Error {
+        match result {
+            Ok(_) => panic!("{message}"),
+            Err(error) => error,
+        }
+    }
+
+    /// The metafile check: every file input must resolve inside the root.
+    /// Namespaced inputs read no file and pass; a `..` path, an absolute
+    /// path, and a link out of the tree are refused; an in-tree link passes.
+    #[test]
+    fn bundle_inputs_outside_the_project_are_refused() {
+        let tree = tempfile::tempdir().unwrap();
+        let (root, outside) = (tree.path().join("project"), tree.path().join("outside"));
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(root.join("src/app.js"), "").unwrap();
+        std::fs::write(outside.join("secret.js"), "").unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("out-link")).unwrap();
+        std::os::unix::fs::symlink(root.join("src"), root.join("in-link")).unwrap();
+        let root = canonical_project_root(&root).unwrap();
+        let meta = |inputs: &[&str]| {
+            let inputs: serde_json::Map<String, Value> = inputs
+                .iter()
+                .map(|name| (name.to_string(), json!({})))
+                .collect();
+            serde_json::to_vec(&json!({ "inputs": inputs })).unwrap()
+        };
+        let inside = meta(&[
+            "src/app.js",
+            "in-link/app.js",
+            "(disabled):fs",
+            "dataurl:data:text/plain,x",
+        ]);
+        contain_bundle_inputs(&root, &inside).expect("in-tree inputs pass");
+        let absolute = outside.join("secret.js");
+        for escaping in [
+            "../outside/secret.js",
+            absolute.to_str().unwrap(),
+            "out-link/secret.js",
+        ] {
+            let error =
+                contain_bundle_inputs(&root, &meta(&["src/app.js", escaping])).expect_err(escaping);
+            assert!(
+                format!("{error:#}").contains("escapes the project directory"),
+                "{escaping}: {error:#}"
+            );
+        }
+        assert!(
+            contain_bundle_inputs(&root, &meta(&["src/gone.js"])).is_err(),
+            "an unresolvable file input fails closed"
+        );
+        // A name spelled like a namespace is skipped only when it names
+        // nothing: a real path is checked like any other.
+        std::os::unix::fs::symlink(outside.join("secret.js"), root.join("ns:x")).unwrap();
+        std::os::unix::fs::symlink(outside.join("secret.js"), root.join("(x).js")).unwrap();
+        for disguised in ["ns:x", "(x).js"] {
+            let error = contain_bundle_inputs(&root, &meta(&[disguised])).expect_err(disguised);
+            assert!(
+                format!("{error:#}").contains("escapes the project directory"),
+                "{disguised}: {error:#}"
+            );
+        }
+    }
+
+    /// End to end through esbuild: an import that climbs out of the
+    /// project, one through a directory link out of it, and a JSON import
+    /// from outside all fail the build, while in-tree imports (through an
+    /// in-tree link too) still bundle.
+    #[test]
+    fn bundled_imports_outside_the_project_are_refused() {
+        if !esbuild_available() {
+            eprintln!("skipping: esbuild not on PATH");
+            return;
+        }
+        let tree = tempfile::tempdir().unwrap();
+        let (root, outside) = (tree.path().join("project"), tree.path().join("outside"));
+        std::fs::create_dir_all(root.join("lib")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.js"), "export default 'OUTSIDE';\n").unwrap();
+        std::fs::write(outside.join("data.json"), "{\"secret\": \"OUTSIDE\"}\n").unwrap();
+        std::fs::write(root.join("lib/ok.js"), "export const ok = 1;\n").unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("ext")).unwrap();
+        std::os::unix::fs::symlink(root.join("lib"), root.join("alias")).unwrap();
+        std::fs::write(
+            root.join("wrangler.json"),
+            r#"{"name": "contain", "main": "entry.js"}"#,
+        )
+        .unwrap();
+        let config = root.join("wrangler.json");
+        let entry = |import: &str| {
+            std::fs::write(
+                root.join("entry.js"),
+                format!(
+                    "import x from {import:?};\n\
+                     export default {{ fetch() {{ return new Response(JSON.stringify(x)); }} }};\n"
+                ),
+            )
+            .unwrap();
+        };
+        // Confined, esbuild cannot read the file at all; unconfined, the
+        // metafile check refuses what it read.
+        let expected = if esbuild_confined() {
+            "permission denied"
+        } else {
+            "escapes the project directory"
+        };
+        for import in [
+            "../outside/secret.js",
+            "./ext/secret.js",
+            "../outside/data.json",
+        ] {
+            entry(import);
+            let error = format!("{:#}", refused(build(&test_options(&config, None)), import));
+            assert!(error.contains(expected), "{import}: {error}");
+            assert!(!error.contains("OUTSIDE"), "{import}: {error}");
+        }
+        std::fs::write(
+            root.join("entry.js"),
+            "import { ok } from \"./alias/ok.js\";\n\
+             export default { fetch() { return new Response(String(ok)); } };\n",
+        )
+        .unwrap();
+        build(&test_options(&config, None)).expect("an in-tree link still bundles");
+    }
+
+    /// The reads the metafile never lists stay inside too: an input's
+    /// `sourceMappingURL`, a `tsconfig.json` `extends` chain, and a linked
+    /// file that fails to parse, whose line esbuild's error would quote.
+    /// None of the outside markers may reach the bundle, the map, or the
+    /// error.
+    #[test]
+    fn confined_esbuild_reads_nothing_outside_the_project() {
+        if !esbuild_available() {
+            eprintln!("skipping: esbuild not on PATH");
+            return;
+        }
+        if !esbuild_confined() {
+            eprintln!("skipping: this kernel offers no Landlock");
+            return;
+        }
+        let tree = tempfile::tempdir().unwrap();
+        let (root, outside) = (tree.path().join("project"), tree.path().join("outside"));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(
+            outside.join("evil.map"),
+            r#"{"version":3,"sources":["x.js"],"sourcesContent":["OUTSIDE-MAP"],"mappings":"AAAA"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            outside.join("base.json"),
+            r#"{"compilerOptions": {"jsxFactory": "OUTSIDE_FACTORY"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            outside.join("broken.js"),
+            "let x = 1;\nmore OUTSIDE-LINE here\n",
+        )
+        .unwrap();
+        let config = root.join("wrangler.json");
+        let leaked = |main: &str, marker: &str| {
+            std::fs::write(
+                &config,
+                format!(r#"{{"name": "confine", "main": {main:?}}}"#),
+            )
+            .unwrap();
+            match build(&test_options(&config, Some(tree.path().join("out.map")))) {
+                Ok(built) => {
+                    built
+                        .modules
+                        .iter()
+                        .any(|(_, bytes)| String::from_utf8_lossy(bytes).contains(marker))
+                        || built
+                            .sourcemap
+                            .as_ref()
+                            .is_some_and(|map| String::from_utf8_lossy(map).contains(marker))
+                }
+                Err(error) => format!("{error:#}").contains(marker),
+            }
+        };
+        std::fs::write(
+            root.join("map.js"),
+            "export default { fetch() { return new Response('ok'); } };\n\
+             //# sourceMappingURL=../outside/evil.map\n",
+        )
+        .unwrap();
+        assert!(!leaked("map.js", "OUTSIDE-MAP"), "an outside input map");
+        std::fs::write(
+            root.join("tsconfig.json"),
+            r#"{"extends": "../outside/base.json"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("view.jsx"),
+            "export default { fetch() { return new Response(String(<b />)); } };\n",
+        )
+        .unwrap();
+        assert!(
+            !leaked("view.jsx", "OUTSIDE_FACTORY"),
+            "an outside tsconfig"
+        );
+        std::fs::remove_file(root.join("tsconfig.json")).unwrap();
+        std::os::unix::fs::symlink(outside.join("broken.js"), root.join("broken.js")).unwrap();
+        std::fs::write(
+            root.join("parse.js"),
+            "import \"./broken.js\";\nexport default { fetch() { return new Response('ok'); } };\n",
+        )
+        .unwrap();
+        assert!(
+            !leaked("parse.js", "OUTSIDE-LINE"),
+            "an outside parse error"
+        );
+    }
+
+    #[test]
+    fn entry_through_a_link_outside_the_project_is_refused() {
+        let project = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("entry.js"), "OUTSIDE\n").unwrap();
+        symlink_for_test(outside.path(), &project.path().join("sub"));
+        std::fs::write(
+            project.path().join("wrangler.json"),
+            r#"{"name": "linktest", "main": "sub/entry.js", "no_bundle": true}"#,
+        )
+        .unwrap();
+        let error = refused(
+            build(&test_options(&project.path().join("wrangler.json"), None)),
+            "an entry outside the project must be refused, not deployed",
+        );
+        let message = format!("{error:?}");
+        assert!(
+            message.contains("config `main`") && message.contains("escapes the project"),
+            "the refusal must name the config key: {message}"
+        );
+        // The bundled path is refused the same way, before esbuild ever runs.
+        std::fs::write(
+            project.path().join("bundled.json"),
+            r#"{"name": "linktest", "main": "sub/entry.js"}"#,
+        )
+        .unwrap();
+        let error = refused(
+            build(&test_options(&project.path().join("bundled.json"), None)),
+            "a bundled entry outside the project must be refused without esbuild",
+        );
+        let message = format!("{error:?}");
+        assert!(
+            message.contains("config `main`") && message.contains("escapes the project"),
+            "the refusal must name the config key: {message}"
+        );
+    }
+
+    #[test]
+    fn entry_through_an_in_tree_link_still_deploys() {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir(project.path().join("real")).unwrap();
+        std::fs::write(project.path().join("real/entry.js"), "INSIDE\n").unwrap();
+        symlink_for_test(Path::new("real"), &project.path().join("sub"));
+        std::fs::write(
+            project.path().join("wrangler.json"),
+            r#"{"name": "linktest", "main": "sub/entry.js", "no_bundle": true}"#,
+        )
+        .unwrap();
+        let built = build(&test_options(&project.path().join("wrangler.json"), None)).unwrap();
+        assert_eq!(
+            built.modules,
+            vec![("index.js".to_string(), b"INSIDE\n".to_vec())]
+        );
+    }
+
+    #[test]
+    fn unbundled_wasm_outside_the_project_is_not_collected() {
+        let project = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("entry.js"), "OUTSIDE\n").unwrap();
+        std::fs::write(outside.path().join("extra.wasm"), "OUTSIDE-WASM").unwrap();
+        symlink_for_test(outside.path(), &project.path().join("sub"));
+        std::fs::write(
+            project.path().join("wrangler.json"),
+            r#"{"name": "linktest", "main": "sub/entry.js", "no_bundle": true}"#,
+        )
+        .unwrap();
+        let error = refused(
+            build(&test_options(&project.path().join("wrangler.json"), None)),
+            "wasm beside an outside entry must be refused with it",
+        );
+        let message = format!("{error:?}");
+        assert!(
+            message.contains("config `main`") && message.contains("escapes the project"),
+            "the refusal must name the config key: {message}"
+        );
+    }
+
+    #[test]
+    fn unbundled_wasm_through_an_in_tree_link_is_collected() {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir(project.path().join("real")).unwrap();
+        std::fs::write(project.path().join("real/entry.js"), "INSIDE\n").unwrap();
+        std::fs::write(project.path().join("real/extra.wasm"), "INSIDE-WASM").unwrap();
+        symlink_for_test(Path::new("real"), &project.path().join("sub"));
+        std::fs::write(
+            project.path().join("wrangler.json"),
+            r#"{"name": "linktest", "main": "sub/entry.js", "no_bundle": true}"#,
+        )
+        .unwrap();
+        let built = build(&test_options(&project.path().join("wrangler.json"), None)).unwrap();
+        assert_eq!(
+            built.modules,
+            vec![
+                ("index.js".to_string(), b"INSIDE\n".to_vec()),
+                ("extra.wasm".to_string(), b"INSIDE-WASM".to_vec()),
+            ]
+        );
+    }
+
+    #[test]
+    fn asset_directory_through_a_link_outside_the_project_is_refused() {
+        let project = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir(outside.path().join("assets")).unwrap();
+        std::fs::write(outside.path().join("assets/index.html"), "OUTSIDE\n").unwrap();
+        symlink_for_test(outside.path(), &project.path().join("sub"));
+        std::fs::write(
+            project.path().join("wrangler.json"),
+            r#"{"name": "linktest", "assets": {"directory": "sub/assets"}}"#,
+        )
+        .unwrap();
+        let error = refused(
+            build(&test_options(&project.path().join("wrangler.json"), None)),
+            "assets outside the project must be refused, not published",
+        );
+        let message = format!("{error:?}");
+        assert!(
+            message.contains("config `assets.directory`")
+                && message.contains("escapes the project"),
+            "the refusal must name the config key: {message}"
+        );
+    }
+
+    #[test]
+    fn asset_directory_through_an_in_tree_link_still_deploys() {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir(project.path().join("real")).unwrap();
+        std::fs::create_dir(project.path().join("real/assets")).unwrap();
+        std::fs::write(project.path().join("real/assets/index.html"), "INSIDE\n").unwrap();
+        symlink_for_test(Path::new("real"), &project.path().join("sub"));
+        std::fs::write(
+            project.path().join("wrangler.json"),
+            r#"{"name": "linktest", "assets": {"directory": "sub/assets"}}"#,
+        )
+        .unwrap();
+        let built = build(&test_options(&project.path().join("wrangler.json"), None)).unwrap();
+        let assets = built.assets.expect("an asset project builds assets");
+        assert_eq!(assets.file_count, 1);
+        assert_eq!(
+            assets.blobs.values().collect::<Vec<_>>(),
+            vec![&b"INSIDE\n".to_vec()]
+        );
+    }
+
+    #[test]
+    fn d1_migrations_dir_outside_the_project_is_refused() {
+        let project = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir(outside.path().join("mig")).unwrap();
+        std::fs::write(outside.path().join("mig/0001_init.sql"), "OUTSIDE\n").unwrap();
+        symlink_for_test(outside.path(), &project.path().join("sub"));
+        std::fs::write(
+            project.path().join("wrangler.json"),
+            r#"{"name": "dbtest", "d1_databases": [{"database_name": "db", "migrations_dir": "sub/mig"}]}"#,
+        )
+        .unwrap();
+        let error = refused(
+            read_d1_project(Some(project.path().join("wrangler.json"))),
+            "a migrations dir outside the project must be refused",
+        );
+        let message = format!("{error:?}");
+        assert!(
+            message.contains("`migrations_dir`") && message.contains("escapes the project"),
+            "the refusal must name the config key: {message}"
+        );
+    }
+
+    #[test]
+    fn d1_migrations_dir_through_an_in_tree_link_is_accepted() {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir(project.path().join("real")).unwrap();
+        std::fs::write(project.path().join("real/0001_init.sql"), "INSIDE\n").unwrap();
+        symlink_for_test(Path::new("real"), &project.path().join("sub"));
+        std::fs::write(
+            project.path().join("wrangler.json"),
+            r#"{"name": "dbtest", "d1_databases": [{"database_name": "db", "migrations_dir": "sub"}]}"#,
+        )
+        .unwrap();
+        let parsed = read_d1_project(Some(project.path().join("wrangler.json"))).unwrap();
+        assert_eq!(parsed.databases.len(), 1);
+        let canonical_root = project.path().canonicalize().unwrap();
+        assert!(
+            parsed.databases[0]
+                .migrations_dir
+                .starts_with(&canonical_root),
+            "the migrations dir must resolve inside the project: {}",
+            parsed.databases[0].migrations_dir.display()
+        );
+    }
+
+    #[test]
+    fn config_through_a_link_outside_the_project_is_refused() {
+        let project = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(
+            outside.path().join("other.json"),
+            r#"{"name": "outside", "main": "entry.js", "no_bundle": true}"#,
+        )
+        .unwrap();
+        std::fs::write(outside.path().join("entry.js"), "OUTSIDE\n").unwrap();
+        symlink_for_test(
+            &outside.path().join("other.json"),
+            &project.path().join("wrangler.json"),
+        );
+        let error = refused(
+            build(&test_options(&project.path().join("wrangler.json"), None)),
+            "a config linked outside the project must be refused",
+        );
+        let message = format!("{error:?}");
+        assert!(
+            message.contains("project config") && message.contains("escapes the project"),
+            "the refusal must name the config: {message}"
+        );
+        // The directory form finds the same linked file and refuses it too.
+        let error = refused(
+            build(&test_options(project.path(), None)),
+            "a linked config found by directory must be refused",
+        );
+        let message = format!("{error:?}");
+        assert!(
+            message.contains("project config") && message.contains("escapes the project"),
+            "the refusal must name the config: {message}"
+        );
+    }
+
+    #[test]
+    fn container_image_outside_the_project_is_refused_before_the_engine() {
+        // The wired path: a config whose image escapes must fail naming the
+        // key, without any engine on PATH (no `CELLD_DOCKER` is set here).
+        let project = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("Dockerfile"), "FROM scratch\n").unwrap();
+        symlink_for_test(outside.path(), &project.path().join("sub"));
+        std::fs::write(
+            project.path().join("wrangler.json"),
+            r#"{"name": "linktest", "main": "entry.js", "no_bundle": true,
+                "durable_objects": {"bindings": [{"name": "C", "class_name": "Worker"}]},
+                "migrations": [{"tag": "v1", "new_sqlite_classes": ["Worker"]}],
+                "containers": [{"class_name": "Worker", "image": "sub/Dockerfile"}]}"#,
+        )
+        .unwrap();
+        std::fs::write(project.path().join("entry.js"), "INSIDE\n").unwrap();
+        let error = refused(
+            build(&test_options(&project.path().join("wrangler.json"), None)),
+            "a container image outside the project must be refused",
+        );
+        let message = format!("{error:?}");
+        assert!(
+            message.contains("config `containers[0].image`")
+                && message.contains("escapes the project"),
+            "the refusal must name the config key: {message}"
+        );
+    }
+
+    #[test]
+    fn bundled_entry_through_an_in_tree_link_still_bundles() {
+        if !esbuild_available() {
+            eprintln!("skipping: esbuild not on PATH");
+            return;
+        }
+        let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir(project.path().join("real")).unwrap();
+        write_bundle_fixture(&project.path().join("real"));
+        // The fixture's config names the bare entry; the project config
+        // reaches it through the link.
+        std::fs::write(
+            project.path().join("wrangler.json"),
+            r#"{"name": "maptest", "main": "sub/entry.js"}"#,
+        )
+        .unwrap();
+        symlink_for_test(Path::new("real"), &project.path().join("sub"));
+        let built = build(&test_options(&project.path().join("wrangler.json"), None)).unwrap();
+        assert_eq!(built.modules.len(), 1);
+        assert_eq!(built.modules[0].0, "index.js");
+        assert!(
+            built.modules[0].1.windows(2).any(|w| w == b"42"),
+            "the bundle must contain the bundled dependency"
+        );
+    }
+
+    #[test]
+    fn unbundled_wasm_does_not_follow_nested_links() {
+        let project = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("evil.wasm"), "OUTSIDE-WASM").unwrap();
+        std::fs::write(project.path().join("entry.js"), "INSIDE\n").unwrap();
+        symlink_for_test(outside.path(), &project.path().join("nested"));
+        std::fs::write(
+            project.path().join("wrangler.json"),
+            r#"{"name": "linktest", "main": "entry.js", "no_bundle": true}"#,
+        )
+        .unwrap();
+        let built = build(&test_options(&project.path().join("wrangler.json"), None)).unwrap();
+        assert_eq!(
+            built.modules,
+            vec![("index.js".to_string(), b"INSIDE\n".to_vec())]
+        );
+    }
+
+    #[test]
+    fn config_through_an_in_tree_link_still_deploys() {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(
+            project.path().join("real.json"),
+            r#"{"name": "linktest", "main": "entry.js", "no_bundle": true}"#,
+        )
+        .unwrap();
+        std::fs::write(project.path().join("entry.js"), "INSIDE\n").unwrap();
+        symlink_for_test(
+            Path::new("real.json"),
+            &project.path().join("wrangler.json"),
+        );
+        let built = build(&test_options(&project.path().join("wrangler.json"), None)).unwrap();
+        assert_eq!(built.script_name, "linktest");
+        assert_eq!(
+            built.modules,
+            vec![("index.js".to_string(), b"INSIDE\n".to_vec())]
         );
     }
 
