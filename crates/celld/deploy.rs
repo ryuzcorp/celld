@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): idempotent content-tagged image create; tag-race tests run the fake engine through sh; deploy --sourcemap writes the bundle's external map; service binding targets validated at deploy; staged activation; deploy --sourcemap collects the no_bundle sibling map.
+// Modified by ryuzcorp (ryuzcorp/celld): idempotent content-tagged image create; tag-race tests run the fake engine through sh; deploy --sourcemap writes the bundle's external map; service binding targets validated at deploy; staged activation; deploy --sourcemap collects the no_bundle sibling map; staged invoke shares the version-ref parsing.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 // Deployment is an operator control-plane path outside the Actor execution
@@ -1224,7 +1224,7 @@ pub struct VersionRef {
     pub version: String,
 }
 
-fn parse_version_ref(argument: &str, command: &str) -> anyhow::Result<VersionRef> {
+pub(crate) fn parse_version_ref(argument: &str, command: &str) -> anyhow::Result<VersionRef> {
     let Some((script, version)) = argument.split_once('=') else {
         bail!("`celld {command}` takes SCRIPT=VERSION arguments, not {argument:?}");
     };
@@ -3784,7 +3784,7 @@ pub(crate) fn valid_resource_name(name: &str) -> bool {
 /// The Wrangler-compatible Worker name that is safe in every place where
 /// celld reuses it. Checking only the generated Workflow class would leave
 /// deployment keys and operator output with a different accepted language.
-fn valid_script_name(name: &str) -> bool {
+pub(crate) fn valid_script_name(name: &str) -> bool {
     name.len() <= MAX_SCRIPT_NAME_BYTES
         && name
             .bytes()

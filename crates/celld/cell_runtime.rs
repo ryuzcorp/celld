@@ -1,3 +1,4 @@
+// Modified by ryuzcorp (ryuzcorp/celld): staged invoke reserves generation ids and parks shadow generations.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! What a node's cell runtime holds whichever engine runs the cells: the
@@ -5,6 +6,7 @@
 //! wake discovery and facet streams. Each engine's `RuntimeManager` wraps one
 //! and adds what only its engine knows: cells, isolates, requests.
 
+use std::collections::BTreeSet;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -29,6 +31,12 @@ use crate::wake::WakeFlusher;
 pub(crate) struct Generations {
     pub(crate) current: Arc<Generation>,
     pub(crate) draining: Vec<Arc<Generation>>,
+    /// Generation ids a staged invoke reserved before its shadow generation
+    /// is built. Minting cannot hold this lock across a compile, so without
+    /// the reservation two concurrent invokes — or an invoke racing an
+    /// adoption — could mint the same id, and one's service calls would
+    /// resolve against the other's graph.
+    pub(crate) reserved: BTreeSet<GenerationId>,
 }
 
 #[derive(Clone)]
@@ -46,6 +54,107 @@ pub struct CellRuntime {
     pub(crate) region: Arc<str>,
 }
 
+/// A generation id held across a build. Minting cannot hold the
+/// generation lock across a compile, so every mint site — adoption and
+/// staged invoke alike — holds one of these from mint to install.
+/// Without it, two builds in the same window could mint the same id,
+/// and one's isolates would resolve against the other's graph.
+/// Dropping releases the id; installing the generation must come first,
+/// so the id always has a holder.
+pub struct GenerationReservation {
+    generations: Arc<std::sync::RwLock<Generations>>,
+    id: GenerationId,
+}
+
+impl GenerationReservation {
+    pub fn id(&self) -> GenerationId {
+        self.id
+    }
+}
+
+impl Drop for GenerationReservation {
+    fn drop(&mut self) {
+        // A poisoned lock means the process is already doomed; the id
+        // just stays reserved.
+        if let Ok(mut generations) = self.generations.write() {
+            generations.reserved.remove(&self.id);
+        }
+    }
+}
+
+/// A staged invoke's claim on a generation id, and on the shadow
+/// generation's registration once one is installed.
+///
+/// The shadow parks in `draining` so `generation_by_id` resolves the tag
+/// the staged isolates carry — without that, a service call from staged
+/// code would fall through to the live generation. It is never current:
+/// nothing adopts it, no `GenerationChanged` names it, and `/state` shows
+/// it only as a draining generation while the invoke runs. The caller
+/// holds the guard until every driver on the shadow has settled (past the
+/// reply, through `waitUntil`), and dropping it retires the shadow before
+/// unregistering it. Retiring first matters while the shadow is still
+/// registered: a call racing the teardown then fails at admission
+/// instead of resolving live. After the unregister, `generation_by_id`
+/// falls through to current — safe only because the settled join leaves
+/// no drivers carrying the shadow tag: it waits past `waitUntil`, and
+/// past its deadline it cancels the straggler before the guard drops.
+pub(crate) struct ShadowGuard {
+    reservation: GenerationReservation,
+    installed: Option<Arc<Generation>>,
+}
+
+impl ShadowGuard {
+    pub(crate) fn id(&self) -> GenerationId {
+        self.reservation.id()
+    }
+
+    /// Park `generation` where its tag resolves. The generation must carry
+    /// the reserved id, so a build that ran beside another invoke cannot
+    /// install under an id that no longer belongs to it.
+    pub(crate) fn install(&mut self, generation: Arc<Generation>) {
+        assert_eq!(
+            generation.id,
+            self.reservation.id(),
+            "a shadow generation installs under its reserved id"
+        );
+        self.reservation
+            .generations
+            .write()
+            .expect("generation lock poisoned")
+            .draining
+            .push(generation.clone());
+        self.installed = Some(generation);
+    }
+}
+
+impl Drop for ShadowGuard {
+    fn drop(&mut self) {
+        if let Some(installed) = self.installed.take() {
+            // Retire before unregistering, never after: see the struct doc.
+            // A poisoned lock here means the process is already doomed, so
+            // a failed unregister just drops the guard's own reference.
+            installed.retire();
+            if let Ok(mut generations) = self.reservation.generations.write() {
+                if let Some(index) = generations
+                    .draining
+                    .iter()
+                    .position(|candidate| Arc::ptr_eq(candidate, &installed))
+                {
+                    generations.draining.remove(index);
+                }
+            }
+            // The shadow's cache scope is salted with its reserved id
+            // (`staged_invoke`), so nothing else carries it: drop it with
+            // the shadow. The reaper never sees a shadow, since it is never
+            // adopted.
+            crate::worker_cache::purge_deployment_scope(&installed.cache_scope);
+        }
+        // The reservation drops with the guard and releases the id. The
+        // shadow's drivers all settled before this, so no isolate still
+        // runs with the tag; dead isolates never resolve.
+    }
+}
+
 impl CellRuntime {
     pub(crate) fn new(
         generation: Arc<Generation>,
@@ -61,6 +170,7 @@ impl CellRuntime {
             generations: Arc::new(std::sync::RwLock::new(Generations {
                 current: generation,
                 draining: Vec::new(),
+                reserved: BTreeSet::new(),
             })),
             data_dir: Arc::new(data_dir),
             replication,
@@ -106,18 +216,42 @@ impl CellRuntime {
             .unwrap_or_else(|| generations.current.clone())
     }
 
-    /// The id the next generation takes: one past the newest this node has
-    /// built, draining generations included, so an id is never reused while
-    /// an isolate still carries it.
-    pub fn next_generation_id(&self) -> GenerationId {
-        let generations = self.generations.read().expect("generation lock poisoned");
+    /// Mint the id the next generation takes — one past the newest this
+    /// node has built, draining generations included, so an id is never
+    /// reused while an isolate still carries it — and hold it across the
+    /// build, which cannot run under the generation lock. Every mint site
+    /// holds the reservation until its generation is installed: dropping
+    /// it releases the id, so every exit path, including a panic or a
+    /// failed build, cleans up.
+    pub fn reserve_generation(&self) -> GenerationReservation {
+        let mut generations = self.generations.write().expect("generation lock poisoned");
         let draining = generations
             .draining
             .iter()
             .map(|generation| generation.id)
             .max()
             .unwrap_or(0);
-        generations.current.id.max(draining) + 1
+        let id = generations
+            .current
+            .id
+            .max(draining)
+            .max(generations.reserved.last().copied().unwrap_or(0))
+            + 1;
+        generations.reserved.insert(id);
+        GenerationReservation {
+            generations: self.generations.clone(),
+            id,
+        }
+    }
+
+    /// Reserve the id a staged invoke's shadow generation will take. The
+    /// returned guard additionally retires and unregisters the shadow
+    /// when it drops.
+    pub(crate) fn reserve_shadow(&self) -> ShadowGuard {
+        ShadowGuard {
+            reservation: self.reserve_generation(),
+            installed: None,
+        }
     }
 
     /// The generations still draining, for `/state`. Each one holds its

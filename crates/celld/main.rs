@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): cross-isolate RPC stubs and streams; operator token for the internal listener; D1 export operator-ingress marker; ported from meln1k/celld: report wake coverage after maintenance (e6cb9a3); staged activation; trusted cell RPC; WebSocket join tokens; --version reports the full build version.
+// Modified by ryuzcorp (ryuzcorp/celld): cross-isolate RPC stubs and streams; operator token for the internal listener; D1 export operator-ingress marker; ported from meln1k/celld: report wake coverage after maintenance (e6cb9a3); staged activation; trusted cell RPC; WebSocket join tokens; --version reports the full build version; staged invoke operator route.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 // The binary contains connection, startup, shutdown, and V8 shell code. The
@@ -884,7 +884,10 @@ async fn adopt_deployment(
         Ok(graph) => graph,
         Err(error) => return failed(format!("{error:#}")),
     };
-    let id = runtime.next_generation_id();
+    // Held across the build below: a staged invoke minting beside this
+    // adoption must see this id as taken, or both could build under it.
+    let reservation = runtime.reserve_generation();
+    let id = reservation.id();
     let options = GenerationOptions {
         node: node.to_string(),
         region: region.to_string(),
@@ -897,6 +900,7 @@ async fn adopt_deployment(
         Err(error) => return failed(format!("generation build panicked: {error}")),
     };
     let adopted = runtime.adopt(generation);
+    drop(reservation);
     // Tell the core, so resident cells move to the new generation at their
     // safe points. The reserved cells move at once, ahead of the cron arm
     // below, which must reach a cron cell already running the new schedule.
@@ -1897,6 +1901,13 @@ const MAX_PEER_FORWARD_BODY_BYTES: usize = DEFAULT_MAX_REQUEST_BODY_BYTES + (1 <
 /// arguments. The 64 MiB ceiling leaves headroom above the 32 MiB D1 result
 /// contract without giving an operator route the 1 GiB forwarding allowance.
 const MAX_PEER_PROTOCOL_BODY_BYTES: usize = 64 << 20;
+
+/// Staged invokes in flight on one node. Each one compiles a service
+/// graph and holds fresh pools plus a response buffer, so the permits
+/// bound that cost; migrations run one at a time, and four absorbs an
+/// accidental burst without starving traffic. Past the permits
+/// `/invoke` sheds with 503 and the CLI tries the next node.
+const MAX_CONCURRENT_INVOKES: usize = 4;
 /// Control messages contain identifiers and counters, not application data.
 const MAX_PEER_CONTROL_BODY_BYTES: usize = 64 << 10;
 const INTERNAL_LOG_APPEND_PATH: &str = "/peer/log/append";
@@ -3192,6 +3203,89 @@ async fn handle_public(
     Ok(result)
 }
 
+/// `POST /invoke`: serve one operator request from staged versions.
+///
+/// Authentication first, like `/runtime/`: a staged version answers real
+/// data, so the token gate above plus the per-request fleet HMAC below
+/// are what keep it unreachable from tenants and the public. The invoke
+/// itself runs in a detached task that owns the shadow generation to
+/// completion: a caller that disconnects or stops waiting cannot retire
+/// the shadow under a running driver, so the staged code keeps resolving
+/// its staged graph past the reply, through `waitUntil`.
+async fn internal_invoke(request: Request<Incoming>, app: AppHandle) -> HttpReply {
+    let method = request.method().clone();
+    let path_and_query = request
+        .uri()
+        .path_and_query()
+        .map_or_else(|| request.uri().path().to_string(), ToString::to_string);
+    let request_headers = request.headers().clone();
+    let body = match collect_limited_body(request.into_body(), MAX_PEER_PROTOCOL_BODY_BYTES).await {
+        Ok(body) => body,
+        Err(error) => return peer_response(body_read_error("staged invoke", error)),
+    };
+    // Authenticated first, decided second: the method, draining, and
+    // overload answers below must not become an oracle for a caller
+    // without the fleet secret.
+    if let Err(error) = app.peer_auth.verify(
+        &method,
+        &path_and_query,
+        &request_headers,
+        &body,
+        app.peer_auth.source(),
+    ) {
+        return peer_response(response(error.status(), error.message()));
+    }
+    if method != hyper::Method::POST {
+        return peer_response(response(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "method not allowed",
+        ));
+    }
+    if app.is_draining() {
+        return peer_response(response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{\"ok\":false,\"draining\":true}",
+        ));
+    }
+    let envelope = match celld::staged_invoke::parse_envelope(&body, app.max_request_body_bytes) {
+        Ok(envelope) => envelope,
+        Err(error) => return peer_response(invoke_error(error)),
+    };
+    // Shed past the permits rather than queue: a migration that runs
+    // minutes later surprises, and the CLI tries the next node.
+    let permit = match app.invoke_permits.clone().try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            return peer_response(response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{\"error\":\"invoke overloaded; retry\"}",
+            ));
+        }
+    };
+    let runtime = app.runtime.clone().expect("checked runtime");
+    let bucket = app.deploy_bucket.clone().expect("checked deploy bucket");
+    let (reply, receive) = oneshot::channel();
+    tokio::spawn(async move {
+        let _permit = permit;
+        let outcome = celld::staged_invoke::invoke(&runtime, &bucket, envelope).await;
+        let _ = reply.send(outcome);
+    });
+    match receive.await {
+        Ok(Ok(answer)) => peer_response(response(StatusCode::OK, answer.result_json())),
+        Ok(Err(error)) => peer_response(invoke_error(error)),
+        Err(_) => peer_response(response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "{\"error\":\"staged invoke task died\"}",
+        )),
+    }
+}
+
+fn invoke_error(error: celld::staged_invoke::InvokeError) -> HttpReply {
+    let status =
+        StatusCode::from_u16(error.status_code()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    response(status, error.error_json())
+}
+
 async fn handle_internal(
     request: Request<Incoming>,
     app: AppHandle,
@@ -3333,6 +3427,17 @@ async fn handle_internal(
                 true,
             )
             .await
+        }
+        // The operator's way into a staged version (`celld invoke`): one
+        // HTTP request served by staged code with its declared bindings,
+        // for the migration that must run before activation serves it.
+        // Nowhere else answers it — the public listener has no such
+        // route, and peer tunnels carry cell calls, never this path — so
+        // only this gate keeps non-activated code out of reach, and it
+        // keeps it the way `/runtime/` does: the operator token above
+        // plus the per-request fleet HMAC inside.
+        _ if path == "/invoke" && app.runtime.is_some() && app.deploy_bucket.is_some() => {
+            internal_invoke(request, app).await
         }
         _ if do_scope.is_some() && app.runtime.is_some() => {
             let runtime = app.runtime.as_ref().expect("checked runtime");
@@ -3857,6 +3962,7 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
         Action::Deploy(arguments) => return fleet::run_deploy(arguments).await,
         Action::Activate(arguments) => return fleet::run_activate(arguments).await,
         Action::Discard(arguments) => return fleet::run_discard(arguments).await,
+        Action::Invoke(arguments) => return celld::invoke_cli::run(arguments).await,
         Action::Dev(arguments) => return celld::dev::run(arguments).await,
         Action::Cell(arguments) => return celld::cell_cli::run(arguments).await,
         Action::D1(arguments) => return celld::d1_cli::run(arguments).await,
@@ -4568,6 +4674,8 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
         operation_deadline_ms: celld::actor::operation_deadline_ms()?,
         follower: follower.clone(),
         operator_token,
+        deploy_bucket: deploy_bucket.clone(),
+        invoke_permits: std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_INVOKES)),
     };
 
     // The in-fleet log tier, v0. The takeover interlock is installed in

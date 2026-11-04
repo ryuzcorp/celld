@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): cross-isolate RPC stubs and streams; operator token for the internal listener; Workers Cache pressure shedding; ported from meln1k/celld: report wake coverage after maintenance (e6cb9a3).
+// Modified by ryuzcorp (ryuzcorp/celld): cross-isolate RPC stubs and streams; operator token for the internal listener; Workers Cache pressure shedding; ported from meln1k/celld: report wake coverage after maintenance (e6cb9a3); staged invoke reads the deploy bucket.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! The serial lifecycle executor and its shell-side request drivers.
@@ -1348,6 +1348,18 @@ pub struct AppHandle {
     /// internal listener's gate compares it in constant time; `None` is
     /// today's open listener. Cloned per connection, never logged.
     pub operator_token: Option<crate::operator_token::OperatorToken>,
+    /// The fleet bucket this node deploys from, for the operator routes
+    /// that read deployments: staged versions are bucket state, so only
+    /// a node with a deployment bucket can invoke them. `None` on a node
+    /// that serves a local script instead. Cloned per connection; the
+    /// handle is cheap and the routes that take it only read.
+    pub deploy_bucket: Option<crate::bucket::Bucket>,
+    /// How many staged invokes may run at once. One invoke compiles a
+    /// service graph and holds fresh pools plus a response buffer, so
+    /// an unbounded burst would scale memory and CPU with concurrency
+    /// against a node whose normal traffic amortizes one build. Past
+    /// the permits `/invoke` sheds with 503, like the dispatcher.
+    pub invoke_permits: std::sync::Arc<tokio::sync::Semaphore>,
 }
 
 impl AppHandle {

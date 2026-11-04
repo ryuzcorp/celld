@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): cross-isolate RPC stubs and streams; D1 export operator-ingress marker; ported from meln1k/celld: report wake coverage after maintenance (e6cb9a3); wake coverage follow-ups: startup observation ordering, installation comparison; trusted cell RPC; deployment cache scope purge on generation free.
+// Modified by ryuzcorp (ryuzcorp/celld): cross-isolate RPC stubs and streams; D1 export operator-ingress marker; ported from meln1k/celld: report wake coverage after maintenance (e6cb9a3); wake coverage follow-ups: startup observation ordering, installation comparison; trusted cell RPC; deployment cache scope purge on generation free; staged invoke joins the driver past the reply.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 // RuntimeManager is the V8 cell-host arm, so its executor and observability
@@ -484,6 +484,18 @@ pub struct StatelessRuntime {
     /// tokio worker is driving the request.
     pub isolates: Arc<crate::pool::Pool>,
 }
+
+/// How a settled dispatch bounds the post-reply driver: how long past
+/// the reply it may run, and whose `waitUntil` to cancel on expiry.
+pub(crate) struct SettledWait {
+    pub(crate) deadline: Duration,
+    pub(crate) cancel: js::RequestId,
+}
+
+/// Grace for a driver to retire after its settle deadline cancels it.
+/// Cancellation retires at the next turn, so this elapses only on a
+/// double fault — and then the error log names it.
+const SETTLE_CANCEL_GRACE: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Copy)]
 #[doc(hidden)]
@@ -2924,27 +2936,108 @@ impl StatelessRuntime {
         shedding: bool,
         make_job: impl FnOnce(tokio::sync::oneshot::Sender<anyhow::Result<T>>) -> StatelessWorkerJob,
     ) -> anyhow::Result<T> {
+        self.dispatch_stateless_inner(verb, shedding, make_job, None)
+            .await
+    }
+
+    /// Like [`StatelessRuntime::dispatch_stateless`], but the future resolves
+    /// only once the driver has settled — past the reply, through `waitUntil`.
+    /// A staged invoke awaits this so its shadow generation outlives every
+    /// call the staged code makes: retiring at the reply would leave
+    /// `waitUntil` service calls resolving against the live generation.
+    async fn dispatch_stateless_settled<T: Send + 'static>(
+        &self,
+        verb: StatelessVerb,
+        shedding: bool,
+        make_job: impl FnOnce(tokio::sync::oneshot::Sender<anyhow::Result<T>>) -> StatelessWorkerJob,
+        settled: SettledWait,
+    ) -> anyhow::Result<T> {
+        self.dispatch_stateless_inner(verb, shedding, make_job, Some(settled))
+            .await
+    }
+
+    async fn dispatch_stateless_inner<T: Send + 'static>(
+        &self,
+        verb: StatelessVerb,
+        shedding: bool,
+        make_job: impl FnOnce(tokio::sync::oneshot::Sender<anyhow::Result<T>>) -> StatelessWorkerJob,
+        settled: Option<SettledWait>,
+    ) -> anyhow::Result<T> {
         let affiliation = self.isolates.admit_or_wait(shedding).await?;
         let (reply, receive) = tokio::sync::oneshot::channel();
         let job = make_job(reply);
         // Spawned rather than awaited inline, because the response and the
         // event are not the same lifetime: `waitUntil` work outlives the
         // answer, and the driver keeps turning until it settles.
-        let driving = tokio::spawn(drive_affiliated(
+        let mut driving = tokio::spawn(drive_affiliated(
             affiliation,
             job,
             Some((self.node.clone(), self.region.clone())),
         ));
-        match receive.await {
+        let result = match receive.await {
             Ok(result) => result,
             // The driver dropped the reply without sending. Joining it here —
             // and only here — turns a bare "channel closed" into the panic
             // that actually caused it, at no cost on the path that works.
-            Err(_) => match driving.await {
-                Err(error) => Err(verb.task_died(error)),
-                Ok(()) => Err(verb.dropped_result()),
-            },
+            Err(_) => {
+                return match driving.await {
+                    Err(error) => Err(verb.task_died(error)),
+                    Ok(()) => Err(verb.dropped_result()),
+                };
+            }
+        };
+        if let Some(settled) = settled {
+            // Joined for lifecycle, not for the answer: the reply above is
+            // fixed, but the driver may still be turning `waitUntil` work
+            // that resolves against this pool's generation.
+            let completed = asyncrt::select_biased! {
+                "a settled driver wins a tie with its own deadline";
+                result = &mut driving => Some(result),
+                _ = crate::asyncrt::sleep(settled.deadline) => None,
+            };
+            match completed {
+                // A driver panic after a successful reply is logged, not
+                // returned — the worker's answer stands, as on the
+                // detached path.
+                Some(Err(error)) => {
+                    tracing::error!(
+                        event = "stateless_driver_died_after_reply",
+                        %error,
+                        "stateless driver panicked after answering; the reply stands"
+                    );
+                }
+                Some(Ok(())) => {}
+                None => {
+                    // The handler answered but its background work never
+                    // settled: hung code must not pin the caller's
+                    // generation forever. Cancel it shutdown-flavored —
+                    // post-reply work ignores graceful aborts by design,
+                    // so only the forced retire ends it, the same call
+                    // node shutdown makes — give it a short grace to
+                    // retire, then fail loudly rather than report a reply
+                    // whose background work never settled.
+                    crate::js::abort_request_for_shutdown(settled.cancel);
+                    let retired = asyncrt::select_biased! {
+                        "a retired driver wins a tie with its grace";
+                        result = &mut driving => Some(result),
+                        _ = crate::asyncrt::sleep(SETTLE_CANCEL_GRACE) => None,
+                    };
+                    if retired.is_none() {
+                        tracing::error!(
+                            event = "stateless_driver_ignored_settle_cancel",
+                            "stateless driver still runs after its settle deadline and cancel; \
+                             its late calls resolve against whatever generation holds its tag"
+                        );
+                    }
+                    return Err(anyhow::anyhow!(
+                        "the worker answered but its background work did not settle \
+                         within {:?}",
+                        settled.deadline
+                    ));
+                }
+            }
         }
+        result
     }
 
     /// Serve one stateless request, entering an isolate once per turn.
@@ -2963,6 +3056,41 @@ impl StatelessRuntime {
         cancellation: Option<Arc<RequestCancellationLifetime>>,
     ) -> impl std::future::Future<Output = anyhow::Result<HttpResponse>> + Send + 'static {
         self.fetch_target(None, url, method, body, headers, cancellation)
+    }
+
+    /// Serve one request and resolve only once its driver has settled —
+    /// past the reply, through `waitUntil`. A staged invoke dispatches
+    /// through this so its shadow generation outlives every call the
+    /// staged code makes; every other caller wants the reply as soon as
+    /// the handler answers and uses [`StatelessRuntime::fetch`].
+    ///
+    /// The settle wait is bounded: past `settle_deadline` the dispatch
+    /// cancels the driver's background work and reports failure rather
+    /// than pin the caller's generation on hung code. The cancellation
+    /// is the caller's own lifetime for this request — nothing cancels
+    /// it but shutdown and this deadline.
+    pub(crate) fn fetch_settled(
+        &self,
+        url: String,
+        method: String,
+        body: js::RequestBody,
+        headers: Vec<(String, String)>,
+        cancellation: Arc<RequestCancellationLifetime>,
+        settle_deadline: Duration,
+    ) -> impl std::future::Future<Output = anyhow::Result<HttpResponse>> + Send + 'static {
+        let runtime = self.clone();
+        let settled = SettledWait {
+            deadline: settle_deadline,
+            cancel: cancellation.request_id(),
+        };
+        let make_job =
+            stateless_fetch_job_factory(None, url, method, body, headers, Some(cancellation));
+        async move {
+            let shedding = crate::ownership_store::node_is_shedding();
+            runtime
+                .dispatch_stateless_settled(StatelessVerb::Fetch, shedding, make_job, settled)
+                .await
+        }
     }
 
     /// Serve one default or named stateless Worker entrypoint.

@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): CELLD_MEMORY_SCOPE help; operator token for the internal listener; staged activation.
+// Modified by ryuzcorp (ryuzcorp/celld): CELLD_MEMORY_SCOPE help; operator token for the internal listener; staged activation; staged invoke command.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! The command line: what the process was asked to do, and the help text
@@ -39,6 +39,7 @@ pub(crate) enum Action {
     Deploy(Vec<String>),
     Activate(Vec<String>),
     Discard(Vec<String>),
+    Invoke(Vec<String>),
     Dev(Vec<String>),
     Cell(Vec<String>),
     D1(Vec<String>),
@@ -78,6 +79,7 @@ pub(crate) fn action_from_process() -> anyhow::Result<Action> {
             "deploy" => return Ok(Action::Deploy(arguments)),
             "activate" => return Ok(Action::Activate(arguments)),
             "discard" => return Ok(Action::Discard(arguments)),
+            "invoke" => return Ok(Action::Invoke(arguments)),
             "dev" => return Ok(Action::Dev(arguments)),
             "cell" => return Ok(Action::Cell(arguments)),
             "d1" => return Ok(Action::D1(arguments)),
@@ -275,6 +277,7 @@ USAGE:
   celld deploy [PROJECT] --bucket [s3://|gs://|az://]NAME[/PREFIX] [OPTIONS]
   celld activate SCRIPT=VERSION... --bucket [s3://|gs://|az://]NAME[/PREFIX] [OPTIONS]
   celld discard SCRIPT=VERSION... --bucket [s3://|gs://|az://]NAME[/PREFIX] [OPTIONS]
+  celld invoke SCRIPT=VERSION... --path PATH --bucket [s3://|gs://|az://]NAME[/PREFIX]
   celld dev [PROJECT] [--host IP] [--port PORT] [--logs]
   celld cell list [CLASS] --bucket [s3://|gs://|az://]NAME[/PREFIX] [OPTIONS]
   celld cell gc --dry-run [CLASS] --bucket [s3://|gs://|az://]NAME[/PREFIX] [OPTIONS]

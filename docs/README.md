@@ -1,4 +1,4 @@
-<!-- Modified by ryuzcorp (ryuzcorp/celld): CELLD_MEMORY_SCOPE; deploy --sourcemap writes the bundle's external map; operator token for the internal listener; r2 list --delimiter, the --page shape, and --cursor continuation; Workers Cache API page; deployment cache scope; deploy --sourcemap collects the no_bundle sibling map. -->
+<!-- Modified by ryuzcorp (ryuzcorp/celld): CELLD_MEMORY_SCOPE; deploy --sourcemap writes the bundle's external map; operator token for the internal listener; r2 list --delimiter, the --page shape, and --cursor continuation; Workers Cache API page; deployment cache scope; deploy --sourcemap collects the no_bundle sibling map; staged invoke docs. -->
 # celld
 
 celld is a stateful distributed system. It runs server-side JavaScript on
@@ -104,6 +104,7 @@ the waker role, and it wakes only the cells whose owner node has stopped.
 - [Deploy an application](#deploy-an-application)
 - [Develop an application locally](#develop-an-application-locally)
 - [Operate D1, KV, and R2](#operate-d1-kv-and-r2)
+- [Invoke a staged version](#invoke-a-staged-version)
 - [Start a node](#start-a-node)
 - [Add nodes](#add-nodes)
 - [Feed an autoscaler](#feed-an-autoscaler)
@@ -365,6 +366,23 @@ Worker's `list()` page without `version`, `checksums` and `storageClass`.
 
 Every celld command writes data to stdout and messages to stderr. A closed
 stdout pipe is a successful stop.
+
+## Invoke a staged version
+
+A version uploaded with `celld deploy --no-activate` serves no traffic
+until `celld activate` names it. `celld invoke` sends one HTTP request to
+a staged version on one node of the fleet, served by that version's code
+with its declared bindings against the real data, so a migration endpoint
+runs before the activation that would serve it:
+
+```sh
+celld invoke app=VERSION --path /migrate --method POST --bucket "$CELLD_BUCKET"
+```
+
+The invoke moves no pointer and changes nothing serving. Only the
+operator can invoke: the internal-listener route requires the fleet
+signature plus the operator token when one is set. See
+[Invoke a staged version](staged-invoke.md).
 
 ## Start a node
 
@@ -663,7 +681,7 @@ unset variable selects its default. A Boolean variable accepts only `0` or
 | `CELLD_INTERNAL_ADDR` | The peer and operator listener. The same as `--internal-listen` |
 | `CELLD_ADVERTISE` | The internal address that peers can reach. The same as `--advertise` |
 | `CELLD_UNSAFE_PUBLIC_ADVERTISE` | Set to `1` to permit a literal public IP in `CELLD_ADVERTISE`. It does not resolve a DNS name or restrict the internal listener |
-| `CELLD_OPERATOR_TOKEN` | A bearer token the whole fleet shares. When set, every internal-listener route requires `Authorization: Bearer <token>` (compared in constant time) and answers 401 without it; `celld d1`, `celld kv`, `celld queue`, and `celld diagnose` read it from the environment and send it. Unset: the internal listener stays open. Set but empty: the node refuses to start. See [security](security.md) |
+| `CELLD_OPERATOR_TOKEN` | A bearer token the whole fleet shares. When set, every internal-listener route requires `Authorization: Bearer <token>` (compared in constant time) and answers 401 without it; `celld d1`, `celld kv`, `celld queue`, `celld diagnose`, and `celld invoke` read it from the environment and send it. Unset: the internal listener stays open. Set but empty: the node refuses to start. See [security](security.md) |
 | `CELLD_NODE` | An explicit node-session ID: 1 to 128 ASCII letters, numbers, dots, dashes, or underscores, but not `.` or `..` |
 | `CELLD_WATCH` | The local work directory for SQLite and replication |
 | `CELLD_ESBUILD` | The path of the esbuild executable |

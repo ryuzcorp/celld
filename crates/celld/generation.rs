@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): shared runtime cells run in a dedicated runtime isolate pool; runtime compat is the union over declaring scripts; staged activation; deployment cache scope key.
+// Modified by ryuzcorp (ryuzcorp/celld): shared runtime cells run in a dedicated runtime isolate pool; runtime compat is the union over declaring scripts; staged activation; deployment cache scope key; staged invoke loads a services-only staged graph.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! One application deployment as the running process holds it.
@@ -409,6 +409,179 @@ impl DeploymentGraph {
             cohosted,
         })
     }
+}
+
+impl DeploymentGraph {
+    /// Resolve the staged versions a `celld invoke` names: the target
+    /// script as primary, plus every service-binding target it reaches,
+    /// transitively.
+    ///
+    /// Each script resolves from the staged pins first and from the live
+    /// pointer otherwise — the activated map when one names it, the named
+    /// pointer on a legacy fleet — so the graph is the generation an
+    /// activation of the same pins would serve. Queue dependencies are
+    /// deliberately not loaded: the queue attachments still name the live
+    /// consumers until activation converges them, and no broker ever
+    /// dispatches a batch to the shadow generation, so loading consumers
+    /// could only fail a graph whose queues all work (sends go to the
+    /// real queue cells). Pins no loaded script depends on are ignored
+    /// with a warning, after the caller has checked they exist: they
+    /// cannot affect execution, because a service call resolves only a
+    /// binding the calling script declares.
+    ///
+    /// This is the deliberate second bucket walk beside [`DeploymentGraph::load`]:
+    /// boot and reload still share exactly one, and this one is never
+    /// adopted — it builds a shadow generation that serves one operator
+    /// request and is retired.
+    pub async fn load_staged(
+        bucket: &Bucket,
+        node: String,
+        pointer: &DeployPointer,
+        target: &crate::deploy::VersionRef,
+        pins: &BTreeMap<String, String>,
+    ) -> anyhow::Result<Self> {
+        let primary = fleet::load_pinned_worker(
+            bucket,
+            &staged_pointer(&target.script, &target.version),
+            &format!("deploy/{}/current.json", target.script),
+            node.clone(),
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "load staged version {} of script {:?}",
+                target.version, target.script
+            )
+        })?;
+        let primary_script = primary.script_name.clone();
+        let components = pointer.components.clone();
+        let mut loaded_scripts = BTreeMap::from([(primary_script.clone(), primary.prefix.clone())]);
+        let mut loaded_pins = BTreeSet::from([target.script.clone()]);
+        let mut dependencies: VecDeque<String> = staged_services_of(&primary).collect();
+        let mut cohosted = Vec::new();
+        while let Some(dependency) = dependencies.pop_front() {
+            if dependency == primary_script || loaded_scripts.contains_key(&dependency) {
+                continue;
+            }
+            let loaded = match pins.get(&dependency) {
+                Some(version) => {
+                    loaded_pins.insert(dependency.clone());
+                    fleet::load_pinned_worker(
+                        bucket,
+                        &staged_pointer(&dependency, version),
+                        &format!("deploy/{dependency}/current.json"),
+                        node.clone(),
+                    )
+                    .await
+                    .with_context(|| {
+                        format!("load staged version {version} of script {dependency:?}")
+                    })?
+                }
+                None => match components
+                    .as_ref()
+                    .and_then(|generation| generation.get(&dependency))
+                {
+                    // A carried script under an activated generation: the
+                    // version the pointer's component map names, exactly as
+                    // an activation of these pins would serve it.
+                    Some(component) => fleet::load_pinned_worker(
+                        bucket,
+                        &DeployPointer {
+                            script_name: Some(dependency.clone()),
+                            version: component.version.clone(),
+                            prefix: component.prefix.clone(),
+                            rollout: Rollout { percent: 100 },
+                            components: None,
+                        },
+                        &format!("deploy/{dependency}/current.json"),
+                        node.clone(),
+                    )
+                    .await
+                    .with_context(|| {
+                        format!("load carried script {dependency:?} from the activated generation")
+                    })?,
+                    // A carried script on a legacy fleet: the named pointer,
+                    // exactly as [`DeploymentGraph::load`] resolves it.
+                    None => fleet::load_named_worker(bucket, &dependency, node.clone())
+                        .await
+                        .with_context(|| {
+                            format!("load carried script {dependency:?} from its named pointer")
+                        })?,
+                },
+            };
+            if loaded.script_name != dependency {
+                anyhow::bail!(
+                    "service pointer {dependency} resolved script {}",
+                    loaded.script_name
+                );
+            }
+            anyhow::ensure!(
+                loaded_scripts
+                    .insert(dependency.clone(), loaded.prefix.clone())
+                    .is_none(),
+                "script {dependency:?} was loaded twice"
+            );
+            dependencies.extend(staged_services_of(&loaded));
+            cohosted.push(loaded);
+        }
+        for pin in pins.keys() {
+            if !loaded_pins.contains(pin) {
+                tracing::warn!(
+                    script = %pin,
+                    target = %primary_script,
+                    "staged pin is not reachable from the invoke target; ignoring it"
+                );
+            }
+        }
+        let staged_map = std::iter::once(&primary)
+            .chain(cohosted.iter())
+            .map(|loaded| {
+                (
+                    loaded.script_name.clone(),
+                    ComponentRef {
+                        version: loaded.version.clone(),
+                        prefix: loaded.prefix.clone(),
+                    },
+                )
+            })
+            .collect();
+        Ok(Self {
+            identity: ServingIdentity {
+                script_name: Some(primary_script),
+                version: primary.version.clone(),
+                prefix: primary.prefix.clone(),
+                components: Some(staged_map),
+            },
+            // The same fleet as the live graph; `staged_invoke` salts it
+            // with the shadow's reserved id, so the shadow's cache scope is
+            // its own even when the staged identity equals the live one.
+            fleet: fleet_identity(bucket.scheme(), &bucket.name, &bucket.prefix),
+            primary,
+            cohosted,
+        })
+    }
+}
+
+/// The pointer for one staged script version: the deterministic version
+/// directory `celld deploy --no-activate` uploaded, never a mutable
+/// pointer. The caller validates the name and version shapes first, and
+/// [`fleet::load_pinned_worker`] re-checks the manifest identity, so a
+/// corrupt entry fails the load instead of serving the wrong code.
+fn staged_pointer(script: &str, version: &str) -> DeployPointer {
+    DeployPointer {
+        script_name: Some(script.to_string()),
+        version: version.to_string(),
+        prefix: format!("deploy/{script}/{version}"),
+        rollout: Rollout { percent: 100 },
+        components: None,
+    }
+}
+
+/// The service-binding targets one loaded deployment reaches. Queue
+/// dependencies are excluded on purpose: see
+/// [`DeploymentGraph::load_staged`].
+fn staged_services_of(loaded: &LoadedDeployment) -> impl Iterator<Item = String> + '_ {
+    loaded.services.iter().map(|(_, script, _)| script.clone())
 }
 
 enum Dependency {
