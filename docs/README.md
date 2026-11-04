@@ -1,4 +1,4 @@
-<!-- Modified by ryuzcorp (ryuzcorp/celld): CELLD_MEMORY_SCOPE; deploy --sourcemap writes the bundle's external map; operator token for the internal listener; r2 list --delimiter, the --page shape, and --cursor continuation; Workers Cache API page; deployment cache scope. -->
+<!-- Modified by ryuzcorp (ryuzcorp/celld): CELLD_MEMORY_SCOPE; deploy --sourcemap writes the bundle's external map; operator token for the internal listener; r2 list --delimiter, the --page shape, and --cursor continuation; Workers Cache API page; deployment cache scope; deploy --sourcemap collects the no_bundle sibling map. -->
 # celld
 
 celld is a stateful distributed system. It runs server-side JavaScript on
@@ -243,10 +243,14 @@ R2 buckets, Workflows, WebAssembly modules, and static assets. An unknown
 Wrangler configuration key stops the deploy. See
 [Cloudflare compatibility](cloudflare-compat.md) for the complete boundary.
 A node verifies the SHA-256 digest of each module before it builds a
-deployment. Pass `--sourcemap PATH` to also write the bundled Worker's
-external source map to a local file for stack-trace symbolication; the
-deployed bytes are identical with or without it, and asset-only,
-`no_bundle`, and Python projects warn and write nothing.
+deployment. Pass `--sourcemap PATH` to also write the Worker's source
+map to a local file for stack-trace symbolication: the esbuild bundle's
+external map, or the `no_bundle` entry's sibling `<entry>.map`. The
+deployed bytes are identical with or without it, and asset-only and
+Python projects, and `no_bundle` entries without a sibling map, warn
+and write nothing. A sibling map never fails the deploy: one that is a
+symlink, not a regular file, larger than 64 MiB, outside the project
+root, or not a v3 source map is skipped with a warning.
 
 A running node does not restart for a new deployment. Each node reads
 `deploy/current.json` every `CELLD_DEPLOY_POLL_S` seconds (default 30) and

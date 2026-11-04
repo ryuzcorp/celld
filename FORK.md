@@ -9,7 +9,7 @@ README below is kept intact; this file documents the fork.
 
 - `main` mirrors upstream `main` and carries no patches.
 - `ryuzcorp/v<version>` is a line branch: the upstream tag `v<version>`
-  plus our patches as commits, one commit per patch, in `0001`-`0046`
+  plus our patches as commits, one commit per patch, in `0001`-`0047`
   order. Each patch commit is self-contained and carries its own tests.
 
 Upstream's `.github/workflows/release.yml` targets `ghcr.io/denoland` and
@@ -485,12 +485,26 @@ push to `ghcr.io/denoland`, but still. Pushing a branch named
   entries, and the old scope is dropped once its last serving
   generation drains. Sharing is total within a deployment (read,
   overwrite, purge), which is why it is opt-in.
-- `0046` (sha TBD at merge) `celld --version` reports the full build
+- `0046` (`802ba54`) `celld --version` reports the full build
   version: `build.rs` bakes `CELLD_VERSION` (`<version>-ryuzcorp.<n>`,
   `<version>-ryuzcorp.ci` in CI) into the binary from the Docker build
   stage, and a plain `cargo build` without it reports the crate
   version. The build fails on any byte outside `[0-9A-Za-z._+-]`, so
   the value cannot inject cargo directives of its own.
+- `0047` (sha TBD at merge) `celld deploy --sourcemap PATH` collects
+  the `no_bundle` entry's sibling `<entry>.map`: the entry deploys as
+  written, so its caller-toolchain map still describes the deployed
+  module. The deployed bytes are untouched. The sibling comes from a
+  tree the caller controls, so it can neither fail the deploy nor reach
+  outside the tree: the entry's directory must resolve inside the
+  project root, the open refuses symlinks (`O_NOFOLLOW`) and blocks on
+  nothing (`O_NONBLOCK`), the fd must be a regular file of at most
+  64 MiB, and the JSON must be a v3 map. Anything else warns and writes
+  nothing, as do a missing sibling and asset-only and Python projects.
+  Its `sources` (with `sourceRoot` folded in) are rebased to
+  project-root-relative paths lexically, never resolved on the host, so
+  the map cannot probe which host files exist; absolute and URL sources
+  keep their file name.
 
 Patches `0025`–`0034` are ported fixes from
 [meln1k/celld](https://github.com/meln1k/celld) by Nikita
