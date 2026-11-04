@@ -1,4 +1,4 @@
-<!-- Modified by ryuzcorp (ryuzcorp/celld): node:crypto scrypt; cloned streaming bodies; cross-isolate RPC stubs and streams; per-node Workers Cache API. -->
+<!-- Modified by ryuzcorp (ryuzcorp/celld): node:crypto scrypt; cloned streaming bodies; cross-isolate RPC stubs and streams; per-node Workers Cache API; receiver-held RPC streams. -->
 # Cloudflare compatibility
 
 This page lists only the differences from the linked Cloudflare APIs. An entry
@@ -97,13 +97,19 @@ The `tail` and `email` handlers are unavailable.
   clear error (no cross-node forwarding yet); a stub whose owner was
   evicted or reloaded rejects like a released same-isolate stub. Old-shape
   markers (no host id) keep failing on use exactly as before.
-- A stub (or stream) received by a caller is owned by the caller's
-  request: when the fetch/RPC/alarm/queue invocation ends, everything it
+- A stub received by a caller is owned by the caller's
+  request: when the fetch/RPC/alarm/queue invocation ends, every stub it
   still holds is disposed and every release routes to the owner. There is
   no idle expiry: a quiet-but-live handle stays usable however long
   nothing flows, and a validated operation pins its entry so a release
   racing it cannot fail it. Owner eviction revokes synchronously, and
   isolate retirement releases whatever the freed isolate still held.
+- A stream received over RPC stays usable while the receiver holds it:
+  an active reader (or writer) keeps the stream past the receiving call
+  and its invocation, the way a ReadableStream sent over RPC stays open
+  until its writer closes it. Reading to the end, closing, cancelling,
+  or an explicit dispose releases the hold at once; a dropped stream
+  frees when collected, or when its isolate retires.
 - A caller-owned `ReadableStream` passed in call arguments crosses to the
   cell through an upload channel: the caller's isolate pumps it host-side
   (bounded, backpressured) and the cell pulls. Cancellation propagates

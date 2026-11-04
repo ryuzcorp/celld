@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): node:crypto scrypt; container exec resize op; cross-isolate RPC stubs and streams; test-only fake exec ops; fake kill completion op; exec reads survive their subscribing event; per-node Workers Cache API ops; tenant egress policy; D1 export operator-ingress marker; stateless attribution tokens; reaction-aware request resources; fake close/signal completion ops; binding-forgery enforcement; trusted cell RPC; Queue DLQ forward host op; DLQ forward caller identity; WebSocket and TCP socket ownership.
+// Modified by ryuzcorp (ryuzcorp/celld): node:crypto scrypt; container exec resize op; cross-isolate RPC stubs and streams; test-only fake exec ops; fake kill completion op; exec reads survive their subscribing event; per-node Workers Cache API ops; tenant egress policy; D1 export operator-ingress marker; stateless attribution tokens; reaction-aware request resources; fake close/signal completion ops; binding-forgery enforcement; trusted cell RPC; Queue DLQ forward host op; DLQ forward caller identity; WebSocket and TCP socket ownership; receiver-held stream lifetime.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 // The raw V8 adapter and its child modules remain outside the Actor execution
@@ -7188,6 +7188,7 @@ ops! { OP_NAMES, install_op_functions,
         "__upload_fail" => op_upload_fail,
         "__upload_cancel" => op_upload_cancel,
         "__upload_abort" => op_upload_abort,
+        "__upload_acquire" => op_upload_acquire,
         "__sc_encode" => storage_ops::op_sc_encode,
         "__sc_decode" => storage_ops::op_sc_decode,
         "__structured_clone" => storage_ops::op_structured_clone,
@@ -10042,6 +10043,25 @@ fn op_upload_cancel(
         return;
     }
     crate::upload_table::cancel_upload(&id);
+}
+
+/// `__upload_acquire(uploadId)`; this isolate revived the receiving
+/// end (or a forward moved it here): record its heap as the holder, so
+/// the retirement backstop cancels what a freed receiver still held.
+/// Best-effort: an unknown id is already gone.
+fn op_upload_acquire(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue<v8::Value>,
+) {
+    let id = args.get(0).to_rust_string_lossy(scope);
+    if !crate::stub_table::valid_host_stub_id(&id) {
+        return;
+    }
+    let Some(holder) = crate::pool::current_slot().map(|slot| slot.heap_id()) else {
+        return;
+    };
+    crate::upload_table::acquire_upload_receiver(&id, holder);
 }
 
 /// `__upload_abort(uploadId)`; the sender is gone (context end or abort).

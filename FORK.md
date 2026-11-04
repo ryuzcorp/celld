@@ -9,7 +9,7 @@ README below is kept intact; this file documents the fork.
 
 - `main` mirrors upstream `main` and carries no patches.
 - `ryuzcorp/v<version>` is a line branch: the upstream tag `v<version>`
-  plus our patches as commits, one commit per patch, in `0001`-`0042`
+  plus our patches as commits, one commit per patch, in `0001`-`0043`
   order. Each patch commit is self-contained and carries its own tests.
 
 Upstream's `.github/workflows/release.yml` targets `ghcr.io/denoland` and
@@ -450,6 +450,18 @@ push to `ghcr.io/denoland`, but still. Pushing a branch named
   cell's upgrade presents a single-use host-minted token, tunneled
   upgrade parks use unguessable numbers, and a reloaded cell still
   owns its sockets by scope after hibernation.
+- `0043` (sha TBD at merge) a stream received over RPC stays usable
+  while the receiver holds it: an active reader (or writer) keeps
+  the stream past the receiving call and its invocation, the way a
+  ReadableStream sent over RPC stays open until its writer closes
+  it. Param disposal and context end spare a held stream; reading
+  to the end, closing, cancelling, or an explicit dispose releases
+  the hold at once, a dropped stream frees when collected, and
+  isolate retirement cancels what a freed receiver still held (the
+  revive records its heap). The sender side is unchanged: its
+  invocation end still terminates the channel. Previously the
+  receiving call's return cancelled a held abort carrier, so every
+  signal-carrying exec aborted spuriously.
 
 Patches `0025`–`0034` are ported fixes from
 [meln1k/celld](https://github.com/meln1k/celld) by Nikita

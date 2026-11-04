@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): ctx.container.images; clone() of streaming and disturbed bodies; __celld$do on the service-binding RPC path; container exec pty/resize; cross-isolate RPC stubs and streams; container exec AbortSignal; test-only fake kill completion; exec reads survive their subscribing event; context end aborts finished uploads; tenant egress policy; D1 export; D1 export operator gate; D1 batch; test-only fake close/signal completion; binding-forgery enforcement; Queue/KV operator fetch gate; Queue/KV stub-RPC allowlists; Queue DLQ host-op forward; Queue send/DLQ cell-side validation; trusted-RPC target pin; Queue operator internal re-checks.
+// Modified by ryuzcorp (ryuzcorp/celld): ctx.container.images; clone() of streaming and disturbed bodies; __celld$do on the service-binding RPC path; container exec pty/resize; cross-isolate RPC stubs and streams; container exec AbortSignal; test-only fake kill completion; exec reads survive their subscribing event; context end aborts finished uploads; tenant egress policy; D1 export; D1 export operator gate; D1 batch; test-only fake close/signal completion; binding-forgery enforcement; Queue/KV operator fetch gate; Queue/KV stub-RPC allowlists; Queue DLQ host-op forward; Queue send/DLQ cell-side validation; trusted-RPC target pin; Queue operator internal re-checks; receiver-held RPC streams.
 // The DO object model and the Cloudflare-compatible runtime surface, run
 // once per isolate by `js.rs::install_harness` after the Web-API prelude.
 // Lived as a 4,000-line raw string inside js.rs until 2026-07-29; it is a
@@ -4116,7 +4116,9 @@ const __ctxUnregister = (meta) => {
 // into it reaches the sender's disposal callback. Runs at invocation end
 // (fetch/RPC/alarm/queue), which is what makes a received stub owned by
 // its request: the caller side dies with the call, and every release
-// routes to the owner.
+// routes to the owner. A received stream with a live reader is spared:
+// the reader holds the stream past its invocation, and closing it here
+// would fire a carrier the sender never closed.
 const __ctxEnd = (id) => {
   __ctxLive.delete(id);
   __ctxEndUploads(id);
@@ -4127,7 +4129,9 @@ const __ctxEnd = (id) => {
   const set = __ctxStubs.get(id);
   if (set === undefined) return;
   __ctxStubs.delete(id);
-  for (const meta of set) __disposeStub(meta);
+  for (const meta of set) {
+    if (!__streamHeld(meta)) __disposeStub(meta);
+  }
 };
 // Drop abort records no live entry or handle references anymore. A stub
 // rooted in a dead context must keep rejecting with its reason, but every
@@ -4332,6 +4336,14 @@ const __disposeStub = (meta) => {
   if (typeof disposer === "function")
     Promise.resolve().then(() => disposer.call(entry.target));
 };
+// Workerd's param-disposal rule: params received by the target are
+// disposed when the op ends -- except a received stream with a live
+// reader, which the receiver holds past the call.
+const __disposeReceived = (received) => {
+  for (const handle of received) {
+    if (!__streamHeld(handle)) __disposeStub(handle);
+  }
+};
 // A mint-cap refusal from `__stub_export`/`__upload_new`. Caps fail the
 // call with a clear error; every other export throw falls back to an
 // upload channel or a same-isolate marker.
@@ -4418,7 +4430,9 @@ const __stubDisposedError = () =>
 // Dispose host-backed handles revived into `ctx` since `before` (a snapshot
 // Set of its handles, or null when it held none): a drive's nested revives
 // that its reply did not move out. Same-isolate handles keep their
-// lifetime; only what crosses isolates shortens.
+// lifetime; only what crosses isolates shortens. A nested stream with a
+// live reader is spared like at context end; a dropped one frees when
+// collected.
 const __disposeNewHostHandles = (ctx, before) => {
   if (ctx === undefined) return;
   const set = __ctxStubs.get(ctx);
@@ -4427,7 +4441,7 @@ const __disposeNewHostHandles = (ctx, before) => {
     if (before !== null && before.has(meta)) continue;
     if (meta.entry.host === undefined && meta.entry.upload === undefined)
       continue;
-    __disposeStub(meta);
+    if (!__streamHeld(meta)) __disposeStub(meta);
   }
 };
 // Shared brand value for RpcTarget instances; see the RpcTarget
@@ -4481,6 +4495,26 @@ const __rsDisconnect = () => new Error(
   "ReadableStream received over RPC disconnected prematurely.");
 // Receiver wrapper stream -> its handle meta, for forwarding.
 const __rpcStreamMeta = new WeakMap();
+// A stream received over RPC stays usable until the receiver releases
+// it: an active reader holds the stream past the receiving call and
+// its invocation, the way a ReadableStream sent over RPC stays open
+// until its writer closes it. Collection -- not context end -- frees
+// a wrapper the receiver dropped without closing. The held value is
+// the meta, which points back at the wrapper only weakly (see
+// `__reviveStream`), so the wrapper still collects; disposal is
+// idempotent, so an explicit dispose first makes this a no-op.
+const __rpcStreamFinalizer = new FinalizationRegistry((meta) => {
+  try {
+    __disposeStub(meta);
+  } catch {}
+});
+// Whether an automatic disposal (param disposal, context end, drive
+// end) must spare this handle: a received stream whose wrapper is
+// still locked to a live reader. Anything else -- stubs, unlocked or
+// collected wrappers -- disposes as before, so a dropped stream still
+// frees its hold promptly at request end.
+const __streamHeld = (meta) =>
+  meta.wrapper !== undefined && meta.wrapper.deref()?.locked === true;
 const __readableBridge = (reader) => {
   const bridge = {
     done: false,
@@ -5269,7 +5303,10 @@ const __reviveStream = (marker, id, readable, handles) => {
   // A host marker revives over the stub channel, whichever isolate this
   // is -- including the minting one. Same wrappers as below, same
   // disconnect errors, one bounded op per chunk. The revive acquires
-  // this isolate's hold; dispose, handoff, and context end drop it.
+  // this isolate's hold; dispose, handoff, and context end drop it,
+  // except a stream with a live reader, which the receiver holds past
+  // its call. A finished stream drops its hold at once (EOF, cancel,
+  // close, abort, or a failed read); a dropped one frees when collected.
   if (marker.h === 1) {
     // The sender moved its hold with the reference, so the revive
     // acquires first; a revive after its invocation ended releases
@@ -5292,21 +5329,37 @@ const __reviveStream = (marker, id, readable, handles) => {
             try {
               result = await __hostStubOp(meta, ["read"], []);
             } catch {
+              __disposeStub(meta);
               throw __rsDisconnect();
             }
-            if (result.done) controller.close();
-            else controller.enqueue(result.value);
+            if (result.done) {
+              controller.close();
+              __disposeStub(meta);
+            } else controller.enqueue(result.value);
           },
-          cancel: () =>
-            __hostStubOp(meta, ["cancel"], []).catch(() => {}),
+          // The hold drops once the cancel lands, like close below:
+          // releasing first races the owner dropping its entry, and the
+          // cancel then never reaches the producer.
+          cancel: () => __hostStubOp(meta, ["cancel"], [])
+            .catch(() => {})
+            .finally(() => __disposeStub(meta)),
         }, { highWaterMark: 0 })
       : new WritableStream({
           write: (chunk) => __hostStubOp(meta, ["write"], [chunk]),
-          close: () => __hostStubOp(meta, ["close"], []),
-          abort: () =>
-            __hostStubOp(meta, ["abort"], []).catch(() => {}),
+          // The hold drops once the close or abort lands: releasing
+          // first could dispose the owner's entry before the op
+          // validates.
+          close: () => __hostStubOp(meta, ["close"], [])
+            .finally(() => __disposeStub(meta)),
+          abort: () => __hostStubOp(meta, ["abort"], [])
+            .catch(() => {})
+            .finally(() => __disposeStub(meta)),
         });
     __rpcStreamMeta.set(stream, meta);
+    if (rctx !== undefined) {
+      meta.wrapper = new WeakRef(stream);
+      __rpcStreamFinalizer.register(stream, meta);
+    }
     return stream;
   }
   // A caller-pushed upload revives as a pull reader over the sender's
@@ -5314,9 +5367,12 @@ const __reviveStream = (marker, id, readable, handles) => {
   // one bounded op per chunk. Old readers see no `h: 1` and fail
   // closed as foreign, as before.
   if (marker.h === 2 && readable) {
-    // Uploads track no reader holds: a revive after its invocation ended
-    // cancels the channel (the sender's pump stops) and arrives disposed,
-    // reading EOF.
+    // A revive after its invocation ended cancels the channel (the
+    // sender's pump stops) and arrives disposed, reading EOF. A live
+    // revive records this isolate as the holder for the retirement
+    // backstop, and holds the channel past its call while a reader is
+    // live; a finished read drops it at once, a dropped wrapper when
+    // collected.
     const rctx = __ctxAdopt();
     const meta = {
       entry: __uploadEntry(id),
@@ -5326,7 +5382,12 @@ const __reviveStream = (marker, id, readable, handles) => {
       try {
         __upload_cancel(id);
       } catch {}
-    } else __ctxRegister(meta);
+    } else {
+      try {
+        __upload_acquire(id);
+      } catch {}
+      __ctxRegister(meta);
+    }
     handles.push(meta);
     const stream = new ReadableStream({
       async pull(controller) {
@@ -5334,18 +5395,26 @@ const __reviveStream = (marker, id, readable, handles) => {
         try {
           bytes = await __upload_pull(id);
         } catch {
+          __disposeStub(meta);
           throw __rsDisconnect();
         }
-        if (bytes[0] === 1) controller.close();
-        else controller.enqueue(bytes.subarray(1));
+        if (bytes[0] === 1) {
+          controller.close();
+          __disposeStub(meta);
+        } else controller.enqueue(bytes.subarray(1));
       },
       cancel: () => {
         try {
           __upload_cancel(id);
         } catch {}
+        __disposeStub(meta);
       },
     }, { highWaterMark: 0 });
     __rpcStreamMeta.set(stream, meta);
+    if (rctx !== undefined) {
+      meta.wrapper = new WeakRef(stream);
+      __rpcStreamFinalizer.register(stream, meta);
+    }
     return stream;
   }
   const entry = marker.t === __stubIsolate
@@ -5365,21 +5434,34 @@ const __reviveStream = (marker, id, readable, handles) => {
           try {
             result = await __stubOp(meta, ["read"], []);
           } catch {
+            __disposeStub(meta);
             throw __rsDisconnect();
           }
-          if (result.done) controller.close();
-          else controller.enqueue(result.value);
+          if (result.done) {
+            controller.close();
+            __disposeStub(meta);
+          } else controller.enqueue(result.value);
         },
-        cancel: () =>
-          __stubOp(meta, ["cancel"], []).catch(() => {}),
+        // The entry drops once the cancel lands, like close below:
+        // disposing first could abort the origin before the cancel walk
+        // runs.
+        cancel: () => __stubOp(meta, ["cancel"], [])
+          .catch(() => {})
+          .finally(() => __disposeStub(meta)),
       }, { highWaterMark: 0 })
     : new WritableStream({
         write: (chunk) => __stubOp(meta, ["write"], [chunk]),
-        close: () => __stubOp(meta, ["close"], []),
-        abort: () =>
-          __stubOp(meta, ["abort"], []).catch(() => {}),
+        // The entry drops once the close or abort lands: disposing first
+        // could abort the origin before the walk runs.
+        close: () => __stubOp(meta, ["close"], [])
+          .finally(() => __disposeStub(meta)),
+        abort: () => __stubOp(meta, ["abort"], [])
+          .catch(() => {})
+          .finally(() => __disposeStub(meta)),
       });
   __rpcStreamMeta.set(stream, meta);
+  meta.wrapper = new WeakRef(stream);
+  __rpcStreamFinalizer.register(stream, meta);
   return stream;
 };
 const __reviveSignal = (marker, id) => {
@@ -5621,7 +5703,8 @@ const __rpcWalk = async (root, path, args, entrypointRoot) => {
 // the reply serialization run in the stub's owning context, so
 // stubs minted by the target belong to the target's context.
 // Params received by the target are disposed when the op ends
-// (Workerd's param-disposal rule).
+// (Workerd's param-disposal rule), except a received stream with a
+// live reader, which the receiver holds past the call.
 const __stubOp = (meta, path, args) => {
   if (meta.disposed) return Promise.reject(__stubDisposedError());
   const entry = meta.entry;
@@ -5679,9 +5762,7 @@ const __stubOp = (meta, path, args) => {
           return await __rpcWalk(entry.target, path,
             decoded === null ? null : decoded.args, false);
         } finally {
-          if (decoded !== null)
-            for (const handle of decoded.received)
-              __disposeStub(handle);
+          if (decoded !== null) __disposeReceived(decoded.received);
         }
       }, true));
     if (__abortedCtxs.size !== 0) {
@@ -6717,7 +6798,9 @@ __celld.__dispatchRpc = async (scope, method, args, trusted) => {
   // A stub received by this invocation dies with it: the reply lift
   // already moved what the call returned, so ending the context only
   // disposes what the handler dropped. Every release routes to the
-  // owner; a quiet-but-open handle never dies on a timer.
+  // owner; a quiet-but-open handle never dies on a timer. A received
+  // stream with a live reader is spared instead: the reader holds the
+  // stream past its invocation.
   const ctxId = __ctxNext();
   try {
     try {
@@ -6744,7 +6827,7 @@ __celld.__dispatchRpc = async (scope, method, args, trusted) => {
             return fn.apply(inst, decoded.args);
           }, "host");
         } finally {
-          for (const handle of decoded.received) __disposeStub(handle);
+          __disposeReceived(decoded.received);
         }
       })());
     } finally {
@@ -6806,9 +6889,7 @@ __celld.__dispatchStubOp = async (scope, hostId, path, args) => {
             return await __rpcWalk(entry.target, path,
               decoded === null ? null : decoded.args, false);
           } finally {
-            if (decoded !== null)
-              for (const handle of decoded.received)
-                __disposeStub(handle);
+            if (decoded !== null) __disposeReceived(decoded.received);
           }
         }, "host"));
       if (__abortedCtxs.size !== 0) {
@@ -7337,8 +7418,7 @@ const __entrypointOp = (name, path, argsSc, local, makeInst, props) => {
     // early throw) still tears the context down, disposing partial
     // revives with it.
     __ctxEnd(id);
-    if (decoded !== null)
-      for (const handle of decoded.received) __disposeStub(handle);
+    if (decoded !== null) __disposeReceived(decoded.received);
   }
   })();
   return Promise.race([running, cancellation]).finally(() => {
