@@ -547,7 +547,7 @@ push to `ghcr.io/denoland`, but still. Pushing a branch named
   a kernel without Landlock, where celld warns that esbuild runs
   unconfined. The Python SDK probe follows no link, so it cannot answer
   whether a host path exists.
-- `0051` (sha TBD at merge) `celld deploy --read-root DIR`
+- `0051` (`7ba9825`) `celld deploy --read-root DIR`
   (repeatable) names directories beyond the project that build inputs may
   come from: esbuild's inputs (the Landlock rule and the metafile check
   admit them) and `containers[].image` Dockerfiles with their build
@@ -611,7 +611,7 @@ source commit; the commits keep the original author with a
     upgrade can still be redriven to the name they carry; planting
     such rows is closed by `0041`, redrive is operator-only, and
     retention ages them out.
-- `v0.6.3-ryuzcorp.7` (the commit that adds this entry): adds
+- `v0.6.3-ryuzcorp.7` (`45c0af0`): adds
   `0043`–`0050`. Upgrade notes:
   - `celld deploy` and `celld d1` refuse a project path that resolves
     outside the project directory, which is the config file's own
@@ -643,6 +643,15 @@ source commit; the commits keep the original author with a
     no `POST /invoke` route (`0048`). A stream received over
     RPC now stays open while the receiver holds it (`0043`), which ends
     the spurious aborts of signal-carrying container execs.
+- `v0.6.3-ryuzcorp.8` (the commit that adds this entry): adds `0051`.
+  Upgrade notes:
+  - `celld deploy --read-root DIR` (repeatable) names directories beyond
+    the project that esbuild's inputs and `containers[].image`
+    Dockerfiles with their build contexts may come from. A platform that
+    deploys a built subdirectory of a checkout, or a monorepo app whose
+    packages are hoisted above its config, names the checkout; with it,
+    an absolute or `..` Dockerfile path inside the read root builds again.
+    Without the flag, `.7`'s project-only bounds are unchanged.
 
 ## License
 
