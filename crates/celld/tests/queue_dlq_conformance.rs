@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): Queue DLQ forward/redrive conformance. Apache-2.0.
+// Modified by ryuzcorp (ryuzcorp/celld): Queue DLQ forward/redrive conformance; deploy --read-root option. Apache-2.0.
 
 // A black-box runner, not node code: it boots the binary, copies fixtures,
 // reads the cells' SQLite files, and polls TCP with wall-clock deadlines,
@@ -105,6 +105,7 @@ fn preseed_victim(app_project: &Path, victim_src: &Path) {
             local_images: true,
             sourcemap: None,
             no_activate: false,
+            read_roots: Vec::new(),
         })
         .expect("build victim");
         celld::deploy::write(&bucket, &built)

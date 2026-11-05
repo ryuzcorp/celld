@@ -1,6 +1,6 @@
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 //
-// Modified by ryuzcorp (ryuzcorp/celld): staged invoke. Apache-2.0.
+// Modified by ryuzcorp (ryuzcorp/celld): staged invoke; deploy --read-root option. Apache-2.0.
 
 // A black-box runner, not node code: it boots the binary, stages versions
 // into the node's own store, and polls TCP with wall-clock deadlines, so
@@ -301,6 +301,7 @@ impl FleetStore {
             local_images: true,
             sourcemap: None,
             no_activate: true,
+            read_roots: Vec::new(),
         })
         .expect("build")
     }

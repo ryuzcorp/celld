@@ -1,7 +1,7 @@
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 //
 // Modified by ryuzcorp (ryuzcorp/celld): cross-isolate RPC
-// stubs and streams; deploy --sourcemap option; staged activation. Apache-2.0.
+// stubs and streams; deploy --sourcemap option; staged activation; deploy --read-root option. Apache-2.0.
 
 // A black-box runner, not node code: it boots the binary, copies fixtures,
 // and polls TCP with wall-clock deadlines, so the execution boundary's
@@ -177,6 +177,7 @@ fn preseed_controller(app_project: &Path, controller_src: &Path) {
             local_images: true,
             sourcemap: None,
             no_activate: false,
+            read_roots: Vec::new(),
         })
         .expect("build controller");
         celld::deploy::write(&bucket, &built)

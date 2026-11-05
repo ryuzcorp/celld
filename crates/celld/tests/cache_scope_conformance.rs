@@ -1,7 +1,7 @@
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 //
 // Modified by ryuzcorp (ryuzcorp/celld): deployment cache scope
-// conformance. Apache-2.0.
+// conformance; deploy --read-root option. Apache-2.0.
 
 // A black-box runner, not node code: it boots the binary, deploys
 // fixtures through the library, and polls TCP with wall-clock deadlines,
@@ -200,6 +200,7 @@ fn deploy_src(bucket: &celld::bucket::Bucket, src: &Path) {
             local_images: true,
             sourcemap: None,
             no_activate: false,
+            read_roots: Vec::new(),
         })
         .expect("build fixture");
         celld::deploy::write(bucket, &built)

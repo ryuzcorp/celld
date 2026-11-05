@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): idempotent content-tagged image create; tag-race tests run the fake engine through sh; deploy --sourcemap writes the bundle's external map; service binding targets validated at deploy; staged activation; deploy --sourcemap collects the no_bundle sibling map; staged invoke shares the version-ref parsing; deploy reads stay inside the project.
+// Modified by ryuzcorp (ryuzcorp/celld): idempotent content-tagged image create; tag-race tests run the fake engine through sh; deploy --sourcemap writes the bundle's external map; service binding targets validated at deploy; staged activation; deploy --sourcemap collects the no_bundle sibling map; staged invoke shares the version-ref parsing; deploy reads stay inside the project; deploy --read-root bounds bundling and container builds.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 // Deployment is an operator control-plane path outside the Actor execution
@@ -222,6 +222,11 @@ pub struct Options {
     /// deployment, so moving it early would leak the staged version into
     /// the next adoption's queue resolution.
     pub no_activate: bool,
+    /// Directories beyond the project that build inputs may come from:
+    /// esbuild's inputs and `containers[].image` Dockerfiles with their
+    /// build contexts. Only the operator names them, on the command line;
+    /// every other project read stays inside the project directory.
+    pub read_roots: Vec<PathBuf>,
 }
 
 /// Local Worker variables, tagged with the kind of file that supplied them.
@@ -247,7 +252,7 @@ pub fn print_help() {
 USAGE:\n  celld deploy [PROJECT] --bucket [s3://|gs://|az://]NAME[/PREFIX] [OPTIONS]\n\n\
 PROJECT is a directory or a Wrangler config; it defaults to the working\n\
 directory, where celld looks for wrangler.jsonc or wrangler.json.\n\n\
-OPTIONS:\n  --sourcemap PATH       Write the Worker's source map to PATH: the bundled JS\n                         entry's external map, or the `no_bundle` entry's sibling\n                         `<entry>.map`; never wasm siblings. Asset-only and Python\n                         projects, and `no_bundle` entries without a sibling map,\n                         warn and write nothing. The deployed bytes are identical\n                         with or without it\n  --config PATH          Same as passing PROJECT positionally\n  --bucket [s3://|gs://|az://]NAME[/PREFIX]\n                         Fleet bucket and prefix; defaults to CELLD_BUCKET.\n                         gs:// selects a Google Cloud Storage bucket, az://\n                         an Azure Blob Storage container with its account in\n                         AZURE_STORAGE_ACCOUNT_NAME; celld then rejects\n                         --endpoint and ignores --region\n  --endpoint URL         S3-compatible endpoint; defaults to S3_ENDPOINT\n  --region REGION        Storage region; defaults to AWS_REGION\n  --dry-run              Bundle and print the version without writing\n  --no-activate          Upload and validate without moving any pointer;\n                         the staged version serves only once `celld activate`\n                         names it\n  --json                 Print the deployment as one JSON object\n  -h, --help             Show this help\n\n\
+OPTIONS:\n  --sourcemap PATH       Write the Worker's source map to PATH: the bundled JS\n                         entry's external map, or the `no_bundle` entry's sibling\n                         `<entry>.map`; never wasm siblings. Asset-only and Python\n                         projects, and `no_bundle` entries without a sibling map,\n                         warn and write nothing. The deployed bytes are identical\n                         with or without it\n  --read-root DIR        A directory beyond the project that build inputs may\n                         come from: esbuild's inputs and `containers[].image`\n                         Dockerfiles with their build contexts. Repeatable\n  --config PATH          Same as passing PROJECT positionally\n  --bucket [s3://|gs://|az://]NAME[/PREFIX]\n                         Fleet bucket and prefix; defaults to CELLD_BUCKET.\n                         gs:// selects a Google Cloud Storage bucket, az://\n                         an Azure Blob Storage container with its account in\n                         AZURE_STORAGE_ACCOUNT_NAME; celld then rejects\n                         --endpoint and ignores --region\n  --endpoint URL         S3-compatible endpoint; defaults to S3_ENDPOINT\n  --region REGION        Storage region; defaults to AWS_REGION\n  --dry-run              Bundle and print the version without writing\n  --no-activate          Upload and validate without moving any pointer;\n                         the staged version serves only once `celld activate`\n                         names it\n  --json                 Print the deployment as one JSON object\n  -h, --help             Show this help\n\n\
 Credentials come from the standard AWS credential chain, from Google\n\
 Application Default Credentials for a gs:// bucket, or from an Azure storage\n\
 account key, managed identity, or workload identity for an az:// bucket.\n\n\
@@ -279,6 +284,7 @@ pub fn options_from_arguments(
         vars: VarOverrides::None,
         sourcemap: None,
         no_activate: false,
+        read_roots: Vec::new(),
     };
     let mut arguments = arguments.into_iter();
     while let Some(argument) = arguments.next() {
@@ -305,6 +311,11 @@ pub fn options_from_arguments(
             "--sourcemap" => {
                 options.sourcemap = Some(PathBuf::from(
                     arguments.next().context("--sourcemap requires a value")?,
+                ));
+            }
+            "--read-root" => {
+                options.read_roots.push(PathBuf::from(
+                    arguments.next().context("--read-root requires a value")?,
                 ));
             }
             other if other.starts_with('-') => {
@@ -756,6 +767,7 @@ fn gzipped(modules: &[(String, Vec<u8>)]) -> usize {
 
 pub fn build(options: &Options) -> anyhow::Result<Built> {
     let (config_path, root) = resolve_project_config(options.config.clone())?;
+    let bounds = ReadBounds::new(&root, &options.read_roots)?;
     let mut project = read_project(&config_path, &root, &options.vars)?;
     // Resolve every image before the version is computed: the id is part of
     // the deployment's identity, so a rebuilt image is a new deployment.
@@ -771,7 +783,7 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
         .enumerate()
         .map(|(index, decl)| {
             resolve_image(
-                &root,
+                &bounds,
                 &decl.image,
                 &format!("config `containers[{index}].image`"),
                 platform.as_deref(),
@@ -846,7 +858,13 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
                 // esbuild resolves the entry itself, so it is handed the
                 // contained path rather than the raw config value.
                 let path = contained_entry(&root, entry)?;
-                run_esbuild(&root, &path, &project.bundle, options.sourcemap.is_some())
+                run_esbuild(
+                    &root,
+                    &bounds,
+                    &path,
+                    &project.bundle,
+                    options.sourcemap.is_some(),
+                )
             }
         })
         .transpose()?;
@@ -968,19 +986,37 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
 /// reference: a project-relative path to a regular file, resolved inside the
 /// project root. Wrangler draws the same line between a path and a reference.
 /// Anything else is a reference — including a symlink, which is never
-/// followed here. A value that is neither project-relative nor a reference
-/// (absolute, climbing with `..`) is refused without probing the filesystem:
-/// branching on whether such a path exists would leak host file existence
-/// one deploy error at a time.
+/// followed here. A value that is absolute or climbs with `..` is a path, never
+/// a reference: it must name a regular file inside an operator's read root,
+/// and is refused otherwise. It is joined lexically and the filesystem is
+/// probed only once it lands inside a bound, since branching on whether a
+/// path outside them exists would leak host file existence one deploy error
+/// at a time.
 fn dockerfile_path(
-    canonical_root: &Path,
-    root: &Path,
+    bounds: &ReadBounds,
     image: &str,
     what: &str,
 ) -> anyhow::Result<Option<PathBuf>> {
-    let relative = match project_relative_path(image, what) {
-        Ok(relative) => relative,
-        Err(_) => bail!("{what} must be a project-relative path or an image reference: {image:?}"),
+    let root = bounds.project();
+    let Ok(relative) = project_relative_path(image, what) else {
+        // One refusal for every failure here, so a value cannot tell a path
+        // outside the bounds from a missing file inside them.
+        let refuse = || {
+            anyhow!(
+                "{what} must be a project-relative path, an image reference, or a \
+                 regular file inside a read root: {image:?}"
+            )
+        };
+        let path = lexical_join(root, image);
+        if !bounds.contains(&path) {
+            return Err(refuse());
+        }
+        let regular =
+            std::fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.file_type().is_file());
+        if !regular {
+            return Err(refuse());
+        }
+        return bounds.contain(&path, what).map(Some);
     };
     let path = root.join(relative);
     let metadata = match std::fs::symlink_metadata(&path) {
@@ -993,7 +1029,26 @@ fn dockerfile_path(
     if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
         return Ok(None);
     }
-    contain_path(canonical_root, &path, what).map(Some)
+    bounds.contain(&path, what).map(Some)
+}
+
+/// `base` joined with `value` with `.` and `..` resolved by name alone, never
+/// by the filesystem. An absolute `value` replaces `base`.
+fn lexical_join(base: &Path, value: &str) -> PathBuf {
+    let mut path = base.to_path_buf();
+    for component in Path::new(value).components() {
+        match component {
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => {
+                path = PathBuf::from(component.as_os_str());
+            }
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                path.pop();
+            }
+            std::path::Component::Normal(name) => path.push(name),
+        }
+    }
+    path
 }
 
 fn engine_cli() -> String {
@@ -1033,12 +1088,12 @@ fn run_engine_cli(cli: &[&str], args: &[&str], what: &str) -> anyhow::Result<Str
 /// builds, so their hash names the image everywhere: in the manifest, in
 /// the bucket key, and as the tag every engine holds it under.
 fn resolve_image(
-    root: &Path,
+    bounds: &ReadBounds,
     image: &str,
     what: &str,
     platform: Option<&str>,
 ) -> anyhow::Result<String> {
-    resolve_image_cli(&[&engine_cli()], root, image, what, platform)
+    resolve_image_cli(&[&engine_cli()], bounds, image, what, platform)
 }
 
 /// `resolve_image` against an explicit engine CLI: the program and any
@@ -1046,7 +1101,7 @@ fn resolve_image(
 /// value escapes the project.
 fn resolve_image_cli(
     cli: &[&str],
-    root: &Path,
+    bounds: &ReadBounds,
     image: &str,
     what: &str,
     platform: Option<&str>,
@@ -1055,13 +1110,14 @@ fn resolve_image_cli(
     let platform_args = platform
         .map(|platform| vec!["--platform", platform])
         .unwrap_or_default();
-    let canonical_root = canonical_project_root(root)?;
-    let id = if let Some(path) = dockerfile_path(&canonical_root, root, image, what)? {
+    // The Dockerfile is canonical and inside a bound, so its directory, the
+    // build context, is too.
+    let id = if let Some(path) = dockerfile_path(bounds, image, what)? {
         let context = path
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
             .map(Path::to_path_buf)
-            .unwrap_or_else(|| canonical_root.clone());
+            .unwrap_or_else(|| bounds.project().to_path_buf());
         let path = path.display().to_string();
         let context = context.display().to_string();
         let mut args = vec!["build", "-q"];
@@ -1135,7 +1191,7 @@ fn resolve_fence_image(platform: Option<&str>) -> anyhow::Result<String> {
     std::fs::write(context.path().join("Dockerfile"), FENCE_DOCKERFILE)
         .context("write fence Dockerfile")?;
     resolve_image(
-        context.path(),
+        &ReadBounds::new(context.path(), &[])?,
         "Dockerfile",
         "the fence Dockerfile",
         platform,
@@ -4130,6 +4186,60 @@ fn contain_path(canonical_root: &Path, path: &Path, what: &str) -> anyhow::Resul
     Ok(canonical)
 }
 
+/// Where a deploy's build inputs may come from: the canonical project
+/// directory plus the operator's `--read-root` directories. esbuild's inputs
+/// and container builds (the Dockerfile and its context) must resolve inside
+/// one of them; every other project read stays inside the project directory.
+#[derive(Debug)]
+struct ReadBounds {
+    project: PathBuf,
+    extra: Vec<PathBuf>,
+}
+
+impl ReadBounds {
+    fn new(project: &Path, read_roots: &[PathBuf]) -> anyhow::Result<Self> {
+        let project = canonical_project_root(project)?;
+        let extra = read_roots
+            .iter()
+            .map(|root| {
+                let canonical = root
+                    .canonicalize()
+                    .with_context(|| format!("resolve --read-root {}", root.display()))?;
+                if !canonical.is_dir() {
+                    bail!("--read-root {} is not a directory", root.display());
+                }
+                Ok(canonical)
+            })
+            .collect::<anyhow::Result<_>>()?;
+        Ok(Self { project, extra })
+    }
+
+    /// The canonical project directory.
+    fn project(&self) -> &Path {
+        &self.project
+    }
+
+    /// Every directory a build input may come from, the project first.
+    fn roots(&self) -> impl Iterator<Item = &Path> {
+        std::iter::once(self.project.as_path()).chain(self.extra.iter().map(PathBuf::as_path))
+    }
+
+    fn contains(&self, path: &Path) -> bool {
+        self.roots().any(|root| path.starts_with(root))
+    }
+
+    /// `contain_path` against every bound.
+    fn contain(&self, path: &Path, what: &str) -> anyhow::Result<PathBuf> {
+        let canonical = path
+            .canonicalize()
+            .with_context(|| format!("resolve {what} {}", path.display()))?;
+        if !self.contains(&canonical) {
+            bail!("{what} escapes the project directory: {}", path.display());
+        }
+        Ok(canonical)
+    }
+}
+
 /// The config file and the canonical project root: the config's directory,
 /// canonicalized, with the config itself required to resolve inside it. A
 /// config that is a link outside the tree would otherwise let another file's
@@ -4496,6 +4606,7 @@ fn collect_unbundled_wasm(
 
 fn run_esbuild(
     root: &Path,
+    bounds: &ReadBounds,
     entry: &Path,
     config: &BundleConfig,
     sourcemap: bool,
@@ -4526,11 +4637,11 @@ fn run_esbuild(
   }
   return builtin;
 };"#;
-    // esbuild may read only the project and its own two directories: an
-    // outside import, input source map, or tsconfig `extends` then fails
+    // esbuild may read only the project, the operator's read roots, and its
+    // own two directories: an outside import, input source map, or tsconfig
+    // `extends` then fails
     // like a missing file, before any of its bytes can reach the bundle,
     // the map, or esbuild's error output (which quotes source lines).
-    let canonical_root = canonical_project_root(root)?;
     let Some(program) = confine::locate_executable(&binary) else {
         bail!(
             "esbuild not found ({binary}).\n\
@@ -4538,15 +4649,16 @@ fn run_esbuild(
              or set CELLD_ESBUILD to its path."
         );
     };
-    let confinement = confine::ReadConfinement::beneath(
-        &[canonical_root.as_path(), outdir.path(), metadir.path()],
-        &program,
-    )?;
+    let readable: Vec<&Path> = bounds
+        .roots()
+        .chain([outdir.path(), metadir.path()])
+        .collect();
+    let confinement = confine::ReadConfinement::beneath(&readable, &program)?;
     #[cfg(target_os = "linux")]
     if let confine::ReadConfinement::Unavailable(reason) = &confinement {
         note!(
             "warning: esbuild runs unconfined: {reason}. Bundled files are still \
-             checked against the project directory, but an outside input source map, \
+             checked against the project and its read roots, but an outside input source map, \
              tsconfig, or failing file can reach the source map or the error output."
         );
     }
@@ -4596,7 +4708,7 @@ fn run_esbuild(
         } else if error.kind() == std::io::ErrorKind::PermissionDenied && confinement.confines() {
             anyhow!(
                 "run esbuild {}: {error}. esbuild runs confined to reads of the \
-                 project; if this is a wrapper script, it cannot read its \
+                 project and its read roots; if this is a wrapper script, it cannot read its \
                  interpreter, so point CELLD_ESBUILD at the self-contained \
                  release binary.",
                 program.display()
@@ -4612,14 +4724,14 @@ fn run_esbuild(
         );
     }
     // Before anything esbuild wrote is used: every file it read must lie in
-    // the project. esbuild follows `..` imports, absolute imports, and
+    // the project or a read root. esbuild follows `..` imports, absolute imports, and
     // directory links wherever they lead, and the deploy may run with more
     // privilege than the project's author, so an import must never pull a
     // file from outside the tree into the deployed bundle or its map.
     // The check stands on its own where the kernel offers no confinement,
     // and backs it up where it does.
     let meta = std::fs::read(&metafile).context("read esbuild metafile")?;
-    contain_bundle_inputs(&canonical_root, &meta)?;
+    contain_bundle_inputs(bounds, &meta)?;
     // The strip keeps the deployed module byte-identical to a run without
     // the flag even if an esbuild ever appends the comment despite `external`.
     let bundle = strip_sourcemap_comment(
@@ -4680,14 +4792,15 @@ fn run_esbuild(
     })
 }
 
-/// Refuse a bundle that read any file outside `canonical_root`. `meta` is
-/// the esbuild metafile from a run whose working directory was the project
-/// root, so each file input is named relative to it (or absolutely). Every
+/// Refuse a bundle that read any file outside `bounds`. `meta` is the esbuild
+/// metafile from a run whose working directory was the project root, so each
+/// file input is named relative to it (or absolutely). Every
 /// input that names an existing path is checked, whatever it looks like;
 /// only one that names nothing and is spelled like another namespace
 /// (`(disabled):…`, `<data:…>`, `dataurl:…`) read no file and is skipped.
 /// Any other input fails closed.
-fn contain_bundle_inputs(canonical_root: &Path, meta: &[u8]) -> anyhow::Result<()> {
+fn contain_bundle_inputs(bounds: &ReadBounds, meta: &[u8]) -> anyhow::Result<()> {
+    let root = bounds.project();
     let meta: Value = serde_json::from_slice(meta).context("parse esbuild metafile")?;
     let inputs = meta
         .get("inputs")
@@ -4699,17 +4812,17 @@ fn contain_bundle_inputs(canonical_root: &Path, meta: &[u8]) -> anyhow::Result<(
             || input
                 .split_once(':')
                 .is_some_and(|(namespace, _)| !namespace.is_empty() && !namespace.contains('/'));
-        if namespaced && std::fs::symlink_metadata(canonical_root.join(input)).is_err() {
+        if namespaced && std::fs::symlink_metadata(root.join(input)).is_err() {
             continue;
         }
         // The error names the input as esbuild keyed it, never the resolved
         // target, so a refusal discloses nothing beyond the project's own
         // spelling.
-        let canonical = canonical_root
+        let canonical = root
             .join(input)
             .canonicalize()
             .with_context(|| format!("resolve a bundled module {input}"))?;
-        if !canonical.starts_with(canonical_root) {
+        if !bounds.contains(&canonical) {
             bail!("a bundled module escapes the project directory: {input}");
         }
     }
@@ -5045,6 +5158,10 @@ fi
         std::fs::write(dir.join("Dockerfile"), "FROM scratch\n").unwrap();
     }
 
+    fn bounds(project: &Path) -> ReadBounds {
+        ReadBounds::new(project, &[]).unwrap()
+    }
+
     fn sh(script: &Path) -> [&str; 2] {
         ["/bin/sh", script.to_str().unwrap()]
     }
@@ -5069,7 +5186,7 @@ fi
         );
         let error = resolve_image_cli(
             &sh(&cli),
-            project.path(),
+            &bounds(project.path()),
             "sub/Dockerfile",
             "config `containers[0].image`",
             None,
@@ -5090,7 +5207,7 @@ fi
         ] {
             let error = resolve_image_cli(
                 &sh(&cli),
-                project.path(),
+                &bounds(project.path()),
                 absolute.to_str().unwrap(),
                 "config `containers[0].image`",
                 None,
@@ -5099,7 +5216,7 @@ fi
             let message = format!("{error:?}");
             assert!(
                 message.contains("config `containers[0].image`")
-                    && message.contains("must be a project-relative path or an image reference"),
+                    && message.contains("must be a project-relative path"),
                 "the refusal must name the key without probing: {message}"
             );
         }
@@ -5108,7 +5225,7 @@ fi
         std::fs::create_dir(project.path().join("inner")).unwrap();
         let error = resolve_image_cli(
             &sh(&cli),
-            &project.path().join("inner"),
+            &bounds(&project.path().join("inner")),
             "../Dockerfile",
             "config `containers[0].image`",
             None,
@@ -5116,9 +5233,108 @@ fi
         .expect_err("a `..` image value must be refused, not built");
         let message = format!("{error:?}");
         assert!(
-            message.contains("must be a project-relative path or an image reference"),
+            message.contains("must be a project-relative path"),
             "the refusal must say the value is neither: {message}"
         );
+    }
+
+    /// An operator's read root admits a Dockerfile outside the project by
+    /// absolute or `..` path, and only there: a value outside every root is
+    /// still refused without probing, and a missing file or a link inside one
+    /// is refused rather than pulled as a reference, with the same message as
+    /// a value outside every root.
+    #[test]
+    fn read_roots_admit_dockerfiles_outside_the_project() {
+        let tree = tempfile::tempdir().unwrap();
+        let tree_path = tree.path().canonicalize().unwrap();
+        let (worktree, outside) = (tree_path.join("worktree"), tree_path.join("outside"));
+        let project = worktree.join("dist");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(worktree.join("images")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(worktree.join("Dockerfile"), "FROM scratch\n").unwrap();
+        std::fs::write(worktree.join("images/app.Dockerfile"), "FROM scratch\n").unwrap();
+        std::fs::write(outside.join("Dockerfile"), "FROM scratch\n").unwrap();
+        symlink_for_test(
+            &outside.join("Dockerfile"),
+            &worktree.join("linked.Dockerfile"),
+        );
+        let content = "[layer]{config}";
+        let cli = fake_engine(&tree_path, "fake-built-id", content, content);
+        let widened = ReadBounds::new(&project, std::slice::from_ref(&worktree)).unwrap();
+        let resolve = |bounds: &ReadBounds, image: &str| {
+            resolve_image_cli(
+                &sh(&cli),
+                bounds,
+                image,
+                "config `containers[0].image`",
+                None,
+            )
+        };
+        let absolute = worktree.join("images/app.Dockerfile");
+        for image in ["../Dockerfile", absolute.to_str().unwrap()] {
+            resolve(&widened, image).unwrap_or_else(|error| panic!("{image}: {error:#}"));
+            let error = resolve(&bounds(&project), image).expect_err(image);
+            assert!(
+                format!("{error:#}").contains("must be a project-relative path"),
+                "{image} without the read root: {error:#}"
+            );
+        }
+        let outside_absolute = outside.join("Dockerfile");
+        let missing = worktree.join("missing.Dockerfile");
+        for (image, want) in [
+            (
+                "../../outside/Dockerfile",
+                "must be a project-relative path",
+            ),
+            (
+                outside_absolute.to_str().unwrap(),
+                "must be a project-relative path",
+            ),
+            (missing.to_str().unwrap(), "must be a project-relative path"),
+            ("../linked.Dockerfile", "must be a project-relative path"),
+        ] {
+            let error = resolve(&widened, image).expect_err(image);
+            assert!(format!("{error:#}").contains(want), "{image}: {error:#}");
+        }
+    }
+
+    /// `.` and `..` resolve by name; `..` stops at `/`; an absolute value
+    /// replaces the base; repeated and trailing slashes add nothing.
+    #[test]
+    fn lexical_join_resolves_by_name_alone() {
+        let base = Path::new("/w/dist");
+        for (value, want) in [
+            ("Dockerfile", "/w/dist/Dockerfile"),
+            ("./a/./b", "/w/dist/a/b"),
+            ("../Dockerfile", "/w/Dockerfile"),
+            ("../../../../etc/x", "/etc/x"),
+            ("/abs//x/", "/abs/x"),
+            ("/abs/y/../x", "/abs/x"),
+        ] {
+            assert_eq!(lexical_join(base, value), Path::new(want), "{value}");
+        }
+    }
+
+    /// A read root must name an existing directory; a link to one counts as
+    /// the directory it resolves to.
+    #[test]
+    fn read_roots_must_be_directories() {
+        let tree = tempfile::tempdir().unwrap();
+        let (project, root) = (tree.path().join("project"), tree.path().join("root"));
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(tree.path().join("file"), "").unwrap();
+        symlink_for_test(&root, &tree.path().join("linked"));
+        for bad in [tree.path().join("file"), tree.path().join("missing")] {
+            assert!(
+                ReadBounds::new(&project, std::slice::from_ref(&bad)).is_err(),
+                "{}",
+                bad.display()
+            );
+        }
+        let bounds = ReadBounds::new(&project, &[tree.path().join("linked")]).unwrap();
+        assert!(bounds.contains(&root.canonicalize().unwrap().join("x")));
     }
 
     #[test]
@@ -5131,7 +5347,7 @@ fi
         let cli = fake_engine(project.path(), "fake-built-id", content, content);
         let reference = resolve_image_cli(
             &sh(&cli),
-            project.path(),
+            &bounds(project.path()),
             "sub/Dockerfile",
             "config `containers[0].image`",
             None,
@@ -5151,7 +5367,7 @@ fi
         let cli = fake_engine(dir.path(), "fake-built-id", content, content);
         let reference = resolve_image_cli(
             &sh(&cli),
-            dir.path(),
+            &bounds(dir.path()),
             "Dockerfile",
             "config `containers[0].image`",
             None,
@@ -5175,7 +5391,7 @@ fi
         );
         let error = resolve_image_cli(
             &sh(&cli),
-            dir.path(),
+            &bounds(dir.path()),
             "Dockerfile",
             "config `containers[0].image`",
             None,
@@ -5299,6 +5515,7 @@ mod sourcemap_tests {
             local_images: false,
             sourcemap,
             no_activate: false,
+            read_roots: Vec::new(),
         }
     }
 
@@ -5835,22 +6052,30 @@ mod sourcemap_tests {
             "(disabled):fs",
             "dataurl:data:text/plain,x",
         ]);
-        contain_bundle_inputs(&root, &inside).expect("in-tree inputs pass");
+        contain_bundle_inputs(&ReadBounds::new(&root, &[]).unwrap(), &inside)
+            .expect("in-tree inputs pass");
         let absolute = outside.join("secret.js");
         for escaping in [
             "../outside/secret.js",
             absolute.to_str().unwrap(),
             "out-link/secret.js",
         ] {
-            let error =
-                contain_bundle_inputs(&root, &meta(&["src/app.js", escaping])).expect_err(escaping);
+            let error = contain_bundle_inputs(
+                &ReadBounds::new(&root, &[]).unwrap(),
+                &meta(&["src/app.js", escaping]),
+            )
+            .expect_err(escaping);
             assert!(
                 format!("{error:#}").contains("escapes the project directory"),
                 "{escaping}: {error:#}"
             );
         }
         assert!(
-            contain_bundle_inputs(&root, &meta(&["src/gone.js"])).is_err(),
+            contain_bundle_inputs(
+                &ReadBounds::new(&root, &[]).unwrap(),
+                &meta(&["src/gone.js"])
+            )
+            .is_err(),
             "an unresolvable file input fails closed"
         );
         // A name spelled like a namespace is skipped only when it names
@@ -5858,7 +6083,9 @@ mod sourcemap_tests {
         std::os::unix::fs::symlink(outside.join("secret.js"), root.join("ns:x")).unwrap();
         std::os::unix::fs::symlink(outside.join("secret.js"), root.join("(x).js")).unwrap();
         for disguised in ["ns:x", "(x).js"] {
-            let error = contain_bundle_inputs(&root, &meta(&[disguised])).expect_err(disguised);
+            let error =
+                contain_bundle_inputs(&ReadBounds::new(&root, &[]).unwrap(), &meta(&[disguised]))
+                    .expect_err(disguised);
             assert!(
                 format!("{error:#}").contains("escapes the project directory"),
                 "{disguised}: {error:#}"
@@ -5925,6 +6152,65 @@ mod sourcemap_tests {
         )
         .unwrap();
         build(&test_options(&config, None)).expect("an in-tree link still bundles");
+    }
+
+    /// A monorepo app whose packages are hoisted above its config bundles
+    /// once the operator names the repository as a read root, and only then.
+    #[test]
+    fn read_root_admits_hoisted_node_modules() {
+        if !esbuild_available() {
+            eprintln!("skipping: esbuild not on PATH");
+            return;
+        }
+        let tree = tempfile::tempdir().unwrap();
+        let (repo, outside) = (tree.path().join("repo"), tree.path().join("outside"));
+        let app = repo.join("apps/web");
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::create_dir_all(repo.join("node_modules/hoisted")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(
+            repo.join("node_modules/hoisted/index.js"),
+            "export const greeting = 'HOISTED';\n",
+        )
+        .unwrap();
+        std::fs::write(outside.join("secret.js"), "export default 'OUTSIDE';\n").unwrap();
+        std::fs::write(
+            app.join("wrangler.json"),
+            r#"{"name": "mono", "main": "entry.js"}"#,
+        )
+        .unwrap();
+        let config = app.join("wrangler.json");
+        std::fs::write(
+            app.join("entry.js"),
+            "import { greeting } from \"hoisted\";\n\
+             export default { fetch() { return new Response(greeting); } };\n",
+        )
+        .unwrap();
+        let widened = |config: &Path| Options {
+            read_roots: vec![repo.clone()],
+            ..test_options(config, None)
+        };
+        refused(
+            build(&test_options(&config, None)),
+            "hoisted without a read root",
+        );
+        let built = build(&widened(&config)).expect("the read root admits the hoisted package");
+        assert!(built
+            .modules
+            .iter()
+            .any(|(_, bytes)| String::from_utf8_lossy(bytes).contains("HOISTED")));
+        // The read root widens nothing beyond itself.
+        std::fs::write(
+            app.join("entry.js"),
+            "import x from \"../../../outside/secret.js\";\n\
+             export default { fetch() { return new Response(x); } };\n",
+        )
+        .unwrap();
+        let error = format!(
+            "{:#}",
+            refused(build(&widened(&config)), "outside the read root")
+        );
+        assert!(!error.contains("OUTSIDE"), "{error}");
     }
 
     /// The reads the metafile never lists stay inside too: an input's
