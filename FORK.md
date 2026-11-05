@@ -518,7 +518,7 @@ push to `ghcr.io/denoland`, but still. Pushing a branch named
   local user reads through `/proc/<pid>/cmdline`; the environment is
   readable only by the same user. An unset variable is refused without
   echoing anything, and the `--header` name and value checks apply.
-- `0050` (sha TBD at merge) `celld deploy` and `celld d1` read the
+- `0050` (`63e97a5`) `celld deploy` and `celld d1` read the
   project tree only inside the project's own directory: every
   project path is canonicalized and refused with an error naming
   its config key when it resolves elsewhere, while a link that
@@ -561,7 +561,7 @@ source commit; the commits keep the original author with a
 - `v0.6.3-ryuzcorp.4` (`65419c6`): patches `0001`–`0006`; first
   release published by this fork.
 - `v0.6.3-ryuzcorp.5` (`750e18a`): adds `0007`–`0008` (PR #2).
-- `v0.6.3-ryuzcorp.6` (the commit that adds this entry): adds
+- `v0.6.3-ryuzcorp.6` (`d15ce19`): adds
   `0009`–`0042`. Upgrade notes:
   - Upgrade every node of a fleet together. A rolling upgrade moves
     cells with no migration (`0037`), but cross-version traffic fails
@@ -598,6 +598,38 @@ source commit; the commits keep the original author with a
     upgrade can still be redriven to the name they carry; planting
     such rows is closed by `0041`, redrive is operator-only, and
     retention ages them out.
+- `v0.6.3-ryuzcorp.7` (the commit that adds this entry): adds
+  `0043`–`0050`. Upgrade notes:
+  - `celld deploy` and `celld d1` refuse a project path that resolves
+    outside the project directory, which is the config file's own
+    directory (`0050`). That covers the config, `main`, assets,
+    Dockerfiles and build contexts, `migrations_dir`, Python sources,
+    and every file esbuild bundles. A monorepo that hoists
+    `node_modules` above that directory no longer bundles: install the
+    packages inside it. `migrations_dir` entries must be regular files,
+    and a `containers[].image` that is an absolute or `..` path is
+    refused.
+  - On Linux, esbuild runs under Landlock with reads confined to the
+    project, so `CELLD_ESBUILD` (or `esbuild` on `PATH`) must be the
+    self-contained release binary, not a wrapper script (`0050`). A
+    kernel or seccomp profile without Landlock runs it unconfined with
+    a warning; Docker's, containerd's and podman's default profiles
+    allow it.
+  - `celld r2 head` and `celld r2 get --json` print a
+    `{"error":"not_found",...}` object on stdout for an absent key
+    (`0044`); the exit code and stderr are unchanged.
+  - `celld --version` reports the full build version, such as
+    `0.6.3-ryuzcorp.7` (`0046`).
+  - New, opt-in: `CELLD_CACHE_SCOPE=deployment` shares one Workers
+    Cache API scope across a deployment's scripts (`0045`; the default
+    `script` scope is unchanged); `celld invoke` runs one request
+    against a staged version before `celld activate` (`0048`), with
+    `--header-env` for secret headers (`0049`); `celld deploy
+    --sourcemap` collects a `no_bundle` entry's sibling map (`0047`).
+  - `celld invoke` needs every node on this release: an older node has
+    no `POST /invoke` route (`0048`). A stream received over
+    RPC now stays open while the receiver holds it (`0043`), which ends
+    the spurious aborts of signal-carrying container execs.
 
 ## License
 
