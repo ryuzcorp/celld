@@ -9,7 +9,7 @@ README below is kept intact; this file documents the fork.
 
 - `main` mirrors upstream `main` and carries no patches.
 - `ryuzcorp/v<version>` is a line branch: the upstream tag `v<version>`
-  plus our patches as commits, one commit per patch, in `0001`-`0048`
+  plus our patches as commits, one commit per patch, in `0001`-`0049`
   order. Each patch commit is self-contained and carries its own tests.
 
 Upstream's `.github/workflows/release.yml` targets `ghcr.io/denoland` and
@@ -505,13 +505,19 @@ push to `ghcr.io/denoland`, but still. Pushing a branch named
   project-root-relative paths lexically, never resolved on the host, so
   the map cannot probe which host files exist; absolute and URL sources
   keep their file name.
-- `0048` (sha TBD at merge) `celld invoke` sends one HTTP request to a
+- `0048` (`ebcd078`) `celld invoke` sends one HTTP request to a
   staged script version on one node, served by that version's code with
   its declared bindings against the real data, so a migration endpoint
   runs before the activation that would serve it. `POST /invoke` on the
   internal listener requires the operator token plus the fleet HMAC; a
   shadow generation serves staged pins overlaid on the live map in
   fresh pools and retires after the request. Nothing serving moves.
+- `0049` (sha TBD at merge) `celld invoke --header-env NAME=VAR` sends
+  header NAME with the value of environment variable VAR, so a secret
+  header (a proxy or migration token) never sits on argv, which every
+  local user reads through `/proc/<pid>/cmdline`; the environment is
+  readable only by the same user. An unset variable is refused without
+  echoing anything, and the `--header` name and value checks apply.
 
 Patches `0025`–`0034` are ported fixes from
 [meln1k/celld](https://github.com/meln1k/celld) by Nikita
