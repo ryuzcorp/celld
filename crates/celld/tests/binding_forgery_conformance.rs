@@ -1,6 +1,6 @@
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 //
-// Modified by ryuzcorp (ryuzcorp/celld): binding-forgery conformance; WebSocket and TCP socket ownership. Apache-2.0.
+// Modified by ryuzcorp (ryuzcorp/celld): binding-forgery conformance; WebSocket and TCP socket ownership; deploy --read-root option. Apache-2.0.
 
 // A black-box runner, not node code: it boots the binary, copies fixtures,
 // and polls TCP with wall-clock deadlines, so the execution boundary's
@@ -88,6 +88,7 @@ fn preseed_victim(attacker_project: &Path, victim_src: &Path) {
             local_images: true,
             sourcemap: None,
             no_activate: false,
+            read_roots: Vec::new(),
         })
         .expect("build victim");
         celld::deploy::write(&bucket, &built)

@@ -9,7 +9,7 @@ README below is kept intact; this file documents the fork.
 
 - `main` mirrors upstream `main` and carries no patches.
 - `ryuzcorp/v<version>` is a line branch: the upstream tag `v<version>`
-  plus our patches as commits, one commit per patch, in `0001`-`0050`
+  plus our patches as commits, one commit per patch, in `0001`-`0051`
   order. Each patch commit is self-contained and carries its own tests.
 
 Upstream's `.github/workflows/release.yml` targets `ghcr.io/denoland` and
@@ -547,6 +547,19 @@ push to `ghcr.io/denoland`, but still. Pushing a branch named
   a kernel without Landlock, where celld warns that esbuild runs
   unconfined. The Python SDK probe follows no link, so it cannot answer
   whether a host path exists.
+- `0051` (sha TBD at merge) `celld deploy --read-root DIR`
+  (repeatable) names directories beyond the project that build inputs may
+  come from: esbuild's inputs (the Landlock rule and the metafile check
+  admit them) and `containers[].image` Dockerfiles with their build
+  contexts. An absolute or `..` image value is a path, never a reference:
+  it builds when it names a regular file inside a read root and is refused
+  otherwise, joined lexically and probed only once it lands inside a
+  bound. Every other project read (the config, `main`, assets,
+  `migrations_dir`, Python sources) stays inside the project directory.
+  Only the operator names a read root, on the command line, so a project
+  cannot widen its own bounds. A platform that deploys a built
+  subdirectory of a checkout, or a staged config whose Dockerfile lives in
+  the checkout, names the checkout.
 
 Patches `0025`–`0034` are ported fixes from
 [meln1k/celld](https://github.com/meln1k/celld) by Nikita

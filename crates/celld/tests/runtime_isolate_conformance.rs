@@ -1,6 +1,6 @@
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 //
-// Modified by ryuzcorp (ryuzcorp/celld): shared runtime cells run in a dedicated runtime isolate pool; Queue/KV operator fetch gate refusals.
+// Modified by ryuzcorp (ryuzcorp/celld): shared runtime cells run in a dedicated runtime isolate pool; Queue/KV operator fetch gate refusals; deploy --read-root option.
 // Apache-2.0.
 
 // A black-box runner, not node code: it boots the binary, copies fixtures,
@@ -177,6 +177,7 @@ fn preseed_victim(app_project: &Path, victim_src: &Path) {
             local_images: true,
             sourcemap: None,
             no_activate: false,
+            read_roots: Vec::new(),
         })
         .expect("build victim");
         celld::deploy::write(&bucket, &built)

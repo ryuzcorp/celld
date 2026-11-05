@@ -1,6 +1,6 @@
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 //
-// Modified by ryuzcorp (ryuzcorp/celld): staged activation. Apache-2.0.
+// Modified by ryuzcorp (ryuzcorp/celld): staged activation; deploy --read-root option. Apache-2.0.
 
 // A black-box runner, not node code: it drives the library against a local
 // bucket and asserts on the adoption read path, so the execution
@@ -205,6 +205,7 @@ impl Fleet {
             local_images: true,
             sourcemap: None,
             no_activate: false,
+            read_roots: Vec::new(),
         })
         .expect("build")
     }

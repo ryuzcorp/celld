@@ -1,7 +1,7 @@
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 //
 // Modified by ryuzcorp (ryuzcorp/celld): per-node Workers Cache
-// API conformance. Apache-2.0.
+// API conformance; deploy --read-root option. Apache-2.0.
 
 // A black-box runner, not node code: it boots the binary, copies fixtures,
 // and polls TCP with wall-clock deadlines, so the execution boundary's
@@ -89,6 +89,7 @@ fn preseed_probe(app_project: &Path, probe_src: &Path) {
             local_images: true,
             sourcemap: None,
             no_activate: false,
+            read_roots: Vec::new(),
         })
         .expect("build probe");
         celld::deploy::write(&bucket, &built)
