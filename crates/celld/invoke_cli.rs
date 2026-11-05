@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): staged invoke operator command. Apache-2.0.
+// Modified by ryuzcorp (ryuzcorp/celld): staged invoke operator command; invoke --header-env. Apache-2.0.
 
 // Operator commands read operator-owned host paths and file descriptors.
 #![allow(clippy::disallowed_methods)]
@@ -38,7 +38,6 @@ use crate::deploy::VersionRef;
 /// rather than tight.
 const INVOKE_TIMEOUT: Duration = Duration::from_secs(600);
 
-#[derive(Debug)]
 struct Command {
     pins: Vec<VersionRef>,
     target: String,
@@ -52,8 +51,38 @@ struct Command {
     unsafe_public_advertise: bool,
 }
 
+/// Header values and the body are redacted: a header may carry a secret
+/// (`--header-env` exists for exactly that), so no debug print shows one.
+impl std::fmt::Debug for Command {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let header_names: Vec<&str> = self.headers.iter().map(|(name, _)| name.as_str()).collect();
+        formatter
+            .debug_struct("Command")
+            .field("pins", &self.pins)
+            .field("target", &self.target)
+            .field("method", &self.method)
+            .field("path", &self.path)
+            .field("header_names", &header_names)
+            .field("body", &self.body.as_ref().map(|_| "<redacted>"))
+            .field("body_file", &self.body_file)
+            .field("fleet", &self.fleet)
+            .field("json", &self.json)
+            .field("unsafe_public_advertise", &self.unsafe_public_advertise)
+            .finish()
+    }
+}
+
 impl Command {
     fn parse(arguments: Vec<String>) -> anyhow::Result<Option<Self>> {
+        Self::parse_with(arguments, |name| std::env::var(name).ok())
+    }
+
+    /// `parse` with the environment lookup `--header-env` reads, so tests
+    /// pass their own instead of mutating the process environment.
+    fn parse_with(
+        arguments: Vec<String>,
+        environment: impl Fn(&str) -> Option<String>,
+    ) -> anyhow::Result<Option<Self>> {
         let mut arguments = arguments.into_iter().peekable();
         let mut pins = Vec::new();
         // Positionals come first, like `celld activate`: every leading
@@ -97,6 +126,9 @@ impl Command {
                 "--method" => method = value("--method")?,
                 "--path" => path = Some(value("--path")?),
                 "--header" => headers.push(parse_header(&value("--header")?)?),
+                "--header-env" => {
+                    headers.push(header_from_env(&value("--header-env")?, &environment)?)
+                }
                 "--body" => body = Some(value("--body")?),
                 "--body-file" => body_file = Some(PathBuf::from(value("--body-file")?)),
                 "--json" => json = true,
@@ -155,15 +187,36 @@ fn parse_header(argument: &str) -> anyhow::Result<(String, String)> {
     let Some((name, value)) = argument.split_once(':') else {
         bail!("--header takes NAME:VALUE, not {argument:?}");
     };
+    checked_header("--header", name, value.trim_start())
+}
+
+/// One `--header-env NAME=VAR`: header NAME with the value of environment
+/// variable VAR. A secret header value on argv is readable by every local
+/// user through `/proc/<pid>/cmdline`, while the environment is readable
+/// only by the same user, so secrets travel this way. The value is never
+/// echoed, not even in an error.
+fn header_from_env(
+    argument: &str,
+    environment: &impl Fn(&str) -> Option<String>,
+) -> anyhow::Result<(String, String)> {
+    let Some((name, variable)) = argument.split_once('=') else {
+        bail!("--header-env takes NAME=VAR, not {argument:?}");
+    };
+    let Some(value) = environment(variable).filter(|value| !value.trim().is_empty()) else {
+        bail!("--header-env {name}: environment variable {variable:?} is not set");
+    };
+    checked_header("--header-env", name, &value)
+}
+
+fn checked_header(flag: &str, name: &str, value: &str) -> anyhow::Result<(String, String)> {
     if axum::http::HeaderName::from_str(name).is_err() {
-        bail!("invalid --header name {name:?}");
+        bail!("invalid {flag} name {name:?}");
     }
     if let Err(reason) = crate::staged_invoke::check_inner_header(name) {
-        bail!("invalid --header name {name:?}: {reason}");
+        bail!("invalid {flag} name {name:?}: {reason}");
     }
-    let value = value.trim_start();
     if axum::http::HeaderValue::from_str(value).is_err() {
-        bail!("invalid --header value for {name:?}");
+        bail!("invalid {flag} value for {name:?}");
     }
     Ok((name.to_string(), value.to_string()))
 }
@@ -295,6 +348,11 @@ refused.
   --path PATH       Origin-form request path, with any query (required)
   --method METHOD   Request method (default: GET)
   --header N:V      Request header; repeatable
+  --header-env N=VAR
+                    Request header N with the value of environment
+                    variable VAR; repeatable. Use it for secrets: argv
+                    is readable by every local user, the environment
+                    only by the same user
   --body TEXT       Request body bytes
   --body-file PATH  Request body from a file, or from stdin with -
   --json            Print the result envelope instead of the body bytes
@@ -315,6 +373,57 @@ mod tests {
 
     fn parse(arguments: &[&str]) -> anyhow::Result<Option<Command>> {
         Command::parse(arguments.iter().map(|value| value.to_string()).collect())
+    }
+
+    /// `--header-env` takes the value from the environment, never from
+    /// argv; an unset variable is refused without echoing anything, and
+    /// the same name and value checks as `--header` apply.
+    #[test]
+    fn header_env_reads_the_value_from_the_environment() {
+        let environment = |name: &str| match name {
+            "PROXY_TOKEN" => Some("s3cret-value".to_string()),
+            "EMPTY" => Some(String::new()),
+            "BLANK" => Some("  ".to_string()),
+            "BAD" => Some("line\nbreak".to_string()),
+            _ => None,
+        };
+        let parse_env = |extra: &[&str]| {
+            let mut arguments: Vec<String> =
+                ["app=0123456789abcdef", "--path", "/m", "--bucket", "b"]
+                    .iter()
+                    .map(|value| value.to_string())
+                    .collect();
+            arguments.extend(extra.iter().map(|value| value.to_string()));
+            Command::parse_with(arguments, environment)
+        };
+        let command = parse_env(&["--header-env", "x-void-internal=PROXY_TOKEN"])
+            .expect("parse")
+            .expect("command");
+        assert_eq!(
+            command.headers,
+            vec![("x-void-internal".to_string(), "s3cret-value".to_string())]
+        );
+        let debug = format!("{command:?}");
+        assert!(debug.contains("x-void-internal"), "{debug}");
+        assert!(!debug.contains("s3cret-value"), "the value leaked: {debug}");
+        for (argument, want) in [
+            ("x-void-internal=MISSING", "is not set"),
+            ("x-void-internal=EMPTY", "is not set"),
+            ("x-void-internal=BLANK", "is not set"),
+            ("x-void-internal=BAD", "invalid --header-env value"),
+            ("no-equals", "takes NAME=VAR"),
+            ("x-cells-node=PROXY_TOKEN", "invalid --header-env name"),
+        ] {
+            let error = match parse_env(&["--header-env", argument]) {
+                Ok(_) => panic!("{argument} must be refused"),
+                Err(error) => format!("{error:#}"),
+            };
+            assert!(error.contains(want), "{argument}: {error}");
+            assert!(
+                !error.contains("s3cret-value"),
+                "{argument}: the value leaked: {error}"
+            );
+        }
     }
 
     #[test]

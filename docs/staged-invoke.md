@@ -1,4 +1,4 @@
-<!-- Modified by ryuzcorp (ryuzcorp/celld): staged invoke page. -->
+<!-- Modified by ryuzcorp (ryuzcorp/celld): staged invoke page; invoke --header-env. -->
 # Invoke a staged version
 
 A version uploaded with `celld deploy --no-activate` serves no traffic
@@ -104,13 +104,17 @@ non-activated version is reachable only through this gate. See
 ```sh
 celld invoke SCRIPT=VERSION [SCRIPT=VERSION...] --path PATH --bucket NAME
   [--target SCRIPT] [--method METHOD] [--header NAME:VALUE]...
+  [--header-env NAME=VAR]...
   [--body TEXT | --body-file PATH] [--json] [--unsafe-public-advertise]
 ```
 
 Stdout carries the staged version's answer body, or the result envelope
 with `--json`; anything else goes to stderr. A non-2xx answer still
 prints its body, then exits nonzero. `--body-file -` reads the request
-body from stdin.
+body from stdin. `--header-env NAME=VAR` sends header NAME with the value of
+environment variable VAR: pass secret headers that way, since argv is
+readable by every local user through `/proc/<pid>/cmdline` and the
+environment only by the same user.
 
 The route answers `{"result": {"status", "headers", "body"}}`, the body
 base64, or `{"error": ...}` with 400 (malformed), 404 (unknown version),
