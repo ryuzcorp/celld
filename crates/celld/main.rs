@@ -3850,10 +3850,11 @@ fn node_bucket(
             managed,
         )
     } else {
-        fleet::bucket_client_with_credentials(
+        fleet::serving_bucket_client_with_credentials(
             bucket,
             settings.endpoint.as_deref(),
             &settings.region,
+            settings.control_plane,
             managed,
         )
     }

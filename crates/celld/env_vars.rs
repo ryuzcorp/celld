@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): validate CELLD_MEMORY_SCOPE; CELLD_CACHE_MAX_BYTES validation; tenant egress policy; CELLD_CACHE_SCOPE validation.
+// Modified by ryuzcorp (ryuzcorp/celld): validate CELLD_MEMORY_SCOPE; CELLD_CACHE_MAX_BYTES validation; tenant egress policy; CELLD_CACHE_SCOPE validation; CELLD_DEPLOY_AWS_* validation.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! Strict runtime environment parsing.
@@ -336,6 +336,9 @@ pub fn validate() -> anyhow::Result<()> {
     if let Some(node) = value("CELLD_NODE")? {
         crate::machine::validate_node_name(&node).map_err(|error| anyhow!("CELLD_NODE {error}"))?;
     }
+    // All-or-nothing, so a node never reads a deployment with a partial
+    // credential pair (see `deploy_credentials`).
+    deploy_credentials()?;
     Ok(())
 }
 
@@ -346,6 +349,46 @@ pub fn validate() -> anyhow::Result<()> {
 pub fn shutdown_timing() -> anyhow::Result<ShutdownTiming> {
     let total_ms = positive("CELLD_SHUTDOWN_TOTAL_MS")?.unwrap_or(DEFAULT_SHUTDOWN_TOTAL_MS);
     Ok(ShutdownTiming::from_total_ms(total_ms))
+}
+
+/// The deployment-artifact credential, if the process was given one: the
+/// access key and secret are both required, and the session token is
+/// optional with them. A node reads `deploy/` and `deploy-blobs/` through
+/// this pair, so it can read a deployment without holding the credential
+/// that publishes one; unset keeps one credential for everything.
+///
+/// A partial setting is a configuration error, never a fallback: reading a
+/// deployment with the publishing credential is exactly what the separate
+/// pair exists to avoid. An empty value counts as unset.
+pub fn deploy_credentials() -> anyhow::Result<Option<(String, String, Option<String>)>> {
+    deploy_credentials_from(value)
+}
+
+/// [`deploy_credentials`] over an injected lookup, so the all-or-nothing
+/// rule is testable without touching the process environment.
+fn deploy_credentials_from(
+    get: impl Fn(&str) -> anyhow::Result<Option<String>>,
+) -> anyhow::Result<Option<(String, String, Option<String>)>> {
+    let get = |name: &str| get(name).map(|value| value.filter(|value| !value.is_empty()));
+    let access_key_id = get("CELLD_DEPLOY_AWS_ACCESS_KEY_ID")?;
+    let secret_access_key = get("CELLD_DEPLOY_AWS_SECRET_ACCESS_KEY")?;
+    let session_token = get("CELLD_DEPLOY_AWS_SESSION_TOKEN")?;
+    match (access_key_id, secret_access_key) {
+        (None, None) if session_token.is_none() => Ok(None),
+        (None, None) => bail!(
+            "CELLD_DEPLOY_AWS_SESSION_TOKEN needs CELLD_DEPLOY_AWS_ACCESS_KEY_ID and \
+             CELLD_DEPLOY_AWS_SECRET_ACCESS_KEY"
+        ),
+        (Some(_), None) => bail!(
+            "CELLD_DEPLOY_AWS_ACCESS_KEY_ID is set without CELLD_DEPLOY_AWS_SECRET_ACCESS_KEY"
+        ),
+        (None, Some(_)) => bail!(
+            "CELLD_DEPLOY_AWS_SECRET_ACCESS_KEY is set without CELLD_DEPLOY_AWS_ACCESS_KEY_ID"
+        ),
+        (Some(access_key_id), Some(secret_access_key)) => {
+            Ok(Some((access_key_id, secret_access_key, session_token)))
+        }
+    }
 }
 
 pub fn value(name: &str) -> anyhow::Result<Option<String>> {
@@ -428,4 +471,68 @@ where
     T::Err: std::fmt::Display,
 {
     Ok(positive(name)?.unwrap_or(default))
+}
+
+#[cfg(test)]
+mod deploy_credential_tests {
+    use super::*;
+
+    fn parse(pairs: &[(&str, &str)]) -> anyhow::Result<Option<(String, String, Option<String>)>> {
+        deploy_credentials_from(|name| {
+            Ok(pairs
+                .iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| (*value).to_string()))
+        })
+    }
+
+    #[test]
+    fn unset_means_one_credential() {
+        assert_eq!(parse(&[]).unwrap(), None);
+    }
+
+    #[test]
+    fn the_pair_rides_together() {
+        let parsed = parse(&[
+            ("CELLD_DEPLOY_AWS_ACCESS_KEY_ID", "id"),
+            ("CELLD_DEPLOY_AWS_SECRET_ACCESS_KEY", "secret"),
+        ])
+        .unwrap();
+        assert_eq!(parsed, Some(("id".into(), "secret".into(), None)));
+    }
+
+    #[test]
+    fn the_session_token_rides_with_the_pair() {
+        let parsed = parse(&[
+            ("CELLD_DEPLOY_AWS_ACCESS_KEY_ID", "id"),
+            ("CELLD_DEPLOY_AWS_SECRET_ACCESS_KEY", "secret"),
+            ("CELLD_DEPLOY_AWS_SESSION_TOKEN", "token"),
+        ])
+        .unwrap();
+        assert_eq!(
+            parsed,
+            Some(("id".into(), "secret".into(), Some("token".into())))
+        );
+    }
+
+    #[test]
+    fn a_partial_pair_is_a_configuration_error() {
+        for pairs in [
+            vec![("CELLD_DEPLOY_AWS_ACCESS_KEY_ID", "id")],
+            vec![("CELLD_DEPLOY_AWS_SECRET_ACCESS_KEY", "secret")],
+            vec![("CELLD_DEPLOY_AWS_SESSION_TOKEN", "token")],
+        ] {
+            assert!(parse(&pairs).is_err(), "{pairs:?} must not parse");
+        }
+    }
+
+    #[test]
+    fn an_empty_value_is_unset() {
+        let parsed = parse(&[
+            ("CELLD_DEPLOY_AWS_ACCESS_KEY_ID", ""),
+            ("CELLD_DEPLOY_AWS_SECRET_ACCESS_KEY", ""),
+        ])
+        .unwrap();
+        assert_eq!(parsed, None);
+    }
 }

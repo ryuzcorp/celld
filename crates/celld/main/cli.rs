@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): CELLD_MEMORY_SCOPE help; operator token for the internal listener; staged activation; staged invoke command.
+// Modified by ryuzcorp (ryuzcorp/celld): CELLD_MEMORY_SCOPE help; operator token for the internal listener; staged activation; staged invoke command; CELLD_DEPLOY_AWS_* help.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! The command line: what the process was asked to do, and the help text
@@ -335,6 +335,12 @@ ENVIRONMENT:
   AWS_REGION, AWS_DEFAULT_REGION  Storage region (default: us-east-1)
   AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN
                                   Explicit credentials in the standard AWS chain
+  CELLD_DEPLOY_AWS_ACCESS_KEY_ID, CELLD_DEPLOY_AWS_SECRET_ACCESS_KEY,
+  CELLD_DEPLOY_AWS_SESSION_TOKEN  A second credential, read-only over the
+                                  deployment pointer and bundles: a node reads
+                                  deploy/ and deploy-blobs/ with it and
+                                  everything else with AWS_*. S3 only; the
+                                  access key and secret are both required.
   CELLD_ADDR                      Public Worker listener; same as --listen
   CELLD_INTERNAL_ADDR             Peer and operator listener; same as --internal-listen
   CELLD_ADVERTISE                 Peer-reachable address; same as --advertise
