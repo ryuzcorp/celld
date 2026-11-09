@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): CELLD_MEMORY_SCOPE help; operator token for the internal listener; staged activation; staged invoke command; CELLD_DEPLOY_AWS_* help.
+// Modified by ryuzcorp (ryuzcorp/celld): CELLD_MEMORY_SCOPE help; operator token for the internal listener; staged activation; staged invoke command; CELLD_DEPLOY_AWS_* help; non-dumpable serving process.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! The command line: what the process was asked to do, and the help text
@@ -55,6 +55,16 @@ pub(crate) enum Action {
 }
 
 impl Action {
+    /// Whether this invocation is the long-running process — a node, or the
+    /// `celld dev` supervisor that owns one — rather than an operator
+    /// command. `main` consults it before anything else reads the
+    /// environment, to make that process non-dumpable (patch 0053): the
+    /// fleet uid is shared with tenant builds, which must not be able to
+    /// read the node's environment through `/proc`.
+    pub(crate) fn serves(&self) -> bool {
+        matches!(self, Self::Run(_) | Self::Dev(_))
+    }
+
     /// Whether this invocation's stdout carries data rather than a log stream.
     ///
     /// A node's stdout *is* its log, and Docker and journald read it. A CLI
@@ -406,4 +416,56 @@ Documentation: https://celld.dev/docs"#,
         shutdown_total_ms = celld::env_vars::DEFAULT_SHUTDOWN_TOTAL_MS,
     );
     celld::cli_output::Output::new(celld::cli_output::Format::Text).help(&help)
+}
+
+#[cfg(test)]
+mod action_serving_tests {
+    use super::*;
+
+    /// Only the long-running invocations are made non-dumpable; every
+    /// operator command stays attachable.
+    #[test]
+    fn only_serving_invocations_are_hardened() {
+        // `celld` with no subcommand, and a `--control-plane` node, both
+        // take `Action::Run`: they are the node itself.
+        for control_plane in [false, true] {
+            let node = Action::Run(Settings {
+                control_plane,
+                bucket: None,
+                load_deployment: false,
+                endpoint: None,
+                region: "test".to_string(),
+                listen: celld::startup::Listen::LoopbackEphemeral,
+                internal_listen: celld::startup::Listen::LoopbackEphemeral,
+                advertise: None,
+                unsafe_public_advertise: false,
+                trust_forwarded_headers: false,
+                dev_store: None,
+            });
+            assert!(node.serves(), "a node is a serving invocation");
+        }
+        assert!(Action::Dev(Vec::new()).serves());
+        assert!(!Action::Help.serves());
+        assert!(!Action::Version.serves());
+        for action in [
+            Action::Deploy(Vec::new()),
+            Action::Activate(Vec::new()),
+            Action::Discard(Vec::new()),
+            Action::Invoke(Vec::new()),
+            Action::Cell(Vec::new()),
+            Action::D1(Vec::new()),
+            Action::Kv(Vec::new()),
+            Action::Queue(Vec::new()),
+            Action::R2(Vec::new()),
+            Action::Connect(Vec::new()),
+            Action::Credentials(Vec::new()),
+            Action::Token(Vec::new()),
+            Action::Disconnect(Vec::new()),
+        ] {
+            assert!(
+                !action.serves(),
+                "an operator command is not a serving invocation"
+            );
+        }
+    }
 }

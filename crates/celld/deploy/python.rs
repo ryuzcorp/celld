@@ -671,7 +671,12 @@ fn download_from(
 
 fn run_esbuild(directory: &Path) -> anyhow::Result<()> {
     let binary = std::env::var("CELLD_ESBUILD").unwrap_or_else(|_| "esbuild".to_string());
-    let output = Command::new(&binary)
+    let mut command = Command::new(&binary);
+    // Same as the Worker bundle: `celld dev` may run this from its serving
+    // supervisor, and esbuild needs none of the environment it would
+    // inherit.
+    crate::hardening::minimal_child_environment(&mut command);
+    let output = command
         .current_dir(directory)
         .arg("worker.js")
         .arg("--bundle")

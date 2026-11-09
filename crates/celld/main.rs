@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): cross-isolate RPC stubs and streams; operator token for the internal listener; D1 export operator-ingress marker; ported from meln1k/celld: report wake coverage after maintenance (e6cb9a3); staged activation; trusted cell RPC; WebSocket join tokens; --version reports the full build version; staged invoke operator route.
+// Modified by ryuzcorp (ryuzcorp/celld): cross-isolate RPC stubs and streams; operator token for the internal listener; D1 export operator-ingress marker; ported from meln1k/celld: report wake coverage after maintenance (e6cb9a3); staged activation; trusted cell RPC; WebSocket join tokens; --version reports the full build version; staged invoke operator route; non-dumpable serving process.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 // The binary contains connection, startup, shutdown, and V8 shell code. The
@@ -3881,6 +3881,16 @@ const DEFAULT_REBALANCE_BATCH_CELLS: usize = 32;
 const LOCAL_CACHE_PRUNE_PERIOD: std::time::Duration = std::time::Duration::from_secs(60);
 
 fn main() -> anyhow::Result<()> {
+    let action = resolved_action()?;
+    // Before anything else reads the environment: a serving process carries
+    // the fleet's credentials in its environ, and the fleet uid is shared
+    // with tenant builds, so they must not be able to read it through
+    // /proc (patch 0053). `execve` resets the flag, and every re-exec (the
+    // node's, `celld dev`'s child) comes back through here with its serving
+    // arguments. Operator commands stay dumpable so an operator can attach.
+    if action.serves() {
+        celld::hardening::set_non_dumpable().context("make the serving process non-dumpable")?;
+    }
     celld::env_vars::validate()?;
     // Parse the telemetry group once, before any command or runtime work.
     // Its specialized values share the strict scalar parsers in env_vars.
@@ -3896,21 +3906,28 @@ fn main() -> anyhow::Result<()> {
     if let Some(workers) = celld::env_vars::positive::<usize>("CELLD_TOKIO_THREADS")? {
         builder.worker_threads(workers);
     }
-    builder.build()?.block_on(async_main(telemetry_config))
+    builder
+        .build()?
+        .block_on(async_main(telemetry_config, action))
 }
 
-async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyhow::Result<()> {
+/// The command this process runs. Resolved before anything else reads the
+/// environment, so a serving process can be made non-dumpable first.
+fn resolved_action() -> anyhow::Result<Action> {
+    #[cfg(all(test, celld_internal_tests))]
+    if std::env::var_os("CELLD_DRAIN_ACCEPT_FAILURE_CHILD").is_some() {
+        return Ok(shutdown_accept_failure_test_action());
+    }
+    action_from_process()
+}
+
+async fn async_main(
+    telemetry_config: Option<celld::telemetry::Config>,
+    action: Action,
+) -> anyhow::Result<()> {
     #[cfg(all(test, celld_internal_tests))]
     let shutdown_accept_failure_test_active =
         std::env::var_os("CELLD_DRAIN_ACCEPT_FAILURE_CHILD").is_some();
-    #[cfg(all(test, celld_internal_tests))]
-    let action = if shutdown_accept_failure_test_active {
-        shutdown_accept_failure_test_action()
-    } else {
-        action_from_process()?
-    };
-    #[cfg(not(all(test, celld_internal_tests)))]
-    let action = action_from_process()?;
     let host_runtime = tokio::runtime::Handle::current();
     celld::asyncrt::set_host_handle(host_runtime.clone());
     // Docker and journald can stop consuming the process pipe during a log

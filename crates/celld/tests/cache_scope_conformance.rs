@@ -1,7 +1,8 @@
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 //
 // Modified by ryuzcorp (ryuzcorp/celld): deployment cache scope
-// conformance; deploy --read-root option. Apache-2.0.
+// conformance; deploy --read-root option; announce-line discovery.
+// Apache-2.0.
 
 // A black-box runner, not node code: it boots the binary, deploys
 // fixtures through the library, and polls TCP with wall-clock deadlines,
@@ -26,19 +27,22 @@
 //!
 //! Every test boots its own `celld dev` nodes on hermetic tempdirs, so
 //! tests share nothing and run in any order. Boots use `--port 0` with
-//! worker-listener discovery over `/proc`, so parallel boots never share
-//! a port and no probe can answer from a neighboring test's node.
-//! Library deploys (the probe preseed, the mid-test redeploy) run on one
-//! shared runtime, because `asyncrt::set_host_handle` runs exactly once
-//! per process. There are no fixed sleeps: every wait polls an observable
-//! condition with a deadline, and the server guard kills the child on
-//! every exit path.
+//! worker-listener discovery from the node's own announce line, which the
+//! supervisor forwards to stderr (`--logs`), so parallel boots never share
+//! a port and no probe can answer from a neighboring test's node. The node
+//! is non-dumpable (patch 0053), so `/proc/<pid>/fd` cannot name its
+//! listeners. Library deploys (the probe preseed, the mid-test redeploy)
+//! run on one shared runtime, because `asyncrt::set_host_handle` runs
+//! exactly once per process. There are no fixed sleeps: every wait polls an
+//! observable condition with a deadline, and the server guard kills the
+//! child on every exit path.
 
 use serde_json::Value;
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// One runtime for the whole binary: `asyncrt::set_host_handle` runs
@@ -74,76 +78,34 @@ fn fixture_dir() -> PathBuf {
         .expect("fixture exists")
 }
 
-fn child_pids(pid: u32) -> Vec<u32> {
-    let mut children = Vec::new();
-    let Ok(tasks) = std::fs::read_dir(format!("/proc/{pid}/task")) else {
-        return children;
-    };
-    for task in tasks.map_while(Result::ok) {
-        let Ok(list) = std::fs::read_to_string(task.path().join("children")) else {
-            continue;
-        };
-        children.extend(
-            list.split_whitespace()
-                .filter_map(|id| id.parse::<u32>().ok()),
-        );
-    }
-    children.sort_unstable();
-    children.dedup();
-    children
+/// One address of a `celld dev` node, from the announce line the supervisor
+/// forwards to its stderr. The node is non-dumpable (patch 0053), so
+/// `/proc/<pid>/fd` no longer names its listeners, and this is the node's
+/// own report of where it bound.
+fn announced(lines: &Mutex<Vec<String>>, prefix: &str) -> Option<String> {
+    lines
+        .lock()
+        .expect("announce lock")
+        .iter()
+        .find_map(|line| {
+            let address = line.strip_prefix(prefix)?.split_once(' ')?.0;
+            Some(address.to_string())
+        })
 }
 
-/// Loopback TCP ports one process listens on, matching its socket inodes
-/// against `/proc/net/tcp` LISTEN entries.
-fn listening_loopback_ports(pid: u32) -> Vec<u16> {
-    let mut inodes = std::collections::HashSet::new();
-    if let Ok(fds) = std::fs::read_dir(format!("/proc/{pid}/fd")) {
-        for fd in fds.map_while(Result::ok) {
-            let Ok(link) = std::fs::read_link(fd.path()) else {
-                continue;
-            };
-            if let Some(name) = link.to_str() {
-                if let Some(inode) = name
-                    .strip_prefix("socket:[")
-                    .and_then(|inode| inode.strip_suffix(']'))
-                {
-                    inodes.insert(inode.to_string());
-                }
-            }
+/// Collect the supervisor's stderr lines, which carry the node's announce
+/// lines (`--logs` forwards them).
+fn forward_announce(stderr: std::process::ChildStderr, lines: Arc<Mutex<Vec<String>>>) {
+    std::thread::spawn(move || {
+        let mut reader = BufReader::new(stderr);
+        let mut line = String::new();
+        while reader.read_line(&mut line).is_ok_and(|read| read > 0) {
+            lines
+                .lock()
+                .expect("announce lock")
+                .push(std::mem::take(&mut line));
         }
-    }
-    let Ok(tcp) = std::fs::read_to_string("/proc/net/tcp") else {
-        return Vec::new();
-    };
-    let mut ports = Vec::new();
-    for line in tcp.lines().skip(1) {
-        let mut fields = line.split_whitespace();
-        let (Some(local), Some(state)) = (fields.nth(1), fields.nth(1)) else {
-            continue;
-        };
-        if state != "0A" {
-            continue;
-        }
-        // Fields past `st`: tx_queue, tr, retransmit, uid, timeout, then
-        // the inode.
-        let Some(inode) = fields.nth(5) else { continue };
-        if !inodes.contains(inode) {
-            continue;
-        }
-        let mut addr = local.split(':');
-        if addr.next() != Some("0100007F") {
-            continue;
-        }
-        if let Some(port) = addr
-            .next()
-            .and_then(|port| u16::from_str_radix(port, 16).ok())
-        {
-            ports.push(port);
-        }
-    }
-    ports.sort_unstable();
-    ports.dedup();
-    ports
+    });
 }
 
 fn copy_dir(src: &Path, dst: &Path) {
@@ -232,6 +194,7 @@ impl TestNode {
         let mut command = Command::new(celld_binary());
         command
             .arg("dev")
+            .env("NO_COLOR", "1")
             .arg(app_project)
             .arg("--port")
             .arg("0")
@@ -246,19 +209,15 @@ impl TestNode {
             .spawn()
             .expect("spawn celld dev");
         let mut stdout = child.stdout.take().expect("piped stdout");
-        let mut stderr = child.stderr.take().expect("piped stderr");
-        // Drain both pipes so a chatty child can never block on a full
-        // one. The drains only discard: the supervisor block-buffers
-        // into pipes, so its log lines are not a discovery channel and
-        // the worker port comes from /proc below instead.
+        let stderr = child.stderr.take().expect("piped stderr");
+        // Drain stdout so a chatty child can never block on a full pipe.
+        // The supervisor's stderr carries the node's announce lines.
         std::thread::spawn(move || {
             let mut sink = Vec::new();
             let _ = stdout.read_to_end(&mut sink);
         });
-        std::thread::spawn(move || {
-            let mut sink = Vec::new();
-            let _ = stderr.read_to_end(&mut sink);
-        });
+        let announced_lines: Arc<Mutex<Vec<String>>> = Arc::default();
+        forward_announce(stderr, Arc::clone(&announced_lines));
         // The kill-on-drop guard exists before discovery, so a boot
         // timeout or an early child exit cannot leak the server; the
         // address is a placeholder until discovery fills it.
@@ -266,26 +225,18 @@ impl TestNode {
             child,
             public: String::new(),
         };
-        // Discovery doubles as readiness: the node binds two loopback
-        // listeners, and the one answering /health with 200 is the
-        // worker listener (the operator listener 404s it). Neither
-        // answers before the app loads. Only this child's listeners are
-        // ever probed, so a neighboring test's node cannot answer.
+        // Discovery doubles as readiness: the node announces its worker
+        // listener before it serves, and /health answers once the app
+        // loads. Only this child's announce is ever read, so a
+        // neighboring test's node cannot answer.
         let public = poll_until("boot", Duration::from_secs(120), || {
             // Liveness first: a dead child must fail fast, not burn
             // the deadline on refused probes.
             if let Some(status) = node.child.try_wait().expect("poll child") {
                 panic!("celld dev exited during boot: {status}");
             }
-            for pid in child_pids(node.child.id()) {
-                for found in listening_loopback_ports(pid) {
-                    let addr = format!("127.0.0.1:{found}");
-                    if probe(&addr, "/health") {
-                        return Some(addr);
-                    }
-                }
-            }
-            None
+            let addr = announced(&announced_lines, "celld listening on ")?;
+            probe(&addr, "/health").then_some(addr)
         });
         node.public = public;
         node
@@ -585,6 +536,7 @@ fn cache_scope_rejects_garbage() {
 
     let mut child = Command::new(celld_binary())
         .arg("dev")
+        .env("NO_COLOR", "1")
         .arg(&app_project)
         .arg("--port")
         .arg("0")
@@ -606,18 +558,9 @@ fn cache_scope_rejects_garbage() {
         let _ = stderr.read_to_string(&mut sink);
         sink
     });
-    // The node must exit without ever serving: a boot that answers
-    // /health on one of its own listeners accepted the garbage scope.
-    // Only this child's listeners are ever probed, so a neighboring
-    // test's node cannot answer.
+    // The node must exit without ever serving: it refuses the scope before
+    // it binds, so no announce line ever reaches the supervisor's stderr.
     poll_until("refuse garbage scope", Duration::from_secs(120), || {
-        for pid in child_pids(child.id()) {
-            for found in listening_loopback_ports(pid) {
-                if probe(&format!("127.0.0.1:{found}"), "/health") {
-                    panic!("celld dev booted with CELLD_CACHE_SCOPE=zone");
-                }
-            }
-        }
         child
             .try_wait()
             .expect("poll child")
@@ -626,6 +569,10 @@ fn cache_scope_rejects_garbage() {
     let status = child.wait().expect("reap child");
     assert!(!status.success(), "garbage scope exited {status}");
     let errors = errors.join().expect("read stderr");
+    assert!(
+        !errors.contains("celld listening on "),
+        "the node announced a listener before refusing the scope: {errors}"
+    );
     assert!(
         errors.contains("CELLD_CACHE_SCOPE must be script or deployment"),
         "stderr names the bad scope: {errors}"

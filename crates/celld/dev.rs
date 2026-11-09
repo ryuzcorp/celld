@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): operator token for the internal listener; `celld dev --port 0` assigns an ephemeral port; staged activation; deploy --read-root option.
+// Modified by ryuzcorp (ryuzcorp/celld): operator token for the internal listener; `celld dev --port 0` assigns an ephemeral port; staged activation; deploy --read-root option; non-dumpable serving process.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 // Modified by ryuzcorp (ryuzcorp/celld): deploy --sourcemap writes the bundle's external map.
 
@@ -738,6 +738,10 @@ async fn start_node(
     // path. An error or cancellation can instead drop it, so the child must
     // not outlive the value that proves the supervisor still owns it.
     command.kill_on_drop(true);
+    // The child re-execs `celld` with serving arguments, so it makes itself
+    // non-dumpable in `main` like any node (`hardening`, patch 0053). The
+    // supervisor does the same at its own start; `execve` resets the flag,
+    // which is why the child sets it again rather than inheriting it.
     if !logs {
         // The supervisor still forwards ERROR records and the child's stderr.
         // INFO and WARN records stay hidden until the operator asks for them.

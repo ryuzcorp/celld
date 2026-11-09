@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): cross-isolate RPC stubs and streams; operator token for the internal listener; per-node Workers Cache API; tenant egress policy; the full build version for --version; staged invoke modules.
+// Modified by ryuzcorp (ryuzcorp/celld): cross-isolate RPC stubs and streams; operator token for the internal listener; per-node Workers Cache API; tenant egress policy; the full build version for --version; staged invoke modules; the hardening module.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 #![warn(clippy::disallowed_methods, clippy::disallowed_types)]
@@ -67,6 +67,7 @@ pub mod fault {
 pub(crate) mod facet_streams;
 pub mod fleet;
 pub mod generation;
+pub mod hardening;
 pub mod host_channels;
 pub mod host_services;
 pub mod http_streams;
