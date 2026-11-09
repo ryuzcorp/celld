@@ -547,7 +547,20 @@ push to `ghcr.io/denoland`, but still. Pushing a branch named
   a kernel without Landlock, where celld warns that esbuild runs
   unconfined. The Python SDK probe follows no link, so it cannot answer
   whether a host path exists.
-- `0052` (sha TBD at merge) `CELLD_DEPLOY_AWS_ACCESS_KEY_ID`,
+- `0051` (`7ba9825`) `celld deploy --read-root DIR`
+  (repeatable) names directories beyond the project that build inputs may
+  come from: esbuild's inputs (the Landlock rule and the metafile check
+  admit them) and `containers[].image` Dockerfiles with their build
+  contexts. An absolute or `..` image value is a path, never a reference:
+  it builds when it names a regular file inside a read root and is refused
+  otherwise, joined lexically and probed only once it lands inside a
+  bound. Every other project read (the config, `main`, assets,
+  `migrations_dir`, Python sources) stays inside the project directory.
+  Only the operator names a read root, on the command line, so a project
+  cannot widen its own bounds. A platform that deploys a built
+  subdirectory of a checkout, or a staged config whose Dockerfile lives in
+  the checkout, names the checkout.
+- `0052` (`8abf440`) `CELLD_DEPLOY_AWS_ACCESS_KEY_ID`,
   `CELLD_DEPLOY_AWS_SECRET_ACCESS_KEY`, `CELLD_DEPLOY_AWS_SESSION_TOKEN`
   give deployment-artifact reads their own credential. With the trio set,
   a node opens a second S3 client over the same bucket and serves
@@ -576,20 +589,7 @@ push to `ghcr.io/denoland`, but still. Pushing a branch named
   probe) deliberately runs on the publishing client, because the deployment
   grant covers only the deployment prefixes; the state grant must keep
   read-write over `probe/` for a node to boot.
-- `0051` (`7ba9825`) `celld deploy --read-root DIR`
-  (repeatable) names directories beyond the project that build inputs may
-  come from: esbuild's inputs (the Landlock rule and the metafile check
-  admit them) and `containers[].image` Dockerfiles with their build
-  contexts. An absolute or `..` image value is a path, never a reference:
-  it builds when it names a regular file inside a read root and is refused
-  otherwise, joined lexically and probed only once it lands inside a
-  bound. Every other project read (the config, `main`, assets,
-  `migrations_dir`, Python sources) stays inside the project directory.
-  Only the operator names a read root, on the command line, so a project
-  cannot widen its own bounds. A platform that deploys a built
-  subdirectory of a checkout, or a staged config whose Dockerfile lives in
-  the checkout, names the checkout.
-- `0053` (sha TBD at merge) a serving process is non-dumpable: `main` calls
+- `0053` (`6f6691e`) a serving process is non-dumpable: `main` calls
   `prctl(PR_SET_DUMPABLE, 0)` before it reads anything else, when the
   invocation is a node or the `celld dev` supervisor (and so the node it
   spawns; `execve` resets the flag, and every re-exec, including the
@@ -692,6 +692,15 @@ source commit; the commits keep the original author with a
     no `POST /invoke` route (`0048`). A stream received over
     RPC now stays open while the receiver holds it (`0043`), which ends
     the spurious aborts of signal-carrying container execs.
+- `v0.6.3-ryuzcorp.8` (`dbf93e2`): adds `0051`.
+  Upgrade notes:
+  - `celld deploy --read-root DIR` (repeatable) names directories beyond
+    the project that esbuild's inputs and `containers[].image`
+    Dockerfiles with their build contexts may come from. A platform that
+    deploys a built subdirectory of a checkout, or a monorepo app whose
+    packages are hoisted above its config, names the checkout; with it,
+    an absolute or `..` Dockerfile path inside the read root builds again.
+    Without the flag, `.7`'s project-only bounds are unchanged.
 - `v0.6.3-ryuzcorp.9` (the commit that adds this entry): adds `0052`–`0053`.
   Upgrade notes:
   - No behavior changes with `CELLD_DEPLOY_AWS_*` unset. A platform that
@@ -718,16 +727,9 @@ source commit; the commits keep the original author with a
     process spawns (`celld dev`'s esbuild, the presence agent's
     `hostname`) are dumpable again after `execve` but start with an
     emptied environment (`PATH`, `HOME`, `TMPDIR` only), so no credential
-    reaches them.
-- `v0.6.3-ryuzcorp.8` (the commit that adds this entry): adds `0051`.
-  Upgrade notes:
-  - `celld deploy --read-root DIR` (repeatable) names directories beyond
-    the project that esbuild's inputs and `containers[].image`
-    Dockerfiles with their build contexts may come from. A platform that
-    deploys a built subdirectory of a checkout, or a monorepo app whose
-    packages are hoisted above its config, names the checkout; with it,
-    an absolute or `..` Dockerfile path inside the read root builds again.
-    Without the flag, `.7`'s project-only bounds are unchanged.
+    reaches them. `celld dev`'s container engine CLI (projects with
+    `containers`) still inherits the environment; a production node never
+    builds.
 
 ## License
 
