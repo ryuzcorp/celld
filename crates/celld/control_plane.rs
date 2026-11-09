@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): tenant egress policy; staged activation.
+// Modified by ryuzcorp (ryuzcorp/celld): tenant egress policy; staged activation; non-dumpable serving process.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 // Managed control-plane sessions execute outside the Actor execution domain.
@@ -72,6 +72,8 @@ fn restart_with_rotated_credentials() -> ! {
     if let Some(node) = REEXEC_NODE_SESSION_ID.get() {
         command.env("CELLD_NODE", node);
     }
+    // `execve` resets PR_SET_DUMPABLE, so the exec'd process sets it again
+    // from `main` with these same arguments (`hardening`, patch 0053).
     let error = command.exec();
     warn!(
         event = "control_plane_restart_exec_failed",
@@ -2808,7 +2810,12 @@ fn machine_hostname() -> String {
         .or_else(|_| std::env::var("COMPUTERNAME"))
         .ok()
         .or_else(|| {
-            std::process::Command::new("hostname")
+            // A serving process's environment carries the fleet's
+            // credentials, and `execve` makes this child dumpable again:
+            // `hostname` needs the search path and nothing else.
+            let mut command = std::process::Command::new("hostname");
+            crate::hardening::minimal_child_environment(&mut command);
+            command
                 .output()
                 .ok()
                 .filter(|output| output.status.success())

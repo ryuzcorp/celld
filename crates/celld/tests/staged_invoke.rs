@@ -1,6 +1,7 @@
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 //
-// Modified by ryuzcorp (ryuzcorp/celld): staged invoke; deploy --read-root option. Apache-2.0.
+// Modified by ryuzcorp (ryuzcorp/celld): staged invoke; deploy --read-root
+// option; announce-line discovery. Apache-2.0.
 
 // A black-box runner, not node code: it boots the binary, stages versions
 // into the node's own store, and polls TCP with wall-clock deadlines, so
@@ -21,10 +22,11 @@
 //! an observable condition with a deadline, and the server guard kills
 //! the child on every exit path.
 
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// One runtime for the whole binary: `asyncrt::set_host_handle` runs
@@ -88,75 +90,34 @@ fn free_port() -> u16 {
     listener.local_addr().expect("probe addr").port()
 }
 
-/// Direct children of a process, via `/proc/<pid>/task/*/children`.
-fn child_pids(pid: u32) -> Vec<u32> {
-    let mut children = Vec::new();
-    let Ok(tasks) = std::fs::read_dir(format!("/proc/{pid}/task")) else {
-        return children;
-    };
-    for task in tasks.map_while(Result::ok) {
-        let Ok(list) = std::fs::read_to_string(task.path().join("children")) else {
-            continue;
-        };
-        children.extend(
-            list.split_whitespace()
-                .filter_map(|id| id.parse::<u32>().ok()),
-        );
-    }
-    children.sort_unstable();
-    children.dedup();
-    children
+/// One address of a `celld dev` node, from the announce line the supervisor
+/// forwards to its stderr. The node is non-dumpable (patch 0053), so
+/// `/proc/<pid>/fd` no longer names its listeners, and this is the node's
+/// own report of where it bound.
+fn announced(lines: &Mutex<Vec<String>>, prefix: &str) -> Option<String> {
+    lines
+        .lock()
+        .expect("announce lock")
+        .iter()
+        .find_map(|line| {
+            let address = line.strip_prefix(prefix)?.split_once(' ')?.0;
+            Some(address.to_string())
+        })
 }
 
-/// Loopback TCP ports one process listens on, matching its socket inodes
-/// against `/proc/net/tcp` LISTEN entries.
-fn listening_loopback_ports(pid: u32) -> Vec<u16> {
-    let mut inodes = std::collections::HashSet::new();
-    if let Ok(fds) = std::fs::read_dir(format!("/proc/{pid}/fd")) {
-        for fd in fds.map_while(Result::ok) {
-            let Ok(link) = std::fs::read_link(fd.path()) else {
-                continue;
-            };
-            if let Some(name) = link.to_str() {
-                if let Some(inode) = name
-                    .strip_prefix("socket:[")
-                    .and_then(|inode| inode.strip_suffix(']'))
-                {
-                    inodes.insert(inode.to_string());
-                }
-            }
+/// Collect the supervisor's stderr lines, which carry the node's announce
+/// lines (`--logs` forwards them).
+fn forward_announce(stderr: std::process::ChildStderr, lines: Arc<Mutex<Vec<String>>>) {
+    std::thread::spawn(move || {
+        let mut reader = BufReader::new(stderr);
+        let mut line = String::new();
+        while reader.read_line(&mut line).is_ok_and(|read| read > 0) {
+            lines
+                .lock()
+                .expect("announce lock")
+                .push(std::mem::take(&mut line));
         }
-    }
-    let Ok(tcp) = std::fs::read_to_string("/proc/net/tcp") else {
-        return Vec::new();
-    };
-    let mut ports = Vec::new();
-    for line in tcp.lines().skip(1) {
-        let mut fields = line.split_whitespace();
-        let (Some(local), Some(state)) = (fields.nth(1), fields.nth(1)) else {
-            continue;
-        };
-        if state != "0A" {
-            continue;
-        }
-        let Some(inode) = fields.nth(5) else { continue };
-        if !inodes.contains(inode) {
-            continue;
-        }
-        let mut addr = local.split(':');
-        if addr.next() != Some("0100007F") {
-            continue;
-        }
-        if let Some(port) = addr
-            .next()
-            .and_then(|port| u16::from_str_radix(port, 16).ok())
-        {
-            ports.push(port);
-        }
-    }
-    ports.sort_unstable();
-    ports.dedup();
-    ports
+    });
 }
 
 /// A booted `celld dev` and its addresses. Kills the child on drop, so a
@@ -185,6 +146,7 @@ impl TestNode {
         let mut command = Command::new(celld_binary());
         command
             .arg("dev")
+            .env("NO_COLOR", "1")
             .arg(project)
             .arg("--port")
             .arg(port.to_string())
@@ -202,18 +164,16 @@ impl TestNode {
             .spawn()
             .expect("spawn celld dev");
         let mut stdout = child.stdout.take().expect("piped stdout");
-        let mut stderr = child.stderr.take().expect("piped stderr");
-        // Drain both pipes so a chatty child can never block on a full
-        // one. The drains only discard: readiness is the public port
-        // serving the live app below.
+        let stderr = child.stderr.take().expect("piped stderr");
         std::thread::spawn(move || {
             let mut sink = Vec::new();
             let _ = stdout.read_to_end(&mut sink);
         });
-        std::thread::spawn(move || {
-            let mut sink = Vec::new();
-            let _ = stderr.read_to_end(&mut sink);
-        });
+        // The supervisor's stderr carries the node's announce lines, the
+        // only channel to the internal listener now that the node is
+        // non-dumpable (patch 0053).
+        let announced_lines: Arc<Mutex<Vec<String>>> = Arc::default();
+        forward_announce(stderr, Arc::clone(&announced_lines));
         let public = format!("127.0.0.1:{port}");
         // The kill-on-drop guard exists before the readiness poll, so a
         // boot timeout or an early child exit cannot leak the server.
@@ -223,8 +183,8 @@ impl TestNode {
             internal: String::new(),
         };
         // Readiness is the live app answering its version: the deploy is
-        // adopted exactly then. The internal port is the node child's
-        // other loopback listener.
+        // adopted exactly then. The internal port comes from the node's own
+        // announce line.
         node.internal = poll_until(&format!("{name} boot"), Duration::from_secs(180), || {
             if get_body(&public, "/version") != Some("app-v1".to_string()) {
                 return None;
@@ -232,15 +192,7 @@ impl TestNode {
             if let Some(status) = node.child.try_wait().expect("poll child") {
                 panic!("{name}: celld dev exited during boot: {status}");
             }
-            let mut internal = None;
-            for pid in child_pids(node.child.id()) {
-                for found in listening_loopback_ports(pid) {
-                    if found != port {
-                        internal = Some(found);
-                    }
-                }
-            }
-            internal.map(|port| format!("127.0.0.1:{port}"))
+            announced(&announced_lines, "celld internal listening on ")
         });
         node
     }

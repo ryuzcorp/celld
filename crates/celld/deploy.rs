@@ -4663,6 +4663,12 @@ fn run_esbuild(
         );
     }
     let mut command = Command::new(&program);
+    // `celld dev` bundles from its serving supervisor, whose environment
+    // holds the fleet's credentials; `execve` also makes the child
+    // dumpable again. esbuild needs none of that — its entry, project,
+    // output, and metafile paths arrive as arguments — so it starts from
+    // the minimal environment.
+    crate::hardening::minimal_child_environment(&mut command);
     command
         .current_dir(root)
         .arg(entry)

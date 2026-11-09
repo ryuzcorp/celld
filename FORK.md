@@ -599,10 +599,16 @@ push to `ghcr.io/denoland`, but still. Pushing a branch named
   the node, so the fleet's `AWS_*`, `CELLD_DEPLOY_AWS_*`, and
   `CELLD_OPERATOR_TOKEN` values stay with the node. Operator commands stay
   dumpable. Linux-only; a no-op elsewhere. Cost: no core dumps from a
-  node, and a non-root debugger cannot attach (root can). The
-  conformance suites read the node's announce lines from the `celld dev`
-  supervisor's stderr instead of `/proc/<pid>/fd`, which a non-dumpable
-  process no longer exposes.
+  node, and a non-root debugger cannot attach (root can). The flag holds
+  from that call onward, not from `execve`: between the two the process is
+  still dumpable, so initial boot, `celld dev`'s node respawn, and the
+  control plane's credential-rotation re-exec each pay that window.
+  Children a serving process spawns (`celld dev`'s esbuild, the presence
+  agent's `hostname`) are dumpable again after `execve` but start with an
+  emptied environment carrying only `PATH`, `HOME`, and `TMPDIR`, so none
+  of the fleet's variables reaches them. The conformance suites read the
+  node's announce lines from the `celld dev` supervisor's stderr instead
+  of `/proc/<pid>/fd`, which a non-dumpable process no longer exposes.
 
 Patches `0025`–`0034` are ported fixes from
 [meln1k/celld](https://github.com/meln1k/celld) by Nikita
@@ -706,7 +712,13 @@ source commit; the commits keep the original author with a
     non-root debugger or profiler cannot attach to one (`ptrace` is
     refused). Root tools are unaffected. Anything that reads the node's
     `/proc/<pid>/environ`, `mem`, or `maps` as the fleet uid now gets
-    `EACCES` (`0053`).
+    `EACCES` (`0053`). The window between `execve` and `main` setting the
+    flag is still dumpable (initial boot, `celld dev`'s node respawn, the
+    control plane's credential-rotation re-exec), and children a serving
+    process spawns (`celld dev`'s esbuild, the presence agent's
+    `hostname`) are dumpable again after `execve` but start with an
+    emptied environment (`PATH`, `HOME`, `TMPDIR` only), so no credential
+    reaches them.
 - `v0.6.3-ryuzcorp.8` (the commit that adds this entry): adds `0051`.
   Upgrade notes:
   - `celld deploy --read-root DIR` (repeatable) names directories beyond

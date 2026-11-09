@@ -1,4 +1,5 @@
-// Modified by ryuzcorp (ryuzcorp/celld): operator token for the internal listener. Apache-2.0.
+// Modified by ryuzcorp (ryuzcorp/celld): operator token for the internal listener;
+// announce-line discovery. Apache-2.0.
 
 // A black-box runner, not node code: it boots the binary, copies fixtures,
 // and polls TCP with wall-clock deadlines, so the execution boundary's
@@ -67,77 +68,16 @@ struct TestNode {
     stderr: Arc<Mutex<Vec<u8>>>,
 }
 
-/// Direct children of a process, via `/proc/<pid>/task/*/children`.
-fn child_pids(pid: u32) -> Vec<u32> {
-    let mut children = Vec::new();
-    let Ok(tasks) = std::fs::read_dir(format!("/proc/{pid}/task")) else {
-        return children;
-    };
-    for task in tasks.map_while(Result::ok) {
-        let Ok(list) = std::fs::read_to_string(task.path().join("children")) else {
-            continue;
-        };
-        children.extend(
-            list.split_whitespace()
-                .filter_map(|id| id.parse::<u32>().ok()),
-        );
-    }
-    children.sort_unstable();
-    children.dedup();
-    children
-}
-
-/// Loopback TCP ports one process listens on, matching its socket inodes
-/// against `/proc/net/tcp` LISTEN entries.
-fn listening_loopback_ports(pid: u32) -> Vec<u16> {
-    let mut inodes = std::collections::HashSet::new();
-    if let Ok(fds) = std::fs::read_dir(format!("/proc/{pid}/fd")) {
-        for fd in fds.map_while(Result::ok) {
-            let Ok(link) = std::fs::read_link(fd.path()) else {
-                continue;
-            };
-            if let Some(name) = link.to_str() {
-                if let Some(inode) = name
-                    .strip_prefix("socket:[")
-                    .and_then(|inode| inode.strip_suffix(']'))
-                {
-                    inodes.insert(inode.to_string());
-                }
-            }
-        }
-    }
-    let Ok(tcp) = std::fs::read_to_string("/proc/net/tcp") else {
-        return Vec::new();
-    };
-    let mut ports = Vec::new();
-    for line in tcp.lines().skip(1) {
-        let mut fields = line.split_whitespace();
-        let (Some(local), Some(state)) = (fields.nth(1), fields.nth(1)) else {
-            continue;
-        };
-        if state != "0A" {
-            continue;
-        }
-        // Fields past `st`: tx_queue, tr, retransmit, uid, timeout, then
-        // the inode.
-        let Some(inode) = fields.nth(5) else { continue };
-        if !inodes.contains(inode) {
-            continue;
-        }
-        let mut addr = local.split(':');
-        if addr.next() != Some("0100007F") {
-            continue;
-        }
-        if let Some(port) = addr
-            .next()
-            .and_then(|port| u16::from_str_radix(port, 16).ok())
-        {
-            ports.push(port);
-        }
-    }
-    ports.sort_unstable();
-    ports.dedup();
-    ports
+/// One address of the node, from the announce line the supervisor forwards
+/// to its stderr. The node is non-dumpable (patch 0053), so
+/// `/proc/<pid>/fd` no longer names its listeners, and this is the node's
+/// own report of where it bound.
+fn announced(stderr: &Mutex<Vec<u8>>, prefix: &str) -> Option<String> {
+    let text = String::from_utf8_lossy(&stderr.lock().expect("stderr lock")).into_owned();
+    text.lines().find_map(|line| {
+        let address = line.strip_prefix(prefix)?.split_once(' ')?.0;
+        Some(address.to_string())
+    })
 }
 
 impl TestNode {
@@ -145,6 +85,7 @@ impl TestNode {
         let port = free_port();
         let mut child = Command::new(celld_binary())
             .arg("dev")
+            .env("NO_COLOR", "1")
             .arg(fixture)
             .arg("--port")
             .arg(port.to_string())
@@ -198,15 +139,7 @@ impl TestNode {
             if let Some(status) = node.child.try_wait().expect("poll child") {
                 panic!("{name}: celld dev exited during boot: {status}");
             }
-            let mut internal = None;
-            for pid in child_pids(node.child.id()) {
-                for found in listening_loopback_ports(pid) {
-                    if found != port {
-                        internal = Some(found);
-                    }
-                }
-            }
-            internal.map(|port| format!("127.0.0.1:{port}"))
+            announced(&node.stderr, "celld internal listening on ")
         });
         node
     }
@@ -397,6 +330,7 @@ fn empty_operator_token_refuses_to_start() {
     let port = free_port();
     let mut child = Command::new(celld_binary())
         .arg("dev")
+        .env("NO_COLOR", "1")
         .arg(fixture.path())
         .arg("--port")
         .arg(port.to_string())

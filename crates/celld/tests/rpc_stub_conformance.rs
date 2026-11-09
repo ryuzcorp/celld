@@ -1,7 +1,8 @@
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 //
 // Modified by ryuzcorp (ryuzcorp/celld): cross-isolate RPC
-// stubs and streams; response bodies across events. Apache-2.0.
+// stubs and streams; response bodies across events; announce-line
+// discovery. Apache-2.0.
 
 // A black-box runner, not node code: it boots the binary, copies fixtures,
 // and polls TCP with wall-clock deadlines, so the execution boundary's
@@ -29,10 +30,11 @@
 //! count alone would miss either side leaking.
 
 use serde_json::Value;
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const RELEASED_STUB_ERROR: &str =
@@ -93,77 +95,34 @@ struct TestNode {
     internal: String,
 }
 
-/// Direct children of a process, via `/proc/<pid>/task/*/children`.
-fn child_pids(pid: u32) -> Vec<u32> {
-    let mut children = Vec::new();
-    let Ok(tasks) = std::fs::read_dir(format!("/proc/{pid}/task")) else {
-        return children;
-    };
-    for task in tasks.map_while(Result::ok) {
-        let Ok(list) = std::fs::read_to_string(task.path().join("children")) else {
-            continue;
-        };
-        children.extend(
-            list.split_whitespace()
-                .filter_map(|id| id.parse::<u32>().ok()),
-        );
-    }
-    children.sort_unstable();
-    children.dedup();
-    children
+/// One address of a `celld dev` node, from the announce line the supervisor
+/// forwards to its stderr. The node is non-dumpable (patch 0053), so
+/// `/proc/<pid>/fd` no longer names its listeners, and this is the node's
+/// own report of where it bound.
+fn announced(lines: &Mutex<Vec<String>>, prefix: &str) -> Option<String> {
+    lines
+        .lock()
+        .expect("announce lock")
+        .iter()
+        .find_map(|line| {
+            let address = line.strip_prefix(prefix)?.split_once(' ')?.0;
+            Some(address.to_string())
+        })
 }
 
-/// Loopback TCP ports one process listens on, matching its socket inodes
-/// against `/proc/net/tcp` LISTEN entries.
-fn listening_loopback_ports(pid: u32) -> Vec<u16> {
-    let mut inodes = std::collections::HashSet::new();
-    if let Ok(fds) = std::fs::read_dir(format!("/proc/{pid}/fd")) {
-        for fd in fds.map_while(Result::ok) {
-            let Ok(link) = std::fs::read_link(fd.path()) else {
-                continue;
-            };
-            if let Some(name) = link.to_str() {
-                if let Some(inode) = name
-                    .strip_prefix("socket:[")
-                    .and_then(|inode| inode.strip_suffix(']'))
-                {
-                    inodes.insert(inode.to_string());
-                }
-            }
+/// Collect the supervisor's stderr lines, which carry the node's announce
+/// lines (`--logs` forwards them).
+fn forward_announce(stderr: std::process::ChildStderr, lines: Arc<Mutex<Vec<String>>>) {
+    std::thread::spawn(move || {
+        let mut reader = BufReader::new(stderr);
+        let mut line = String::new();
+        while reader.read_line(&mut line).is_ok_and(|read| read > 0) {
+            lines
+                .lock()
+                .expect("announce lock")
+                .push(std::mem::take(&mut line));
         }
-    }
-    let Ok(tcp) = std::fs::read_to_string("/proc/net/tcp") else {
-        return Vec::new();
-    };
-    let mut ports = Vec::new();
-    for line in tcp.lines().skip(1) {
-        let mut fields = line.split_whitespace();
-        let (Some(local), Some(state)) = (fields.nth(1), fields.nth(1)) else {
-            continue;
-        };
-        if state != "0A" {
-            continue;
-        }
-        // Fields past `st`: tx_queue, tr, retransmit, uid, timeout, then
-        // the inode.
-        let Some(inode) = fields.nth(5) else { continue };
-        if !inodes.contains(inode) {
-            continue;
-        }
-        let mut addr = local.split(':');
-        if addr.next() != Some("0100007F") {
-            continue;
-        }
-        if let Some(port) = addr
-            .next()
-            .and_then(|port| u16::from_str_radix(port, 16).ok())
-        {
-            ports.push(port);
-        }
-    }
-    ports.sort_unstable();
-    ports.dedup();
-    ports
+    });
 }
 
 impl TestNode {
@@ -176,6 +135,7 @@ impl TestNode {
         // can never claim the same one; discovery below learns it.
         let mut child = Command::new(celld_binary())
             .arg("dev")
+            .env("NO_COLOR", "1")
             .arg(fixture)
             .arg("--port")
             .arg("0")
@@ -188,7 +148,7 @@ impl TestNode {
             .spawn()
             .expect("spawn celld dev");
         let mut stdout = child.stdout.take().expect("piped stdout");
-        let mut stderr = child.stderr.take().expect("piped stderr");
+        let stderr = child.stderr.take().expect("piped stderr");
         // Drain both pipes so a chatty child can never block on a full
         // one. The drains only discard: the supervisor block-buffers
         // into pipes, so its log lines are not a discovery channel and
@@ -197,10 +157,8 @@ impl TestNode {
             let mut sink = Vec::new();
             let _ = stdout.read_to_end(&mut sink);
         });
-        std::thread::spawn(move || {
-            let mut sink = Vec::new();
-            let _ = stderr.read_to_end(&mut sink);
-        });
+        let announced_lines: Arc<Mutex<Vec<String>>> = Arc::default();
+        forward_announce(stderr, Arc::clone(&announced_lines));
         // The kill-on-drop guard exists before discovery, so a boot
         // timeout or an early child exit cannot leak the server; the
         // addresses are placeholders until discovery fills them.
@@ -209,10 +167,10 @@ impl TestNode {
             public: String::new(),
             internal: String::new(),
         };
-        // Discovery doubles as readiness: the node binds two loopback
-        // listeners, and the one answering /scope with 200 is the worker
-        // listener (the operator listener 404s it). Neither answers
-        // before the app loads.
+        // Discovery doubles as readiness: the node announces both of its
+        // loopback listeners before it serves, and /scope answers once the
+        // app loads. The node is non-dumpable (patch 0053), so the
+        // supervisor's stderr is the discovery channel.
         let (public, internal) =
             poll_until(&format!("{name} boot"), Duration::from_secs(120), || {
                 // Liveness first: a dead child must fail fast, not burn
@@ -220,22 +178,9 @@ impl TestNode {
                 if let Some(status) = node.child.try_wait().expect("poll child") {
                     panic!("{name}: celld dev exited during boot: {status}");
                 }
-                let mut public = None;
-                let mut internal = None;
-                for pid in child_pids(node.child.id()) {
-                    for found in listening_loopback_ports(pid) {
-                        let addr = format!("127.0.0.1:{found}");
-                        if probe(&addr, "/scope?name=probe") {
-                            public = Some(addr);
-                        } else if internal.is_none() {
-                            internal = Some(addr);
-                        }
-                    }
-                }
-                match (public, internal) {
-                    (Some(public), Some(internal)) => Some((public, internal)),
-                    _ => None,
-                }
+                let public = announced(&announced_lines, "celld listening on ")?;
+                let internal = announced(&announced_lines, "celld internal listening on ")?;
+                probe(&public, "/scope?name=probe").then_some((public, internal))
             });
         node.public = public;
         node.internal = internal;
