@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): staged activation.
+// Modified by ryuzcorp (ryuzcorp/celld): staged activation; the serving bucket constructor.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 // Modified by ryuzcorp (ryuzcorp/celld): deploy --sourcemap writes the bundle's external map.
 
@@ -229,6 +229,61 @@ pub fn bucket_client_with_credentials(
     managed: Option<&crate::control_plane::ManagedStorageConfig>,
 ) -> anyhow::Result<Bucket> {
     open(bucket, endpoint, region, managed, None)
+}
+
+/// The serving node's bucket: [`bucket_client_with_credentials`] plus the
+/// deployment read client when `CELLD_DEPLOY_AWS_*` is set (patch 0052).
+///
+/// Only the long-running node calls this. The operator commands — `celld
+/// deploy`, `activate`, `discard`, and the rest — open through
+/// [`bucket_client`] and keep the publishing credential, so an operator
+/// environment that carries both credentials still publishes with `AWS_*`.
+///
+/// A control-plane node, managed storage or BYO bucket alike, writes the
+/// deployment pointer and the bundles itself, so a read-only deployment
+/// credential would leave those writes refused: the trio is a startup error
+/// there.
+pub fn serving_bucket_client_with_credentials(
+    bucket: &str,
+    endpoint: Option<&str>,
+    region: &str,
+    control_plane: bool,
+    managed: Option<&crate::control_plane::ManagedStorageConfig>,
+) -> anyhow::Result<Bucket> {
+    let credentials = crate::env_vars::deploy_credentials()?;
+    serving_bucket_client(
+        bucket,
+        endpoint,
+        region,
+        control_plane,
+        managed,
+        credentials,
+    )
+}
+
+/// [`serving_bucket_client_with_credentials`] over an already-parsed
+/// credential, so the refusal rule is testable without the process
+/// environment.
+fn serving_bucket_client(
+    bucket: &str,
+    endpoint: Option<&str>,
+    region: &str,
+    control_plane: bool,
+    managed: Option<&crate::control_plane::ManagedStorageConfig>,
+    credentials: Option<(String, String, Option<String>)>,
+) -> anyhow::Result<Bucket> {
+    let client = open(bucket, endpoint, region, managed, None)?;
+    if control_plane || managed.is_some() {
+        anyhow::ensure!(
+            credentials.is_none(),
+            "CELLD_DEPLOY_AWS_* is not supported on a control-plane node: its deploy \
+             agent publishes deploy/ and deploy-blobs/ through this node's bucket \
+             (managed storage or BYO alike), and a read-only deployment credential \
+             would refuse those writes"
+        );
+        return Ok(client);
+    }
+    client.with_deploy_read_credentials(endpoint, region, None, credentials)
 }
 
 fn open(
@@ -1225,4 +1280,76 @@ fn worker_vars(manifest: &Manifest) -> Vec<(String, String)> {
             ))
         })
         .collect()
+}
+
+/// A control-plane node publishes deployment artifacts itself, so the
+/// read-only deployment credential the serving node may use would refuse
+/// its writes. The trio is refused there whether the bucket is managed or
+/// BYO; a plain serving node still splits its reads.
+#[cfg(test)]
+mod serving_credential_tests {
+    use super::*;
+
+    const ENDPOINT: Option<&str> = Some("http://127.0.0.1:9");
+
+    fn trio() -> Option<(String, String, Option<String>)> {
+        Some(("deploy-key".into(), "deploy-secret".into(), None))
+    }
+
+    fn managed() -> crate::control_plane::ManagedStorageConfig {
+        crate::control_plane::ManagedStorageConfig {
+            bucket: "fleet".to_string(),
+            endpoint: "http://127.0.0.1:9".to_string(),
+            region: "us-east-1".to_string(),
+            access_key_id: "managed-key".to_string(),
+            secret_access_key: "managed-secret".to_string(),
+            session_token: None,
+        }
+    }
+
+    #[test]
+    fn a_control_plane_node_refuses_the_deploy_credential() {
+        let managed = managed();
+        for (control_plane, storage) in [
+            (true, None),
+            (true, Some(&managed)),
+            (false, Some(&managed)),
+        ] {
+            let error = serving_bucket_client(
+                "s3://fleet",
+                ENDPOINT,
+                "us-east-1",
+                control_plane,
+                storage,
+                trio(),
+            )
+            .err()
+            .expect("the trio must be refused: the node writes deploy/ itself");
+            assert!(
+                format!("{error:#}").contains("control-plane node"),
+                "the refusal must name the cause: {error:#}"
+            );
+        }
+        // A BYO control-plane node with no trio keeps the publishing client.
+        let client = serving_bucket_client("s3://fleet", ENDPOINT, "us-east-1", true, None, None)
+            .expect("an unset trio is accepted");
+        assert!(client.deploy_read().is_none());
+    }
+
+    #[test]
+    fn a_serving_node_splits_its_reads() {
+        let client =
+            serving_bucket_client("s3://fleet", ENDPOINT, "us-east-1", false, None, trio())
+                .expect("a serving node accepts the trio");
+        assert!(
+            client.deploy_read().is_some(),
+            "a serving node reads deploy/ with the deployment credential"
+        );
+        let client = serving_bucket_client("s3://fleet", ENDPOINT, "us-east-1", false, None, None)
+            .expect("an unset trio is accepted");
+        assert!(
+            client.deploy_read().is_none(),
+            "an unset trio keeps one credential for everything"
+        );
+    }
 }

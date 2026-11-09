@@ -9,7 +9,7 @@ README below is kept intact; this file documents the fork.
 
 - `main` mirrors upstream `main` and carries no patches.
 - `ryuzcorp/v<version>` is a line branch: the upstream tag `v<version>`
-  plus our patches as commits, one commit per patch, in `0001`-`0051`
+  plus our patches as commits, one commit per patch, in `0001`-`0053`
   order. Each patch commit is self-contained and carries its own tests.
 
 Upstream's `.github/workflows/release.yml` targets `ghcr.io/denoland` and
@@ -547,6 +547,35 @@ push to `ghcr.io/denoland`, but still. Pushing a branch named
   a kernel without Landlock, where celld warns that esbuild runs
   unconfined. The Python SDK probe follows no link, so it cannot answer
   whether a host path exists.
+- `0052` (sha TBD at merge) `CELLD_DEPLOY_AWS_ACCESS_KEY_ID`,
+  `CELLD_DEPLOY_AWS_SECRET_ACCESS_KEY`, `CELLD_DEPLOY_AWS_SESSION_TOKEN`
+  give deployment-artifact reads their own credential. With the trio set,
+  a node opens a second S3 client over the same bucket and serves
+  `deploy/` and `deploy-blobs/` from it (the pointer, manifests, bundles,
+  asset bodies, and container image tars), while every other key keeps
+  `AWS_*`. A platform that mints a read-only grant over the deployment
+  prefix and a read-write grant over the state prefixes can then hand the
+  node both, so a credential copied out of the node's environment can
+  read a deployment but never publish one. Access key and secret ride
+  together, so a partial setting is a startup error for every invocation;
+  a serving node also refuses the trio on a `gs://`/`az://` bucket, whose
+  credential chain takes no static key. Unset keeps one credential for
+  everything, exactly as before. The split belongs to the serving node only:
+  `celld deploy`, `activate`, `discard`, and the other operator commands
+  open the publishing client whatever their environment carries, because
+  their writes must not go through a read-only credential. Every keyed
+  bucket operation routes by key, so deployment artifacts read, list, and
+  delete through the deployment client from one place rather than per call
+  site.
+  A managed node (`CELLD_CLOUD`, whose control plane deploys and prunes the
+  pointer itself) refuses the trio at boot: its control-plane writes to
+  `deploy/` would go through the read-only client and be refused, and so
+  does every control-plane node with a BYO bucket, which runs the same
+  deploy agent over `deploy/` and `deploy-blobs/`.
+  The storage probe (`Bucket::validate` and the startup conditional-write
+  probe) deliberately runs on the publishing client, because the deployment
+  grant covers only the deployment prefixes; the state grant must keep
+  read-write over `probe/` for a node to boot.
 - `0051` (`7ba9825`) `celld deploy --read-root DIR`
   (repeatable) names directories beyond the project that build inputs may
   come from: esbuild's inputs (the Landlock rule and the metafile check
@@ -560,6 +589,20 @@ push to `ghcr.io/denoland`, but still. Pushing a branch named
   cannot widen its own bounds. A platform that deploys a built
   subdirectory of a checkout, or a staged config whose Dockerfile lives in
   the checkout, names the checkout.
+- `0053` (sha TBD at merge) a serving process is non-dumpable: `main` calls
+  `prctl(PR_SET_DUMPABLE, 0)` before it reads anything else, when the
+  invocation is a node or the `celld dev` supervisor (and so the node it
+  spawns; `execve` resets the flag, and every re-exec, including the
+  control plane's credential rotation, comes back through `main`). A
+  same-uid sibling — a tenant build running as the fleet uid — can then no
+  longer read `/proc/<celld pid>/environ`, `mem`, or `maps`, or `ptrace`
+  the node, so the fleet's `AWS_*`, `CELLD_DEPLOY_AWS_*`, and
+  `CELLD_OPERATOR_TOKEN` values stay with the node. Operator commands stay
+  dumpable. Linux-only; a no-op elsewhere. Cost: no core dumps from a
+  node, and a non-root debugger cannot attach (root can). The
+  conformance suites read the node's announce lines from the `celld dev`
+  supervisor's stderr instead of `/proc/<pid>/fd`, which a non-dumpable
+  process no longer exposes.
 
 Patches `0025`–`0034` are ported fixes from
 [meln1k/celld](https://github.com/meln1k/celld) by Nikita
@@ -643,6 +686,27 @@ source commit; the commits keep the original author with a
     no `POST /invoke` route (`0048`). A stream received over
     RPC now stays open while the receiver holds it (`0043`), which ends
     the spurious aborts of signal-carrying container execs.
+- `v0.6.3-ryuzcorp.9` (the commit that adds this entry): adds `0052`–`0053`.
+  Upgrade notes:
+  - No behavior changes with `CELLD_DEPLOY_AWS_*` unset. A platform that
+    sets the trio must give the deployment credential read access to both
+    `deploy/` and `deploy-blobs/`, and keep the ordinary `AWS_*` grant
+    read-write over the state prefixes (`cells/`, `log/`, `nodes/`,
+    `fleet/`, `wake/`, `drain/`, `kv/`, `r2/`, `probe/`, `telemetry/`).
+    The runtime also reads `wake-format.json` (GET) and lists `wake-v2/`
+    and `wake-retired-v2/` (`wake_format.rs`), which one read-only prefix
+    grant over `wake-` covers, and lists and deletes the `node-cells/`
+    markers (`dead_node_gc.rs`), so that prefix stays read-write. The
+    deploy command keeps the ordinary credential, which still needs write
+    access to the deployment prefixes. A control-plane node, managed
+    (`CELLD_CLOUD`) or BYO bucket alike, must not set the trio: it runs
+    the deploy agent and publishes `deploy/` itself, so it refuses the
+    trio at boot.
+  - A serving node is non-dumpable: no core dump comes out of a node, and a
+    non-root debugger or profiler cannot attach to one (`ptrace` is
+    refused). Root tools are unaffected. Anything that reads the node's
+    `/proc/<pid>/environ`, `mem`, or `maps` as the fleet uid now gets
+    `EACCES` (`0053`).
 - `v0.6.3-ryuzcorp.8` (the commit that adds this entry): adds `0051`.
   Upgrade notes:
   - `celld deploy --read-root DIR` (repeatable) names directories beyond

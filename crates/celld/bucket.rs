@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): R2 startAfter compares decoded keys; listing pages carry walk-ordered rows; staged activation.
+// Modified by ryuzcorp (ryuzcorp/celld): R2 startAfter compares decoded keys; listing pages carry walk-ordered rows; staged activation; separate CELLD_DEPLOY_AWS_* credentials for deployment-artifact reads.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! The engine's single object-store client: the `object_store` crate
@@ -32,6 +32,7 @@ use bytes::Bytes;
 use futures_util::stream::BoxStream;
 use futures_util::StreamExt;
 use object_store::aws::AmazonS3Builder;
+use object_store::aws::AwsCredential;
 use object_store::aws::S3ConditionalPut;
 use object_store::azure::authority_hosts;
 use object_store::azure::AzureConfigKey;
@@ -55,6 +56,7 @@ use object_store::PutMultipartOptions;
 use object_store::PutOptions;
 use object_store::PutPayload;
 use object_store::RetryConfig;
+use object_store::StaticCredentialProvider;
 use object_store::UpdateVersion;
 use std::borrow::Cow;
 use std::sync::Arc;
@@ -198,6 +200,11 @@ pub struct Bucket {
     /// to. Call sites keep forming unprefixed keys; this type is the one
     /// place that knows where in the bucket a fleet lives.
     pub prefix: String,
+    /// The deployment artifacts (`deploy/`, `deploy-blobs/`) read with a
+    /// separate credential when `CELLD_DEPLOY_AWS_*` is set: a node then
+    /// holds a credential that can read a deployment but never publish one
+    /// (`0052`). `None` keeps one credential for everything, as upstream.
+    read_deploy: Option<Arc<Bucket>>,
 }
 
 /// One page of [`Bucket::common_prefixes_page`].
@@ -312,6 +319,20 @@ pub fn resolve_env_endpoint() -> Option<String> {
     ["AWS_ENDPOINT_URL", "AWS_ENDPOINT"]
         .iter()
         .find_map(|var| std::env::var(var).ok().filter(|value| !value.is_empty()))
+}
+
+/// Keys whose objects are deployment artifacts: the pointer, manifests and
+/// bundles under `deploy/`, and asset bodies under `deploy-blobs/`. With a
+/// deployment credential set, these read through it (see
+/// [`Bucket::with_deploy_read`]).
+fn is_deploy_key(key: &str) -> bool {
+    // The first segment, so a listing prefix (`deploy`, `deploy-blobs`) and
+    // a key below it (`deploy/current.json`) classify alike. `deployment/`
+    // is a different namespace and stays on the primary client.
+    matches!(
+        key.trim_start_matches('/').split('/').next(),
+        Some("deploy") | Some("deploy-blobs")
+    )
 }
 
 /// The byte range a `get` asked for. R2 spells a range four ways and so
@@ -642,6 +663,7 @@ impl Bucket {
             backend: StorageBackend::S3,
             name: "telemetry-test".to_string(),
             prefix,
+            read_deploy: None,
         }
     }
 
@@ -662,6 +684,7 @@ impl Bucket {
             backend,
             name,
             prefix,
+            read_deploy: None,
         }
     }
 
@@ -682,6 +705,12 @@ impl Bucket {
     /// `app` labels this client's traffic in the User-Agent (the aws
     /// AppName format, `app/<name>`), keeping e.g. the lease safety lane
     /// observable in black-box storage traces.
+    ///
+    /// This is the publishing client and nothing else: it never attaches a
+    /// deployment read client, so `CELLD_DEPLOY_AWS_*` in the environment of
+    /// a `deploy`/`activate`/`discard` invocation cannot turn its writes
+    /// into reads that the deployment credential is not granted. The
+    /// serving node adds that client with [`Self::with_deploy_read`].
     pub fn open(
         bucket: &str,
         endpoint: Option<&str>,
@@ -703,6 +732,83 @@ impl Bucket {
         )
     }
 
+    /// Give deployment-artifact reads their own credential when the process
+    /// carries one (`CELLD_DEPLOY_AWS_ACCESS_KEY_ID`, `..._SECRET_ACCESS_KEY`,
+    /// optional `..._SESSION_TOKEN`). A node started this way holds a
+    /// credential that can read `deploy/` and `deploy-blobs/` but cannot
+    /// publish a deployment; everything else keeps the ordinary `AWS_*`
+    /// credential. Unset means one credential for everything, as upstream.
+    ///
+    /// Only the serving node applies this (`fleet::
+    /// serving_bucket_client_with_credentials`): it is the process that
+    /// serves deployment artifacts and has no business publishing them. The
+    /// operator commands open with [`Self::open`] and keep publishing, so an
+    /// operator shell carrying both credentials works.
+    ///
+    /// The second client opens the same bucket spec with the deployment
+    /// keys as static credentials, so it reaches the same objects and no
+    /// others. `gs://` and `az://` have no static-credential channel here
+    /// and refuse the setting rather than silently reading with the
+    /// primary credential.
+    pub fn with_deploy_read(
+        self,
+        endpoint: Option<&str>,
+        region: &str,
+        app: Option<&str>,
+    ) -> anyhow::Result<Bucket> {
+        let credentials = crate::env_vars::deploy_credentials()?;
+        self.with_deploy_read_credentials(endpoint, region, app, credentials)
+    }
+
+    /// [`Self::with_deploy_read`] over an already-parsed credential, so a
+    /// test can prove the split without writing the process environment.
+    pub(crate) fn with_deploy_read_credentials(
+        self,
+        endpoint: Option<&str>,
+        region: &str,
+        app: Option<&str>,
+        credentials: Option<(String, String, Option<String>)>,
+    ) -> anyhow::Result<Bucket> {
+        let Some((access_key_id, secret_access_key, session_token)) = credentials else {
+            return Ok(self);
+        };
+        anyhow::ensure!(
+            self.backend == StorageBackend::S3,
+            "CELLD_DEPLOY_AWS_* needs an s3:// bucket; a {}:// bucket authenticates with \
+             its own credential chain",
+            self.scheme()
+        );
+        let spec = format!("s3://{}/{}", self.name, self.prefix);
+        let deploy = Bucket::open_with_sources(
+            &spec,
+            endpoint,
+            region,
+            Some(StaticCredentials {
+                access_key_id,
+                secret_access_key,
+                session_token,
+            }),
+            app,
+            CloudSources::from_process(),
+        )?;
+        Ok(self.with_read_deploy(deploy))
+    }
+
+    /// Attach the client that serves deployment artifacts. The tests use it
+    /// to pair two independent stores without touching the process
+    /// environment; [`Self::with_deploy_read`] builds it from
+    /// `CELLD_DEPLOY_AWS_*`.
+    pub(crate) fn with_read_deploy(mut self, deploy: Bucket) -> Bucket {
+        self.read_deploy = Some(Arc::new(deploy));
+        self
+    }
+
+    /// The client that serves deployment artifacts, when one is attached.
+    #[cfg(test)]
+    pub(crate) fn deploy_read(&self) -> Option<&Bucket> {
+        self.read_deploy.as_deref()
+    }
+
     /// Open the machine-local development store. Only the `celld dev`
     /// supervisor and its child node receive this constructor; fleet flags
     /// continue to resolve exclusively through the cloud backend parser.
@@ -715,6 +821,7 @@ impl Bucket {
             backend: StorageBackend::Local,
             name: database.display().to_string(),
             prefix: String::new(),
+            read_deploy: None,
         })
     }
 
@@ -812,12 +919,18 @@ impl Bucket {
                     builder = builder.with_virtual_hosted_style_request(true);
                 }
                 if let Some(credentials) = credentials {
-                    builder = builder
-                        .with_access_key_id(credentials.access_key_id)
-                        .with_secret_access_key(credentials.secret_access_key);
-                    if let Some(token) = credentials.session_token {
-                        builder = builder.with_token(token);
-                    }
+                    // Replace the whole credential chain, including the
+                    // AWS_SESSION_TOKEN `from_env` may have read: pairing an
+                    // explicit key with an inherited token signs every
+                    // request for a credential that does not exist. A
+                    // credential without a token therefore really has none.
+                    builder = builder.with_credentials(Arc::new(StaticCredentialProvider::new(
+                        AwsCredential {
+                            key_id: credentials.access_key_id,
+                            secret_key: credentials.secret_access_key,
+                            token: credentials.session_token,
+                        },
+                    )));
                 }
                 let cas_builder = builder.clone().with_retry(cas_retry);
                 let client = Arc::new(builder.build().context("build s3 client")?);
@@ -897,6 +1010,7 @@ impl Bucket {
             backend,
             name: bucket.to_string(),
             prefix,
+            read_deploy: None,
         })
     }
 
@@ -911,6 +1025,18 @@ impl Bucket {
     #[doc(hidden)]
     pub fn backend(&self) -> StorageBackend {
         self.backend
+    }
+
+    /// The client a key belongs to: deployment artifacts through the
+    /// deployment credential when one is attached, everything else through
+    /// this client. Writes route the same way, so a credential that is
+    /// read-only over `deploy/` cannot publish through this type — the
+    /// request goes to that credential and the store refuses it.
+    fn keyed(&self, key: &str) -> &Bucket {
+        match &self.read_deploy {
+            Some(deploy) if is_deploy_key(key) => deploy,
+            _ => self,
+        }
     }
 
     /// Scope a caller's key to this client's prefix.
@@ -984,49 +1110,52 @@ impl Bucket {
 
     /// Body and CAS token, or `None` when the key does not exist.
     pub async fn get(&self, key: &str) -> anyhow::Result<Option<(Bytes, String)>> {
-        let key = self.key(key);
-        match self.store.get(&Path::from(key.as_str())).await {
+        let this = self.keyed(key);
+        let key = this.key(key);
+        match this.store.get(&Path::from(key.as_str())).await {
             Ok(result) => {
-                let token = self
+                let token = this
                     .backend
                     .token(result.meta.e_tag.clone(), result.meta.version.clone())
-                    .with_context(|| format!("read {}://{}/{key}", self.scheme(), self.name))?;
+                    .with_context(|| format!("read {}://{}/{key}", this.scheme(), this.name))?;
                 let bytes = result.bytes().await.with_context(|| {
-                    format!("read body {}://{}/{key}", self.scheme(), self.name)
+                    format!("read body {}://{}/{key}", this.scheme(), this.name)
                 })?;
                 Ok(Some((bytes, token)))
             }
             Err(Error::NotFound { .. }) => Ok(None),
             Err(error) => {
-                Err(anyhow!(error).context(format!("read {}://{}/{key}", self.scheme(), self.name)))
+                Err(anyhow!(error).context(format!("read {}://{}/{key}", this.scheme(), this.name)))
             }
         }
     }
 
     /// Size and CAS token, or `None` when the key does not exist.
     pub async fn head(&self, key: &str) -> anyhow::Result<Option<(u64, String)>> {
-        let key = self.key(key);
-        match self.store.head(&Path::from(key.as_str())).await {
+        let this = self.keyed(key);
+        let key = this.key(key);
+        match this.store.head(&Path::from(key.as_str())).await {
             Ok(meta) => {
-                let token = self
+                let token = this
                     .backend
                     .token(meta.e_tag, meta.version)
-                    .with_context(|| format!("head {}://{}/{key}", self.scheme(), self.name))?;
+                    .with_context(|| format!("head {}://{}/{key}", this.scheme(), this.name))?;
                 Ok(Some((meta.size, token)))
             }
             Err(Error::NotFound { .. }) => Ok(None),
             Err(error) => {
-                Err(anyhow!(error).context(format!("head {}://{}/{key}", self.scheme(), self.name)))
+                Err(anyhow!(error).context(format!("head {}://{}/{key}", this.scheme(), this.name)))
             }
         }
     }
 
     pub async fn put(&self, key: &str, body: impl Into<PutPayload>) -> anyhow::Result<()> {
-        let key = self.key(key);
-        self.store
+        let this = self.keyed(key);
+        let key = this.key(key);
+        this.store
             .put(&Path::from(key.as_str()), body.into())
             .await
-            .with_context(|| format!("write {}://{}/{key}", self.scheme(), self.name))?;
+            .with_context(|| format!("write {}://{}/{key}", this.scheme(), this.name))?;
         Ok(())
     }
 
@@ -1039,12 +1168,13 @@ impl Bucket {
         key: &str,
         name: &str,
     ) -> anyhow::Result<Option<(u64, Option<String>)>> {
-        let key = self.key(key);
+        let this = self.keyed(key);
+        let key = this.key(key);
         let options = GetOptions {
             head: true,
             ..GetOptions::default()
         };
-        match self
+        match this
             .store
             .get_opts(&Path::from(key.as_str()), options)
             .await
@@ -1057,7 +1187,7 @@ impl Bucket {
             }
             Err(Error::NotFound { .. }) => Ok(None),
             Err(error) => {
-                Err(anyhow!(error).context(format!("head {}://{}/{key}", self.scheme(), self.name)))
+                Err(anyhow!(error).context(format!("head {}://{}/{key}", this.scheme(), this.name)))
             }
         }
     }
@@ -1070,7 +1200,8 @@ impl Bucket {
         body: impl Into<PutPayload>,
         meta: &[(&'static str, &str)],
     ) -> anyhow::Result<()> {
-        let key = self.key(key);
+        let this = self.keyed(key);
+        let key = this.key(key);
         let attributes = BlobAttributes {
             metadata: meta
                 .iter()
@@ -1079,13 +1210,13 @@ impl Bucket {
             ..BlobAttributes::default()
         };
         let options = PutOptions {
-            attributes: attributes.write(self.backend),
+            attributes: attributes.write(this.backend),
             ..PutOptions::default()
         };
-        self.store
+        this.store
             .put_opts(&Path::from(key.as_str()), body.into(), options)
             .await
-            .with_context(|| format!("write {}://{}/{key}", self.scheme(), self.name))?;
+            .with_context(|| format!("write {}://{}/{key}", this.scheme(), this.name))?;
         Ok(())
     }
 
@@ -1101,12 +1232,13 @@ impl Bucket {
         body: impl Into<PutPayload>,
         token: Option<&str>,
     ) -> anyhow::Result<Option<String>> {
-        let key = self.key(key);
+        let this = self.keyed(key);
+        let key = this.key(key);
         let mode = match token {
             None => PutMode::Create,
-            Some(token) => PutMode::Update(self.backend.update(token)),
+            Some(token) => PutMode::Update(this.backend.update(token)),
         };
-        match self
+        match this
             .cas_store
             .put_opts(
                 &Path::from(key.as_str()),
@@ -1119,14 +1251,14 @@ impl Bucket {
                 // The write applied; a result without a usable token still
                 // surfaces as `Err`, which callers already treat as "may
                 // have committed" and reconcile.
-                let token = self
+                let token = this
                     .backend
                     .token(result.e_tag, result.version)
                     .with_context(|| {
                         format!(
                             "conditional write {}://{}/{key} applied without a CAS token",
-                            self.scheme(),
-                            self.name
+                            this.scheme(),
+                            this.name
                         )
                     })?;
                 Ok(Some(token))
@@ -1134,21 +1266,22 @@ impl Bucket {
             Err(error) if is_clean_cas_rejection(&error) => Ok(None),
             Err(error) => Err(anyhow!(error).context(format!(
                 "conditional write {}://{}/{key} may have committed",
-                self.scheme(),
-                self.name
+                this.scheme(),
+                this.name
             ))),
         }
     }
 
     /// Idempotent: deleting an absent key succeeds, as S3's DELETE does.
     pub async fn delete(&self, key: &str) -> anyhow::Result<()> {
-        let key = self.key(key);
-        match self.store.delete(&Path::from(key.as_str())).await {
+        let this = self.keyed(key);
+        let key = this.key(key);
+        match this.store.delete(&Path::from(key.as_str())).await {
             Ok(()) | Err(Error::NotFound { .. }) => Ok(()),
             Err(error) => Err(anyhow!(error).context(format!(
                 "delete {}://{}/{key}",
-                self.scheme(),
-                self.name
+                this.scheme(),
+                this.name
             ))),
         }
     }
@@ -1158,23 +1291,56 @@ impl Bucket {
     /// bundle GC's one-key-at-a-time deletes at 9k operations an hour.
     /// Returns the keys that are now gone; an absent key counts as gone,
     /// and a key that fails stays listed for the next pass.
+    ///
+    /// Each key routes through [`Self::keyed`] like every other operation:
+    /// a deployment key is deleted through the deployment credential, which
+    /// is read-only, so a serving node cannot prune a deployment. The
+    /// `deploy` and `discard` commands open without that credential (see
+    /// [`Self::open`]) and delete their versions through the publishing
+    /// client.
     pub async fn delete_many(&self, keys: &[String]) -> Vec<String> {
-        self.delete_paths(
-            keys.iter()
-                .map(|key| Path::from(self.key(key).as_str()))
-                .collect(),
-        )
-        .await
+        self.delete_batched(keys, |this, key| Path::from(this.key(key).as_str()))
+            .await
     }
 
     /// [`Self::delete_many`] for blob keys, which address their objects
     /// through [`Self::blob_path`]. Returns how many are now gone.
     pub async fn delete_blobs(&self, keys: &[String]) -> usize {
-        self.delete_paths(keys.iter().map(|key| self.blob_path(key)).collect())
+        self.delete_batched(keys, |this, key| this.blob_path(key))
             .await
             .len()
     }
 
+    /// Delete one batch, each key through the client it routes to. A
+    /// caller's GC names one namespace — deployment version directories, a
+    /// log prefix, one R2 bucket — so in practice a batch reaches one
+    /// client; the split keeps a mixed batch correct rather than sending
+    /// half of it to a credential that must not write there.
+    async fn delete_batched(
+        &self,
+        keys: &[String],
+        path_of: impl Fn(&Bucket, &str) -> Path,
+    ) -> Vec<String> {
+        let Some(deploy) = self.read_deploy.as_deref() else {
+            return self
+                .delete_paths(keys.iter().map(|key| path_of(self, key)).collect())
+                .await;
+        };
+        let (deploy_keys, state_keys): (Vec<&String>, Vec<&String>) =
+            keys.iter().partition(|key| is_deploy_key(key));
+        let mut gone = self
+            .delete_paths(state_keys.iter().map(|key| path_of(self, key)).collect())
+            .await;
+        gone.extend(
+            deploy
+                .delete_paths(deploy_keys.iter().map(|key| path_of(deploy, key)).collect())
+                .await,
+        );
+        gone
+    }
+
+    /// One DeleteObjects stream against this client's store. The caller
+    /// chose the client ([`Self::delete_batched`] routes by key class).
     async fn delete_paths(&self, paths: Vec<Path>) -> Vec<String> {
         let count = paths.len();
         let locations = futures_util::stream::iter(paths.into_iter().map(Ok)).boxed();
@@ -1203,16 +1369,17 @@ impl Bucket {
     /// wrote them, because the caller parses them and knows nothing of
     /// the fleet's prefix.
     pub async fn list(&self, prefix: &str) -> anyhow::Result<Vec<ObjectMeta>> {
-        let path = Path::from(self.key(prefix.trim_end_matches('/')));
-        let mut stream = self.store.list(Some(&path));
+        let this = self.keyed(prefix);
+        let path = Path::from(this.key(prefix.trim_end_matches('/')));
+        let mut stream = this.store.list(Some(&path));
         let mut objects = Vec::new();
         while let Some(meta) = stream.next().await {
             let mut meta =
-                meta.with_context(|| format!("list {}://{}/{path}", self.scheme(), self.name))?;
-            if !self.prefix.is_empty() {
+                meta.with_context(|| format!("list {}://{}/{path}", this.scheme(), this.name))?;
+            if !this.prefix.is_empty() {
                 // The listing gave object_store a valid key, so re-parsing
                 // the tail of it cannot fail.
-                meta.location = Path::parse(self.unkey(meta.location.as_ref())).unwrap();
+                meta.location = Path::parse(this.unkey(meta.location.as_ref())).unwrap();
             }
             objects.push(meta);
         }
@@ -1222,14 +1389,15 @@ impl Bucket {
     /// Does anything exist under the byte prefix `prefix` (see
     /// [`Self::list`])? One page at most.
     pub async fn list_any(&self, prefix: &str) -> anyhow::Result<bool> {
-        let path = Path::from(self.key(prefix.trim_end_matches('/')));
-        match self.store.list(Some(&path)).next().await {
+        let this = self.keyed(prefix);
+        let path = Path::from(this.key(prefix.trim_end_matches('/')));
+        match this.store.list(Some(&path)).next().await {
             None => Ok(false),
             Some(Ok(_)) => Ok(true),
             Some(Err(error)) => Err(anyhow!(error).context(format!(
                 "list {}://{}/{path}",
-                self.scheme(),
-                self.name
+                this.scheme(),
+                this.name
             ))),
         }
     }
@@ -1248,12 +1416,13 @@ impl Bucket {
     ) -> anyhow::Result<ObjectPage> {
         // `PaginatedListStore` does not append the separator that
         // `ObjectStore::list` appends to a path-segment prefix.
+        let this = self.keyed(prefix);
         let path = if prefix.is_empty() {
-            self.key("")
+            this.key("")
         } else {
-            self.key(&format!("{}/", prefix.trim_end_matches('/')))
+            this.key(&format!("{}/", prefix.trim_end_matches('/')))
         };
-        let mut result = self
+        let mut result = this
             .paginated
             .list_paginated(
                 Some(path.as_str()),
@@ -1264,10 +1433,10 @@ impl Bucket {
                 },
             )
             .await
-            .with_context(|| format!("list {}://{}/{path}", self.scheme(), self.name))?;
-        if !self.prefix.is_empty() {
+            .with_context(|| format!("list {}://{}/{path}", this.scheme(), this.name))?;
+        if !this.prefix.is_empty() {
             for object in &mut result.result.objects {
-                object.location = Path::parse(self.unkey(object.location.as_ref())).unwrap();
+                object.location = Path::parse(this.unkey(object.location.as_ref())).unwrap();
             }
         }
         Ok(ObjectPage {
@@ -1299,19 +1468,20 @@ impl Bucket {
         // Keep the caller's exact prefix. Most callers use a directory prefix
         // such as `cells/`, but a class-filtered cell walk uses `cells/Class:`
         // so the store excludes every other class before it applies the bound.
-        let path = self.key(prefix);
-        if start_after.is_some() && self.backend == StorageBackend::Azure {
+        let this = self.keyed(prefix);
+        let path = this.key(prefix);
+        if start_after.is_some() && this.backend == StorageBackend::Azure {
             anyhow::bail!(
                 "az:// cannot resume a listing by name, because Azure listing has no \
                  start-after; drop --after and list the whole container"
             );
         }
-        let result = self
+        let result = this
             .paginated
             .list_paginated(
                 Some(path.as_str()),
                 PaginatedListOptions {
-                    offset: start_after.map(|child| self.key(&format!("{child}/"))),
+                    offset: start_after.map(|child| this.key(&format!("{child}/"))),
                     delimiter: Some(std::borrow::Cow::Borrowed("/")),
                     max_keys: Some(max_keys),
                     page_token,
@@ -1319,13 +1489,13 @@ impl Bucket {
                 },
             )
             .await
-            .with_context(|| format!("list {}://{}/{path}", self.scheme(), self.name))?;
+            .with_context(|| format!("list {}://{}/{path}", this.scheme(), this.name))?;
         Ok(CommonPrefixPage {
             prefixes: result
                 .result
                 .common_prefixes
                 .into_iter()
-                .map(|child| self.unkey(child.as_ref()).to_string())
+                .map(|child| this.unkey(child.as_ref()).to_string())
                 .collect(),
             page_token: result.page_token,
         })
@@ -1338,16 +1508,17 @@ impl Bucket {
     /// listing. A caller that only needs a bounded answer must use
     /// [`Self::common_prefixes_page`] instead.
     pub async fn common_prefixes(&self, prefix: &str) -> anyhow::Result<Vec<String>> {
-        let path = Path::from(self.key(prefix.trim_end_matches('/')));
-        let result = self
+        let this = self.keyed(prefix);
+        let path = Path::from(this.key(prefix.trim_end_matches('/')));
+        let result = this
             .store
             .list_with_delimiter(Some(&path))
             .await
-            .with_context(|| format!("list {}://{}/{path}", self.scheme(), self.name))?;
+            .with_context(|| format!("list {}://{}/{path}", this.scheme(), this.name))?;
         Ok(result
             .common_prefixes
             .into_iter()
-            .map(|p| self.unkey(p.as_ref()).to_string())
+            .map(|p| this.unkey(p.as_ref()).to_string())
             .collect())
     }
 
@@ -1365,17 +1536,18 @@ impl Bucket {
     /// does not exist. This is R2's `head`, and the read half of every
     /// conditional write.
     pub async fn head_blob(&self, key: &str) -> anyhow::Result<Option<BlobMeta>> {
-        let path = self.blob_path(key);
-        let key = self.key(key);
+        let this = self.keyed(key);
+        let path = this.blob_path(key);
+        let key = this.key(key);
         let options = GetOptions {
             head: true,
             ..GetOptions::default()
         };
-        match self.store.get_opts(&path, options).await {
-            Ok(result) => Ok(Some(self.blob_meta(&result.meta, &result.attributes))),
+        match this.store.get_opts(&path, options).await {
+            Ok(result) => Ok(Some(this.blob_meta(&result.meta, &result.attributes))),
             Err(Error::NotFound { .. }) => Ok(None),
             Err(error) => {
-                Err(anyhow!(error).context(format!("head {}://{}/{key}", self.scheme(), self.name)))
+                Err(anyhow!(error).context(format!("head {}://{}/{key}", this.scheme(), this.name)))
             }
         }
     }
@@ -1387,7 +1559,8 @@ impl Bucket {
         range: BlobRange,
         conditions: &BlobConditions,
     ) -> anyhow::Result<BlobRead> {
-        let scoped = self.key(key);
+        let this = self.keyed(key);
+        let scoped = this.key(key);
         let options = GetOptions {
             range: match range {
                 BlobRange::Whole => None,
@@ -1401,7 +1574,7 @@ impl Bucket {
             if_none_match: conditions.if_none_match.clone(),
             ..GetOptions::default()
         };
-        let result = match self.store.get_opts(&self.blob_path(key), options).await {
+        let result = match this.store.get_opts(&this.blob_path(key), options).await {
             Ok(result) => result,
             // Only an absent key is a miss. A range that overshoots the end
             // of the object is served short, as R2 serves it; a range that
@@ -1413,7 +1586,7 @@ impl Bucket {
             // refused `onlyIf` with the object itself, minus the body, so
             // one more head fills in what the caller is entitled to see.
             Err(Error::Precondition { .. } | Error::NotModified { .. }) => {
-                return Ok(match self.head_blob(key).await? {
+                return Ok(match this.head_blob(key).await? {
                     Some(meta) => BlobRead::Unmet(meta),
                     None => BlobRead::Missing,
                 })
@@ -1421,12 +1594,12 @@ impl Bucket {
             Err(error) => {
                 return Err(anyhow!(error).context(format!(
                     "read {}://{}/{scoped}",
-                    self.scheme(),
-                    self.name
+                    this.scheme(),
+                    this.name
                 )))
             }
         };
-        let meta = self.blob_meta(&result.meta, &result.attributes);
+        let meta = this.blob_meta(&result.meta, &result.attributes);
         // The upload-time half of `onlyIf` is answered here, against the
         // millisecond the object carries. The body is dropped unread.
         if !conditions.time_met(meta.uploaded_ms) {
@@ -1436,7 +1609,7 @@ impl Bucket {
         // what the caller reads; a bounded request past the end is clamped
         // here rather than by the store.
         let served = result.range.clone();
-        let label = format!("read body {}://{}/{scoped}", self.scheme(), self.name);
+        let label = format!("read body {}://{}/{scoped}", this.scheme(), this.name);
         let body = result
             .into_stream()
             .map(move |chunk| match chunk {
@@ -1467,10 +1640,11 @@ impl Bucket {
         attributes: &BlobAttributes,
         conditions: &BlobConditions,
     ) -> anyhow::Result<Option<BlobMeta>> {
+        let this = self.keyed(key);
         let size = body.content_length() as u64;
         let mode = match conditions.is_empty() {
             true => PutMode::Overwrite,
-            false => match self.head_blob(key).await? {
+            false => match this.head_blob(key).await? {
                 Some(current) => {
                     if !conditions.etag_met(current.etag.as_deref())
                         || !conditions.time_met(current.uploaded_ms)
@@ -1481,11 +1655,11 @@ impl Bucket {
                         return Err(anyhow!(
                             "conditional R2 write of {}://{}/{key} cannot be fenced: \
                              the store answered no version token",
-                            self.scheme(),
-                            self.name
+                            this.scheme(),
+                            this.name
                         ));
                     };
-                    PutMode::Update(self.backend.update(&cas))
+                    PutMode::Update(this.backend.update(&cas))
                 }
                 // Nothing there: only a condition that an absent object can
                 // satisfy may write, and it writes as a create so that a
@@ -1498,19 +1672,19 @@ impl Bucket {
         };
         let conditional = !matches!(mode, PutMode::Overwrite);
         let store = match conditional {
-            true => &self.cas_store,
-            false => &self.store,
+            true => &this.cas_store,
+            false => &this.store,
         };
-        let scoped = self.key(key);
+        let scoped = this.key(key);
         let options = PutOptions {
             mode,
-            attributes: attributes.write(self.backend),
+            attributes: attributes.write(this.backend),
             ..PutOptions::default()
         };
-        match store.put_opts(&self.blob_path(key), body, options).await {
+        match store.put_opts(&this.blob_path(key), body, options).await {
             Ok(result) => Ok(Some(BlobMeta {
                 size,
-                cas: self
+                cas: this
                     .backend
                     .token(result.e_tag.clone(), result.version.clone())
                     .ok(),
@@ -1525,8 +1699,8 @@ impl Bucket {
             Err(error) if conditional && is_clean_cas_rejection(&error) => Ok(None),
             Err(error) => Err(anyhow!(error).context(format!(
                 "write {}://{}/{scoped}",
-                self.scheme(),
-                self.name
+                this.scheme(),
+                this.name
             ))),
         }
     }
@@ -1550,14 +1724,15 @@ impl Bucket {
         limit: usize,
         delimiter: Option<&str>,
     ) -> anyhow::Result<BlobPage> {
+        let this = self.keyed(prefix);
         let directory = prefix.rsplit_once('/').map_or("", |(head, _)| head);
-        let path = self.blob_path(directory);
+        let path = this.blob_path(directory);
         let start_after = after.and_then(|after| after.bound());
         let mut stream = match after.and_then(|after| after.offset()) {
-            Some(cursor) => self
+            Some(cursor) => this
                 .store
-                .list_with_offset(Some(&path), &self.blob_path(cursor)),
-            None => self.store.list(Some(&path)),
+                .list_with_offset(Some(&path), &this.blob_path(cursor)),
+            None => this.store.list(Some(&path)),
         };
         let delimiter = delimiter.filter(|delimiter| !delimiter.is_empty());
         let mut page = BlobPage {
@@ -1576,8 +1751,8 @@ impl Bucket {
         let mut prefix_at = std::collections::BTreeMap::new();
         while let Some(meta) = stream.next().await {
             let meta =
-                meta.with_context(|| format!("list {}://{}/{path}", self.scheme(), self.name))?;
-            let key = self.listed_key(&meta.location)?;
+                meta.with_context(|| format!("list {}://{}/{path}", this.scheme(), this.name))?;
+            let key = this.listed_key(&meta.location)?;
             let key = key.as_str();
             // `startAfter` compares decoded keys in byte order. The walk
             // started at the prefix rather than at an encoded offset, so
@@ -1653,16 +1828,17 @@ impl Bucket {
         key: &str,
         attributes: &BlobAttributes,
     ) -> anyhow::Result<Box<dyn MultipartUpload>> {
-        let path = self.blob_path(key);
-        let key = self.key(key);
+        let this = self.keyed(key);
+        let path = this.blob_path(key);
+        let key = this.key(key);
         let options = PutMultipartOptions {
-            attributes: attributes.write(self.backend),
+            attributes: attributes.write(this.backend),
             ..PutMultipartOptions::default()
         };
-        self.store
+        this.store
             .put_multipart_opts(&path, options)
             .await
-            .with_context(|| format!("begin multipart {}://{}/{key}", self.scheme(), self.name))
+            .with_context(|| format!("begin multipart {}://{}/{key}", this.scheme(), this.name))
     }
 
     /// One object's metadata, in the shape every R2 answer carries.
@@ -1681,11 +1857,21 @@ impl Bucket {
     }
 
     /// The head_bucket replacement: prove the bucket is reachable and the
-    /// credential is accepted with one list page. Scoped to the prefix, so
-    /// a credential scoped to it validates too.
+    /// credential is accepted with one list page.
+    ///
+    /// The page is `probe/`, the namespace a node writes at startup, not the
+    /// whole bucket prefix: a credential granted over individual prefixes
+    /// (`CELLD_DEPLOY_AWS_*`, outer's split fleet grants) cannot list their
+    /// parent, and listing the parent would fail a credential that is in
+    /// fact valid for everything the caller does.
     pub async fn validate(&self) -> anyhow::Result<()> {
-        let scope = (!self.prefix.is_empty()).then(|| Path::from(self.prefix.as_str()));
-        match self.store.list(scope.as_ref()).next().await {
+        // Deliberately `self` and not [`Self::keyed`]: the probe namespace is
+        // the publishing credential's. The deployment credential is granted
+        // only over `deploy/` and `deploy-blobs/`, so listing `probe/`
+        // through it would refuse a credential that is valid for every
+        // deployment read the node does.
+        let scope = Path::from(self.key("probe/").as_str());
+        match self.store.list(Some(&scope)).next().await {
             None | Some(Ok(_)) => Ok(()),
             Some(Err(error)) => {
                 Err(anyhow!(error).context(format!("validate {}://{}", self.scheme(), self.name)))
@@ -1861,8 +2047,9 @@ impl Bucket {
         self.put(key, BODY.to_vec())
             .await
             .context("the ranged-read probe could not create its object")?;
-        let scoped = self.key(key);
-        let result = self
+        let this = self.keyed(key);
+        let scoped = this.key(key);
+        let result = this
             .store
             .get_opts(
                 &Path::from(scoped.as_str()),
@@ -1875,8 +2062,8 @@ impl Bucket {
             .with_context(|| {
                 format!(
                     "the ranged-read probe could not read {}://{}/{scoped}",
-                    self.scheme(),
-                    self.name
+                    this.scheme(),
+                    this.name
                 )
             })?;
         let served = result.range.clone();
@@ -2279,6 +2466,7 @@ impl Bucket {
             backend: StorageBackend::S3,
             name: "list-test".to_string(),
             prefix: String::new(),
+            read_deploy: None,
         }
     }
 }
@@ -2538,5 +2726,193 @@ mod r2_list_tests {
             .map(|entry| entry.key.as_str())
             .collect();
         assert_eq!(keys, ["r2/b/aa", "r2/b/m"]);
+    }
+}
+
+/// With `CELLD_DEPLOY_AWS_*` set, the deployment artifacts (`deploy/`,
+/// `deploy-blobs/`) are served by a second client holding that credential.
+/// Two independent stores stand in for two credentials: a deployment
+/// object must land only in the deployment store, an ordinary object only
+/// in the primary one, and no key may be visible to the other side.
+#[cfg(test)]
+mod deploy_credential_routing_tests {
+    use super::*;
+
+    async fn put(bucket: &Bucket, key: &str) {
+        bucket
+            .put(key, b"body".to_vec())
+            .await
+            .expect("the test object is written");
+    }
+
+    async fn present(store: &Arc<dyn ObjectStore>, key: &str) -> bool {
+        store.head(&Path::from(key)).await.is_ok()
+    }
+
+    #[tokio::test]
+    async fn deployment_objects_use_the_deploy_client_only() {
+        let primary = Bucket::for_test();
+        let deploy = Bucket::for_test();
+        let primary_store = primary.store.clone();
+        let deploy_store = deploy.store.clone();
+        let bucket = primary.with_read_deploy(deploy);
+
+        for key in ["deploy/current.json", "deploy-blobs/assets/sha256/ab/abcd"] {
+            put(&bucket, key).await;
+            assert!(
+                present(&deploy_store, key).await,
+                "{key} must reach the deploy client"
+            );
+            assert!(
+                !present(&primary_store, key).await,
+                "{key} must not reach the publishing client"
+            );
+            let (body, _) = bucket
+                .get(key)
+                .await
+                .expect("read applies")
+                .expect("present");
+            assert_eq!(&body[..], b"body");
+        }
+
+        put(&bucket, "cells/c/own.json").await;
+        assert!(present(&primary_store, "cells/c/own.json").await);
+        assert!(
+            !present(&deploy_store, "cells/c/own.json").await,
+            "ordinary state must not reach the deployment client"
+        );
+    }
+
+    #[test]
+    fn only_the_serving_constructor_attaches_the_deploy_client() {
+        // A spec both clients accept; building an S3 client reaches no
+        // network until a request does.
+        let endpoint = Some("http://127.0.0.1:9");
+        let publishing = Bucket::open("s3://fleet", endpoint, "us-east-1", None, None)
+            .expect("the publishing client opens");
+        assert!(
+            publishing.deploy_read().is_none(),
+            "`celld deploy`, `activate`, and `discard` open the publishing client only"
+        );
+        let serving = publishing
+            .with_deploy_read_credentials(
+                endpoint,
+                "us-east-1",
+                None,
+                Some(("deploy-key".into(), "deploy-secret".into(), None)),
+            )
+            .expect("the serving split applies");
+        let deploy = serving
+            .deploy_read()
+            .expect("the serving constructor attaches the deployment client");
+        assert_eq!(deploy.name, "fleet");
+        assert_eq!(deploy.prefix, "");
+        assert_eq!(deploy.backend, StorageBackend::S3);
+    }
+
+    #[tokio::test]
+    async fn blob_ops_route_by_key_class() {
+        let primary = Bucket::for_test();
+        let deploy = Bucket::for_test();
+        let primary_store = primary.store.clone();
+        let deploy_store = deploy.store.clone();
+        let bucket = primary.with_read_deploy(deploy);
+        let conditions = BlobConditions::default();
+
+        // Put, head, get, list, multipart, and batched delete are keyed
+        // operations too: a deployment key reaches only the deployment
+        // client.
+        bucket
+            .put_blob(
+                "deploy/bundle.wasm",
+                b"wasm".to_vec().into(),
+                &BlobAttributes::default(),
+                &conditions,
+            )
+            .await
+            .expect("the blob write applies")
+            .expect("an unconditional write applies");
+        assert!(present(&deploy_store, "deploy/bundle.wasm").await);
+        assert!(!present(&primary_store, "deploy/bundle.wasm").await);
+        let meta = bucket
+            .head_blob("deploy/bundle.wasm")
+            .await
+            .expect("head applies")
+            .expect("the blob is present");
+        assert_eq!(meta.size, 4);
+        assert!(matches!(
+            bucket
+                .get_blob("deploy/bundle.wasm", BlobRange::Whole, &conditions)
+                .await
+                .expect("get applies"),
+            BlobRead::Hit(_)
+        ));
+        let page = bucket
+            .list_page("deploy/", None, 10, None)
+            .await
+            .expect("list the deployment directory");
+        let keys: Vec<&str> = page
+            .objects
+            .iter()
+            .map(|entry| entry.key.as_str())
+            .collect();
+        assert_eq!(keys, ["deploy/bundle.wasm"]);
+
+        // An R2 key is ordinary state: the multipart upload and its
+        // completion land in the publishing client.
+        let mut upload = bucket
+            .begin_multipart("r2/b/big", &BlobAttributes::default())
+            .await
+            .expect("open the multipart upload");
+        upload
+            .put_part(b"part".to_vec().into())
+            .await
+            .expect("write the part");
+        upload.complete().await.expect("complete the upload");
+        assert!(present(&primary_store, "r2/b/big").await);
+        assert!(!present(&deploy_store, "r2/b/big").await);
+
+        // A batch split across classes deletes each key through its client.
+        let gone = bucket
+            .delete_many(&[
+                "deploy/bundle.wasm".to_string(),
+                "r2/b/big".to_string(),
+                "cells/c/absent.json".to_string(),
+            ])
+            .await;
+        let mut gone = gone;
+        gone.sort();
+        assert_eq!(
+            gone,
+            ["cells/c/absent.json", "deploy/bundle.wasm", "r2/b/big"]
+        );
+        assert!(!present(&deploy_store, "deploy/bundle.wasm").await);
+        assert!(!present(&primary_store, "r2/b/big").await);
+        assert_eq!(
+            bucket.delete_blobs(&["r2/b/gone".to_string()]).await,
+            1,
+            "an absent blob key counts as gone"
+        );
+        assert!(!present(&deploy_store, "r2/b/gone").await);
+    }
+
+    #[tokio::test]
+    async fn listing_routes_by_prefix() {
+        let primary = Bucket::for_test();
+        let deploy = Bucket::for_test();
+        let deploy_store = deploy.store.clone();
+        let bucket = primary.with_read_deploy(deploy);
+        put(&bucket, "deploy/current.json").await;
+        put(&bucket, "wake/format.json").await;
+
+        let listed: Vec<String> = bucket
+            .list("deploy")
+            .await
+            .expect("list the deployment prefix")
+            .into_iter()
+            .map(|meta| meta.location.to_string())
+            .collect();
+        assert_eq!(listed, ["deploy/current.json"]);
+        assert!(!present(&deploy_store, "wake/format.json").await);
     }
 }
