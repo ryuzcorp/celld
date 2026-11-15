@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): operator token for the internal listener; list_page resume is a cursor; ported from meln1k/celld: seal a dead lease that never opened a log (01522b3); seal_absent_log regression tests; lone-node repair backoff; bucket-posture group commit: bucket-session record encoding + old-reader interop tests (0059); bucket-posture group commit: bucket executor without ensemble (0060); bucket-posture group commit: successor fold of bucket bundles (0063).
+// Modified by ryuzcorp (ryuzcorp/celld): operator token for the internal listener; list_page resume is a cursor; ported from meln1k/celld: seal a dead lease that never opened a log (01522b3); seal_absent_log regression tests; lone-node repair backoff; bucket-posture group commit: bucket-session record encoding + old-reader interop tests (0059); bucket-posture group commit: bucket executor without ensemble (0060); bucket-posture group commit: successor fold of bucket bundles (0063); bucket-posture group commit: bucket-session drain, per-cell seal, bundle GC without ensemble, linger holds only while the dirty set is shared (0064).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! v0 of the in-fleet replicated log tier (`CELLD_DURABILITY=fleet`).
@@ -308,6 +308,10 @@ const RECOVERY_GATHER_WINDOW_BYTES: u64 = 512 * 1024 * 1024;
 const COVERAGE_READ_CONCURRENCY: usize = 16;
 const BUNDLE_ROW_INDEX_CAPACITY: usize = 512;
 const BUNDLE_GC_EXAMINED_PER_TICK: usize = 512;
+/// Single-key deletes in flight per bundle-GC tick. One `DeleteObject` per
+/// bundle is one round trip each, so bound the burst; the leftovers wait
+/// for the next tick, which re-lists from the cursor.
+const BUNDLE_GC_DELETE_CONCURRENCY: usize = 16;
 
 struct IndexedBundle {
     cells: BTreeSet<String>,
@@ -5639,11 +5643,19 @@ impl NodeLogManager {
             // Quiesce the sink before degrading the shipper. The lifecycle
             // guard makes both decisions visible before any maintenance or
             // first-ack transition can enter its publication section.
+            // Closing also quiesces the bucket bundle sink (`bundle_active`
+            // refuses while closing), so no new bundle credit can land past
+            // the seal scan below.
             self.closing.store(true, Ordering::SeqCst);
             self.inner.lock().unwrap().clone()
         };
-        let Some(shipper) = shipper else { return };
-        shipper.degrade("graceful shutdown");
+        let Some(shipper) = shipper else {
+            // No shipper: bucket posture. A bucket session has no ensemble
+            // to degrade, so drain its bundled cells per-cell and seal iff
+            // the retained scan comes back clean.
+            self.close_bucket_session_gracefully().await;
+            return;
+        };
         for _ in 0..50 {
             if self.ltx.all_shipped_tiered() {
                 break;
@@ -5705,6 +5717,83 @@ impl NodeLogManager {
             );
             return;
         }
+        let sealed = log_tier::LogRecord {
+            state: LogState::Sealed,
+            ..record
+        };
+        match transition
+            .write(Some(log_to_wire(&sealed, may_have_fleet_acks)))
+            .await
+        {
+            Ok(()) => eprintln!("node-log close: sealed epoch {}", sealed.epoch),
+            Err(error) => eprintln!("node-log close: seal not durable: {error:#}"),
+        }
+    }
+
+    /// Graceful close for a bucket session: no shipper to degrade and no
+    /// ensemble to wait on, so snapshot every bundled cell per-cell (one PUT
+    /// each, with the L0 fallback under the same barrier budget), then seal
+    /// iff every acked row is per-cell. Anything uncovered — a failed
+    /// snapshot, a failed drain, an unreadable bundle — leaves the record
+    /// Open, and the next incarnation's recovery drains the bundles (layer
+    /// 3 folds them). Never seals over bundle-credited rows: a sealed
+    /// record tells every future recovery there is nothing to gather.
+    async fn close_bucket_session_gracefully(&self) {
+        // An in-flight bundle PUT credits after it lands; wait it out so the
+        // drain below sees every row it could cover. No new flush can start
+        // past the closing latch (`bundle_active` refuses), so this settles.
+        for _ in 0..30 {
+            if !self.flush_in_flight.load(Ordering::SeqCst) {
+                break;
+            }
+            crate::asyncrt::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        // Best effort per cell, bounded by the outer shutdown budget: the
+        // seal scan below decides, so one stubborn cell must not starve the
+        // rest of the drain.
+        for (cell, epoch) in self.ltx.bundle_drain_candidates() {
+            self.ltx.drain_bundled_cell(&cell, epoch).await;
+        }
+        let transition = self.live_log.lock().await;
+        debug_assert!(!transition.is_running());
+        // eprintln, not tracing: this runs on the way out of the process,
+        // and buffered stdout may never flush before exit.
+        let Some(current) = transition.current() else {
+            eprintln!("node-log close: no folded log; nothing to seal");
+            return;
+        };
+        let Ok(record) = log_from_wire(&current) else {
+            eprintln!("node-log close: folded log unreadable; left as is");
+            return;
+        };
+        if record.kind != log_tier::SessionKind::Bucket {
+            // A fleet record is not ours to seal here; the shipper path owns
+            // it and returned early only because no shipper is installed.
+            return;
+        }
+        // "Tiered" includes bundle coverage, but a sealed record tells every
+        // future recovery there is nothing to gather — so the seal requires
+        // every acked row as a per-cell object. The barrier is the RETAINED
+        // BUNDLE SCAN, not a cell counter: an Open record is always safe, the
+        // next incarnation's recovery drains the bundles.
+        let per_cell_complete = self.ltx.all_tails_tiered()
+            && match self.uncovered_bundle_rows().await {
+                Ok(uncovered) => uncovered.is_empty(),
+                Err(_) => false,
+            };
+        if !log_tier::graceful_seal_allowed(
+            &record,
+            record.epoch,
+            self.flush_in_flight.load(Ordering::SeqCst),
+            per_cell_complete,
+        ) {
+            eprintln!(
+                "node-log close: not sealable (record epoch {} state {:?}); record left open",
+                record.epoch, record.state
+            );
+            return;
+        }
+        let may_have_fleet_acks = current.may_have_fleet_acks;
         let sealed = log_tier::LogRecord {
             state: LogState::Sealed,
             ..record
@@ -6530,20 +6619,39 @@ impl NodeLogManager {
         if deletable.is_empty() {
             return Ok(());
         }
-        // One DeleteObjects request instead of one DELETE per bundle: the
-        // lab priced the per-key path at 9k class A operations an hour.
-        let keys: Vec<String> = deletable.iter().map(|(key, _)| key.clone()).collect();
-        let gone = self.bucket.delete_many(&keys).await;
+        // One single-key `DeleteObject` per bundle, never bulk `POST
+        // ?delete`: the bulk path is a Class A operation per request on R2
+        // while single-key deletes are free, and the per-cell trim (0057)
+        // already deletes this way. A failed key stays for the next wrap of
+        // the cursor; the index only forgets what the store confirmed gone.
+        let deletes = deletable.into_iter().map(|(key, rows)| {
+            let bucket = self.bucket.clone();
+            async move {
+                match bucket.delete(&key).await {
+                    Ok(()) => Some((key, rows)),
+                    Err(error) => {
+                        warn!(key, %error, "bundle GC: delete failed; retrying next tick");
+                        None
+                    }
+                }
+            }
+        });
+        let mut gone: Vec<String> = Vec::new();
+        let mut rows = 0usize;
+        let mut deletes =
+            futures_util::stream::iter(deletes).buffer_unordered(BUNDLE_GC_DELETE_CONCURRENCY);
+        while let Some(outcome) = deletes.next().await {
+            if let Some((key, count)) = outcome {
+                gone.push(key);
+                rows += count;
+            }
+        }
+        drop(deletes);
         if !gone.is_empty() {
-            let rows: usize = deletable
-                .iter()
-                .filter(|(key, _)| gone.contains(key))
-                .map(|(_, rows)| rows)
-                .sum();
             self.bundle_index.lock().unwrap().remove(&gone);
             info!(
                 bundles = gone.len(),
-                rows, "bundle GC: drained bundles deleted in one batch"
+                rows, "bundle GC: drained bundles deleted"
             );
         }
         Ok(())
@@ -6669,16 +6777,18 @@ impl NodeLogManager {
 /// tail is every ack's tail, so verdicts poll at a sub-second cadence and
 /// an eviction repairs the ensemble immediately.
 ///
-/// Without `fleet`, the tick runs only epoch GC, and no eviction watch
-/// starts. A bucket node installs no registration, so it has no ensemble
-/// to recruit or repair, no bundles to collect, and no posture to watch.
-/// Its acks wait for per-cell uploads, so its restore chain base already
-/// holds every acknowledged row when epoch GC deletes below it. A fleet
-/// predecessor's follower-only rows reach the bucket before this node can
-/// hold the cell: the boot runs `recover_self` before it builds the owner
-/// and starts this loop, and a takeover runs `ensure_recovered` before the
-/// restore. The actor reaches that interlock through the manager in every
-/// posture, so neither step depends on the fleet phases here.
+/// Without `fleet`, the tick runs epoch GC plus, for a bucket session, the
+/// bundle-GC phase — and no eviction watch starts. A bucket node installs a
+/// registration without an ensemble (so `bundle_loop` fires with no
+/// shipper) and never recruits or repairs one; `maintain` returns early for
+/// its record. While bundling is active its acks wait for bundle proofs, so
+/// the drained-or-evicted per-cell objects are what cover every acknowledged
+/// row when the collectors delete below them. A fleet predecessor's
+/// follower-only rows reach the bucket before this node can hold the cell:
+/// the boot runs `recover_self` before it builds the owner and starts this
+/// loop, and a takeover runs `ensure_recovered` before the restore. The
+/// actor reaches that interlock through the manager in every posture, so
+/// neither step depends on the fleet phases here.
 fn spawn_maintenance(
     manager: Arc<NodeLogManager>,
     stop: crate::ltx_repl::StopToken,
@@ -6717,6 +6827,11 @@ fn spawn_maintenance(
                     manager.maintain().map(|r| r.map(|_| ())).boxed(),
                 ));
                 phases.push(("dead-leader sweep", manager.sweep_dead_leaders().boxed()));
+                phases.push(("bundle GC", manager.gc_bundles().boxed()));
+            } else if manager.is_bucket_session().await {
+                // No ensemble to maintain and no dead leaders to sweep (the
+                // sweep recovers through the fleet path layer 3 owns), but
+                // retained bundles still need their covered-only collector.
                 phases.push(("bundle GC", manager.gc_bundles().boxed()));
             }
             phases.push(("epoch GC", manager.gc_superseded_epochs().boxed()));
@@ -7012,6 +7127,17 @@ impl NodeLogManager {
     /// split path uses it to recognise a bucket flush.
     pub(crate) fn bucket_bundling(&self) -> bool {
         self.bucket_epoch.load(Ordering::SeqCst) != 0 && self.bucket_candidate()
+    }
+
+    /// Whether the live session is a bucket session. The maintenance tick
+    /// uses it to run bundle GC without an ensemble; the in-memory epoch
+    /// alone is not enough (a credit refusal clears it while the record —
+    /// and its bundles — remain). The live record is the authority, as in
+    /// `maintain`.
+    pub(crate) async fn is_bucket_session(&self) -> bool {
+        self.live_log.lock().await.current().is_some_and(|current| {
+            log_from_wire(&current).is_ok_and(|record| record.kind == log_tier::SessionKind::Bucket)
+        })
     }
 
     /// Stop bucket bundling so pending rows fall back to per-cell uploads
@@ -7714,6 +7840,13 @@ mod bucket_executor_tests {
     use crate::ownership_store::{NodeLeaseWire, NodeLoadWire};
 
     fn test_manager(dir: &std::path::Path) -> (NodeLogManager, Arc<Bucket>) {
+        test_manager_with_nudge(dir, Box::new(|| {}))
+    }
+
+    fn test_manager_with_nudge(
+        dir: &std::path::Path,
+        nudge: Box<dyn Fn() + Send + Sync>,
+    ) -> (NodeLogManager, Arc<Bucket>) {
         let database = dir.join("objects.sqlite3");
         let bucket = Arc::new(crate::dev::open_local_bucket(&database).expect("dev bucket"));
         let replication = crate::ltx_replication::Replication::start(
@@ -7732,7 +7865,7 @@ mod bucket_executor_tests {
         ));
         let own_log = Arc::new(OwnLog {
             ownership,
-            nudge: Box::new(|| {}),
+            nudge,
             write_lock: tokio::sync::Mutex::new(()),
         });
         let auth = Arc::new(PeerAuth::new([0u8; 32], "n0").expect("test auth"));
@@ -7782,6 +7915,13 @@ mod bucket_executor_tests {
             .await
             .expect("lease publishes");
         manager.bucket_epoch.store(record.epoch, Ordering::SeqCst);
+        // Mirror into the in-memory fold state, as the live-session lease
+        // chain does after its `transition.write` applies: readers of the
+        // live record (`ensure_bucket_record`, the graceful close) see the
+        // same session the bucket carries.
+        manager
+            .ownership
+            .set_own_log(Some(log_to_wire(&record, false)));
     }
 
     async fn publish_bucket_sealed(_manager: &NodeLogManager, bucket: &Bucket) {
@@ -8128,6 +8268,245 @@ mod bucket_executor_tests {
             assert!(
                 manager.inner.lock().unwrap().is_none(),
                 "no silent bucket-to-fleet conversion"
+            );
+        });
+    }
+
+    /// Mirror of the test watch layout: the tests stage rows through a
+    /// second connection, the way the isolate's own connection writes
+    /// beside the replicator.
+    fn cell_db(watch: &std::path::Path, cell: &str, epoch: u64) -> std::path::PathBuf {
+        watch
+            .join(cell)
+            .join("ltx")
+            .join(format!("e{epoch}"))
+            .join("db.sqlite")
+    }
+
+    fn sql_write(db: &std::path::Path) {
+        let connection = rusqlite::Connection::open(db).unwrap();
+        connection
+            .busy_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS t(x TEXT); INSERT INTO t(x) VALUES('hello');",
+            )
+            .unwrap();
+    }
+
+    async fn activate_cell(manager: &NodeLogManager, cell: &str, epoch: u64, fresh: bool) {
+        manager
+            .ltx
+            .activate(crate::replication::ActivationOptions {
+                cell,
+                epoch,
+                fresh,
+                took_over: false,
+                resume_local: false,
+                prior: None,
+            })
+            .await
+            .expect("activation works");
+    }
+
+    async fn lease_state(bucket: &Bucket) -> String {
+        let Some((bytes, _)) = bucket.get(&lease_key("n0")).await.expect("lease reads") else {
+            panic!("no lease published");
+        };
+        let lease: serde_json::Value = serde_json::from_slice(&bytes).expect("lease parses");
+        lease["log"]["state"]
+            .as_str()
+            .expect("state reads")
+            .to_string()
+    }
+
+    /// A minimal event-driven lease writer: applies the folded log the
+    /// manager publishes, so the graceful close's seal write completes
+    /// without the production renewal loop. Wakes on the `OwnLog` nudge and
+    /// exits after one apply; no polling. Applies through the same CAS path
+    /// the renewal loop uses, so `applied_log` advances exactly as in
+    /// production.
+    async fn apply_one_lease_write(
+        ownership: Arc<crate::ownership_store::BucketOwnership>,
+        nudged: Arc<tokio::sync::Notify>,
+    ) {
+        nudged.notified().await;
+        let Some(record) = ownership.read_node_lease("n0").await.expect("lease reads") else {
+            return;
+        };
+        let mut stamped = None;
+        let _ = ownership
+            .cas_node_lease(
+                celld_logic::CasGuard::Match(record.etag.clone()),
+                &record,
+                &mut stamped,
+            )
+            .await;
+    }
+
+    /// `gc_bundles` deletes a bundle only when every row it carries is
+    /// per-cell-covered: the fresh bundle survives the tick, and the same
+    /// bundle goes once a per-cell drain covers its row. Fail-before: without
+    /// the `bundle_deletable` gate the first collection already deletes the
+    /// uncovered bundle.
+    #[test]
+    fn gc_bundles_keeps_uncovered_and_deletes_covered() {
+        let runtime = crate::asyncrt::shared_test_runtime();
+        runtime.block_on(async {
+            let dir = tempfile::tempdir().expect("test dir");
+            let (manager, bucket) = test_manager(dir.path());
+            open_gate(&manager);
+            publish_bucket_open(&manager, &bucket).await;
+            assert!(
+                manager.put_bundle(vec![bundle_entry("c0", 1)]).await,
+                "open record credits"
+            );
+            manager.gc_bundles().await.expect("gc runs");
+            assert_eq!(
+                bundle_keys(&bucket, "log/n0/gen1/bundle/").await.len(),
+                1,
+                "an uncovered bundle survives the tick"
+            );
+            // Cover the row per-cell: activate the cell, stage its row, and
+            // drain through the direct per-cell upload.
+            activate_cell(&manager, "c0", 1, true).await;
+            sql_write(&cell_db(&dir.path().join("watch"), "c0", 1));
+            assert!(matches!(
+                manager
+                    .ltx
+                    .sync_wait("c0", 1, std::time::Duration::from_secs(10))
+                    .await,
+                crate::replication::SyncWait::Durable
+            ));
+            manager.gc_bundles().await.expect("gc runs");
+            assert!(
+                bundle_keys(&bucket, "log/n0/gen1/bundle/").await.is_empty(),
+                "a covered bundle is deleted"
+            );
+        });
+    }
+
+    /// A graceful close with bundle rows no drain can cover leaves the record
+    /// Open: the bundle belongs to a cell this node never activated, so no
+    /// local database can snapshot it. Fail-before: without the retained-scan
+    /// barrier the close seals over the uncovered row.
+    #[test]
+    fn close_gracefully_leaves_open_when_bundles_undrainable() {
+        let runtime = crate::asyncrt::shared_test_runtime();
+        runtime.block_on(async {
+            let dir = tempfile::tempdir().expect("test dir");
+            let nudged = Arc::new(tokio::sync::Notify::new());
+            let (manager, bucket) = test_manager_with_nudge(
+                dir.path(),
+                Box::new({
+                    let nudged = nudged.clone();
+                    move || nudged.notify_one()
+                }),
+            );
+            open_gate(&manager);
+            publish_bucket_open(&manager, &bucket).await;
+            assert!(
+                manager.put_bundle(vec![bundle_entry("c0", 1)]).await,
+                "open record credits"
+            );
+            // The seal write has a writer behind it, so a barrier revert
+            // seals here and this assertion — not a stuck write — is what
+            // goes red. Without the retained-scan barrier the close would
+            // seal over the uncovered row.
+            let ownership = manager.ownership.clone();
+            let waker = nudged.clone();
+            let _writer = crate::asyncrt::spawn(apply_one_lease_write(ownership, waker));
+            manager.close_gracefully().await;
+            assert_eq!(
+                lease_state(&bucket).await,
+                "open",
+                "undrainable bundles keep the record open"
+            );
+        });
+    }
+
+    /// A graceful close snapshots each bundled cell per-cell and seals only
+    /// once the retained scan is clean. Fail-before: without the drain loop
+    /// the close leaves the record Open.
+    #[test]
+    fn close_gracefully_drains_bundled_cells_then_seals() {
+        let runtime = crate::asyncrt::shared_test_runtime();
+        runtime.block_on(async {
+            let dir = tempfile::tempdir().expect("test dir");
+            let nudged = Arc::new(tokio::sync::Notify::new());
+            let (manager, bucket) = test_manager_with_nudge(
+                dir.path(),
+                Box::new({
+                    let nudged = nudged.clone();
+                    move || nudged.notify_one()
+                }),
+            );
+            open_gate(&manager);
+            publish_bucket_open(&manager, &bucket).await;
+            assert!(
+                manager.put_bundle(vec![bundle_entry("c0", 1)]).await,
+                "open record credits"
+            );
+            activate_cell(&manager, "c0", 1, true).await;
+            sql_write(&cell_db(&dir.path().join("watch"), "c0", 1));
+            manager.ltx.stage_bundle_credit_for_test("c0", 1, 1);
+            // The seal write needs a lease writer; this one-shot stand-in
+            // applies the folded log through the production CAS path.
+            let ownership = manager.ownership.clone();
+            let waker = nudged.clone();
+            let _writer = crate::asyncrt::spawn(apply_one_lease_write(ownership, waker));
+            manager.close_gracefully().await;
+            assert_eq!(
+                lease_state(&bucket).await,
+                "sealed",
+                "drained bundles let the close seal"
+            );
+            assert!(
+                !bundle_keys(&bucket, "cells/c0/ltx/").await.is_empty(),
+                "the drain snapshots the cell per-cell"
+            );
+        });
+    }
+
+    /// Loop-level executor wiring: a write's gate ticket wakes `bundle_loop`,
+    /// which takes the bucket record path (`ensure_bucket_record` finds the
+    /// installed session), flushes one shared bundle, and credits the ack —
+    /// with no per-cell upload. Fail-before: without the registration the
+    /// loop never fires and the wait times out.
+    #[test]
+    fn bundle_loop_flushes_dirty_writes_end_to_end() {
+        let runtime = crate::asyncrt::shared_test_runtime();
+        runtime.block_on(async {
+            let dir = tempfile::tempdir().expect("test dir");
+            let (manager, bucket) = test_manager(dir.path());
+            let manager = Arc::new(manager);
+            let _registration = manager
+                .ltx
+                .register_durability(manager.clone())
+                .expect("registration installs");
+            open_gate(&manager);
+            publish_bucket_open(&manager, &bucket).await;
+            activate_cell(&manager, "c0", 1, true).await;
+            sql_write(&cell_db(&dir.path().join("watch"), "c0", 1));
+            let (_, source) = manager
+                .ltx
+                .await_durable("c0", 1, 1)
+                .await
+                .expect("bundle proof credits");
+            assert_eq!(
+                source,
+                celld_logic::ProofSource::Bucket,
+                "bucket posture acks on the bundle proof"
+            );
+            assert_eq!(
+                bundle_keys(&bucket, "log/n0/gen1/bundle/").await.len(),
+                1,
+                "one shared bundle PUT carries the write"
+            );
+            assert!(
+                bundle_keys(&bucket, "cells/").await.is_empty(),
+                "no per-cell L0 PUTs while bundling"
             );
         });
     }
