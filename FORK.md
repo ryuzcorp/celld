@@ -825,6 +825,10 @@ push to `ghcr.io/denoland`, but still. Pushing a branch named
   linger (`CELLD_BUCKET_BUNDLE_LINGER_MS`) holds the window open only while
   more than one cell is dirty — a lone cell flushes at once, since waiting
   would add the whole linger to one ack without batching anything.
+- `0066` (sha TBD at merge) a per-connection SQLite page-cache budget:
+  `finish_open` sets `PRAGMA cache_size=-<kb>` from `CELLD_SQLITE_CACHE_KB`
+  (default 2000, the stock ceiling: no behavior change at merge). Knob
+  validated at startup and documented in `docs/`.
 - `0067` (sha TBD at merge) share the `/bundle` tree per deployment
   generation instead of per isolate: the projection lives on the shared
   `Arc<WorkerConfig>`, so N isolates project once; read-only semantics

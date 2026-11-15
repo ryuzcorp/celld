@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): D1 export; D1 export hardening; D1 batch tests; D1 export sequence scoping; binding-forgery enforcement.
+// Modified by ryuzcorp (ryuzcorp/celld): D1 export; D1 export hardening; D1 batch tests; D1 export sequence scoping; binding-forgery enforcement; per-connection SQLite page-cache budget (CELLD_SQLITE_CACHE_KB).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 // This is V8-thread SQLite plumbing outside the Actor execution domain.
@@ -299,6 +299,23 @@ fn sql_critical_errors<T>(f: impl FnOnce(&RefCell<HashMap<String, String>>) -> T
 /// `finish_open()` disables lookaside on every connection, so a reported byte
 /// is a real heap byte and the budget bounds the cache.
 const SQL_STATEMENT_CACHE_MAX_SIZE: usize = 128 * 1024;
+
+/// The stock SQLite page-cache ceiling, in KiB, `finish_open()` keeps unless
+/// `CELLD_SQLITE_CACHE_KB` says otherwise. A negative `cache_size` counts
+/// KiB, not pages, so one knob sets the budget in KiB directly. One
+/// connection serves one resident cell, so the stock 2 MiB multiplies by
+/// residency; the audit measured ~176 KiB of glibc use per active cell, most
+/// of it this cache and V8's C++ side.
+const SQLITE_CACHE_DEFAULT_KB: u64 = 2000;
+
+/// The per-connection SQLite page-cache budget in KiB. Reads
+/// `CELLD_SQLITE_CACHE_KB` on every open so tests can set it; an unset value
+/// keeps the stock ceiling. Startup validation rejects a non-positive
+/// value, so this falls back to the default instead of failing the open.
+pub fn sqlite_cache_kb() -> u64 {
+    crate::env_vars::positive_or("CELLD_SQLITE_CACHE_KB", SQLITE_CACHE_DEFAULT_KB)
+        .unwrap_or(SQLITE_CACHE_DEFAULT_KB)
+}
 
 #[derive(Clone, Copy)]
 struct ActiveAlarm {
@@ -866,6 +883,13 @@ fn finish_open(
     // rusqlite's default holds 16 statements; the KV texts plus a cell's
     // few hot user statements fit in 64 without evicting each other.
     c.set_prepared_statement_cache_capacity(64);
+    // One connection serves one resident cell, so the stock 2 MiB page cache
+    // multiplies by residency. `cache_size` is negative KiB here, not pages,
+    // so the knob budgets KiB directly. The authorizer stays off for the
+    // pragma: it guards application SQL, not connection setup.
+    let cache_kb = sqlite_cache_kb();
+    let cache_size = i64::try_from(cache_kb).unwrap_or(i64::MAX).saturating_neg();
+    without_sql_authorizer(&c, || c.pragma_update(None, "cache_size", cache_size))?;
     close_sync_list_cursors(scope);
     close_sql_cursors(scope);
     close_sql_statement_cache(scope);
@@ -5465,6 +5489,45 @@ mod d1_test_db {
     impl Drop for TestDb {
         fn drop(&mut self) {
             close(&self.scope);
+        }
+    }
+}
+
+#[cfg(test)]
+mod sqlite_cache_tests {
+    use super::d1_test_db::TestDb;
+    use super::*;
+
+    fn cache_size_of(db: &TestDb) -> i64 {
+        // The authorizer guards application SQL, so the read bypasses it
+        // exactly as `finish_open`'s write does.
+        with_mut(&db.scope, |connection| {
+            without_sql_authorizer_mut(connection, |connection| {
+                connection
+                    .query_row("PRAGMA cache_size", [], |row| row.get::<_, i64>(0))
+                    .expect("cache_size reads")
+            })
+        })
+        .expect("cell is open")
+    }
+
+    /// `finish_open` applies `CELLD_SQLITE_CACHE_KB` as a negative
+    /// `cache_size` (KiB, not pages), and an unset knob keeps the stock
+    /// -2000 ceiling, so the default changes nothing at merge. Revert the
+    /// pragma and the first assertion reads -2000. One test, not two: the
+    /// knob is process-global and parallel tests would race it.
+    #[test]
+    fn open_applies_the_configured_page_cache() {
+        let previous = std::env::var("CELLD_SQLITE_CACHE_KB").ok();
+        std::env::set_var("CELLD_SQLITE_CACHE_KB", "512");
+        let configured = TestDb::open("page-cache");
+        assert_eq!(cache_size_of(&configured), -512);
+        std::env::remove_var("CELLD_SQLITE_CACHE_KB");
+        let stock = TestDb::open("page-cache-default");
+        assert_eq!(cache_size_of(&stock), -2000);
+        match previous {
+            Some(value) => std::env::set_var("CELLD_SQLITE_CACHE_KB", value),
+            None => std::env::remove_var("CELLD_SQLITE_CACHE_KB"),
         }
     }
 }
