@@ -7096,9 +7096,9 @@ impl NodeLogManager {
         // and late writes ride per-cell acks instead.
         // Layer 2 adds the bucket path: a bucket session with a published
         // record and an open gate bundles with no shipper at all. The gate
-        // (fleet sample + `CELLD_BUCKET_BUNDLES=1`) is re-checked per flush
-        // via `bucket_bundling`, so closing the gate falls back at once to
-        // per-cell L0 uploads for new writes.
+        // (fleet sample + the operator switch, on by default) is re-checked
+        // per flush via `bucket_bundling`, so closing the gate falls back at
+        // once to per-cell L0 uploads for new writes.
         if self.closing.load(Ordering::SeqCst) {
             return false;
         }
@@ -7110,8 +7110,8 @@ impl NodeLogManager {
 
     /// Whether this node may run the bucket bundle path at all: not closing,
     /// no shipper (a fleet ensemble owns tiering otherwise), and the gate is
-    /// open (fleet sample + `CELLD_BUCKET_BUNDLES=1`; the sampler opens it only
-    /// in bucket posture). The bundle loop uses this to reach
+    /// open (fleet sample + the operator switch, on by default; the sampler
+    /// opens it only in bucket posture). The bundle loop uses this to reach
     /// [`Self::ensure_bucket_record`], which publishes the record and only
     /// then lets [`Self::bucket_bundling`] turn true.
     pub(crate) fn bucket_candidate(&self) -> bool {

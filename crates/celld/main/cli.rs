@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): CELLD_MEMORY_SCOPE help; operator token for the internal listener; staged activation; staged invoke command; CELLD_DEPLOY_AWS_* help; non-dumpable serving process.
+// Modified by ryuzcorp (ryuzcorp/celld): CELLD_MEMORY_SCOPE help; operator token for the internal listener; staged activation; staged invoke command; CELLD_DEPLOY_AWS_* help; non-dumpable serving process. bucket-posture group commit: bundle switch help (0070).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! The command line: what the process was asked to do, and the help text
@@ -406,6 +406,12 @@ TUNING:
                                   2+ nodes, else every ack waits for the
                                   bucket and writes are much slower
                                   (default: `fleet`; `bucket` always waits)
+  CELLD_BUCKET_BUNDLES            Group a bucket-posture flush round into one
+                                  shared bundle proof (default: `1`; `0`
+                                  uploads per-cell)
+  CELLD_BUCKET_BUNDLE_LINGER_MS   Hold a bundle round open for concurrent
+                                  writes while 2+ cells are dirty (default: 0;
+                                  clamps to 1000)
   CELLD_LOG_PIPELINE              Fleet log rounds in flight (default: 4)
   CELLD_LOG_HEDGE_MS              Duplicate a slow log append (default: adaptive; 0 disables)
   CELLD_LTX_TRUNCATE_PAGES        WAL pages before a truncate checkpoint (default: 128; Queues never truncate; 0 disables)

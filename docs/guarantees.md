@@ -199,6 +199,15 @@ locally and replicate into its superseded prefix, but it does not acknowledge.
 The check reads the record instead of a clock, so a paused process or a skewed
 clock cannot pass it.
 
+In bucket posture the node groups writes: once per flush round it writes one
+shared bundle object (`log/<node>/<generation>/bundle/`) carrying every dirty
+cell's new rows, and that single PUT is the bucket proof for every row it
+carries — instead of one upload per write. Grouping is on by default (set
+`CELLD_BUCKET_BUNDLES=0` to upload per-cell as before); the ownership read
+above still answers every acknowledgement, and `CELLD_BUCKET_BUNDLE_LINGER_MS`
+holds a round open only while more than one cell is dirty, so a lone dirty
+cell never waits.
+
 A fleet proof needs no such read. The owner sends each write to one or two other
 nodes, its followers (together, the ensemble), and every follower must fsync it.
 A takeover seals the prior node-log session before it restores, so a stale owner
@@ -247,6 +256,19 @@ record forces recovery before the restore: compare-and-swap the record to fence
 it, seal the reachable followers, upload their retained segments and bundles
 into the per-cell prefixes, and mark the record sealed.
 
+A bucket-posture node that writes shared bundle proofs creates a node-log
+record of a bucket-session flavour before its first bundle-credited
+acknowledgement, for the same reason: once bundles exist, "no record" no
+longer proves the bucket complete, because acknowledged rows may live only
+in `log/<node>/<generation>/bundle/`. The record is recovered like any
+other — fence it, fold every retained bundle of the dead session into the
+per-cell prefixes, seal it — with no follower leg: there is no ensemble to
+seal or tail, and a bucket pass never declares bounded loss, it only drains
+bundles. A sealed record therefore means every acknowledged row is per-cell:
+the seal is refused while any retained bundle row sits outside the per-cell
+layout, so a takeover reading per-cell prefixes can never miss an
+acknowledged row.
+
 A cell can stop while its node session stays open; its next activation gathers
 any acknowledged tail outside its per-cell prefix. Once the log epoch is
 active (before its first fleet proof), at least one current follower must
@@ -279,6 +301,31 @@ receives one object per window. A failed or timed-out attempt does not fail
 waiting requests: the cell retries with a backoff (`CELLD_RECOVERY_RETRY_MS`,
 default 1000), and the requests fail with a resolve error only after
 `CELLD_RECOVERY_RETRIES` (default 240) attempts.
+
+### Bucket-posture bundle proofs
+
+Bundles are written only while every live lease reads format 3. A node writes
+a bundle proof only while no live peer could mistake the record's absence for
+completeness: a single node's own format-3 lease opens the gate, any live
+older lease holds it closed, and the node uploads per-cell while it does.
+The gate is re-checked per flush, not per process.
+
+Downgrade safety rests on recovery, not on refusal. An older binary that takes
+over from a bundling node decodes the bucket-session record (unknown fields
+ignored) and recovers it like any open record: it fences the record, folds
+the whole bundle prefix into the per-cell prefixes, never declares loss, and
+seals it. No path treats the record as complete while bundles may exist, so
+neither a rollout step nor a rollback loses an acknowledged row. No binary
+refuses to boot on downgrade; the refusal would have to run in the old
+binary, which cannot know the new format.
+
+An eviction keeps the sealed-means-per-cell promise for bundled cells: the
+evicting node uploads one per-cell snapshot from its complete local
+database, covering every bundle-credited row, before it releases the cell.
+The guard proves durability through that snapshot and refuses the eviction
+when the per-cell layout (snapshot, or the L0 fallback it verifies with one
+HEAD per journaled key) does not cover every acknowledged row, so the folded
+per-cell layout a successor restores from is complete.
 
 ### Epoch-chain restore
 

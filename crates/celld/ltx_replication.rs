@@ -32,7 +32,7 @@ impl Replication {
     /// See `LtxRepl::set_bucket_bundles_fleet`: the fleet sampler's answer to
     /// whether every live lease reads bucket-posture bundle proofs (format 3).
     /// Off until the first sample; the per-flush path additionally requires
-    /// `CELLD_BUCKET_BUNDLES=1`.
+    /// the operator switch (on by default; `CELLD_BUCKET_BUNDLES=0` disables).
     pub fn set_bucket_bundles_fleet(&self, ready: bool) -> bool {
         self.ltx.set_bucket_bundles_fleet(ready)
     }
