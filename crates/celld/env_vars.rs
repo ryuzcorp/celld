@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): validate CELLD_MEMORY_SCOPE; CELLD_CACHE_MAX_BYTES validation; tenant egress policy; CELLD_CACHE_SCOPE validation; CELLD_DEPLOY_AWS_* validation; CELLD_SQLITE_CACHE_KB validation.
+// Modified by ryuzcorp (ryuzcorp/celld): validate CELLD_MEMORY_SCOPE; CELLD_CACHE_MAX_BYTES validation; tenant egress policy; CELLD_CACHE_SCOPE validation; CELLD_DEPLOY_AWS_* validation; CELLD_SQLITE_CACHE_KB validation; CELLD_C_TRIM_MB validation.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! Strict runtime environment parsing.
@@ -243,6 +243,7 @@ pub fn validate() -> anyhow::Result<()> {
 
     for name in [
         "CELLD_ACTIVATIONS",
+        "CELLD_C_TRIM_MB",
         "CELLD_DEPLOY_POLL_S",
         "CELLD_FETCH_TIMEOUT_S",
         "CELLD_HANDLER_BUDGET_S",

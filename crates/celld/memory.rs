@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): per-process cgroup memory scope.
+// Modified by ryuzcorp (ryuzcorp/celld): per-process cgroup memory scope; C-trim threshold 8 MiB with CELLD_C_TRIM_MB knob and trim_due predicate.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! What the process holds, and how much of that a cell actually holds.
@@ -447,11 +447,35 @@ pub fn libc_malloc_stats() -> Option<LibcMallocStats> {
 
 /// Growth of the C allocator's free lists since the last trim that earns
 /// another one. A trim walks every free chunk of every arena, so it is not
-/// worth running for the churn of ordinary requests; 32 MiB is about a
-/// hundred evicted cells' storage caches, so a node hibernating cells
-/// trims within seconds of the first batch and a busy node with nothing
-/// freed never does.
-const C_HEAP_TRIM_THRESHOLD_BYTES: u64 = 32 << 20;
+/// worth running for the churn of ordinary requests; 8 MiB is about two
+/// dozen evicted cells' storage caches, so a node hibernating cells trims
+/// within seconds of the first batch and a busy node with nothing freed
+/// never does. `CELLD_C_TRIM_MB` overrides the default.
+const C_HEAP_TRIM_DEFAULT_MB: u64 = 8;
+
+/// The C-trim growth threshold in bytes. Reads `CELLD_C_TRIM_MB` on every
+/// call so tests can set it; an unset or invalid value keeps the default. A
+/// per-tick read cannot fail startup, so invalid input falls back instead of
+/// erroring.
+pub fn c_heap_trim_threshold_bytes() -> u64 {
+    mb_to_bytes(
+        crate::env_vars::positive_or("CELLD_C_TRIM_MB", C_HEAP_TRIM_DEFAULT_MB)
+            .unwrap_or(C_HEAP_TRIM_DEFAULT_MB),
+    )
+}
+
+/// Mebibytes to bytes, saturating: an absurd `CELLD_C_TRIM_MB` means "never
+/// trim", not a shift that wraps to a tiny threshold and trims every tick.
+fn mb_to_bytes(mb: u64) -> u64 {
+    mb.saturating_mul(1 << 20)
+}
+
+/// Whether freed C-heap growth since the floor earns another trim: the
+/// growth, not the absolute free-list size, because `mallinfo2` keeps
+/// counting decommitted chunks as free.
+pub fn trim_due(free_bytes: u64, floor_bytes: u64, threshold_bytes: u64) -> bool {
+    free_bytes.saturating_sub(floor_bytes) >= threshold_bytes
+}
 
 /// The free-list size at the last trim, lowered whenever the lists shrink
 /// below it, so a trim answers memory freed since then and not the chunks a
@@ -479,13 +503,13 @@ pub fn trim_c_heap_if_retained() -> Option<u64> {
     let floor = C_HEAP_FREE_AT_TRIM
         .fetch_min(free_bytes, Ordering::Relaxed)
         .min(free_bytes);
-    if free_bytes.saturating_sub(floor) < C_HEAP_TRIM_THRESHOLD_BYTES {
+    if !trim_due(free_bytes, floor, c_heap_trim_threshold_bytes()) {
         return None;
     }
     let started_ms = crate::asyncrt::mono_ms();
     trim_c_heap();
     C_HEAP_FREE_AT_TRIM.store(free_bytes, Ordering::Relaxed);
-    tracing::debug!(
+    tracing::info!(
         event = "c_heap_trimmed",
         free_bytes,
         elapsed_ms = crate::asyncrt::mono_ms().saturating_sub(started_ms),
@@ -505,6 +529,39 @@ fn trim_c_heap() {
 
 #[cfg(not(target_os = "linux"))]
 fn trim_c_heap() {}
+
+#[cfg(test)]
+mod retention_tests {
+    use super::{mb_to_bytes, trim_due};
+
+    /// An absurd knob never trims instead of wrapping into a threshold that
+    /// trims every tick. Fail-before: `mb << 20` wraps 2^44 MiB to 0.
+    #[test]
+    fn huge_trim_threshold_saturates() {
+        assert_eq!(mb_to_bytes(8), 8 << 20);
+        assert_eq!(mb_to_bytes(1 << 44), u64::MAX);
+        assert!(!trim_due(u64::MAX - 1, 0, mb_to_bytes(1 << 44)));
+    }
+
+    #[test]
+    fn trim_needs_growth_past_the_threshold() {
+        // Growth below the threshold earns nothing; the floor ratchets on
+        // shrink, so the same free-list size never trims twice.
+        assert!(!trim_due(100, 90, 32));
+        assert!(trim_due(100, 68, 32));
+        assert!(trim_due(100, 68, 32));
+        assert!(trim_due(132, 100, 32));
+    }
+
+    #[test]
+    fn trim_handles_a_shrunken_floor() {
+        // The floor is the minimum seen, so free lists below it saturate to
+        // zero growth instead of wrapping.
+        assert!(!trim_due(50, 90, 32));
+        assert!(!trim_due(0, 0, 32));
+        assert!(trim_due(u64::MAX, 0, 32));
+    }
+}
 
 /// Ask jemalloc to give freed pages back on a timer. Its 10-second decay runs
 /// only when a thread next calls the allocator, which a node that just shed its

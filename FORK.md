@@ -825,6 +825,14 @@ push to `ghcr.io/denoland`, but still. Pushing a branch named
   linger (`CELLD_BUCKET_BUNDLE_LINGER_MS`) holds the window open only while
   more than one cell is dirty — a lone cell flushes at once, since waiting
   would add the whole linger to one ack without batching anything.
+- `0065` (sha TBD at merge) trim the C heap sooner after eviction: the
+  sampler tick returns glibc free pages past `CELLD_C_TRIM_MB` (default 8,
+  was a 32 MiB const), with a pure `trim_due` predicate and unit tests.
+  Measured post-drain RSS 72.0 → 61.9 MiB on the agent-50 s3bench shape. A
+  jemalloc arena purge/decay was tried and dropped: log-verified, it freed
+  only ~1 MiB of ~20 MiB slack (the rest is active-run fragmentation
+  `mallctl` cannot return), and the post-drain "counting" bump is the
+  graceful-shutdown drain's working set, not retention — no fix needed.
 - `0066` (sha TBD at merge) a per-connection SQLite page-cache budget:
   `finish_open` sets `PRAGMA cache_size=-<kb>` from `CELLD_SQLITE_CACHE_KB`
   (default 2000, the stock ceiling: no behavior change at merge). Knob
