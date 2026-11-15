@@ -152,9 +152,15 @@ closed database or falls back to its L0 chain, and keeps the local copy until
 the bucket can restore the cell. When this residency itself uploaded into the
 epoch prefix and got a success response, that response is the proof: a
 successor finds the objects through a listing, as every restore does, which
-relies on the list-after-write consistency described above. A residency that
-uploaded nothing itself, such as one that resumed a local copy, and an eviction
-that falls back to the L0 chain, list the prefix instead. The capture before an
+relies on the list-after-write consistency described above. When the
+residency's upload journal names keys but that self-uploaded mark is absent —
+recovery uploads and compaction output journal their keys without setting it —
+the guard reads the newest journaled key instead of listing: a HEAD on the
+exact key the upload wrote, which needs only the read-after-write consistency
+described above, falling back to a listing on a miss or an error. A residency
+with an empty journal, such as one that resumed a local copy without
+uploading, and an eviction whose fallback finds no journaled key, list the
+prefix instead. The capture before an
 eviction skips the time-based checkpoint, whose sealing write would upload one
 more object just before the snapshot that covers it. After the snapshot
 publishes, a background task deletes the epoch's per-cell L0 and L1 objects

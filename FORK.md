@@ -750,6 +750,20 @@ push to `ghcr.io/denoland`, but still. Pushing a branch named
   (`CELLD_DURABILITY=bucket`). `maintain` never converts a bucket session to an ensemble; no
   posture watch or recruit on bucket posture. Layers 3-5 still pending (successor fold of
   bucket bundles, drain/GC/graceful seal for bucket sessions) — do not enable in production.
+- `0061` (sha TBD at merge) the eviction guard proves a journaled epoch with a
+  HEAD on the newest journaled key instead of a prefix LIST (parity item (iii),
+  layer 1). `ObjectStoreClient::ltx_file_exists` HEADs the `ltx_key` the
+  uploader wrote and the 0057 trim deletes — one constructor shared by all
+  three, pinned by a round-trip test — and `epoch_replicated` tries it first,
+  falling back to today's LIST on a miss, an error, or an empty journal;
+  refusal on LIST-empty is unchanged. The agent workload's 200
+  `LIST cells/*/ltx` are the claim-time lost-record check (`ltx_exists`), a
+  cold path with no journal by construction, so they keep the LIST; every
+  warmer guard (non-self-uploaded residencies such as recovery uploads and
+  compaction output, the L0-fallback barrier) drops from one Class-A LIST to
+  one Class-B HEAD, proven by unit tests (warm guard: 1 HEAD + 0 LISTs; empty
+  journal: LIST kept; HEAD miss: LIST fallback, then refuse). No name,
+  format, or protocol change.
 - `0062` (sha TBD at merge) parity item (iv) layer 1, core-only: the per-round
   fence credit predicate plus the output-gate settlement it feeds. `log_tier`
   gains a two-arm credit check per flush-round cell — the session-record arm
