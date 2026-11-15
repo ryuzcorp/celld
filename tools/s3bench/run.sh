@@ -321,7 +321,7 @@ if failed:
 EOF
 else
   python3 - "http://127.0.0.1:$PUB0" "$AGENTS" "$LIFE_S" "$WRITE_EVERY_S" <<'EOF'
-import http.client, math, sys, time
+import concurrent.futures, http.client, math, sys, threading, time
 base = sys.argv[1].split("://", 1)[1]
 agents, life, every = int(sys.argv[2]), float(sys.argv[3]), float(sys.argv[4])
 host, _, port = base.partition(":")
@@ -334,35 +334,70 @@ rounds = max(1, math.ceil(life / every)) if every > 0 else 1
 ok = 0
 fired = 0
 failed = 0
+fail_lock = threading.Lock()
 fail_notes = []
-conn = http.client.HTTPConnection(host, int(port), timeout=120)
-for round_ in range(rounds):
-    wait_until = start + round_ * every if every > 0 else start
-    delay = wait_until - time.time()
-    if delay > 0:
-        time.sleep(delay)
-    if time.time() > deadline:
-        break
-    fired += 1
-    for agent in range(agents):
+
+def note_failure(note):
+    global failed
+    with fail_lock:
+        failed += 1
+        if len(fail_notes) < 5:
+            fail_notes.append(note)
+
+# One thread per agent, each with its own connection, writing every `every`
+# seconds on its own phase (start + agent*every/agents): agents are
+# independent concurrent clients like real Noite/Outer agents, so arrivals
+# are uniform and cross-cell group commit can batch. A serial walk would
+# keep at most one cell in flight and never batch.
+def phase_of(agent):
+    return agent * (every / agents) if every > 0 else 0
+
+def due(agent, round_):
+    # Seconds after start this agent's round is scheduled; a round is part
+    # of the run only when it is scheduled within `life`.
+    return round_ * every + phase_of(agent) if every > 0 else 0
+
+def drive(agent):
+    conn = http.client.HTTPConnection(host, int(port), timeout=120)
+    local_ok = 0
+    local_fired = 0
+    for round_ in range(rounds):
+        offset = due(agent, round_)
+        if offset > life:
+            break
+        delay = start + offset - time.time()
+        if delay > 0:
+            time.sleep(delay)
+        # A round that slipped past the deadline is not fired; `expected`
+        # below still counts it, so the run reports the shortfall.
         if time.time() > deadline:
             break
+        local_fired += 1
         try:
             conn.request("GET", f"/agent/{agent}/write")
             response = conn.getresponse()
             response.read()
             if 200 <= response.status < 300:
-                ok += 1
+                local_ok += 1
             else:
-                failed += 1
-                if len(fail_notes) < 5:
-                    fail_notes.append(f"agent/{agent} status {response.status}")
+                note_failure(f"agent/{agent} status {response.status}")
         except Exception as error:
-            failed += 1
-            if len(fail_notes) < 5:
-                fail_notes.append(f"agent/{agent} error {type(error).__name__}: {error}")
+            note_failure(f"agent/{agent} error {type(error).__name__}: {error}")
+            try:
+                conn.close()
+            except Exception:
+                pass
             conn = http.client.HTTPConnection(host, int(port), timeout=120)
-expected = agents * fired
+    return (local_ok, local_fired)
+
+with concurrent.futures.ThreadPoolExecutor(max_workers=agents) as pool:
+    results = list(pool.map(drive, range(agents)))
+ok = sum(item[0] for item in results)
+fired = sum(item[1] for item in results)
+# Fixed by the schedule, not by what fired: a round truncated by the
+# deadline (or by another agent's slow write) must not shrink the bar.
+expected = sum(1 for agent in range(agents) for round_ in range(rounds)
+               if due(agent, round_) <= life)
 print(f"ok turns: {ok}")
 if failed:
     print(f"failures: {failed} (expected {expected} ok)", file=sys.stderr)
