@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): ported from meln1k/celld: seal a dead lease that never opened a log (01522b3).
+// Modified by ryuzcorp (ryuzcorp/celld): ported from meln1k/celld: seal a dead lease that never opened a log (01522b3); lone-node repair backoff schedule.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! Decision core for the in-fleet replicated log tier (design stage; not
@@ -484,4 +484,96 @@ pub fn fleet_shortfall(
     } else {
         Shortfall::NoEligiblePeer
     })
+}
+
+/// The posture watch's wait before its next `maintain` pass.
+///
+/// A lone node never becomes healthy — no peer can be a follower — so a
+/// flat 1 s retry replays the peer listing (one `nodes/` LIST plus one GET
+/// per lease) every second forever, about 2.6M of each a month. While the
+/// pass found no eligible peer there is nobody to recruit, so the wait
+/// doubles from the 1 s base up to `lone_cap_ms` (the caller passes the
+/// maintenance tick, so the lone scan never runs ahead of it). Every other
+/// arm is the old policy unchanged: healthy resets to the base, a peer
+/// that exists but lost to the drain barrier retries at once, and a pass
+/// that stepped the epoch keeps the swap rate cap's doubling to 10 s. The
+/// stepped arm wins over the no-peer arm: the maintenance tick can step the
+/// epoch while the watch's discovery is pending, and a moving epoch must
+/// not stretch the wait past the old cap.
+pub fn repair_interval_after(
+    healthy: bool,
+    epoch_stepped: bool,
+    no_eligible_peer: bool,
+    current_ms: u64,
+    lone_cap_ms: u64,
+) -> u64 {
+    const BASE_MS: u64 = 1_000;
+    const STEPPED_CAP_MS: u64 = 10_000;
+    if healthy {
+        return BASE_MS;
+    }
+    if epoch_stepped {
+        return current_ms.saturating_mul(2).min(STEPPED_CAP_MS);
+    }
+    if no_eligible_peer {
+        return current_ms.saturating_mul(2).min(lone_cap_ms);
+    }
+    BASE_MS
+}
+
+#[cfg(test)]
+mod repair_interval_tests {
+    use super::*;
+
+    /// A lone node's successive "no eligible peer" passes back the wait off
+    /// exponentially until the maintenance tick is the bound.
+    #[test]
+    fn lone_node_scans_back_off_to_the_tick() {
+        let mut interval = 1_000;
+        let mut waits = Vec::with_capacity(6);
+        for _ in 0..6 {
+            interval = repair_interval_after(false, false, true, interval, 30_000);
+            waits.push(interval);
+        }
+        assert_eq!(waits, [2_000, 4_000, 8_000, 16_000, 30_000, 30_000]);
+    }
+
+    /// A peer found (or health regained) resets to the 1 s base at once, so
+    /// a node that starts next to a lone node is recruited without waiting
+    /// out the backoff. The healthy arm takes the asserted pair too: the
+    /// watch re-reads health after the pass, so a node that became healthy
+    /// while its pass found nobody still resets, and health must dominate
+    /// the backoff in any order the two observations arrive in.
+    #[test]
+    fn peer_found_resets_to_the_base() {
+        assert_eq!(
+            repair_interval_after(false, false, false, 30_000, 30_000),
+            1_000
+        );
+        assert_eq!(
+            repair_interval_after(true, false, true, 30_000, 30_000),
+            1_000
+        );
+    }
+
+    /// A pass that stepped the epoch keeps the old swap rate cap: doubling
+    /// to 10 s, while a pass that lost to the drain barrier with a peer
+    /// present still retries at once.
+    #[test]
+    fn stepped_keeps_its_ten_second_cap() {
+        let mut interval = 1_000;
+        for _ in 0..5 {
+            interval = repair_interval_after(false, true, false, interval, 30_000);
+        }
+        assert_eq!(interval, 10_000);
+        assert_eq!(
+            repair_interval_after(false, false, false, 10_000, 30_000),
+            1_000
+        );
+        assert_eq!(
+            repair_interval_after(false, true, true, 30_000, 30_000),
+            10_000,
+            "a stepped pass keeps the 10 s cap even when it also found no peer"
+        );
+    }
 }

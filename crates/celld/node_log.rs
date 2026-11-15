@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): operator token for the internal listener; list_page resume is a cursor; ported from meln1k/celld: seal a dead lease that never opened a log (01522b3); seal_absent_log regression tests.
+// Modified by ryuzcorp (ryuzcorp/celld): operator token for the internal listener; list_page resume is a cursor; ported from meln1k/celld: seal a dead lease that never opened a log (01522b3); seal_absent_log regression tests; lone-node repair backoff.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! v0 of the in-fleet replicated log tier (`CELLD_DURABILITY=fleet`).
@@ -4397,6 +4397,66 @@ impl crate::ltx_repl::Shipper for NodeLogManager {
     }
 }
 
+/// What one `maintain` pass found. Recruitment is advisory: while no
+/// ensemble exists every write is acknowledged on a bucket proof
+/// (guarantees.md "The ensemble needs two nodes"), so a slower peer scan
+/// only delays fleet posture — it never weakens RPO=0 or fencing. The
+/// posture watch uses this to back off its peer listing on a lone node;
+/// every other caller ignores it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MaintainOutcome {
+    /// The pass reached peer discovery, found nobody to recruit, and no
+    /// ensemble was ever installed: the lone-node backoff applies.
+    NoEligiblePeer,
+    /// Every other path: nothing to do, waiting on a barrier, an
+    /// ensemble opened or already in place — or a degraded ensemble
+    /// whose followers are all gone, which must keep retrying at once
+    /// so it re-recruits the moment one returns.
+    Other,
+}
+
+impl MaintainOutcome {
+    /// Classify a pass that reached peer discovery and found nobody
+    /// recruitable. Only a node that never installed an ensemble backs
+    /// off: a degraded ensemble that lost all its followers reports
+    /// `Other`, so the watch keeps its 1 s retry and re-recruits at
+    /// once instead of waiting out the lone-node backoff with acks on
+    /// the bucket.
+    fn for_no_eligible_peer(ensemble_has_members: bool) -> MaintainOutcome {
+        if ensemble_has_members {
+            MaintainOutcome::Other
+        } else {
+            MaintainOutcome::NoEligiblePeer
+        }
+    }
+}
+
+#[cfg(test)]
+mod maintain_outcome_tests {
+    use super::*;
+
+    /// A node that never installed an ensemble and finds nobody backs
+    /// off: this is the lone-node scan the 30 s cap exists for.
+    #[test]
+    fn lone_node_with_no_peer_backs_off() {
+        assert_eq!(
+            MaintainOutcome::for_no_eligible_peer(false),
+            MaintainOutcome::NoEligiblePeer
+        );
+    }
+
+    /// A degraded ensemble that lost all its followers finds nobody but
+    /// must keep the 1 s retry, so it re-recruits the moment one
+    /// returns instead of waiting out the lone-node backoff with acks
+    /// stuck on the bucket.
+    #[test]
+    fn degraded_ensemble_with_no_peer_retries_at_once() {
+        assert_eq!(
+            MaintainOutcome::for_no_eligible_peer(true),
+            MaintainOutcome::Other
+        );
+    }
+}
 impl NodeLogManager {
     #[cfg(all(test, celld_internal_tests))]
     pub fn reset_shipper_injection_calls_for_world(&self) {
@@ -5717,12 +5777,12 @@ impl NodeLogManager {
     /// become garbage), CAS the record at the next epoch, then install the
     /// new shipper. A lost CAS leaves us at bucket posture; the next pass
     /// re-reads and retries.
-    pub async fn maintain(&self) -> anyhow::Result<()> {
+    pub async fn maintain(&self) -> anyhow::Result<MaintainOutcome> {
         // Avoid every remote read after local ownership has ended. Shutdown
         // can still race a pass after this check, so publication has a second
         // check under the lifecycle transition below.
         if self.task_stop.is_stopped() {
-            return Ok(());
+            return Ok(MaintainOutcome::Other);
         }
         // A healthy ensemble below the recruitment target still reads peers.
         // Returning on `healthy` alone kept a one-follower ensemble at one
@@ -5732,13 +5792,13 @@ impl NodeLogManager {
         // The width check below returns before any change when no further
         // peer is eligible, so the cost is one peer listing per tick.
         if self.healthy() && self.ensemble_width() >= RECRUIT_FOLLOWERS {
-            return Ok(());
+            return Ok(MaintainOutcome::Other);
         }
         // Self-suspicion parks recruitment: opening epochs into our own
         // partition churns records and proves nothing. Any successful
         // peer response lifts it.
         if self.suspect_self.load(Ordering::SeqCst) {
-            return Ok(());
+            return Ok(MaintainOutcome::Other);
         }
         let peers = self.ownership.read_capacity_peers().await?;
         let now = crate::ownership_store::now_ms();
@@ -5771,14 +5831,14 @@ impl NodeLogManager {
         // publication, and successor installation in one critical section.
         let transition = self.live_log.lock().await;
         if !transition.is_running() {
-            return Ok(());
+            return Ok(MaintainOutcome::Other);
         }
         {
             let inner = self.inner.lock().unwrap().clone();
             if let Some(current) = inner {
                 // Same strength available: nothing to improve.
                 if current.is_active() && members.len() <= current.members.len() {
-                    return Ok(());
+                    return Ok(MaintainOutcome::Other);
                 }
                 // Deactivate first: acks fall to the bucket and pacing
                 // stops, so the drain below converges.
@@ -5792,16 +5852,27 @@ impl NodeLogManager {
                     current.outstanding.load(Ordering::SeqCst) > 0,
                     self.ltx.all_fragment_rows_tiered(),
                 ) {
-                    return Ok(());
+                    return Ok(MaintainOutcome::Other);
                 }
             }
         }
         if members.is_empty() {
             self.report_fleet_shortfall(live_peers, mono);
-            return Ok(());
+            // Same lock order as above: the transition guard, then the
+            // shipper. A degraded ensemble that lost all its followers
+            // reaches this arm once its drain passes, and it must not
+            // back off: re-recruiting the moment one returns is worth
+            // more than the listing it costs.
+            let ensemble_has_members = self
+                .inner
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|current| !current.members.is_empty());
+            return Ok(MaintainOutcome::for_no_eligible_peer(ensemble_has_members));
         }
         if !self.ltx.all_fragment_rows_tiered() {
-            return Ok(()); // re-checked: the drain may regress between locks
+            return Ok(MaintainOutcome::Other); // re-checked: the drain may regress between locks
         }
         let ensemble: BTreeSet<String> = members.iter().map(|member| member.node.clone()).collect();
         // The in-process folded state IS the record (single lease writer):
@@ -5817,7 +5888,7 @@ impl NodeLogManager {
         let record = match step {
             log_tier::MaintainStep::CreateFresh => log_tier::create_record(ensemble.clone(), 0)
                 .ok_or_else(|| anyhow!("empty ensemble"))?,
-            log_tier::MaintainStep::Wait => return Ok(()),
+            log_tier::MaintainStep::Wait => return Ok(MaintainOutcome::Other),
             // v0 tiers per cell, so the record's tiered offset stays 0
             // and the drain barrier above is what makes the old
             // fragments abandonable — the same precondition
@@ -5847,7 +5918,7 @@ impl NodeLogManager {
         // A write admitted here can finish after fallback, so dead-session
         // recovery remains responsible for that remote Open record.
         if self.task_stop.is_stopped() {
-            return Ok(());
+            return Ok(MaintainOutcome::Other);
         }
         transition.write(Some(log_to_wire(&record, false))).await?;
         #[cfg(all(test, celld_internal_tests))]
@@ -5873,7 +5944,7 @@ impl NodeLogManager {
         // cannot resurrect a shipper or its member lanes afterward.
         let mut installed = self.inner.lock().unwrap();
         if self.task_stop.is_stopped() {
-            return Ok(());
+            return Ok(MaintainOutcome::Other);
         }
         // The stream window (the stream-window design): a nonzero
         // CELLD_LOG_WINDOW is the appends-per-lane bound and takes over the
@@ -5942,7 +6013,7 @@ impl NodeLogManager {
         // The successor record and its in-memory shipper form one state
         // transition. Keep shutdown excluded until both values are visible.
         drop(transition);
-        Ok(())
+        Ok(MaintainOutcome::Other)
     }
 }
 
@@ -6580,7 +6651,10 @@ fn spawn_maintenance(
             // phase could orphan a half-installed ensemble.
             let mut phases = Vec::with_capacity(4);
             if fleet {
-                phases.push(("maintain", manager.maintain().boxed()));
+                phases.push((
+                    "maintain",
+                    manager.maintain().map(|r| r.map(|_| ())).boxed(),
+                ));
                 phases.push(("dead-leader sweep", manager.sweep_dead_leaders().boxed()));
                 phases.push(("bundle GC", manager.gc_bundles().boxed()));
             }
@@ -6651,21 +6725,27 @@ fn spawn_maintenance(
             // The first repair after a degrade is immediate — that is the
             // 0.7s swap — but successive failed repairs back off to the
             // swap rate cap: a full peer partition once opened seventeen
-            // doomed epochs in twenty seconds at the flat retry rate.
+            // doomed epochs in twenty seconds at the flat retry rate. A lone
+            // node backs off further, to the maintenance tick: with nobody
+            // to recruit the listing only proves the fleet is still one.
             if mono_ms().saturating_sub(last_repair_try) >= repair_interval.as_millis() as u64 {
                 last_repair_try = mono_ms();
                 let epoch_before = crate::ltx_repl::Shipper::epoch(&*watcher);
-                if let Err(error) = watcher.maintain().await {
-                    warn!(%error, "posture repair failed");
-                }
+                let no_eligible_peer = matches!(
+                    watcher.maintain().await.map_err(|error| {
+                        warn!(%error, "posture repair failed");
+                    }),
+                    Ok(MaintainOutcome::NoEligiblePeer)
+                );
                 let stepped = crate::ltx_repl::Shipper::epoch(&*watcher) != epoch_before;
-                repair_interval = if watcher.healthy() {
-                    std::time::Duration::from_secs(1)
-                } else if stepped {
-                    (repair_interval * 2).min(std::time::Duration::from_secs(10))
-                } else {
-                    std::time::Duration::from_secs(1)
-                };
+                repair_interval =
+                    std::time::Duration::from_millis(log_tier::repair_interval_after(
+                        watcher.healthy(),
+                        stepped,
+                        no_eligible_peer,
+                        repair_interval.as_millis() as u64,
+                        LOG_MAINTENANCE_TICK_MS,
+                    ));
             }
         }
     });

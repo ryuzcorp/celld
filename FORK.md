@@ -9,7 +9,7 @@ README below is kept intact; this file documents the fork.
 
 - `main` mirrors upstream `main` and carries no patches.
 - `ryuzcorp/v<version>` is a line branch: the upstream tag `v<version>`
-  plus our patches as commits, one commit per patch, in `0001`-`0053`
+  plus our patches as commits, one commit per patch, in `0001`-`0054`
   order. Each patch commit is self-contained and carries its own tests.
 
 Upstream's `.github/workflows/release.yml` targets `ghcr.io/denoland` and
@@ -625,6 +625,24 @@ push to `ghcr.io/denoland`, but still. Pushing a branch named
   Measured on 200 short-lived Durable Objects (6 writes each,
   `CELLD_DURABILITY=bucket`): 12 Class A requests per cell before, 9 after
   (per 200 cells: `cells/*/ltx` PUTs 1600 → 1400, LISTs 600 → 200).
+- `0055` (sha TBD at merge) a lone fleet node slows its posture-repair
+  scan: while a `maintain` pass finds no eligible peer, the wait before the
+  next pass doubles from one second up to the maintenance tick (thirty
+  seconds) instead of retrying every second forever. Each pass lists
+  `nodes/` and reads every lease, so the flat retry cost a lone node about
+  2.6M LIST plus 2.6M GET a month doing nothing. `maintain` now reports
+  whether the pass found no eligible peer, and only a node that never
+  installed an ensemble backs off on it: a degraded ensemble that lost
+  all its followers still retries at once, so it re-recruits the moment
+  one returns. Every other branch behaves as before, and the first
+  repair after a degrade is still immediate, a peer that loses to the
+  drain barrier still retries at once, and the epoch step still doubles
+  to ten seconds. Recruitment is advisory — without an
+  ensemble every write already waits for a bucket proof — so the slower
+  scan only delays fleet posture, never RPO=0 or fencing. The tradeoff: a
+  node that starts next to a lone node is recruited by it within about
+  thirty seconds instead of about one (the new node recruits the old one
+  itself at once).
 - `0056` (sha TBD at merge) concurrent bucket-posture writes share
   ownership reads instead of reading once per write. A gated write's
   bucket proof used to emit its own `VerifyOwnership` (one GET of
