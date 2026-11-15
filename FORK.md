@@ -833,6 +833,18 @@ push to `ghcr.io/denoland`, but still. Pushing a branch named
   generation instead of per isolate: the projection lives on the shared
   `Arc<WorkerConfig>`, so N isolates project once; read-only semantics
   unchanged. Counter-based unit test proves one projection per config.
+- `0069` (sha TBD at merge) the s3bench agent workload drives its agents
+  concurrently: one thread (and connection) per agent, each writing every
+  `write_every_s` seconds on its own phase (`start + agent*every/agents`),
+  so arrivals are uniform like independent Noite/Outer clients and
+  cross-cell group commit can batch. The serial walk kept at most one cell
+  in flight and could never batch. The expected turn count comes from the
+  schedule (every round due within the run), not from what fired, so a
+  round truncated by the deadline or a slow write fails the run as a
+  shortfall. Per-cell behaviour does not depend on concurrency, so the
+  measured counts match the serial driver. The README notes that agents
+  are concurrent and suggests `DELAY_MS=100` for realistic batching numbers
+  (R2 answers a PUT in ~100–200 ms from a VPS).
 
 Patches `0025`–`0034` are ported fixes from
 [meln1k/celld](https://github.com/meln1k/celld) by Nikita

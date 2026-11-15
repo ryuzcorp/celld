@@ -39,7 +39,13 @@ work dir, which a successful run deletes).
 
 ## Agent workload
 
-200 short-lived agents, 6 writes each, then eviction (`0054` numbers):
+200 short-lived agents, 6 writes each, then eviction (`0054` numbers).
+Agents are concurrent: one thread per agent, each with its own connection,
+writing every `write_every_s` seconds on its own phase, so arrivals are
+uniform and cross-cell group commit can batch — like independent Noite/Outer
+clients. A serial walk would keep at most one cell in flight and never batch.
+`DELAY_MS` emulates store latency; R2 from a VPS answers a PUT in
+~100–200 ms, so `DELAY_MS=100` gives realistic batching numbers.
 
 ```sh
 ./run.sh s3bench-agent-1 1 200 60 10 60 120 CELLD_DURABILITY=bucket CELLD_IDLE_EVICT_S=30 CELLD_TTL_MS=60000
