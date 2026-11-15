@@ -209,6 +209,15 @@ A node without an ensemble stays correct. It acknowledges each write on a bucket
 proof instead, at the cost of latency: an object store round trip is much slower
 than a follower fsync.
 
+A node with no eligible peer slows its recruitment scan: the wait between
+scans doubles from one second up to the maintenance tick (thirty seconds)
+while every scan finds nobody. Recruitment is advisory — every write above
+already waits for a bucket proof — so the slower scan only delays fleet
+posture; it never weakens the acknowledgement rule. The tradeoff: a node
+that starts next to a lone node is recruited by it within about thirty
+seconds instead of about one (the new node recruits the old one itself at
+once).
+
 ### The takeover recovery gate
 
 In fleet mode, celld can acknowledge a write before its bucket upload completes.
