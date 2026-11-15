@@ -35,7 +35,9 @@ counts. `stored.py` reports the `cells/` objects and bytes left behind.
 
 `run.sh` suspect env knobs: `CELLD_BIN`, `OFF` (port offset), `HOT=1`
 (hot-cell workload), `DELAY_MS` (proxy latency), `KEEP_WORK=1` (keep the
-work dir, which a successful run deletes).
+ work dir, which a successful run deletes). The driver prints `ok turns:`
+ plus per-turn end-to-end latency
+ (`turn latency ms: n=… mean=… p50=… p95=… p99=…`).
 
 ## Agent workload
 

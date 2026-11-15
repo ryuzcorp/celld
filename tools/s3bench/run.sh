@@ -254,7 +254,7 @@ EOF
 echo "== driving the workload" >&2
 if [[ "$HOT" == 1 ]]; then
   python3 - "http://127.0.0.1:$PUB0" "$AGENTS" "$LIFE_S" <<'EOF'
-import concurrent.futures, http.client, sys, threading, time
+import concurrent.futures, http.client, math, sys, threading, time
 base = sys.argv[1].split("://", 1)[1]
 workers, life = int(sys.argv[2]), float(sys.argv[3])
 host, _, port = base.partition(":")
@@ -269,6 +269,14 @@ ok = 0
 failed = 0
 fail_lock = threading.Lock()
 fail_notes = []
+lat = []
+
+def pct(xs, q):
+    # Nearest-rank percentile over end-to-end turn latencies.
+    if not xs:
+        return 0.0
+    ordered = sorted(xs)
+    return ordered[min(len(ordered) - 1, math.ceil(q * len(ordered)) - 1)]
 
 def note_failure(note):
     global failed
@@ -281,6 +289,7 @@ def hammer(index):
     global ok
     conn = http.client.HTTPConnection(host, int(port), timeout=120)
     local = 0
+    local_lat = []
     # Phase writers across the round so they do not fire in lockstep.
     first = start + index * (ROUND_S / workers)
     while True:
@@ -289,12 +298,14 @@ def hammer(index):
             break
         if wait_until - ROUND_S < first:
             time.sleep(first - (wait_until - ROUND_S))
+        begun = time.time()
         try:
             conn.request("GET", "/hot/write")
             response = conn.getresponse()
             response.read()
             if 200 <= response.status < 300:
                 local += 1
+                local_lat.append((time.time() - begun) * 1000.0)
             else:
                 note_failure(f"hot/write status {response.status}")
         except Exception as error:
@@ -309,10 +320,12 @@ def hammer(index):
             time.sleep(delay)
     with fail_lock:
         ok += local
+        lat.extend(local_lat)
 
 with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
     list(pool.map(hammer, range(workers)))
 print(f"ok turns: {ok}")
+print(f"turn latency ms: n={len(lat)} mean={sum(lat)/len(lat) if lat else 0:.0f} p50={pct(lat, 0.50):.0f} p95={pct(lat, 0.95):.0f} p99={pct(lat, 0.99):.0f}")
 if failed:
     print(f"failures: {failed}", file=sys.stderr)
     for note in fail_notes:
@@ -361,6 +374,7 @@ def drive(agent):
     conn = http.client.HTTPConnection(host, int(port), timeout=120)
     local_ok = 0
     local_fired = 0
+    local_lat = []
     for round_ in range(rounds):
         offset = due(agent, round_)
         if offset > life:
@@ -373,12 +387,14 @@ def drive(agent):
         if time.time() > deadline:
             break
         local_fired += 1
+        begun = time.time()
         try:
             conn.request("GET", f"/agent/{agent}/write")
             response = conn.getresponse()
             response.read()
             if 200 <= response.status < 300:
                 local_ok += 1
+                local_lat.append((time.time() - begun) * 1000.0)
             else:
                 note_failure(f"agent/{agent} status {response.status}")
         except Exception as error:
@@ -388,17 +404,26 @@ def drive(agent):
             except Exception:
                 pass
             conn = http.client.HTTPConnection(host, int(port), timeout=120)
-    return (local_ok, local_fired)
+    return (local_ok, local_fired, local_lat)
+
+def pct(xs, q):
+    # Nearest-rank percentile over end-to-end turn latencies.
+    if not xs:
+        return 0.0
+    ordered = sorted(xs)
+    return ordered[min(len(ordered) - 1, math.ceil(q * len(ordered)) - 1)]
 
 with concurrent.futures.ThreadPoolExecutor(max_workers=agents) as pool:
     results = list(pool.map(drive, range(agents)))
 ok = sum(item[0] for item in results)
 fired = sum(item[1] for item in results)
+lat = [d for item in results for d in item[2]]
 # Fixed by the schedule, not by what fired: a round truncated by the
 # deadline (or by another agent's slow write) must not shrink the bar.
 expected = sum(1 for agent in range(agents) for round_ in range(rounds)
                if due(agent, round_) <= life)
 print(f"ok turns: {ok}")
+print(f"turn latency ms: n={len(lat)} mean={sum(lat)/len(lat) if lat else 0:.0f} p50={pct(lat, 0.50):.0f} p95={pct(lat, 0.95):.0f} p99={pct(lat, 0.99):.0f}")
 if failed:
     print(f"failures: {failed} (expected {expected} ok)", file=sys.stderr)
     for note in fail_notes:
