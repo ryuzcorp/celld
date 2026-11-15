@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): an eviction skips the visibility LISTs its own uploads already prove and the time-based checkpoint before the handoff; an eviction deletes the per-cell L0/L1 objects its handoff snapshot supersedes.
+// Modified by ryuzcorp (ryuzcorp/celld): an eviction skips the visibility LISTs its own uploads already prove and the time-based checkpoint before the handoff; an eviction deletes the per-cell L0/L1 objects its handoff snapshot supersedes; bucket-posture group commit: paged gate judges PAGED_FORMAT (0059).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! In-process replication backend built on `celld-ltx`.
@@ -1330,8 +1330,8 @@ pub struct LtxRepl {
     /// chain from the cut. On unless `CELLD_LTX_PAGED=0`.
     paged_restore: AtomicBool,
     /// Whether every live lease in the fleet reads a paged epoch
-    /// (`celld_logic::format`). Off until the fleet sampler has seen every
-    /// lease at `BUCKET_FORMAT`, so a node in a rolling update clones a whale
+    /// (`celld_logic::format::PAGED_FORMAT`). Off until the fleet sampler has
+    /// seen every lease at that minimum, so a node in a rolling update clones
     /// the way the old release does instead of writing an epoch the old
     /// release cannot restore. `CELLD_LTX_PAGED` is the operator's switch;
     /// this one is the fleet's.

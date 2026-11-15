@@ -1,3 +1,4 @@
+// Modified by ryuzcorp (ryuzcorp/celld): bucket-posture group commit: bucket-session node-log wire marker (0059).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! Bucket ownership effect adapter, over either conditional-write dialect.
@@ -212,8 +213,8 @@ impl From<NodeLeaseWireRaw> for NodeLeaseWire {
     }
 }
 
-/// The folded log fields, exactly the old log/<session>.json body: the
-/// record moved into the lease, the shape did not change.
+/// The folded log fields: the old log/<session>.json body moved into the lease,
+/// plus the `bucket` session marker (absent on old records, which read as fleet).
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub(crate) struct NodeLogWire {
     pub(crate) state: String,
@@ -228,6 +229,16 @@ pub(crate) struct NodeLogWire {
     /// The JSON key remains `active` for compatibility with existing records.
     #[serde(default, rename = "active")]
     pub(crate) may_have_fleet_acks: bool,
+    /// Bucket-session marker (`log_tier::SessionKind::Bucket`): this session's
+    /// acks rode shared bundle PUTs, so recovery drains the bundle prefix and
+    /// never declares fleet-style bounded loss or demands follower witnesses.
+    /// Absent on every record older releases wrote, which all read as fleet —
+    /// and older releases ignore this key (no `deny_unknown_fields`), reading a
+    /// bucket record as an ensemble-less fleet session with no fleet acks, which
+    /// §2 of `bundles.contracts.md` proves fail-closed. Bucket sessions always
+    /// carry `active == false`: they never have fleet acknowledgements.
+    #[serde(default)]
+    pub(crate) bucket: bool,
     /// The node recovering this log and its last heartbeat, while the state
     /// is `recovering`. Absent from records older than the claim.
     #[serde(default)]
