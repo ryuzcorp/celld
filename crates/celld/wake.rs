@@ -351,7 +351,10 @@ pub(crate) trait AlarmHost: Sync {
         cell: &'a str,
         epoch: u64,
         position: u64,
-    ) -> impl std::future::Future<Output = anyhow::Result<(u64, celld_logic::ProofSource)>> + Send + 'a;
+    ) -> impl std::future::Future<
+        Output = anyhow::Result<(u64, celld_logic::ProofSource, Option<u64>)>,
+    > + Send
+           + 'a;
 }
 
 impl AlarmHost for crate::cell_host::CellHost {
@@ -364,8 +367,10 @@ impl AlarmHost for crate::cell_host::CellHost {
         cell: &'a str,
         epoch: u64,
         position: u64,
-    ) -> impl std::future::Future<Output = anyhow::Result<(u64, celld_logic::ProofSource)>> + Send + 'a
-    {
+    ) -> impl std::future::Future<
+        Output = anyhow::Result<(u64, celld_logic::ProofSource, Option<u64>)>,
+    > + Send
+           + 'a {
         self.await_durable(cell, epoch, position)
     }
 }
@@ -452,7 +457,7 @@ impl WakeFlusher {
             return Ok(());
         }
         self.publish(bucket, cell, alarm).await?;
-        let (durable, _) = host
+        let (durable, _, _) = host
             .prove_alarm(cell, source.id.epoch, source.position)
             .await?;
         anyhow::ensure!(durable >= source.position, "wake retirement proof is short");

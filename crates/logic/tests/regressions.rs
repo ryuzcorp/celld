@@ -398,6 +398,7 @@ fn a_failed_proof_settles_an_alarm_still_running() {
         op: proof,
         result: Err(Failure::Ambiguous),
         source: ProofSource::Bucket,
+        ticket: None,
     });
     // The handler's answer arrives after its runtime is gone.
     let (op, cell, epoch) = fire;
@@ -585,6 +586,7 @@ fn a_reset_drops_a_stopping_cell_s_sockets() {
         op: proof,
         result: Err(Failure::Ambiguous),
         source: ProofSource::Bucket,
+        ticket: None,
     });
     shell.state.validate().expect("state invariant");
 }
@@ -920,6 +922,7 @@ fn prove_gate(shell: &mut Shell, seen: &mut Vec<Effect>, position: u64) {
         op,
         result: Ok(position),
         source: ProofSource::Bucket,
+        ticket: None,
     }));
 }
 
@@ -1064,6 +1067,7 @@ fn a_reported_watermark_does_not_widen_a_read_cover() {
         op,
         result: Ok(5),
         source: ProofSource::Bucket,
+        ticket: None,
     });
     prove_gate(&mut shell, &mut seen, 2);
     assert_eq!(
@@ -1131,6 +1135,7 @@ fn a_refused_read_fails_every_joined_gate_and_resets() {
         op: swept,
         result: Ok(1),
         source: ProofSource::Bucket,
+        ticket: None,
     });
     assert!(
         !seen
@@ -1237,31 +1242,14 @@ fn held_gate_op_for_cell_position(held: &[Effect], cell: &str, position: u64) ->
         .expect("the write waits for its proof")
 }
 
-/// The epoch a bucket proof's ownership round names for `cell`.
-fn verify_epoch_for_cell(held: &[Effect], cell: &str) -> u64 {
-    held.iter()
-        .find_map(|effect| match effect {
-            Effect::VerifyOwnership { cell: c, epoch, .. } if c == cell => Some(*epoch),
-            _ => None,
-        })
-        .expect("a proof opened an ownership read for the cell")
-}
-
-/// Prove one gate on `cell` and append the effects the proof produced.
-fn prove_cell_gate(shell: &mut Shell, seen: &mut Vec<Effect>, cell: &str, position: u64) {
-    let op = held_gate_op_for_cell_position(&shell.held, cell, position);
-    seen.extend(shell.send(Event::DurableReached {
-        op,
-        result: Ok(position),
-        source: ProofSource::Bucket,
-    }));
-}
-
-/// A round-level fence read settles the gates its proof captured with no
-/// per-gate ownership answer: the credited cell's writes release proven
-/// while the uncredited cell's writes fail, and a gate past the cover keeps
-/// waiting. The trapped per-gate reads stay unanswered, and a late answer to
-/// one releases nothing.
+/// A round-level fence read settles the held gates its proof captured with
+/// no per-gate ownership answer: the credited cell's held writes release
+/// proven while the uncredited cell's held writes fail. Matching is by
+/// waiter ticket against the round's ticket cover — never by barrier
+/// position, which is a SQLite fingerprint in unrelated units. A hold past
+/// the cover belongs to a later round and keeps waiting; a non-held gate
+/// keeps the per-gate read its own proof opened.
+// Modified by ryuzcorp (ryuzcorp/celld): fence-round hold (0068).
 #[test]
 fn fence_round_verified_settles_covered_gates_without_per_gate_reads() {
     let mut shell = bucket_gate_shell();
@@ -1281,14 +1269,32 @@ fn fence_round_verified_settles_covered_gates_without_per_gate_reads() {
         epoch: None,
         now_mono_ms: MONO_MS,
     });
+    // The proofs hold their gates: no per-gate read leaves the core. The
+    // tickets are the commit-ordered links the round's gather captured.
     let mut seen = Vec::new();
-    prove_cell_gate(&mut shell, &mut seen, "a", 1);
-    prove_cell_gate(&mut shell, &mut seen, "a", 2);
-    prove_cell_gate(&mut shell, &mut seen, "b", 7);
-    let reads = verify_reads(&seen);
-    assert_eq!(reads.len(), 3, "every proof opens its own round: {seen:?}");
-    let epoch_a = verify_epoch_for_cell(&shell.held, "a");
-    let epoch_b = verify_epoch_for_cell(&shell.held, "b");
+    for (cell, position, ticket) in [("a", 1, 10), ("a", 2, 11), ("a", 9, 12), ("b", 7, 20)] {
+        let op = held_gate_op_for_cell_position(&shell.held, cell, position);
+        seen.extend(shell.send(Event::DurableReached {
+            op,
+            result: Ok(position),
+            source: ProofSource::BucketBundle,
+            ticket: Some(ticket),
+        }));
+    }
+    assert!(
+        !seen
+            .iter()
+            .any(|effect| matches!(effect, Effect::VerifyOwnership { .. })),
+        "held proofs open no per-gate read: {seen:?}"
+    );
+    assert!(
+        !seen
+            .iter()
+            .any(|effect| matches!(effect, Effect::Release { .. })),
+        "the held gates wait for the settlement: {seen:?}"
+    );
+    let epoch_a = shell.owners["a"].epoch;
+    let epoch_b = shell.owners["b"].epoch;
     let settled = shell.send(Event::FenceRoundVerified {
         round: FenceRoundSettlement {
             order: ProofThenRead {
@@ -1299,13 +1305,13 @@ fn fence_round_verified_settles_covered_gates_without_per_gate_reads() {
                 FenceCellSettlement {
                     cell: "a".into(),
                     epoch: epoch_a,
-                    cover: 2,
+                    cover: 11,
                     credit: CellCredit::Credit,
                 },
                 FenceCellSettlement {
                     cell: "b".into(),
                     epoch: epoch_b,
-                    cover: 7,
+                    cover: 20,
                     credit: CellCredit::Uncredited,
                 },
             ],
@@ -1339,7 +1345,7 @@ fn fence_round_verified_settles_covered_gates_without_per_gate_reads() {
         !settled
             .iter()
             .any(|effect| matches!(effect, Effect::Release { request: 3, .. })),
-        "the gate past the cover keeps waiting: {settled:?}"
+        "the hold past the cover keeps waiting: {settled:?}"
     );
     assert!(
         !settled
@@ -1355,31 +1361,568 @@ fn fence_round_verified_settles_covered_gates_without_per_gate_reads() {
             .map(|(_, count)| count);
         assert_eq!(count, Some(1), "the round outcome is counted once");
     }
-    // The trapped per-gate reads stay unanswered, and a late answer to one
-    // releases nothing: the fence read superseded them.
-    assert_eq!(
-        shell
-            .held
+    shell.state.validate().expect("state invariant");
+}
+
+/// A fence-round-enabled bundle proof holds its gate for the round's
+/// settlement instead of opening a per-gate ownership read: no
+/// `VerifyOwnership` leaves the core, the wait is probed once per gate, and
+/// the settlement still releases the gates proven. Fail-before: without the
+/// hold the proof opens a per-gate read at once.
+// Modified by ryuzcorp (ryuzcorp/celld): fence-round hold (0068).
+#[test]
+fn bucket_bundle_proof_holds_gate_for_settlement() {
+    let mut shell = bucket_gate_shell();
+    shell.start();
+    open_gated_writes(&mut shell, &[1, 2]);
+    let mut proven = Vec::new();
+    for (position, ticket) in [(1, 10), (2, 11)] {
+        let op = held_gate_op_for_position(&shell.held, position);
+        proven.extend(shell.send(Event::DurableReached {
+            op,
+            result: Ok(position),
+            source: ProofSource::BucketBundle,
+            ticket: Some(ticket),
+        }));
+    }
+    assert!(
+        !proven
             .iter()
-            .filter(|effect| matches!(effect, Effect::VerifyOwnership { .. }))
-            .count(),
-        3,
-        "no per-gate read was answered"
+            .any(|effect| matches!(effect, Effect::VerifyOwnership { .. })),
+        "a fence-round proof opens no per-gate read: {proven:?}"
     );
-    for op in reads {
-        let quiet = shell.send(Event::OwnershipVerified { op, result: Ok(()) });
+    assert!(
+        !proven
+            .iter()
+            .any(|effect| matches!(effect, Effect::Release { .. })),
+        "the held gates wait for the settlement: {proven:?}"
+    );
+    let waits = shell
+        .state
+        .probes()
+        .find(|(probe, _)| *probe == Probe::GateFenceWait)
+        .map(|(_, count)| count);
+    assert_eq!(waits, Some(2), "each held gate is counted");
+    let epoch = shell.owners["a"].epoch;
+    let settled = shell.send(Event::FenceRoundVerified {
+        round: FenceRoundSettlement {
+            order: ProofThenRead {
+                proof_seq: 1,
+                read_seq: 2,
+            },
+            cells: vec![FenceCellSettlement {
+                cell: "a".into(),
+                epoch,
+                cover: 11,
+                credit: CellCredit::Credit,
+            }],
+        },
+    });
+    for request in [1, 2] {
         assert!(
-            !quiet
-                .iter()
-                .any(|effect| matches!(effect, Effect::Release { .. })),
-            "a late read answers nothing: {quiet:?}"
+            settled.iter().any(|effect| matches!(
+                effect,
+                Effect::Release {
+                    request: r,
+                    result: Ok(()),
+                    ..
+                } if *r == request
+            )),
+            "held write {request} is acknowledged: {settled:?}"
         );
     }
+    assert!(
+        !settled
+            .iter()
+            .any(|effect| matches!(effect, Effect::VerifyOwnership { .. })),
+        "the settlement needs no per-gate read either: {settled:?}"
+    );
+    shell.state.validate().expect("state invariant");
+}
+
+/// A fence-held gate whose round never settles falls back to a per-gate
+/// ownership read at the operation deadline instead of failing a write whose
+/// proof already landed; the fallback read then settles the gate. Fail-before:
+/// without the fallback the deadline fails the gate as ambiguous.
+// Modified by ryuzcorp (ryuzcorp/celld): fence-round hold (0068).
+#[test]
+fn fence_held_gate_falls_back_to_per_gate_read_at_deadline() {
+    let mut shell = bucket_gate_shell();
+    shell.start();
+    open_gated_writes(&mut shell, &[1]);
+    let op = held_gate_op_for_position(&shell.held, 1);
+    let proven = shell.send(Event::DurableReached {
+        op,
+        result: Ok(1),
+        source: ProofSource::BucketBundle,
+        ticket: Some(10),
+    });
+    assert!(
+        !proven
+            .iter()
+            .any(|effect| matches!(effect, Effect::VerifyOwnership { .. })),
+        "the proof holds for the settlement: {proven:?}"
+    );
+    // The operation deadline fires while the round is still lost.
+    let expired = shell.send(Event::TimerFired {
+        timer: Timer::OperationDeadline { op },
+        now_ms: NOW_MS + 15_000,
+        now_mono_ms: MONO_MS + 15_000,
+    });
+    let read = expired
+        .iter()
+        .find_map(|effect| match effect {
+            Effect::VerifyOwnership { op: found, .. } if *found == op => Some(effect.clone()),
+            _ => None,
+        })
+        .expect("the deadline opens the superseded per-gate read: {expired:?}");
+    assert!(
+        !expired
+            .iter()
+            .any(|effect| matches!(effect, Effect::Release { .. })),
+        "the deadline does not fail the proven write: {expired:?}"
+    );
+    let reply = shell
+        .answer(&read)
+        .expect("the fallback read is answerable");
+    let settled = shell.send(reply);
+    assert!(
+        settled.iter().any(|effect| matches!(
+            effect,
+            Effect::Release {
+                request: 1,
+                result: Ok(()),
+                ..
+            }
+        )),
+        "the fallback read settles the gate: {settled:?}"
+    );
+    shell.state.validate().expect("state invariant");
+}
+
+/// A fence-held gate is never settled by a non-fence proof: a Fleet proof
+/// that lands while the hold is open releases nothing — only the round's
+/// settlement (or the deadline) resolves it. Fail-before: without the guard
+/// the Fleet proof settles the gate proven at once.
+// Modified by ryuzcorp (ryuzcorp/celld): fence-round hold (0068).
+#[test]
+fn fence_held_gate_ignores_a_fleet_proof() {
+    let mut shell = bucket_gate_shell();
+    shell.start();
+    open_gated_writes(&mut shell, &[1]);
+    let op = held_gate_op_for_position(&shell.held, 1);
+    let proven = shell.send(Event::DurableReached {
+        op,
+        result: Ok(1),
+        source: ProofSource::BucketBundle,
+        ticket: Some(10),
+    });
+    assert!(
+        !proven
+            .iter()
+            .any(|effect| matches!(effect, Effect::VerifyOwnership { .. })),
+        "the proof holds for the settlement: {proven:?}"
+    );
+    // A duplicate Fleet completion for the same gate changes nothing: no
+    // release, no read — the hold does not depend on posture.
+    let stray = shell.send(Event::DurableReached {
+        op,
+        result: Ok(1),
+        source: ProofSource::Fleet,
+        ticket: Some(10),
+    });
+    assert!(
+        !stray
+            .iter()
+            .any(|effect| matches!(effect, Effect::Release { .. })),
+        "a non-fence proof never settles a held gate: {stray:?}"
+    );
+    assert!(
+        !stray
+            .iter()
+            .any(|effect| matches!(effect, Effect::VerifyOwnership { .. })),
+        "a non-fence proof never opens a read for a held gate either: {stray:?}"
+    );
+    let epoch = shell.owners["a"].epoch;
+    let settled = shell.send(Event::FenceRoundVerified {
+        round: FenceRoundSettlement {
+            order: ProofThenRead {
+                proof_seq: 1,
+                read_seq: 2,
+            },
+            cells: vec![FenceCellSettlement {
+                cell: "a".into(),
+                epoch,
+                cover: 10,
+                credit: CellCredit::Credit,
+            }],
+        },
+    });
+    assert!(
+        settled.iter().any(|effect| matches!(
+            effect,
+            Effect::Release {
+                request: 1,
+                result: Ok(()),
+                ..
+            }
+        )),
+        "the settlement still releases the held gate: {settled:?}"
+    );
+    shell.state.validate().expect("state invariant");
+}
+
+/// A proof that lands after its settlement was already processed settles
+/// from the latch at once instead of holding for a round that will never
+/// come again: the proof and the settlement travel separate actor paths, so
+/// either order resolves the gate. A gate above the latched cover still
+/// holds for a later round. Fail-before: without the latch consult the late
+/// proof holds and never releases.
+// Modified by ryuzcorp (ryuzcorp/celld): fence-round latch (0068).
+#[test]
+fn fence_settlement_before_proof_settles_from_latch() {
+    let mut shell = bucket_gate_shell();
+    shell.start();
+    open_gated_writes(&mut shell, &[1, 2]);
+    let epoch = shell.owners["a"].epoch;
+    // The settlement arrives first: no gate holds yet, so nothing releases
+    // — but the verified cover latches.
+    let early = shell.send(Event::FenceRoundVerified {
+        round: FenceRoundSettlement {
+            order: ProofThenRead {
+                proof_seq: 1,
+                read_seq: 2,
+            },
+            cells: vec![FenceCellSettlement {
+                cell: "a".into(),
+                epoch,
+                cover: 11,
+                credit: CellCredit::Credit,
+            }],
+        },
+    });
+    assert!(
+        !early
+            .iter()
+            .any(|effect| matches!(effect, Effect::Release { .. })),
+        "no hold yet, so the early settlement releases nothing: {early:?}"
+    );
+    // The covered proof resolves at once: release, no per-gate read, no hold.
+    let op = held_gate_op_for_position(&shell.held, 1);
+    let late = shell.send(Event::DurableReached {
+        op,
+        result: Ok(1),
+        source: ProofSource::BucketBundle,
+        ticket: Some(10),
+    });
+    assert!(
+        late.iter().any(|effect| matches!(
+            effect,
+            Effect::Release {
+                request: 1,
+                result: Ok(()),
+                ..
+            }
+        )),
+        "the late proof settles from the latch: {late:?}"
+    );
+    assert!(
+        !late
+            .iter()
+            .any(|effect| matches!(effect, Effect::VerifyOwnership { .. })),
+        "the latched proof opens no per-gate read: {late:?}"
+    );
+    let waits = shell
+        .state
+        .probes()
+        .find(|(probe, _)| *probe == Probe::GateFenceWait)
+        .map(|(_, count)| count);
+    assert_eq!(waits, Some(0), "the latched gate never holds");
+    // A gate above the latched cover still holds for a later round.
+    let op = held_gate_op_for_position(&shell.held, 2);
+    let held = shell.send(Event::DurableReached {
+        op,
+        result: Ok(2),
+        source: ProofSource::BucketBundle,
+        ticket: Some(12),
+    });
+    assert!(
+        !held
+            .iter()
+            .any(|effect| matches!(effect, Effect::Release { .. })),
+        "the gate past the latch keeps waiting: {held:?}"
+    );
+    assert!(
+        !held
+            .iter()
+            .any(|effect| matches!(effect, Effect::VerifyOwnership { .. })),
+        "the gate past the latch still opens no per-gate read: {held:?}"
+    );
+    let settled = shell.send(Event::FenceRoundVerified {
+        round: FenceRoundSettlement {
+            order: ProofThenRead {
+                proof_seq: 3,
+                read_seq: 4,
+            },
+            cells: vec![FenceCellSettlement {
+                cell: "a".into(),
+                epoch,
+                cover: 12,
+                credit: CellCredit::Credit,
+            }],
+        },
+    });
+    assert!(
+        settled.iter().any(|effect| matches!(
+            effect,
+            Effect::Release {
+                request: 2,
+                result: Ok(()),
+                ..
+            }
+        )),
+        "the next round releases the held gate: {settled:?}"
+    );
+    shell.state.validate().expect("state invariant");
+}
+
+/// A failed round clears the latch: a later proof holds for the next round
+/// instead of settling from a stale cover. Fail-before: without the clear
+/// the late proof releases proven from the stale latch.
+// Modified by ryuzcorp (ryuzcorp/celld): fence-round latch (0068).
+#[test]
+fn fence_latch_cleared_on_fence_failure() {
+    let mut shell = bucket_gate_shell();
+    shell.start();
+    open_gated_writes(&mut shell, &[1]);
+    let epoch = shell.owners["a"].epoch;
+    let latch = || FenceRoundSettlement {
+        order: ProofThenRead {
+            proof_seq: 1,
+            read_seq: 2,
+        },
+        cells: vec![FenceCellSettlement {
+            cell: "a".into(),
+            epoch,
+            cover: 11,
+            credit: CellCredit::Credit,
+        }],
+    };
+    shell.send(Event::FenceRoundVerified { round: latch() });
+    // The fence fails the cell: the rows fall back to per-cell upload, and
+    // the latch clears so nothing settles from the old cover again.
+    let failed = shell.send(Event::FenceRoundVerified {
+        round: FenceRoundSettlement {
+            order: ProofThenRead {
+                proof_seq: 3,
+                read_seq: 4,
+            },
+            cells: vec![FenceCellSettlement {
+                cell: "a".into(),
+                epoch,
+                cover: 12,
+                credit: CellCredit::Uncredited,
+            }],
+        },
+    });
+    assert!(
+        !failed
+            .iter()
+            .any(|effect| matches!(effect, Effect::Release { .. })),
+        "no hold is open, so the failed round releases nothing: {failed:?}"
+    );
+    let op = held_gate_op_for_position(&shell.held, 1);
+    let held = shell.send(Event::DurableReached {
+        op,
+        result: Ok(1),
+        source: ProofSource::BucketBundle,
+        ticket: Some(10),
+    });
+    assert!(
+        !held
+            .iter()
+            .any(|effect| matches!(effect, Effect::Release { .. })),
+        "the stale latch settles nothing: the gate holds: {held:?}"
+    );
+    assert!(
+        !held
+            .iter()
+            .any(|effect| matches!(effect, Effect::VerifyOwnership { .. })),
+        "the held gate still opens no per-gate read: {held:?}"
+    );
+    // The next verified round releases it.
+    let settled = shell.send(Event::FenceRoundVerified { round: latch() });
+    assert!(
+        settled.iter().any(|effect| matches!(
+            effect,
+            Effect::Release {
+                request: 1,
+                result: Ok(()),
+                ..
+            }
+        )),
+        "a later verified round releases the held gate: {settled:?}"
+    );
+    shell.state.validate().expect("state invariant");
+}
+
+/// The latch never crosses epochs: a proof on a new epoch holds even when
+/// its ticket is at or below an old verified cover. Fail-before: a latch
+/// keyed by cell alone settles the new-epoch gate from the stale cover.
+/// Tickets restart with every residency and only grow within one, so a
+/// same-epoch gate with a small ticket is always old — but a new epoch is a
+/// new residency (a takeover moved the cell), and its small tickets must
+/// never match the old cover.
+// Modified by ryuzcorp (ryuzcorp/celld): fence-round latch (0068).
+#[test]
+fn fence_latch_ignores_new_epoch() {
+    let mut shell = bucket_gate_shell();
+    shell.start();
+    open_gated_writes(&mut shell, &[1]);
+    let epoch = shell.owners["a"].epoch;
+    shell.send(Event::FenceRoundVerified {
+        round: FenceRoundSettlement {
+            order: ProofThenRead {
+                proof_seq: 1,
+                read_seq: 2,
+            },
+            cells: vec![FenceCellSettlement {
+                cell: "a".into(),
+                epoch,
+                cover: 11,
+                credit: CellCredit::Credit,
+            }],
+        },
+    });
+    // The old write resolves from the latch first, draining its barrier, so
+    // only the new epoch's barrier is live below.
+    let op = held_gate_op_for_position(&shell.held, 1);
+    let old = shell.send(Event::DurableReached {
+        op,
+        result: Ok(1),
+        source: ProofSource::BucketBundle,
+        ticket: Some(10),
+    });
+    assert!(
+        old.iter().any(|effect| matches!(
+            effect,
+            Effect::Release {
+                request: 1,
+                result: Ok(()),
+                ..
+            }
+        )),
+        "the old write settles from the latch: {old:?}"
+    );
+    // The cell is evicted (its activity is over, so nothing pins it) and the
+    // record is re-created at a new epoch (a peer took it over and gave it
+    // up). The reclaim claims one epoch further on and starts a new
+    // residency: waiter tickets restart, so the new write's small ticket
+    // must never match the old cover.
+    shell.send(Event::ActivityFinished { request: 1 });
+    shell.send(Event::Evict { cell: "a".into() });
+    shell.owners.insert(
+        "a".into(),
+        OwnerRecord {
+            node: None,
+            epoch: epoch + 1,
+            etag: "released".into(),
+        },
+    );
+    shell.send(Event::RequestAt {
+        request: 2,
+        cell: "a".into(),
+        now_mono_ms: MONO_MS,
+    });
+    // Capture the new barrier's op from its own effects: the settled old
+    // barrier still sits in `held`, so a position lookup would find the
+    // drained op and prove nothing.
+    let out = shell.send(Event::OutputAt {
+        request: 2,
+        channel: Channel::Response,
+        position: Some(1),
+        observed: None,
+        epoch: None,
+        now_mono_ms: MONO_MS,
+    });
+    let op = match out.iter().find_map(|effect| match effect {
+        Effect::AwaitDurable { op, .. } => Some(*op),
+        _ => None,
+    }) {
+        Some(op) => op,
+        None => panic!("the new write waits for its proof, got: {out:?}"),
+    };
+    let held = shell.send(Event::DurableReached {
+        op,
+        result: Ok(1),
+        source: ProofSource::BucketBundle,
+        ticket: Some(1),
+    });
+    assert!(
+        !held
+            .iter()
+            .any(|effect| matches!(effect, Effect::Release { .. })),
+        "the new-epoch gate never settles from the old latch: {held:?}"
+    );
+    assert!(
+        !held
+            .iter()
+            .any(|effect| matches!(effect, Effect::VerifyOwnership { .. })),
+        "the new-epoch gate holds for its own round: {held:?}"
+    );
+    shell.state.validate().expect("state invariant");
+}
+
+/// An unordered round latches nothing: a later proof holds for a real round
+/// instead of settling from a read that predated its proof. Fail-before:
+/// latching the unordered cover releases the late proof at once.
+// Modified by ryuzcorp (ryuzcorp/celld): fence-round latch (0068).
+#[test]
+fn fence_unordered_round_leaves_no_latch() {
+    let mut shell = bucket_gate_shell();
+    shell.start();
+    open_gated_writes(&mut shell, &[1]);
+    let epoch = shell.owners["a"].epoch;
+    for order in [
+        ProofThenRead {
+            proof_seq: 2,
+            read_seq: 2,
+        },
+        ProofThenRead {
+            proof_seq: 3,
+            read_seq: 2,
+        },
+    ] {
+        shell.send(Event::FenceRoundVerified {
+            round: FenceRoundSettlement {
+                order,
+                cells: vec![FenceCellSettlement {
+                    cell: "a".into(),
+                    epoch,
+                    cover: 11,
+                    credit: CellCredit::Credit,
+                }],
+            },
+        });
+    }
+    let op = held_gate_op_for_position(&shell.held, 1);
+    let held = shell.send(Event::DurableReached {
+        op,
+        result: Ok(1),
+        source: ProofSource::BucketBundle,
+        ticket: Some(10),
+    });
+    assert!(
+        !held
+            .iter()
+            .any(|effect| matches!(effect, Effect::Release { .. })),
+        "no latch was stored: the gate holds: {held:?}"
+    );
     shell.state.validate().expect("state invariant");
 }
 
 /// A fence read issued at or before the proof is never accepted: even a
-/// `Credit` verdict on the cell fails the covered gates instead of
+/// `Credit` verdict on the cell fails the covered holds instead of
 /// acknowledging them.
 #[test]
 fn fence_round_before_its_proof_is_never_accepted() {
@@ -1396,16 +1939,27 @@ fn fence_round_before_its_proof_is_never_accepted() {
         let mut shell = bucket_gate_shell();
         shell.start();
         open_gated_writes(&mut shell, &[1]);
-        let mut seen = Vec::new();
-        prove_gate(&mut shell, &mut seen, 1);
-        let epoch = verify_epoch_for_cell(&shell.held, "a");
+        let op = held_gate_op_for_position(&shell.held, 1);
+        let proven = shell.send(Event::DurableReached {
+            op,
+            result: Ok(1),
+            source: ProofSource::BucketBundle,
+            ticket: Some(10),
+        });
+        assert!(
+            !proven
+                .iter()
+                .any(|effect| matches!(effect, Effect::VerifyOwnership { .. })),
+            "the proof holds for the settlement: {proven:?}"
+        );
+        let epoch = shell.owners["a"].epoch;
         let settled = shell.send(Event::FenceRoundVerified {
             round: FenceRoundSettlement {
                 order,
                 cells: vec![FenceCellSettlement {
                     cell: "a".into(),
                     epoch,
-                    cover: 1,
+                    cover: 10,
                     credit: CellCredit::Credit,
                 }],
             },

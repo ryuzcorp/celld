@@ -338,10 +338,13 @@ impl CellRuntime {
         cell: &str,
         epoch: u64,
         position: u64,
-    ) -> anyhow::Result<(u64, celld_logic::ProofSource)> {
+    ) -> anyhow::Result<(u64, celld_logic::ProofSource, Option<u64>)> {
         match &self.replication {
             Some(replication) => replication.await_durable(cell, epoch, position).await,
-            None => Ok((position, celld_logic::ProofSource::Fleet)),
+            // No waiter ran, so there is no ticket: the label keeps today's
+            // read and the core never holds on this proof.
+            // Modified by ryuzcorp (ryuzcorp/celld): fence-round hold (0068).
+            None => Ok((position, celld_logic::ProofSource::Fleet, None)),
         }
     }
 

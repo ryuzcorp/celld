@@ -468,6 +468,15 @@ pub enum Message {
     /// The log tier changed the folded log object the next lease write
     /// must carry (lease-fold): renew now so the change becomes durable.
     NudgeNodeLease,
+    /// A bucket bundle flush's fence round answered: every entry was read
+    /// after the round's bundle PUT completed. The output gate settles the
+    /// round's covered gates with no per-gate `VerifyOwnership` read —
+    /// credited cells release proven, uncredited cells fail exactly like a
+    /// refused ownership read.
+    /// Modified by ryuzcorp (ryuzcorp/celld): per-round fence reads (0068).
+    FenceRoundVerified {
+        round: celld_logic::log_tier::FenceRoundSettlement,
+    },
     /// Stop new internal routing while a clean same-node reload drains. The
     /// request shell has already stopped admission; this closes wake and
     /// service paths that do not pass through the HTTP gate.
@@ -3067,6 +3076,9 @@ impl Actor {
                     out,
                 );
             }
+            Message::FenceRoundVerified { round } => {
+                self.drive(Event::FenceRoundVerified { round }, out);
+            }
             Message::MaintainWake { cell } => {
                 if let Some(host) = &self.host {
                     let alarm = host.with_alarm(&cell, |alarm, _| alarm);
@@ -3918,30 +3930,64 @@ impl Actor {
                 position,
             } => {
                 if let Some(runtime) = self.host.clone() {
+                    let node_log = self.node_log.clone();
                     out.spawn_scoped(async move {
                         // The replicator reports the position it actually
                         // proved durable and which mechanism proved it; the
                         // core acks only if the position covers this write,
                         // and decides per source whether ownership
                         // verification must run first (Effect::VerifyOwnership).
-                        let (result, source) =
+                        let (result, source, ticket) =
                             match runtime.await_durable(&cell, epoch, position).await {
-                                Ok((durable, source)) => (Ok(durable), source),
+                                Ok((durable, source, ticket)) => {
+                                    // A fence-round-enabled bundle proof holds
+                                    // its gate for the round's settlement:
+                                    // label it after the proof lands, when
+                                    // the round's ticket cover is already
+                                    // inserted. The ticket is the
+                                    // commit-ordered link the cover is
+                                    // written in; the gate's position is a
+                                    // SQLite fingerprint in unrelated units
+                                    // and is never compared against it.
+                                    let source = match source {
+                                        celld_logic::ProofSource::Bucket => {
+                                            let manager = node_log.lock().unwrap();
+                                            crate::node_log::label_bucket_proof(
+                                                manager.as_deref(),
+                                                &cell,
+                                                epoch,
+                                                ticket,
+                                            )
+                                        }
+                                        source => source,
+                                    };
+                                    (Ok(durable), source, ticket)
+                                }
                                 Err(error) => {
                                     eprintln!(
                                         "celld output-gate durability proof failed for {cell} \
                                          epoch {epoch}: {error:#}"
                                     );
-                                    (Err(Failure::Ambiguous), celld_logic::ProofSource::Bucket)
+                                    (
+                                        Err(Failure::Ambiguous),
+                                        celld_logic::ProofSource::Bucket,
+                                        None,
+                                    )
                                 }
                             };
-                        CompletedEffect::plain(Event::DurableReached { op, result, source })
+                        CompletedEffect::plain(Event::DurableReached {
+                            op,
+                            result,
+                            source,
+                            ticket,
+                        })
                     });
                 } else {
                     immediate.push_back(Event::DurableReached {
                         op,
                         result: Ok(position),
                         source: celld_logic::ProofSource::Fleet,
+                        ticket: None,
                     });
                 }
             }

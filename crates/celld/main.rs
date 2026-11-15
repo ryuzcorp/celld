@@ -4741,6 +4741,15 @@ async fn async_main(
                 celld::node_log::eviction_policy_from_env()?,
             ));
             *actor.node_log.lock().unwrap() = Some(manager.clone());
+            // Bucket fence rounds settle output gates with no per-gate
+            // `VerifyOwnership` read: hand every round's settlement to the
+            // actor, which drives `Event::FenceRoundVerified` into the
+            // core. Best-effort — a gone actor just falls back to per-gate
+            // reads. Modified by ryuzcorp (ryuzcorp/celld): per-round fence reads (0068).
+            let fence_tx = app.tx.clone();
+            manager.set_fence_sink(Some(Arc::new(move |round| {
+                let _ = fence_tx.send(Message::FenceRoundVerified { round });
+            })));
             // Recovery-before-install is fatal for every posture: the
             // predecessor's folded state lives in the lease record this
             // session is about to replace, and the install writes a fresh

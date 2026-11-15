@@ -66,6 +66,10 @@ probes! {
     /// A write released with no new proof: a verified proof already covered
     /// its position at this epoch.
     GateReleasedProven,
+    /// A fence-round-enabled bundle proof holds its gate for the round's
+    /// settlement instead of opening a per-gate ownership read.
+    /// Modified by ryuzcorp (ryuzcorp/celld): fence-round hold (0068).
+    GateFenceWait,
     /// A gate outlived the operation deadline.
     GateDeadline,
 

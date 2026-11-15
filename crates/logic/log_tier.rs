@@ -608,9 +608,15 @@ pub struct FenceCellSettlement {
     pub cell: CellId,
     /// The cell epoch the round served.
     pub epoch: Epoch,
-    /// Highest gate position this round's proof captured for the cell.
-    /// Gates above it were committed after the proof (or never covered by
-    /// it), so this settlement never answers them.
+    /// Highest durability-waiter ticket this round's proof captured for the
+    /// cell: the flush gathered with this request sequence loaded, so every
+    /// gate whose waiter ticket is at or below it committed before the
+    /// gather and its row is in this round's bundle (or was already
+    /// durable). The gate's barrier position is a SQLite fingerprint in
+    /// unrelated units, so the round matches holds by ticket, never by
+    /// position. Gates above the cover belong to later rounds, so this
+    /// settlement never answers them.
+    /// Modified by ryuzcorp (ryuzcorp/celld): fence-round hold (0068).
     pub cover: u64,
     /// The two-arm verdict for the cell.
     pub credit: CellCredit,

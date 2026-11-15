@@ -3929,6 +3929,41 @@ const EPOCH_GC_SETTLED_RETRY_MS: u64 = 60 * 60 * 1000;
 /// still keeps one tick from listing the bucket thousands of times.
 pub(crate) const EPOCH_GC_CELLS_PER_PASS: usize = 32;
 
+/// Where a bucket fence round's settlement goes. The shell installs a sender
+/// into the actor, so the round's covered gates settle with no per-gate
+/// `VerifyOwnership` read; tests install a recorder or nothing at all.
+/// Modified by ryuzcorp (ryuzcorp/celld): per-round fence reads (0068).
+pub type FenceRoundSink = Arc<dyn Fn(log_tier::FenceRoundSettlement) + Send + Sync>;
+
+/// Label a bucket durability proof for the output gate. A proof whose waiter
+/// ticket is at or below its cell's latest ticket cover makes it
+/// `BucketBundle`: the proof rode a fence-round-enabled bundle flush — the
+/// flush gathered with that request sequence loaded, so the gate's write
+/// committed before the gather and its row is in the round's bundle (or was
+/// already durable) — and the core holds the gate for the round's settlement
+/// instead of opening a per-gate `VerifyOwnership` read. Anything else stays
+/// `Bucket` for today's immediate read: no cover, a newer ticket, a
+/// fallback-marked cell (uncredited rows re-prove per-cell by design), and
+/// the kill-switch path, which never inserts a cover. The label is read
+/// after the proof lands (covers are inserted before the counters advance,
+/// and the waiter only wakes after), so a covered proof is always labelled.
+/// Modified by ryuzcorp (ryuzcorp/celld): fence-round hold (0068).
+pub(crate) fn label_bucket_proof(
+    manager: Option<&NodeLogManager>,
+    cell: &str,
+    epoch: u64,
+    ticket: Option<u64>,
+) -> celld_logic::ProofSource {
+    let covered = manager.is_some_and(|manager| {
+        ticket.is_some_and(|ticket| manager.fence_covered_for(cell, epoch, ticket))
+    });
+    if covered {
+        celld_logic::ProofSource::BucketBundle
+    } else {
+        celld_logic::ProofSource::Bucket
+    }
+}
+
 /// Everything node-log recovery needs from the node: the bucket, the signed
 /// peer client, address resolution, and the raw per-cell upload.
 pub struct NodeLogManager {
@@ -3948,6 +3983,45 @@ pub struct NodeLogManager {
     /// loop. The manager itself is the installed `Shipper`, delegating here.
     inner: Mutex<Option<Arc<FleetShipper>>>,
     bundle_seq: std::sync::atomic::AtomicU64,
+    /// The proof-then-read ordering counter for bucket fence rounds: the
+    /// bundle PUT's completion side mints `proof_seq` right after the PUT
+    /// returns, and the fence-entries issue side mints `read_seq` right
+    /// before the reads go out, so every round's read strictly follows its
+    /// own proof (`ProofThenRead::ordered`). One atomic serves concurrent
+    /// flushes: markers only ever grow, so a round's read can never predate
+    /// its proof.
+    /// Modified by ryuzcorp (ryuzcorp/celld): per-round fence reads (0068).
+    fence_seq: std::sync::atomic::AtomicU64,
+    /// Where a bucket fence round's settlement goes: the shell hands
+    /// `Event::FenceRoundVerified` to the output gate so the round's covered
+    /// gates settle with no per-gate `VerifyOwnership` read. Best-effort —
+    /// a closed receiver just means the gates fall back to their own reads.
+    /// `None` in tests, which assert on the returned settlement directly.
+    /// Modified by ryuzcorp (ryuzcorp/celld): per-round fence reads (0068).
+    fence_sink: Mutex<Option<FenceRoundSink>>,
+    /// Cells whose latest fence round uncredited them: their rows re-prove
+    /// per-cell while the node keeps bundling the rest, so one taken-over
+    /// cell never tanks the batching of the others. Cleared on credit and
+    /// for cells with nothing dirty left.
+    /// Modified by ryuzcorp (ryuzcorp/celld): per-round fence reads (0068).
+    fence_fallback_cells: Mutex<BTreeSet<(String, u64)>>,
+    /// The latest fence round's ticket cover per (cell, epoch): the flush's
+    /// gather request sequence for the cell — the waiter-ticket high-water
+    /// mark whose writes this round's bundle captured. The shell labels a
+    /// bucket proof `BucketBundle` — hold for the settlement, no per-gate
+    /// read — exactly when the proof's waiter ticket is at or below it.
+    /// Ticket units, not positions: barrier positions are SQLite
+    /// fingerprints in unrelated units and can never be compared against a
+    /// cover. Latest wins: request sequences only grow, and a newer fence
+    /// verdict supersedes an older one. Pruned with the fallback marks per
+    /// flush.
+    /// Modified by ryuzcorp (ryuzcorp/celld): fence-round hold (0068).
+    fence_covers: Mutex<BTreeMap<(String, u64), u64>>,
+    /// Test-only override for the `CELLD_FENCE_ROUNDS` leg, so deterministic
+    /// tests do not touch the process environment.
+    /// Modified by ryuzcorp (ryuzcorp/celld): per-round fence reads (0068).
+    #[cfg(test)]
+    fence_rounds_override: Mutex<Option<bool>>,
     /// The leader's own index of the bundles it wrote this run. Cell
     /// membership stays complete for the process session, while full row
     /// metadata stays bounded. A restart loses the index safely because it
@@ -4551,6 +4625,12 @@ impl NodeLogManager {
             transport,
             inner: Mutex::new(None),
             bundle_seq: std::sync::atomic::AtomicU64::new(0),
+            fence_seq: std::sync::atomic::AtomicU64::new(0),
+            fence_sink: Mutex::new(None),
+            fence_fallback_cells: Mutex::new(BTreeSet::new()),
+            fence_covers: Mutex::new(BTreeMap::new()),
+            #[cfg(test)]
+            fence_rounds_override: Mutex::new(None),
             bundle_index: Mutex::new(BundleIndex::default()),
             bundle_gc_cursor: tokio::sync::Mutex::new(None),
             bundle_cache: tokio::sync::Mutex::new(None),
@@ -6954,12 +7034,341 @@ fn spawn_fragment_gc(
     });
 }
 
+/// Who owned the epoch one bundle flush proved: a fleet shipper, or the
+/// published bucket-session epoch with no shipper.
+/// Modified by ryuzcorp (ryuzcorp/celld): per-round fence reads (0068).
+enum FlushOwner {
+    Fleet(Arc<FleetShipper>, u64),
+    Bucket(u64),
+}
+
+/// What one bundle PUT proved. `flushed` is today's bool: the PUT landed
+/// and the session-record arm credited the flush. `settlement` carries the
+/// fence round when one ran (bucket path with fence rounds on and the
+/// record arm passed): the caller advances only credited cells and the
+/// shell hands the settlement to the output gate. `None` keeps today's
+/// record-only credit — fleet path, kill switch off, or record refused.
+/// Modified by ryuzcorp (ryuzcorp/celld): per-round fence reads (0068).
+pub(crate) struct PutBundleOutcome {
+    pub flushed: bool,
+    pub settlement: Option<log_tier::FenceRoundSettlement>,
+}
+
+impl PutBundleOutcome {
+    fn refused() -> Self {
+        Self {
+            flushed: false,
+            settlement: None,
+        }
+    }
+}
+
+/// Whether the operator enabled bucket-posture fence rounds
+/// (`CELLD_FENCE_ROUNDS=0` disables). Default on: only an explicit `0`
+/// reverts the bucket path to per-gate reads. Pure value helper keeps
+/// tests deterministic without touching the process environment.
+/// Modified by ryuzcorp (ryuzcorp/celld): per-round fence reads (0068).
+fn fence_rounds_env_value(value: Option<&str>) -> bool {
+    !matches!(value.map(str::trim), Some("0"))
+}
+
+/// Production read of the fence-round switch, per flush (not per process).
+/// Modified by ryuzcorp (ryuzcorp/celld): per-round fence reads (0068).
+pub(crate) fn fence_rounds_env_on() -> bool {
+    fence_rounds_env_value(std::env::var("CELLD_FENCE_ROUNDS").ok().as_deref())
+}
+
 impl NodeLogManager {
+    /// Install the fence-round sink: production hands every bucket fence
+    /// round's settlement to the actor, which drives
+    /// `Event::FenceRoundVerified` into the output gate. `None` clears it.
+    /// Modified by ryuzcorp (ryuzcorp/celld): per-round fence reads (0068).
+    pub fn set_fence_sink(&self, sink: Option<FenceRoundSink>) {
+        *self.fence_sink.lock().unwrap() = sink;
+    }
+
+    /// Whether this flush may settle its gates by round. The operator kill
+    /// switch `CELLD_FENCE_ROUNDS=0` reverts the bucket path to per-gate
+    /// `VerifyOwnership` reads. Default on: anything but an explicit `0`
+    /// keeps the round path. Re-checked per flush, not per process.
+    /// Modified by ryuzcorp (ryuzcorp/celld): per-round fence reads (0068).
+    pub(crate) fn fence_rounds_enabled(&self) -> bool {
+        #[cfg(test)]
+        if let Some(forced) = *self.fence_rounds_override.lock().unwrap() {
+            return forced;
+        }
+        fence_rounds_env_on()
+    }
+
+    /// Test-only override for the `CELLD_FENCE_ROUNDS` leg, so deterministic
+    /// tests do not touch the process environment.
+    /// Modified by ryuzcorp (ryuzcorp/celld): per-round fence reads (0068).
+    #[cfg(test)]
+    pub fn set_fence_rounds_override_for_test(&self, on: Option<bool>) {
+        *self.fence_rounds_override.lock().unwrap() = on;
+    }
+
+    /// Whether this cell still owes per-cell proof: its latest fence round
+    /// left it uncredited, so `sync_loop` uploads it per-cell while the
+    /// node keeps bundling the rest.
+    /// Modified by ryuzcorp (ryuzcorp/celld): per-round fence reads (0068).
+    pub(crate) fn fence_fallback(&self, cell: &str, epoch: u64) -> bool {
+        self.fence_fallback_cells
+            .lock()
+            .unwrap()
+            .contains(&(cell.to_string(), epoch))
+    }
+
+    /// Keep fallback marks only for cells with rows still dirty: a credited
+    /// cell leaves the set at credit time, and a clean or removed cell
+    /// needs no per-cell exemption.
+    /// Modified by ryuzcorp (ryuzcorp/celld): per-round fence reads (0068).
+    pub(crate) fn retain_fence_fallback(&self, live: &BTreeSet<(String, u64)>) {
+        self.fence_fallback_cells
+            .lock()
+            .unwrap()
+            .retain(|key| live.contains(key));
+        self.fence_covers
+            .lock()
+            .unwrap()
+            .retain(|key, _| live.contains(key));
+    }
+
+    /// Whether a bucket proof with waiter `ticket` for (`cell`, `epoch`)
+    /// rode a fence-round-enabled bundle flush whose round covers it: the
+    /// shell labels it `BucketBundle` so the core holds the gate for the
+    /// settlement instead of opening a per-gate read. False when fence
+    /// rounds are off (no round ever inserts), when the cell is marked for
+    /// per-cell fallback (uncredited rows re-prove per-cell by design, and
+    /// a concurrent per-cell upload must never be settled by a bundle
+    /// round), and when the ticket postdates the latest cover (a later
+    /// round's gather had not loaded it, so its write is not in any bundle
+    /// this round vouches for) — so the kill-switch, fallback, and
+    /// not-yet-bundled paths keep today's immediate per-gate read.
+    /// Modified by ryuzcorp (ryuzcorp/celld): fence-round hold (0068).
+    pub(crate) fn fence_covered_for(&self, cell: &str, epoch: u64, ticket: u64) -> bool {
+        self.fence_rounds_enabled()
+            && !self.fence_fallback(cell, epoch)
+            && self
+                .fence_covers
+                .lock()
+                .unwrap()
+                .get(&(cell.to_string(), epoch))
+                .is_some_and(|cover| *cover >= ticket)
+    }
+
+    /// Mark a fence-uncredited cell for per-cell fallback.
+    /// Modified by ryuzcorp (ryuzcorp/celld): per-round fence reads (0068).
+    fn mark_fence_fallback(&self, cell: &str, epoch: u64) {
+        self.fence_fallback_cells
+            .lock()
+            .unwrap()
+            .insert((cell.to_string(), epoch));
+    }
+
+    /// A credited cell rides the bundle again: clear its fallback mark.
+    /// Modified by ryuzcorp (ryuzcorp/celld): per-round fence reads (0068).
+    fn unmark_fence_fallback(&self, cell: &str, epoch: u64) {
+        self.fence_fallback_cells
+            .lock()
+            .unwrap()
+            .remove(&(cell.to_string(), epoch));
+    }
+
+    /// One fence-entry read for a flush-round cell: the `own.json` GET via
+    /// the existing ownership store. A released record (empty node) reads as
+    /// missing, and a read error fails the cell — never credits, never hangs.
+    /// Modified by ryuzcorp (ryuzcorp/celld): per-round fence reads (0068).
+    async fn read_fence_entry(&self, cell: &str) -> log_tier::RoundFenceOutcome {
+        match self.ownership.read_owner(cell).await {
+            Ok(Some(record)) => match record.node {
+                Some(node) => log_tier::RoundFenceOutcome::Entry {
+                    node,
+                    epoch: record.epoch,
+                },
+                None => log_tier::RoundFenceOutcome::Missing,
+            },
+            Ok(None) => log_tier::RoundFenceOutcome::Missing,
+            Err(error) => {
+                warn!(cell, %error, "fence entry read failed; the round leaves this cell uncredited");
+                log_tier::RoundFenceOutcome::ReadError
+            }
+        }
+    }
+
+    /// Refuse a bundle flush whose session-record arm failed, exactly as
+    /// before: the owning shipper degrades (fleet) or the node stops
+    /// bundling (bucket), so the uncredited rows fall back to per-cell
+    /// upload — never acked on the bundle. `fenced` latches the session
+    /// when the bucket definitively answered that the record moved; a read
+    /// error stays re-armable.
+    /// Modified by ryuzcorp (ryuzcorp/celld): per-round fence reads (0068).
+    fn refuse_bundle_credit(
+        &self,
+        owner: &FlushOwner,
+        key: &str,
+        fenced: bool,
+    ) -> PutBundleOutcome {
+        match owner {
+            FlushOwner::Fleet(flusher, _) => {
+                // Degrade the shipper that OWNED this flush's
+                // epoch, not whichever is installed now: a flush
+                // racing a legitimate reconfiguration must not
+                // poison the successor ensemble it knows nothing
+                // about. For a true zombie the flusher IS the
+                // installed shipper and stops exactly as before;
+                // for a swap race this degrades a retired object,
+                // which is the correct no-op — the lab measured
+                // the alternative as an epoch-churn loop.
+                flusher.degrade("record moved under a bundle flush");
+            }
+            FlushOwner::Bucket(_) => {
+                // Fenced mid-flight (record no longer Open at epoch):
+                // stop bundling so uncredited rows fall back to per-cell
+                // uploads, never acked on the bundle.
+                self.stop_bucket_bundling(fenced);
+            }
+        }
+        warn!(key, "bundle flush not credited: record moved");
+        PutBundleOutcome::refused()
+    }
+
+    /// Bucket-path credit with per-round fence reads: after the bundle PUT
+    /// succeeded, re-read the session record and read one fence entry per
+    /// distinct (cell, epoch) in the round CONCURRENTLY, then credit each
+    /// cell with the two-arm predicate. Both reads are issued strictly
+    /// after the PUT completed (proof-then-read); the ordering witness the
+    /// core needs is minted here.
+    /// Modified by ryuzcorp (ryuzcorp/celld): per-round fence reads (0068).
+    async fn credit_fence_round(
+        &self,
+        key: String,
+        rows: Vec<celld_ltx::bundle::BundleRow>,
+        entries: &[celld_ltx::bundle::BundleEntry],
+        epoch: u64,
+        owner: &FlushOwner,
+        ticket_reqs: &BTreeMap<(String, u64), u64>,
+    ) -> PutBundleOutcome {
+        // One fence read per distinct (cell, epoch). The cover is the flush's
+        // gather ticket per cell — the request sequence loaded when the rows
+        // were gathered, in the same task before this PUT. A gate whose
+        // waiter ticket is at or below it committed before the gather, so
+        // its row is in this round's bundle (or was already durable); the
+        // barrier position cannot serve instead, because it is a SQLite
+        // fingerprint in unrelated units. Cells the legacy path flushed
+        // without tickets cover nothing and never hold.
+        let mut covers: BTreeMap<(String, u64), u64> = BTreeMap::new();
+        for entry in entries {
+            let req = ticket_reqs
+                .get(&(entry.cell.clone(), entry.cell_epoch))
+                .copied()
+                .unwrap_or(0);
+            covers
+                .entry((entry.cell.clone(), entry.cell_epoch))
+                .and_modify(|cover| *cover = (*cover).max(req))
+                .or_insert(req);
+        }
+        // Proof-then-read: the PUT above already completed, the proof side
+        // mints first and the fence-issue side second, so every fence read
+        // is strictly after the proof it follows.
+        let order = log_tier::ProofThenRead {
+            proof_seq: self.fence_seq.fetch_add(1, Ordering::SeqCst),
+            read_seq: self.fence_seq.fetch_add(1, Ordering::SeqCst),
+        };
+        let (record, fences) = futures_util::join!(
+            read_record(&self.bucket, &self.session),
+            futures_util::future::join_all(
+                covers.keys().map(|(cell, _)| self.read_fence_entry(cell))
+            )
+        );
+        // A read the bucket answered is definitive and latches the session;
+        // a read error is transient and leaves it re-armable.
+        let fenced = record.is_ok();
+        let record = record.ok().flatten();
+        let record_ref = record.as_ref().map(|folded| &folded.record);
+        if !log_tier::bundle_credit_allowed(record_ref, epoch) {
+            return self.refuse_bundle_credit(owner, &key, fenced);
+        }
+        let round_cells: Vec<(String, u64)> = covers.keys().cloned().collect();
+        let mut fence_entries: BTreeMap<String, log_tier::RoundFenceOutcome> = BTreeMap::new();
+        for ((cell, _), outcome) in covers.keys().zip(fences) {
+            fence_entries.insert(cell.clone(), outcome);
+        }
+        let verdicts = log_tier::round_credit(
+            record_ref,
+            epoch,
+            &self.node,
+            &round_cells,
+            &fence_entries,
+            order,
+        );
+        let mut settled = Vec::with_capacity(round_cells.len());
+        let mut covers_to_publish = BTreeMap::new();
+        for ((cell, cell_epoch), (_, credit)) in round_cells.into_iter().zip(verdicts) {
+            let cover = covers[&(cell.clone(), cell_epoch)];
+            if credit.credited() {
+                self.unmark_fence_fallback(&cell, cell_epoch);
+            } else {
+                self.mark_fence_fallback(&cell, cell_epoch);
+            }
+            // Latest wins: request sequences only grow, and the newest fence
+            // verdict supersedes older ones for the shell's proof labelling.
+            covers_to_publish.insert((cell.clone(), cell_epoch), cover);
+            settled.push(log_tier::FenceCellSettlement {
+                cell,
+                epoch: cell_epoch,
+                cover,
+                credit,
+            });
+        }
+        self.fence_covers.lock().unwrap().extend(covers_to_publish);
+        let settlement = log_tier::FenceRoundSettlement {
+            order,
+            cells: settled,
+        };
+        // Hand the round to the output gate. The shell labels a proof
+        // `BucketBundle` exactly when its waiter ticket is at or below the
+        // round's ticket cover, so the core holds its gate for this
+        // settlement instead of opening a per-gate `VerifyOwnership` read
+        // however the two events interleave; a lost settlement still falls
+        // back to the per-gate read at the operation deadline.
+        // Best-effort: a gone receiver falls back to per-gate reads, never
+        // a hang.
+        if let Some(sink) = self.fence_sink.lock().unwrap().as_ref() {
+            sink(settlement.clone());
+        }
+        self.bundle_index.lock().unwrap().insert(key, rows);
+        PutBundleOutcome {
+            flushed: true,
+            settlement: Some(settlement),
+        }
+    }
+
     /// One object per node-flush: `log/<node>/bundle/e<epoch>-<seq>.ltxb`,
     /// verbatim L0 segments plus the footer (`crate::bundle`). Keys are
     /// unique per (epoch, seq), so the PUT needs no condition; the epoch in
     /// the key scopes recovery's gather and the eventual GC sweep.
-    pub(crate) async fn put_bundle(&self, entries: Vec<celld_ltx::bundle::BundleEntry>) -> bool {
+    /// Modified by ryuzcorp (ryuzcorp/celld): per-round fence reads (0068).
+    pub(crate) async fn put_bundle(
+        &self,
+        entries: Vec<celld_ltx::bundle::BundleEntry>,
+    ) -> PutBundleOutcome {
+        self.put_bundle_with_tickets(entries, &BTreeMap::new())
+            .await
+    }
+
+    /// `put_bundle` with the flush's gather tickets: per (cell, epoch) the
+    /// request sequence loaded when the rows were gathered. The fence cover
+    /// is this ticket, not a position — barrier positions are SQLite
+    /// fingerprints in unrelated units, so only the commit-ordered ticket
+    /// the gate's waiter holds can be compared against it. The legacy
+    /// ticketless path (tests, non-flush callers) covers nothing.
+    /// Modified by ryuzcorp (ryuzcorp/celld): fence-round hold (0068).
+    pub(crate) async fn put_bundle_with_tickets(
+        &self,
+        entries: Vec<celld_ltx::bundle::BundleEntry>,
+        ticket_reqs: &BTreeMap<(String, u64), u64>,
+    ) -> PutBundleOutcome {
         struct FlushGuard<'a>(&'a std::sync::atomic::AtomicBool);
         impl Drop for FlushGuard<'_> {
             fn drop(&mut self) {
@@ -6973,10 +7382,6 @@ impl NodeLogManager {
         // bucket re-read then `bundle_credit_allowed` credit check verbatim, so
         // credit advances the same counters and `wait_for_durability_ticket`
         // returns `ProofSource::Bucket` for either path.
-        enum FlushOwner {
-            Fleet(Arc<FleetShipper>, u64),
-            Bucket(u64),
-        }
         let owner = {
             let inner = self.inner.lock().unwrap();
             match inner.as_ref() {
@@ -6984,7 +7389,7 @@ impl NodeLogManager {
                 None => {
                     let epoch = self.bucket_epoch.load(Ordering::SeqCst);
                     if epoch == 0 || !self.ltx.bucket_bundles_enabled() {
-                        return false;
+                        return PutBundleOutcome::refused();
                     }
                     FlushOwner::Bucket(epoch)
                 }
@@ -6994,6 +7399,11 @@ impl NodeLogManager {
             FlushOwner::Fleet(_, epoch) => *epoch,
             FlushOwner::Bucket(epoch) => *epoch,
         };
+        // Bucket path with fence rounds on: one ownership-fence read per
+        // flush round instead of one per write. Fleet-posture bundles and
+        // per-cell uploads keep today's per-write `VerifyOwnership`,
+        // unchanged, as does the bucket path with `CELLD_FENCE_ROUNDS=0`.
+        let fence = matches!(owner, FlushOwner::Bucket(_)) && self.fence_rounds_enabled();
         let seq = self.bundle_seq.fetch_add(1, Ordering::SeqCst);
         let bucket_owner = matches!(owner, FlushOwner::Bucket(_));
         let body = match celld_ltx::bundle::encode(&entries) {
@@ -7003,7 +7413,7 @@ impl NodeLogManager {
                 if bucket_owner {
                     self.stop_bucket_bundling(false);
                 }
-                return false;
+                return PutBundleOutcome::refused();
             }
         };
         let rows = match celld_ltx::bundle::decode_rows(&body) {
@@ -7013,12 +7423,17 @@ impl NodeLogManager {
                 if bucket_owner {
                     self.stop_bucket_bundling(false);
                 }
-                return false;
+                return PutBundleOutcome::refused();
             }
         };
         let key = format!("log/{}/bundle/e{epoch}-{seq:08}.ltxb", self.session);
         match self.bucket.put(&key, body).await {
             Ok(()) => {
+                if fence && !entries.is_empty() {
+                    return self
+                        .credit_fence_round(key, rows, &entries, epoch, &owner, ticket_reqs)
+                        .await;
+                }
                 // The credit check: the PUT is unconditional, so by
                 // itself it proves nothing to the ack path — a healed
                 // zombie whose record a recoverer already sealed can
@@ -7041,33 +7456,13 @@ impl NodeLogManager {
                     epoch,
                 );
                 if !credit {
-                    match &owner {
-                        FlushOwner::Fleet(flusher, _) => {
-                            // Degrade the shipper that OWNED this flush's
-                            // epoch, not whichever is installed now: a flush
-                            // racing a legitimate reconfiguration must not
-                            // poison the successor ensemble it knows nothing
-                            // about. For a true zombie the flusher IS the
-                            // installed shipper and stops exactly as before;
-                            // for a swap race this degrades a retired object,
-                            // which is the correct no-op — the lab measured
-                            // the alternative as an epoch-churn loop.
-                            flusher.degrade("record moved under a bundle flush");
-                        }
-                        FlushOwner::Bucket(_) => {
-                            // Fenced mid-flight (record no longer Open at epoch):
-                            // stop bundling so uncredited rows fall back to per-cell
-                            // uploads, never acked on the bundle. A read the bucket
-                            // answered is definitive and latches the session; a read
-                            // error is transient and leaves it re-armable.
-                            self.stop_bucket_bundling(read.is_ok());
-                        }
-                    }
-                    warn!(key, "bundle flush not credited: record moved");
-                    return false;
+                    return self.refuse_bundle_credit(&owner, &key, read.is_ok());
                 }
                 self.bundle_index.lock().unwrap().insert(key, rows);
-                true
+                PutBundleOutcome {
+                    flushed: true,
+                    settlement: None,
+                }
             }
             Err(error) => {
                 warn!(%error, key, "bundle put failed");
@@ -7078,7 +7473,7 @@ impl NodeLogManager {
                 if bucket_owner {
                     self.stop_bucket_bundling(false);
                 }
-                false
+                PutBundleOutcome::refused()
             }
         }
     }
@@ -7978,7 +8373,10 @@ mod bucket_executor_tests {
             open_gate(&manager);
             assert!(!manager.bundle_active(), "no record yet: no bundling");
             assert!(
-                !manager.put_bundle(vec![bundle_entry("c0", 1)]).await,
+                !manager
+                    .put_bundle(vec![bundle_entry("c0", 1)])
+                    .await
+                    .flushed,
                 "no epoch: refused"
             );
             publish_bucket_open(&manager, &bucket).await;
@@ -7988,7 +8386,10 @@ mod bucket_executor_tests {
             );
             assert!(manager.bucket_bundling(), "bucket path, no shipper");
             assert!(
-                manager.put_bundle(vec![bundle_entry("c0", 1)]).await,
+                manager
+                    .put_bundle(vec![bundle_entry("c0", 1)])
+                    .await
+                    .flushed,
                 "open record credits"
             );
             let bundles = bundle_keys(&bucket, "log/n0/gen1/bundle/").await;
@@ -8023,7 +8424,7 @@ mod bucket_executor_tests {
             publish_bucket_open(&manager, &bucket).await;
             let entries: Vec<_> = (0..4).map(|i| bundle_entry(&format!("c{i}"), 1)).collect();
             assert!(
-                manager.put_bundle(entries).await,
+                manager.put_bundle(entries).await.flushed,
                 "one flush carries all four"
             );
             let bundles = bundle_keys(&bucket, "log/n0/gen1/bundle/").await;
@@ -8058,7 +8459,10 @@ mod bucket_executor_tests {
                 "closed gate falls back to per-cell"
             );
             assert!(
-                !manager.put_bundle(vec![bundle_entry("c0", 1)]).await,
+                !manager
+                    .put_bundle(vec![bundle_entry("c0", 1)])
+                    .await
+                    .flushed,
                 "closed gate refuses"
             );
             // One bundle from the open-gate publish would already exist if the gate
@@ -8079,7 +8483,10 @@ mod bucket_executor_tests {
             let (manager, bucket) = test_manager(dir.path());
             open_gate(&manager);
             assert!(
-                !manager.put_bundle(vec![bundle_entry("c0", 1)]).await,
+                !manager
+                    .put_bundle(vec![bundle_entry("c0", 1)])
+                    .await
+                    .flushed,
                 "no record: no credit"
             );
             assert!(
@@ -8094,7 +8501,10 @@ mod bucket_executor_tests {
             // unconditional, so only the post-PUT bucket re-read proves durability.
             manager.bucket_epoch.store(1, Ordering::SeqCst);
             assert!(
-                !manager.put_bundle(vec![bundle_entry("c0", 1)]).await,
+                !manager
+                    .put_bundle(vec![bundle_entry("c0", 1)])
+                    .await
+                    .flushed,
                 "epoch without lease: no credit"
             );
             manager.bucket_epoch.store(0, Ordering::SeqCst);
@@ -8107,7 +8517,10 @@ mod bucket_executor_tests {
                 "record before ack"
             );
             assert!(
-                manager.put_bundle(vec![bundle_entry("c0", 1)]).await,
+                manager
+                    .put_bundle(vec![bundle_entry("c0", 1)])
+                    .await
+                    .flushed,
                 "record first, then credit"
             );
         });
@@ -8125,12 +8538,18 @@ mod bucket_executor_tests {
             open_gate(&manager);
             publish_bucket_open(&manager, &bucket).await;
             assert!(
-                manager.put_bundle(vec![bundle_entry("c0", 1)]).await,
+                manager
+                    .put_bundle(vec![bundle_entry("c0", 1)])
+                    .await
+                    .flushed,
                 "open record credits"
             );
             publish_bucket_sealed(&manager, &bucket).await;
             assert!(
-                !manager.put_bundle(vec![bundle_entry("c0", 2)]).await,
+                !manager
+                    .put_bundle(vec![bundle_entry("c0", 2)])
+                    .await
+                    .flushed,
                 "sealed record refuses the zombie"
             );
             assert_eq!(
@@ -8171,12 +8590,18 @@ mod bucket_executor_tests {
             publish_bucket_open(&manager, &bucket).await;
             mirror_local_open(&manager);
             assert!(
-                manager.put_bundle(vec![bundle_entry("c0", 1)]).await,
+                manager
+                    .put_bundle(vec![bundle_entry("c0", 1)])
+                    .await
+                    .flushed,
                 "open record credits"
             );
             publish_bucket_sealed(&manager, &bucket).await;
             assert!(
-                !manager.put_bundle(vec![bundle_entry("c0", 2)]).await,
+                !manager
+                    .put_bundle(vec![bundle_entry("c0", 2)])
+                    .await
+                    .flushed,
                 "sealed record refuses"
             );
             assert!(
@@ -8209,7 +8634,10 @@ mod bucket_executor_tests {
                 .execute("ALTER TABLE objects RENAME TO objects_offline", [])
                 .expect("store goes offline");
             assert!(
-                !manager.put_bundle(vec![bundle_entry("c0", 1)]).await,
+                !manager
+                    .put_bundle(vec![bundle_entry("c0", 1)])
+                    .await
+                    .flushed,
                 "an offline store refuses the PUT"
             );
             assert!(
@@ -8228,7 +8656,10 @@ mod bucket_executor_tests {
                 "a transient failure re-arms from the bucket's Open record"
             );
             assert!(
-                manager.put_bundle(vec![bundle_entry("c0", 1)]).await,
+                manager
+                    .put_bundle(vec![bundle_entry("c0", 1)])
+                    .await
+                    .flushed,
                 "bundling resumes"
             );
         });
@@ -8359,7 +8790,10 @@ mod bucket_executor_tests {
             open_gate(&manager);
             publish_bucket_open(&manager, &bucket).await;
             assert!(
-                manager.put_bundle(vec![bundle_entry("c0", 1)]).await,
+                manager
+                    .put_bundle(vec![bundle_entry("c0", 1)])
+                    .await
+                    .flushed,
                 "open record credits"
             );
             manager.gc_bundles().await.expect("gc runs");
@@ -8407,7 +8841,10 @@ mod bucket_executor_tests {
             open_gate(&manager);
             publish_bucket_open(&manager, &bucket).await;
             assert!(
-                manager.put_bundle(vec![bundle_entry("c0", 1)]).await,
+                manager
+                    .put_bundle(vec![bundle_entry("c0", 1)])
+                    .await
+                    .flushed,
                 "open record credits"
             );
             // The seal write has a writer behind it, so a barrier revert
@@ -8445,7 +8882,10 @@ mod bucket_executor_tests {
             open_gate(&manager);
             publish_bucket_open(&manager, &bucket).await;
             assert!(
-                manager.put_bundle(vec![bundle_entry("c0", 1)]).await,
+                manager
+                    .put_bundle(vec![bundle_entry("c0", 1)])
+                    .await
+                    .flushed,
                 "open record credits"
             );
             activate_cell(&manager, "c0", 1, true).await;
@@ -8489,7 +8929,7 @@ mod bucket_executor_tests {
             publish_bucket_open(&manager, &bucket).await;
             activate_cell(&manager, "c0", 1, true).await;
             sql_write(&cell_db(&dir.path().join("watch"), "c0", 1));
-            let (_, source) = manager
+            let (_, source, _) = manager
                 .ltx
                 .await_durable("c0", 1, 1)
                 .await
@@ -8666,7 +9106,7 @@ mod bucket_recovery_tests {
                 }
             }
             assert!(
-                donor.put_bundle(entries).await,
+                donor.put_bundle(entries).await.flushed,
                 "the shared PUT credits: every row is acked"
             );
             // The node dies with its rows only in bundles: expire the lease,
@@ -8741,13 +9181,15 @@ mod bucket_recovery_tests {
             assert!(
                 donor
                     .put_bundle(vec![bundle_row("c0", 1), bundle_row("c0", 2)])
-                    .await,
+                    .await
+                    .flushed,
                 "first round acked"
             );
             assert!(
                 donor
                     .put_bundle(vec![bundle_row("c0", 3), bundle_row("c0", 4)])
-                    .await,
+                    .await
+                    .flushed,
                 "second round acked, still no per-cell coverage"
             );
             publish_lease(&bucket, "dead", "gen9", 1, Some((&record, false))).await;
@@ -8805,7 +9247,8 @@ mod bucket_recovery_tests {
             assert!(
                 donor
                     .put_bundle(vec![bundle_row("c0", 1), bundle_row("c0", 2)])
-                    .await,
+                    .await
+                    .flushed,
                 "rows acked before the restart"
             );
             // The process restarts as a new generation; its lease still
@@ -8876,7 +9319,8 @@ mod bucket_recovery_tests {
                         bundle_row("c0", 2),
                         bundle_row("c0", 3),
                     ])
-                    .await,
+                    .await
+                    .flushed,
                 "rows acked into bundles"
             );
             manager.fold_cell("c0").await.expect("the fold proceeds");
@@ -8915,7 +9359,8 @@ mod bucket_recovery_tests {
             assert!(
                 donor
                     .put_bundle(vec![bundle_row("c0", 1), bundle_row("c0", 2)])
-                    .await,
+                    .await
+                    .flushed,
                 "rows acked"
             );
             publish_lease(&bucket, "dead", "gen9", 1, Some((&record, true))).await;
@@ -8970,7 +9415,8 @@ mod bucket_recovery_tests {
             assert!(
                 manager
                     .put_bundle(vec![bundle_row("c0", 1), bundle_row("c0", 2)])
-                    .await,
+                    .await
+                    .flushed,
                 "rows acked into bundles"
             );
             publish_lease(
@@ -8991,5 +9437,1117 @@ mod bucket_recovery_tests {
                 "bundle coverage alone restores the rows"
             );
         });
+    }
+}
+
+/// Bucket fence-round integration tests (0068). Plain `#[cfg(test)]`:
+/// deterministic, no sleeps or polling. A counting store wrapper observes
+/// every `own.json` GET while fault hooks interleave takeovers, seals and
+/// read errors between the bundle PUT and the fence reads. A minimal core
+/// driver opens real output-gate barriers, so each test proves the gates
+/// settle with no per-gate `VerifyOwnership` GET beyond the round's own
+/// fence reads.
+/// Modified by ryuzcorp (ryuzcorp/celld): per-round fence reads (0068).
+#[cfg(test)]
+mod fence_round_tests {
+    use super::*;
+    use celld_ltx::object_store::path::Path as ObjPath;
+    use celld_ltx::object_store::GetOptions;
+    use celld_ltx::object_store::GetResult;
+    use celld_ltx::object_store::ListResult;
+    use celld_ltx::object_store::MultipartUpload;
+    use celld_ltx::object_store::ObjectMeta;
+    use celld_ltx::object_store::ObjectStore;
+    use celld_ltx::object_store::PutMultipartOptions;
+    use celld_ltx::object_store::PutOptions;
+    use celld_ltx::object_store::PutPayload;
+    use celld_ltx::object_store::PutResult;
+    use celld_ltx::object_store::Result as StoreResult;
+    use std::collections::VecDeque;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::AtomicUsize;
+    // `futures::stream::BoxStream`, spelled out: the celld crate carries
+    // futures-util only, and this names the same object type.
+    type ListStream = std::pin::Pin<
+        Box<dyn futures_util::Stream<Item = StoreResult<ObjectMeta>> + Send + 'static>,
+    >;
+
+    const NOW_MS: u64 = 1_800_000_000_000;
+    const MONO_MS: u64 = 1_000;
+    const TTL_MS: u64 = 10_000;
+
+    /// What the store does when a bundle PUT lands, before the fence reads
+    /// run: nothing, a live-donor takeover of one cell, or a seal of the
+    /// session record.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum FenceHook {
+        None,
+        Takeover {
+            cell: &'static str,
+            node: &'static str,
+            epoch: u64,
+        },
+        SealSession,
+    }
+
+    /// The dev store with `own.json` GET counting, bundle-PUT hooks and
+    /// `own.json` read-error injection. Every other operation delegates
+    /// untouched, so the bucket the manager sees is the real one.
+    #[derive(Debug)]
+    struct FenceProbeStore {
+        inner: Arc<crate::local_store::LocalStore>,
+        own_gets: AtomicUsize,
+        hook: Mutex<FenceHook>,
+        fail_own_reads: AtomicBool,
+    }
+
+    impl FenceProbeStore {
+        fn new(inner: Arc<crate::local_store::LocalStore>) -> Self {
+            Self {
+                inner,
+                own_gets: AtomicUsize::new(0),
+                hook: Mutex::new(FenceHook::None),
+                fail_own_reads: AtomicBool::new(false),
+            }
+        }
+
+        fn set_hook(&self, hook: FenceHook) {
+            *self.hook.lock().unwrap() = hook;
+        }
+
+        fn own_gets(&self) -> usize {
+            self.own_gets.load(Ordering::SeqCst)
+        }
+    }
+
+    impl std::fmt::Display for FenceProbeStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "FenceProbeStore")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for FenceProbeStore {
+        async fn put_opts(
+            &self,
+            location: &ObjPath,
+            payload: PutPayload,
+            opts: PutOptions,
+        ) -> StoreResult<PutResult> {
+            let out = self.inner.put_opts(location, payload, opts).await?;
+            if location.as_ref().starts_with("log/") {
+                let hook = *self.hook.lock().unwrap();
+                match hook {
+                    FenceHook::None => {}
+                    FenceHook::Takeover { cell, node, epoch } => {
+                        let body = serde_json::json!({ "node": node, "epoch": epoch });
+                        self.inner
+                            .put(
+                                &ObjPath::from(format!("cells/{cell}/own.json")),
+                                PutPayload::from(serde_json::to_vec(&body).expect("owner encodes")),
+                            )
+                            .await?;
+                    }
+                    FenceHook::SealSession => {
+                        let lease_key = ObjPath::from("nodes/n0.json");
+                        let bytes =
+                            self.inner
+                                .get(&lease_key)
+                                .await?
+                                .bytes()
+                                .await
+                                .map_err(|error| celld_ltx::object_store::Error::Generic {
+                                    store: "FenceProbeStore",
+                                    source: Box::new(error),
+                                })?;
+                        let mut lease: serde_json::Value =
+                            serde_json::from_slice(&bytes).expect("lease decodes");
+                        lease["log"]["state"] = serde_json::Value::from("sealed");
+                        self.inner
+                            .put(
+                                &lease_key,
+                                PutPayload::from(
+                                    serde_json::to_vec(&lease).expect("lease encodes"),
+                                ),
+                            )
+                            .await?;
+                    }
+                }
+            }
+            Ok(out)
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &ObjPath,
+            opts: PutMultipartOptions,
+        ) -> StoreResult<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &ObjPath,
+            options: GetOptions,
+        ) -> StoreResult<GetResult> {
+            if location.as_ref().ends_with("/own.json") {
+                // Count the attempt even when injection fails it: the fence
+                // read ran and the error is its verdict.
+                self.own_gets.fetch_add(1, Ordering::SeqCst);
+                if self.fail_own_reads.load(Ordering::SeqCst) {
+                    return Err(celld_ltx::object_store::Error::Generic {
+                        store: "FenceProbeStore",
+                        source: "injected own.json failure".into(),
+                    });
+                }
+            }
+            self.inner.get_opts(location, options).await
+        }
+
+        async fn delete(&self, location: &ObjPath) -> StoreResult<()> {
+            self.inner.delete(location).await
+        }
+
+        fn list(&self, prefix: Option<&ObjPath>) -> ListStream {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(&self, prefix: Option<&ObjPath>) -> StoreResult<ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy(&self, from: &ObjPath, to: &ObjPath) -> StoreResult<()> {
+            self.inner.copy(from, to).await
+        }
+
+        async fn copy_if_not_exists(&self, from: &ObjPath, to: &ObjPath) -> StoreResult<()> {
+            self.inner.copy_if_not_exists(from, to).await
+        }
+    }
+
+    fn fence_setup(dir: &std::path::Path) -> (NodeLogManager, Arc<Bucket>, Arc<FenceProbeStore>) {
+        let database = dir.join("objects.sqlite3");
+        let inner = Arc::new(crate::local_store::LocalStore::open(&database).expect("dev store"));
+        let probe = Arc::new(FenceProbeStore::new(inner));
+        let bucket = Arc::new(
+            crate::dev::open_local_bucket(&database)
+                .expect("dev bucket")
+                .with_store(probe.clone()),
+        );
+        let replication = crate::ltx_replication::Replication::start(
+            bucket.as_ref().clone(),
+            &dir.join("watch"),
+            None,
+            "test".into(),
+            None,
+        )
+        .expect("replication starts");
+        let ownership = Arc::new(crate::ownership_store::BucketOwnership::new(
+            bucket.as_ref().clone(),
+            bucket.as_ref().clone(),
+            "n0".into(),
+            "test-probe-key".into(),
+        ));
+        let own_log = Arc::new(OwnLog {
+            ownership,
+            nudge: Box::new(|| {}),
+            write_lock: tokio::sync::Mutex::new(()),
+        });
+        let auth = Arc::new(PeerAuth::new([0u8; 32], "n0").expect("test auth"));
+        let manager = NodeLogManager::new(
+            "n0/gen1",
+            bucket.clone(),
+            own_log,
+            replication.ltx(),
+            auth,
+            celld_logic::log_evict::EvictionPolicy::default(),
+        );
+        (manager, bucket, probe)
+    }
+
+    fn open_fence_gate(manager: &NodeLogManager) {
+        manager.ltx.set_bucket_bundles_fleet(true);
+        manager
+            .ltx
+            .set_bucket_bundles_env_override_for_test(Some(true));
+        manager.set_fence_rounds_override_for_test(Some(true));
+    }
+
+    async fn publish_bucket_open(manager: &NodeLogManager, bucket: &Bucket) {
+        let record = log_tier::create_bucket_record();
+        let wire = crate::ownership_store::NodeLeaseWire {
+            node: "n0".into(),
+            expires_ms: crate::ownership_store::now_ms() + 3_600_000,
+            addr: String::new(),
+            probe_public_key: String::new(),
+            peer_protocol: 1,
+            paced_handoff: false,
+            generation: "gen1".into(),
+            log: Some(log_to_wire(&record, false)),
+            load: crate::ownership_store::NodeLoadWire::default(),
+        };
+        bucket
+            .put(
+                &lease_key("n0"),
+                serde_json::to_vec(&wire).expect("lease encodes"),
+            )
+            .await
+            .expect("lease publishes");
+        manager.bucket_epoch.store(record.epoch, Ordering::SeqCst);
+    }
+
+    async fn publish_owner(bucket: &Bucket, cell: &str, node: &str, epoch: u64) {
+        let body = serde_json::json!({ "node": node, "epoch": epoch });
+        bucket
+            .put(
+                &format!("cells/{cell}/own.json"),
+                serde_json::to_vec(&body).expect("owner encodes"),
+            )
+            .await
+            .expect("owner publishes");
+    }
+
+    fn bundle_entry(cell: &str, cell_epoch: u64, txid: u64) -> celld_ltx::bundle::BundleEntry {
+        celld_ltx::bundle::BundleEntry {
+            cell: cell.to_string(),
+            cell_epoch,
+            txid,
+            bytes: vec![0xA5u8; 64],
+        }
+    }
+
+    /// A minimal core driver: opens real output-gate barriers against an
+    /// in-memory ownership table, holding durability proofs and ownership
+    /// reads so each test drives the fence interleaving by hand.
+    struct CoreDriver {
+        state: celld_logic::State,
+        owners: BTreeMap<String, celld_logic::OwnerRecord>,
+        held: Vec<celld_logic::Effect>,
+        next_request: u64,
+        next_etag: u64,
+    }
+
+    impl CoreDriver {
+        fn new() -> Self {
+            Self {
+                state: celld_logic::State::new(
+                    "n0",
+                    celld_logic::Config {
+                        max_resident: 4,
+                        max_activations: 4,
+                        max_evictions: 2,
+                        max_releases: 2,
+                        max_outbound_websockets: 32,
+                        ownership_on_evict: celld_logic::OwnershipOnEvict::Release,
+                        require_node_lease: true,
+                        peer_protocol: 1,
+                        operation_deadline_ms: Some(15_000),
+                        owner_log_recovery_backoff_ms: 1_000,
+                        owner_log_recovery_attempts: 240,
+                        alarm_resident_ms: 3_600_000,
+                        idle_evict_ms: None,
+                        pressure: celld_logic::pressure::PressureConfig::from_limits(None, Some(0)),
+                    },
+                ),
+                owners: BTreeMap::new(),
+                held: Vec::new(),
+                next_request: 1,
+                next_etag: 1,
+            }
+        }
+
+        fn seed_owner(&mut self, cell: &str, epoch: u64) {
+            self.next_etag += 1;
+            self.owners.insert(
+                cell.to_string(),
+                celld_logic::OwnerRecord {
+                    node: Some("n0".into()),
+                    epoch,
+                    etag: self.next_etag.to_string(),
+                },
+            );
+        }
+
+        fn start(&mut self) {
+            self.send(celld_logic::Event::StartNodeLease {
+                now_ms: NOW_MS,
+                now_mono_ms: MONO_MS,
+                spec: celld_logic::NodeLeaseSpec {
+                    addr: "n0".into(),
+                    peer_protocol: 1,
+                    generation: "g1".into(),
+                    resume_generation: None,
+                    ttl_ms: TTL_MS,
+                },
+            });
+            assert!(self.state.node_authoritative());
+        }
+
+        fn send(&mut self, event: celld_logic::Event) -> Vec<celld_logic::Effect> {
+            use celld_logic::Effect;
+            let mut seen = Vec::new();
+            let mut queue = VecDeque::from([event]);
+            while let Some(event) = queue.pop_front() {
+                for effect in celld_logic::on_event(&mut self.state, event) {
+                    self.state.validate().expect("state invariant");
+                    if matches!(
+                        effect,
+                        Effect::AwaitDurable { .. } | Effect::VerifyOwnership { .. }
+                    ) {
+                        self.held.push(effect.clone());
+                    } else if let Some(reply) = self.answer(&effect) {
+                        queue.push_back(reply);
+                    }
+                    seen.push(effect);
+                }
+                self.state.validate().expect("state invariant");
+            }
+            seen
+        }
+
+        fn answer(&mut self, effect: &celld_logic::Effect) -> Option<celld_logic::Event> {
+            use celld_logic::Effect;
+            use celld_logic::Event;
+            Some(match effect {
+                Effect::ScheduleTimer { .. } => return None,
+                Effect::ReadSelfNodeLease { op } => Event::SelfNodeLeaseRead {
+                    op: *op,
+                    now_ms: NOW_MS,
+                    now_mono_ms: MONO_MS,
+                    result: Ok(None),
+                },
+                Effect::CasNodeLease { op, .. } => Event::NodeLeaseCasCompleted {
+                    op: *op,
+                    now_mono_ms: MONO_MS,
+                    result: Ok(celld_logic::LeaseCasOutcome::Applied {
+                        etag: "lease".into(),
+                    }),
+                    stamped_log_state: None,
+                },
+                Effect::ReadCapacityPeers { op, .. } => Event::CapacityPeersRead {
+                    op: *op,
+                    now_ms: NOW_MS,
+                    result: Ok(Vec::new()),
+                },
+                Effect::ReadLocalCells => Event::LocalCellsRead {
+                    result: Ok(Vec::new()),
+                },
+                Effect::ReadOwner { op, cell } => Event::OwnerRead {
+                    op: *op,
+                    now_ms: NOW_MS,
+                    result: Ok(self.owners.get(cell).cloned()),
+                },
+                Effect::CasOwner {
+                    op, cell, epoch, ..
+                } => {
+                    self.next_etag += 1;
+                    self.owners.insert(
+                        cell.clone(),
+                        celld_logic::OwnerRecord {
+                            node: Some("n0".into()),
+                            epoch: *epoch,
+                            etag: self.next_etag.to_string(),
+                        },
+                    );
+                    Event::OwnerCasCompleted {
+                        op: *op,
+                        result: Ok(celld_logic::CasOutcome::Applied),
+                    }
+                }
+                Effect::Restore { op, .. } => Event::RestoreCompleted {
+                    op: *op,
+                    result: Ok(celld_logic::RestoreOutcome {
+                        restored: false,
+                        alarm: None,
+                    }),
+                },
+                Effect::StartRuntime { op, .. } => Event::RuntimeStarted {
+                    op: *op,
+                    isolate: None,
+                    generation: self.state.current_generation(),
+                    result: Ok(()),
+                },
+                Effect::Publish { op, .. } => Event::Published {
+                    op: *op,
+                    result: Ok(()),
+                },
+                Effect::EnsureDurable { op, .. } => Event::DurabilityChecked {
+                    op: *op,
+                    result: Ok(()),
+                },
+                Effect::VerifyOwnership { op, cell, epoch } => {
+                    let owned = self.owners.get(cell).is_some_and(|record| {
+                        record.node.as_deref() == Some("n0") && record.epoch == *epoch
+                    });
+                    Event::OwnershipVerified {
+                        op: *op,
+                        result: if owned {
+                            Ok(())
+                        } else {
+                            Err(celld_logic::Failure::Definite)
+                        },
+                    }
+                }
+                Effect::AwaitDurable { .. } => return None,
+                Effect::StopRuntime { op, .. } => Event::RuntimeStopped { op: *op },
+                Effect::Complete { .. }
+                | Effect::Release { .. }
+                | Effect::Halt { .. }
+                | Effect::ReconcileWakeEntry { .. }
+                | Effect::EvictionAdmission { .. }
+                | Effect::EvictionFinished { .. }
+                | Effect::CancelCellActivity { .. } => return None,
+                other => panic!("unexpected effect {other:?}"),
+            })
+        }
+
+        /// Open one gated write barrier and return its request, durability
+        /// op and epoch.
+        fn open_write(&mut self, cell: &str, position: u64) -> (u64, u64, u64) {
+            let request = self.next_request;
+            self.next_request += 1;
+            self.send(celld_logic::Event::RequestAt {
+                request,
+                cell: cell.to_string(),
+                now_mono_ms: MONO_MS,
+            });
+            self.send(celld_logic::Event::OutputAt {
+                request,
+                channel: celld_logic::Channel::Response,
+                position: Some(position),
+                observed: None,
+                epoch: None,
+                now_mono_ms: MONO_MS,
+            });
+            self.held
+                .iter()
+                .find_map(|effect| match effect {
+                    celld_logic::Effect::AwaitDurable {
+                        op,
+                        cell: c,
+                        epoch,
+                        position: p,
+                    } if c == cell && *p == position => Some((request, *op, *epoch)),
+                    _ => None,
+                })
+                .expect("the write waits for its proof")
+        }
+    }
+
+    /// A credited round settles its gates with one `own.json` GET per cell
+    /// per round: six writes on two cells cost two fence reads and zero
+    /// per-gate reads. Fail-before: per-entry fence reads turn the count
+    /// red; record-only credit turns the settlement red.
+    #[test]
+    fn credited_round_settles_gates_with_one_read_per_cell() {
+        let runtime = crate::asyncrt::shared_test_runtime();
+        runtime.block_on(async {
+            let dir = tempfile::tempdir().expect("test dir");
+            let (manager, bucket, probe) = fence_setup(dir.path());
+            open_fence_gate(&manager);
+            publish_bucket_open(&manager, &bucket).await;
+            publish_owner(&bucket, "c0", "n0", 1).await;
+            publish_owner(&bucket, "c1", "n0", 1).await;
+            let mut driver = CoreDriver::new();
+            driver.seed_owner("c0", 1);
+            driver.seed_owner("c1", 1);
+            driver.start();
+            let mut gates = Vec::new();
+            let mut adopted = None;
+            for cell in ["c0", "c1"] {
+                // Waiter tickets are the commit-ordered links the fence
+                // cover is written in: c0's gates ticket 100-102, c1's
+                // 200-202, all at or below the round's gather tickets.
+                let base = if cell == "c0" { 100 } else { 200 };
+                for position in 1..=3u64 {
+                    let (request, op, epoch) = driver.open_write(cell, position);
+                    // Activation steps the owned epoch (the claim CAS the
+                    // driver answers); the live record follows it below, the
+                    // way a real claim CAS would rewrite `own.json`.
+                    adopted = Some(adopted.unwrap_or(epoch));
+                    assert_eq!(Some(epoch), adopted, "one activation epoch per test");
+                    gates.push((cell, request, op, position, base + position - 1));
+                }
+            }
+            let epoch = adopted.expect("gates opened");
+            for cell in ["c0", "c1"] {
+                publish_owner(&bucket, cell, "n0", epoch).await;
+                driver.seed_owner(cell, epoch);
+            }
+            let recorded: Arc<Mutex<Vec<log_tier::FenceRoundSettlement>>> =
+                Arc::new(Mutex::new(Vec::new()));
+            let sink_records = recorded.clone();
+            manager.set_fence_sink(Some(Arc::new(move |round| {
+                sink_records.lock().unwrap().push(round);
+            })));
+            let baseline = probe.own_gets();
+            let entries: Vec<_> = ["c0", "c1"]
+                .into_iter()
+                .flat_map(|cell| (1..=3u64).map(move |txid| bundle_entry(cell, epoch, txid)))
+                .collect();
+            // Gather tickets are the commit-ordered links the fence cover is
+            // written in: the flush loaded these request sequences with the
+            // rows, so every gate ticketed at or below them committed before
+            // the gather.
+            let ticket_reqs: BTreeMap<(String, u64), u64> =
+                [("c0".to_string(), 102), ("c1".to_string(), 202)]
+                    .into_iter()
+                    .map(|(cell, req)| ((cell, epoch), req))
+                    .collect();
+            let outcome = manager.put_bundle_with_tickets(entries, &ticket_reqs).await;
+            assert!(outcome.flushed, "open record credits the flush");
+            let settlement = outcome.settlement.expect("the fence round ran");
+            assert!(settlement.order.ordered(), "reads follow the proof");
+            assert_eq!(settlement.cells.len(), 2, "one verdict per round cell");
+            for cell in &settlement.cells {
+                assert!(cell.credit.credited(), "intact entries credit: {cell:?}");
+                let want = ticket_reqs[&(cell.cell.clone(), cell.epoch)];
+                assert_eq!(cell.cover, want, "the cover is the gather ticket: {cell:?}");
+            }
+            assert_eq!(
+                probe.own_gets() - baseline,
+                2,
+                "one fence GET per cell per round, not one per write"
+            );
+            assert_eq!(recorded.lock().unwrap().len(), 1, "one round sent");
+            assert_eq!(
+                recorded.lock().unwrap()[0],
+                settlement,
+                "the sent round is the computed one"
+            );
+            assert!(
+                !manager.fence_fallback("c0", epoch) && !manager.fence_fallback("c1", epoch),
+                "credited cells need no per-cell fallback"
+            );
+            // The round publishes its ticket cover for the shell's proof
+            // labelling: a proof whose waiter ticket is at or below it is a
+            // `BucketBundle` (core hold, no per-gate read), while a newer
+            // ticket, an unknown cell, or no waiter at all stays `Bucket`.
+            for cell in ["c0", "c1"] {
+                let cover = ticket_reqs[&(cell.to_string(), epoch)];
+                assert!(
+                    manager.fence_covered_for(cell, epoch, cover),
+                    "the credited cover reaches the round's tickets"
+                );
+                assert!(
+                    !manager.fence_covered_for(cell, epoch, cover + 1),
+                    "the cover does not reach past the round"
+                );
+                assert_eq!(
+                    label_bucket_proof(Some(&manager), cell, epoch, Some(cover)),
+                    celld_logic::ProofSource::BucketBundle,
+                    "a covered proof holds for the settlement"
+                );
+                assert_eq!(
+                    label_bucket_proof(Some(&manager), cell, epoch, Some(cover + 1)),
+                    celld_logic::ProofSource::Bucket,
+                    "a proof past the cover reads per-gate"
+                );
+            }
+            assert_eq!(
+                label_bucket_proof(None, "c0", epoch, Some(100)),
+                celld_logic::ProofSource::Bucket,
+                "no manager means today's read"
+            );
+            assert_eq!(
+                label_bucket_proof(Some(&manager), "c0", epoch, None),
+                celld_logic::ProofSource::Bucket,
+                "no waiter means today's read"
+            );
+            assert_eq!(
+                label_bucket_proof(Some(&manager), "nope", epoch, Some(1)),
+                celld_logic::ProofSource::Bucket,
+                "a cell with no round reads per-gate"
+            );
+            // Every gate's proof labels `BucketBundle`, so the core holds it
+            // for the settlement with no per-gate read — the full chain.
+            for (cell, _, op, position, ticket) in &gates {
+                let source = label_bucket_proof(Some(&manager), cell, epoch, Some(*ticket));
+                assert_eq!(
+                    source,
+                    celld_logic::ProofSource::BucketBundle,
+                    "gate ticket {ticket} is covered"
+                );
+                let held = driver.send(celld_logic::Event::DurableReached {
+                    op: *op,
+                    result: Ok(*position),
+                    source,
+                    ticket: Some(*ticket),
+                });
+                assert!(
+                    !held.iter().any(|effect| matches!(
+                        effect,
+                        celld_logic::Effect::VerifyOwnership { .. }
+                    )),
+                    "the covered gate holds with no per-gate read: {held:?}"
+                );
+            }
+            // The round settles every held gate with no per-gate read.
+            let settled = driver.send(celld_logic::Event::FenceRoundVerified { round: settlement });
+            for (_, request, _, _, _) in &gates {
+                assert!(
+                    settled.iter().any(|effect| matches!(
+                        effect,
+                        celld_logic::Effect::Release { request: r, result: Ok(()), .. }
+                        if r == request
+                    )),
+                    "gate {request} releases proven: {settled:?}"
+                );
+            }
+            assert!(
+                !settled
+                    .iter()
+                    .any(|effect| matches!(effect, celld_logic::Effect::VerifyOwnership { .. })),
+                "the round settles with no per-gate ownership read: {settled:?}"
+            );
+            // A late durability proof for the same gates answers nothing.
+            for (_, _, op, position, _) in &gates {
+                let quiet = driver.send(celld_logic::Event::DurableReached {
+                    op: *op,
+                    result: Ok(*position),
+                    source: celld_logic::ProofSource::Bucket,
+                    ticket: None,
+                });
+                assert!(
+                    !quiet.iter().any(|effect| matches!(
+                        effect,
+                        celld_logic::Effect::VerifyOwnership { .. }
+                            | celld_logic::Effect::Release { .. }
+                    )),
+                    "a late proof releases and reads nothing: {quiet:?}"
+                );
+            }
+            driver.state.validate().expect("state invariant");
+        });
+    }
+
+    /// A live-donor takeover between the bundle PUT and the fence read
+    /// leaves the round uncredited for the taken cell: its gates fail
+    /// instead of hanging, its rows fall back to per-cell, and the intact
+    /// neighbour still credits. Fail-before: record-only credit acks the
+    /// stale cell.
+    #[test]
+    fn takeover_between_put_and_fence_leaves_stale_cell_uncredited() {
+        let runtime = crate::asyncrt::shared_test_runtime();
+        runtime.block_on(async {
+            let dir = tempfile::tempdir().expect("test dir");
+            let (manager, bucket, probe) = fence_setup(dir.path());
+            open_fence_gate(&manager);
+            publish_bucket_open(&manager, &bucket).await;
+            publish_owner(&bucket, "c0", "n0", 1).await;
+            publish_owner(&bucket, "c1", "n0", 1).await;
+            let mut driver = CoreDriver::new();
+            driver.seed_owner("c0", 1);
+            driver.seed_owner("c1", 1);
+            driver.start();
+            let (stale_request, stale_op, stale_epoch) = driver.open_write("c0", 1);
+            let (stale_request2, stale_op2, stale_epoch2) = driver.open_write("c0", 2);
+            let (live_request, live_op, live_epoch) = driver.open_write("c1", 1);
+            assert_eq!(stale_epoch, stale_epoch2, "one activation epoch per cell");
+            assert_eq!(stale_epoch, live_epoch, "one activation epoch per test");
+            let epoch = stale_epoch;
+            for cell in ["c0", "c1"] {
+                publish_owner(&bucket, cell, "n0", epoch).await;
+                driver.seed_owner(cell, epoch);
+            }
+            probe.set_hook(FenceHook::Takeover {
+                cell: "c0",
+                node: "n1",
+                epoch: epoch + 1,
+            });
+            let baseline = probe.own_gets();
+            let entries = vec![
+                bundle_entry("c0", epoch, 1),
+                bundle_entry("c0", epoch, 2),
+                bundle_entry("c1", epoch, 1),
+            ];
+            let ticket_reqs: BTreeMap<(String, u64), u64> = [
+                (("c0".to_string(), epoch), 11),
+                (("c1".to_string(), epoch), 20),
+            ]
+            .into_iter()
+            .collect();
+            let outcome = manager.put_bundle_with_tickets(entries, &ticket_reqs).await;
+            assert!(outcome.flushed, "the record still stands: the PUT credits");
+            let settlement = outcome.settlement.expect("the fence round ran");
+            assert_eq!(settlement.cells.len(), 2);
+            let stale = settlement
+                .cells
+                .iter()
+                .find(|cell| cell.cell == "c0")
+                .expect("stale cell judged");
+            let live = settlement
+                .cells
+                .iter()
+                .find(|cell| cell.cell == "c1")
+                .expect("live cell judged");
+            assert!(!stale.credit.credited(), "the taken cell is uncredited");
+            assert_eq!(stale.cover, 11, "the cover is the gather ticket");
+            assert!(live.credit.credited(), "the intact cell still credits");
+            assert_eq!(live.cover, 20, "the cover is the gather ticket");
+            assert_eq!(
+                probe.own_gets() - baseline,
+                2,
+                "both fence reads still ran exactly once"
+            );
+            assert!(
+                manager.fence_fallback("c0", epoch),
+                "the stale cell falls back to per-cell upload"
+            );
+            assert!(
+                !manager.fence_fallback("c1", epoch),
+                "the credited cell keeps riding the bundle"
+            );
+            // The fallback mark shadows the stale cover: the taken cell's
+            // proofs stay `Bucket` and re-prove per-cell, while the live
+            // cell's proofs hold for the settlement. Fail-before: without
+            // the mark check the stale cell labels `BucketBundle`.
+            assert_eq!(
+                label_bucket_proof(Some(&manager), "c0", epoch, Some(11)),
+                celld_logic::ProofSource::Bucket,
+                "a fallback-marked cell never holds"
+            );
+            assert_eq!(
+                label_bucket_proof(Some(&manager), "c1", epoch, Some(20)),
+                celld_logic::ProofSource::BucketBundle,
+                "the intact cell holds for the settlement"
+            );
+            // Hold every gate, as their labelled proofs would: the round
+            // then releases the intact gate proven and fails the taken
+            // gates fast instead of hanging them.
+            for (op, position, ticket) in [(stale_op, 1, 10), (stale_op2, 2, 11), (live_op, 1, 20)]
+            {
+                let held = driver.send(celld_logic::Event::DurableReached {
+                    op,
+                    result: Ok(position),
+                    source: celld_logic::ProofSource::BucketBundle,
+                    ticket: Some(ticket),
+                });
+                assert!(
+                    !held.iter().any(|effect| matches!(
+                        effect,
+                        celld_logic::Effect::VerifyOwnership { .. }
+                    )),
+                    "the covered gate holds with no per-gate read: {held:?}"
+                );
+            }
+            let settled = driver.send(celld_logic::Event::FenceRoundVerified { round: settlement });
+            assert!(
+                settled.iter().any(|effect| matches!(
+                    effect,
+                    celld_logic::Effect::Release { request, result: Ok(()), .. }
+                    if *request == live_request
+                )),
+                "the intact gate releases proven: {settled:?}"
+            );
+            for request in [stale_request, stale_request2] {
+                assert!(
+                    settled.iter().any(|effect| matches!(
+                        effect,
+                        celld_logic::Effect::Release {
+                            request: r,
+                            result: Err(celld_logic::RequestError::DurabilityUnproven),
+                            ..
+                        } if *r == request
+                    )),
+                    "stale gate {request} fails instead of hanging: {settled:?}"
+                );
+            }
+            assert!(
+                !settled
+                    .iter()
+                    .any(|effect| matches!(effect, celld_logic::Effect::VerifyOwnership { .. })),
+                "the round settles with no per-gate ownership read: {settled:?}"
+            );
+            driver.state.validate().expect("state invariant");
+        });
+    }
+
+    /// A record sealed after the PUT credits nothing: no settlement, no
+    /// sink send, bundling stopped for per-cell fallback. The concurrent
+    /// fence read still runs (it raced the record re-read), but with no
+    /// settlement no per-gate read follows it. Fail-before: crediting
+    /// without the post-PUT re-read acks the zombie.
+    #[test]
+    fn sealed_record_after_put_refuses_credit() {
+        let runtime = crate::asyncrt::shared_test_runtime();
+        runtime.block_on(async {
+            let dir = tempfile::tempdir().expect("test dir");
+            let (manager, bucket, probe) = fence_setup(dir.path());
+            open_fence_gate(&manager);
+            publish_bucket_open(&manager, &bucket).await;
+            publish_owner(&bucket, "c0", "n0", 1).await;
+            let recorded: Arc<Mutex<Vec<log_tier::FenceRoundSettlement>>> =
+                Arc::new(Mutex::new(Vec::new()));
+            let sink_records = recorded.clone();
+            manager.set_fence_sink(Some(Arc::new(move |round| {
+                sink_records.lock().unwrap().push(round);
+            })));
+            probe.set_hook(FenceHook::SealSession);
+            let baseline = probe.own_gets();
+            let outcome = manager.put_bundle(vec![bundle_entry("c0", 1, 1)]).await;
+            assert!(
+                !outcome.flushed,
+                "a sealed record never credits a zombie PUT"
+            );
+            assert!(
+                outcome.settlement.is_none(),
+                "no record arm, no fence round"
+            );
+            assert!(recorded.lock().unwrap().is_empty(), "no settlement is sent");
+            assert_eq!(
+                probe.own_gets() - baseline,
+                1,
+                "the record arm and the fence read raced concurrently: the round's \
+                 own read ran, but with no settlement no per-gate read follows it"
+            );
+            assert!(
+                bucket
+                    .list("log/n0/gen1/bundle/")
+                    .await
+                    .expect("list works")
+                    .len()
+                    == 1,
+                "the zombie PUT still landed; only credit is refused"
+            );
+            assert_eq!(
+                manager.bucket_epoch.load(Ordering::SeqCst),
+                0,
+                "refusal stops bundling for per-cell fallback"
+            );
+            assert!(
+                !manager.bundle_active(),
+                "fenced node falls back to per-cell"
+            );
+        });
+    }
+
+    /// A fence read error fails the cell's gates instead of hanging them:
+    /// the round carries `Uncredited`, the settlement is still sent, and
+    /// the gates fail. Fail-before: dropping the errored cell from the
+    /// round would strand its gates.
+    #[test]
+    fn fence_read_error_fails_gates_without_hanging() {
+        let runtime = crate::asyncrt::shared_test_runtime();
+        runtime.block_on(async {
+            let dir = tempfile::tempdir().expect("test dir");
+            let (manager, bucket, probe) = fence_setup(dir.path());
+            open_fence_gate(&manager);
+            publish_bucket_open(&manager, &bucket).await;
+            publish_owner(&bucket, "c0", "n0", 1).await;
+            let mut driver = CoreDriver::new();
+            driver.seed_owner("c0", 1);
+            driver.start();
+            let (request, op, epoch) = driver.open_write("c0", 1);
+            publish_owner(&bucket, "c0", "n0", epoch).await;
+            driver.seed_owner("c0", epoch);
+            let recorded: Arc<Mutex<Vec<log_tier::FenceRoundSettlement>>> =
+                Arc::new(Mutex::new(Vec::new()));
+            let sink_records = recorded.clone();
+            manager.set_fence_sink(Some(Arc::new(move |round| {
+                sink_records.lock().unwrap().push(round);
+            })));
+            probe.fail_own_reads.store(true, Ordering::SeqCst);
+            let baseline = probe.own_gets();
+            let ticket_reqs: BTreeMap<(String, u64), u64> =
+                [(("c0".to_string(), epoch), 10)].into_iter().collect();
+            let outcome = manager
+                .put_bundle_with_tickets(vec![bundle_entry("c0", epoch, 1)], &ticket_reqs)
+                .await;
+            assert!(
+                outcome.flushed,
+                "the record arm passes; only the fence read fails"
+            );
+            let settlement = outcome.settlement.expect("the fence round ran");
+            assert!(
+                settlement.order.ordered(),
+                "the read was still issued after the proof"
+            );
+            assert_eq!(
+                settlement.cells.len(),
+                1,
+                "the errored cell is judged, not dropped"
+            );
+            assert!(
+                !settlement.cells[0].credit.credited(),
+                "a read error never credits"
+            );
+            assert_eq!(
+                settlement.cells[0].cover, 10,
+                "the cover is the gather ticket"
+            );
+            assert_eq!(
+                label_bucket_proof(Some(&manager), "c0", epoch, Some(10)),
+                celld_logic::ProofSource::Bucket,
+                "a fallback-marked cell never holds, even covered"
+            );
+            assert_eq!(
+                probe.own_gets() - baseline,
+                1,
+                "the failed fence read still ran once"
+            );
+            assert_eq!(recorded.lock().unwrap().len(), 1, "the round is still sent");
+            assert!(
+                manager.fence_fallback("c0", epoch),
+                "the errored cell falls back to per-cell upload"
+            );
+            // Hold the gate as its proof would have: the round then fails it
+            // fast instead of hanging it. (In production the fallback-marked
+            // cell's proof labels `Bucket` and re-proves per-cell; the hold
+            // here drives the round's verdict the same way T2's live cell
+            // does.)
+            let held = driver.send(celld_logic::Event::DurableReached {
+                op,
+                result: Ok(1),
+                source: celld_logic::ProofSource::BucketBundle,
+                ticket: Some(10),
+            });
+            assert!(
+                !held
+                    .iter()
+                    .any(|effect| matches!(effect, celld_logic::Effect::VerifyOwnership { .. })),
+                "the covered gate holds with no per-gate read: {held:?}"
+            );
+            let settled = driver.send(celld_logic::Event::FenceRoundVerified { round: settlement });
+            assert!(
+                settled.iter().any(|effect| matches!(
+                    effect,
+                    celld_logic::Effect::Release {
+                        request: r,
+                        result: Err(celld_logic::RequestError::DurabilityUnproven),
+                        ..
+                    } if *r == request
+                )),
+                "the gate fails instead of hanging: {settled:?}"
+            );
+            driver.state.validate().expect("state invariant");
+        });
+    }
+
+    /// The kill switch restores per-gate reads: with `CELLD_FENCE_ROUNDS=0`
+    /// the flush credits on the record arm alone, runs no fence reads,
+    /// sends no settlement, and the gates prove through their own
+    /// `VerifyOwnership` reads. Fail-before: ignoring the switch runs the
+    /// fence round.
+    #[test]
+    fn kill_switch_restores_per_gate_reads() {
+        let runtime = crate::asyncrt::shared_test_runtime();
+        runtime.block_on(async {
+            let dir = tempfile::tempdir().expect("test dir");
+            let (manager, bucket, probe) = fence_setup(dir.path());
+            open_fence_gate(&manager);
+            manager.set_fence_rounds_override_for_test(Some(false));
+            publish_bucket_open(&manager, &bucket).await;
+            publish_owner(&bucket, "c0", "n0", 1).await;
+            let mut driver = CoreDriver::new();
+            driver.seed_owner("c0", 1);
+            driver.start();
+            let (_request1, op1, epoch) = driver.open_write("c0", 1);
+            let (_request2, op2, epoch2) = driver.open_write("c0", 2);
+            assert_eq!(epoch, epoch2, "one activation epoch per cell");
+            publish_owner(&bucket, "c0", "n0", epoch).await;
+            driver.seed_owner("c0", epoch);
+            let recorded: Arc<Mutex<Vec<log_tier::FenceRoundSettlement>>> =
+                Arc::new(Mutex::new(Vec::new()));
+            let sink_records = recorded.clone();
+            manager.set_fence_sink(Some(Arc::new(move |round| {
+                sink_records.lock().unwrap().push(round);
+            })));
+            let baseline = probe.own_gets();
+            let entries = vec![bundle_entry("c0", epoch, 1), bundle_entry("c0", epoch, 2)];
+            let outcome = manager.put_bundle(entries).await;
+            assert!(outcome.flushed, "the record arm still credits");
+            assert!(
+                outcome.settlement.is_none(),
+                "the kill switch runs no fence round"
+            );
+            assert!(recorded.lock().unwrap().is_empty(), "no settlement is sent");
+            assert_eq!(
+                probe.own_gets() - baseline,
+                0,
+                "the flush itself reads no fence entries"
+            );
+            // No cover is published while the switch is off, so the shell
+            // labels every proof `Bucket`: the gates keep today's read.
+            assert!(
+                !manager.fence_covered_for("c0", epoch, 2),
+                "the kill switch publishes no cover"
+            );
+            assert_eq!(
+                label_bucket_proof(Some(&manager), "c0", epoch, Some(2)),
+                celld_logic::ProofSource::Bucket,
+                "the kill switch keeps the per-gate read label"
+            );
+            // The gates prove through their own reads, as before.
+            let mut proven = 0;
+            for (op, position) in [(op1, 1), (op2, 2)] {
+                let seen = driver.send(celld_logic::Event::DurableReached {
+                    op,
+                    result: Ok(position),
+                    source: celld_logic::ProofSource::Bucket,
+                    ticket: None,
+                });
+                assert!(
+                    seen.iter().any(|effect| matches!(
+                        effect,
+                        celld_logic::Effect::VerifyOwnership { .. }
+                    )),
+                    "gate {op} opens its own ownership read: {seen:?}"
+                );
+                proven += 1;
+            }
+            assert_eq!(proven, 2);
+            for effect in driver.held.clone() {
+                if let celld_logic::Effect::VerifyOwnership { op, .. } = effect {
+                    let released =
+                        driver.send(celld_logic::Event::OwnershipVerified { op, result: Ok(()) });
+                    assert!(
+                        released.iter().any(|effect| matches!(
+                            effect,
+                            celld_logic::Effect::Release { result: Ok(()), .. }
+                        )),
+                        "the per-gate read proves the gate: {released:?}"
+                    );
+                }
+            }
+            driver.state.validate().expect("state invariant");
+        });
+    }
+
+    /// The fallback marks and the kill-switch predicate: uncredited cells
+    /// are marked for per-cell upload, credited ones unmarked, and the
+    /// retain pass drops clean or removed cells. Fail-before per arm in
+    /// `fence_rounds_env_value`.
+    #[test]
+    fn fence_fallback_marks_and_switch_predicate() {
+        let dir = tempfile::tempdir().expect("test dir");
+        let (manager, _bucket, _probe) = fence_setup(dir.path());
+        assert!(!manager.fence_fallback("c0", 1), "no mark initially");
+        manager.mark_fence_fallback("c0", 1);
+        manager.mark_fence_fallback("c1", 2);
+        assert!(manager.fence_fallback("c0", 1));
+        assert!(manager.fence_fallback("c1", 2));
+        assert!(!manager.fence_fallback("c0", 2), "epoch is part of the key");
+        manager.unmark_fence_fallback("c0", 1);
+        assert!(!manager.fence_fallback("c0", 1), "credit clears the mark");
+        manager.mark_fence_fallback("c0", 1);
+        let mut live = BTreeSet::new();
+        live.insert(("c0".to_string(), 1u64));
+        manager.retain_fence_fallback(&live);
+        assert!(manager.fence_fallback("c0", 1), "dirty cells keep the mark");
+        assert!(
+            !manager.fence_fallback("c1", 2),
+            "clean or removed cells drop it"
+        );
+        assert!(fence_rounds_env_value(None), "default on");
+        assert!(fence_rounds_env_value(Some("1")), "explicit on");
+        assert!(!fence_rounds_env_value(Some("0")), "explicit off");
+        assert!(!fence_rounds_env_value(Some(" 0 ")), "whitespace trims");
+        assert!(fence_rounds_env_value(Some("")), "empty stays on");
+        manager.set_fence_rounds_override_for_test(Some(false));
+        assert!(!manager.fence_rounds_enabled(), "override off wins");
+        manager.set_fence_rounds_override_for_test(Some(true));
+        assert!(manager.fence_rounds_enabled(), "override on wins");
+        manager.set_fence_rounds_override_for_test(None);
     }
 }

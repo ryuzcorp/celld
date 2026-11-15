@@ -1085,6 +1085,21 @@ fn split_bundle_entries(
     }
     chunks
 }
+/// Whether `sync_loop` must upload this cell per-cell even while the bundle
+/// loop owns the rest: a fence-uncredited cell's rows re-prove per-cell
+/// (its gates already failed via the round event), while credited cells
+/// keep riding the bundle. Pure predicate so tests pin the exemption
+/// without a daemon.
+/// Modified by ryuzcorp (ryuzcorp/celld): per-round fence reads (0068).
+fn sync_cell_fallback(
+    paced: bool,
+    bundle_active: bool,
+    bucket_bundling: bool,
+    fence_fallback: bool,
+) -> bool {
+    !sync_should_bundle(paced, bundle_active, bucket_bundling) || fence_fallback
+}
+
 /// Whether `sync_loop` must skip per-cell L0 uploads because the bundle loop owns
 /// them. Fleet bundling is paced (`paced && bundle_active`); bucket bundling stops
 /// per-cell uploads even though `paced` is false (no shipper) — the bundle PUT is
@@ -3271,7 +3286,7 @@ impl LtxRepl {
         cell: &str,
         epoch: u64,
         position: u64,
-    ) -> anyhow::Result<(u64, celld_logic::ProofSource)> {
+    ) -> anyhow::Result<(u64, celld_logic::ProofSource, Option<u64>)> {
         let Some(handle) = self
             .cells
             .lock()
@@ -3290,7 +3305,12 @@ impl LtxRepl {
         let source = self
             .wait_for_durability_ticket(&handle, cell, epoch, ticket)
             .await?;
-        Ok((position, source))
+        // The ticket is the commit-ordered link the fence cover is written
+        // in: a gate holding it is covered exactly when the flush gathered
+        // with this request sequence loaded. Unknown only when no waiter
+        // ran (tests), which never holds.
+        // Modified by ryuzcorp (ryuzcorp/celld): fence-round hold (0068).
+        Ok((position, source, Some(ticket)))
     }
 
     /// Prove that every write before handoff nomination reached either the
@@ -5222,25 +5242,32 @@ async fn sync_loop(
         // PUT is the ack path there, not the per-cell one. When the gate closes
         // (or credit is refused and bundling stops), this falls back at once to
         // today's per-cell uploads for new writes.
-        let bucket_bundling = registered
+        let manager = registered.as_ref().map(|targets| targets.manager.clone());
+        let bucket_bundling = manager
             .as_ref()
-            .is_some_and(|targets| targets.manager.bucket_bundling());
-        let bundle_active = registered
+            .is_some_and(|manager| manager.bucket_bundling());
+        let bundle_active = manager
             .as_ref()
-            .is_some_and(|targets| targets.manager.bundle_active());
-        let bundling = sync_should_bundle(paced, bundle_active, bucket_bundling);
+            .is_some_and(|manager| manager.bundle_active());
         let now = asyncrt::wall_ms().max(0) as u64;
         let work: Vec<CellHandle> = {
             let map = cells.lock().unwrap();
-            map.values()
-                .filter(|c| {
+            map.iter()
+                .filter(|((cell, epoch), c)| {
                     c.req_seq.load(Ordering::SeqCst) > c.synced_seq.load(Ordering::SeqCst)
-                        && !bundling
+                        && sync_cell_fallback(
+                            paced,
+                            bundle_active,
+                            bucket_bundling,
+                            manager
+                                .as_ref()
+                                .is_some_and(|manager| manager.fence_fallback(cell, *epoch)),
+                        )
                         && (!paced
                             || now.saturating_sub(c.last_sync_ms.load(Ordering::SeqCst))
                                 >= flush_ms)
                 })
-                .cloned()
+                .map(|(_, c)| c.clone())
                 .collect()
         };
         for cell in work {
@@ -5418,7 +5445,8 @@ async fn bundle_loop(
         if work.is_empty() {
             continue;
         }
-        type Credits = Vec<(CellHandle, u64, u64)>;
+        type Credits = Vec<((String, u64), CellHandle, u64, u64)>;
+        let live_cells: BTreeSet<(String, u64)> = work.iter().map(|(key, _)| key.clone()).collect();
         let (entries, credits): (Vec<celld_ltx::bundle::BundleEntry>, Credits) =
             asyncrt::blocking(move || {
                 let mut entries = Vec::new();
@@ -5453,7 +5481,7 @@ async fn bundle_loop(
                     }
                     drop(replica);
                     if complete {
-                        credits.push((handle, tickets, pos.txid.0));
+                        credits.push(((cell, epoch), handle, tickets, pos.txid.0));
                     }
                 }
                 (entries, credits)
@@ -5469,18 +5497,45 @@ async fn bundle_loop(
         // Credit requires every chunk credited; any refusal falls back to per-cell.
         let is_bucket = active.bucket_bundling();
         let mut flushed_ok = false;
+        // Cells the fence rounds already decided, with their verdict. A
+        // fence-uncredited cell skips the durable advance below: its gates
+        // already failed via the round event, and its rows re-prove per-cell.
+        // Modified by ryuzcorp (ryuzcorp/celld): per-round fence reads (0068).
+        let mut fence_decided: BTreeMap<(String, u64), bool> = BTreeMap::new();
+        // The fence cover is written in waiter-ticket units: per (cell,
+        // epoch) the request sequence the gather loaded, so a gate whose
+        // waiter ticket is at or below it committed before the gather and
+        // its row is in the round's bundle. Barrier positions cannot serve
+        // instead — they are SQLite fingerprints in unrelated units.
+        // Modified by ryuzcorp (ryuzcorp/celld): fence-round hold (0068).
+        let ticket_reqs: BTreeMap<(String, u64), u64> = credits
+            .iter()
+            .map(|(key, _, tickets, _)| (key.clone(), *tickets))
+            .collect();
         if entries.is_empty() {
             flushed_ok = true;
         } else if is_bucket {
             flushed_ok = true;
             for chunk in split_bundle_entries(entries) {
-                if !active.put_bundle(chunk).await {
+                let outcome = active.put_bundle_with_tickets(chunk, &ticket_reqs).await;
+                if !outcome.flushed {
                     flushed_ok = false;
                     break;
                 }
+                if let Some(settlement) = outcome.settlement {
+                    for cell in &settlement.cells {
+                        fence_decided
+                            .insert((cell.cell.clone(), cell.epoch), cell.credit.credited());
+                    }
+                }
             }
-        } else if active.put_bundle(entries).await {
+        } else if active.put_bundle(entries).await.flushed {
             flushed_ok = true;
+        }
+        if is_bucket {
+            // Drop fallback marks for cells with nothing dirty left; the
+            // uncredited ones below re-mark themselves.
+            active.retain_fence_fallback(&live_cells);
         }
         if flushed_ok {
             if count > 0 {
@@ -5491,7 +5546,18 @@ async fn bundle_loop(
                     "flushed a bundle"
                 );
             }
-            for (handle, tickets, position) in credits {
+            for ((cell, epoch), handle, tickets, position) in credits {
+                if fence_decided.get(&(cell, epoch)) == Some(&false) {
+                    // The fence refused this cell while the record still
+                    // stands: wake its durability waiters (their gates
+                    // already failed via the round event) but leave
+                    // `durable_txid`, so the rows stay dirty and re-prove
+                    // per-cell instead of hanging behind the bundle.
+                    // Modified by ryuzcorp (ryuzcorp/celld): per-round fence reads (0068).
+                    handle.synced_seq.fetch_max(tickets, Ordering::SeqCst);
+                    handle.ready.notify_waiters();
+                    continue;
+                }
                 handle.durable_txid.fetch_max(position, Ordering::SeqCst);
                 handle.synced_seq.fetch_max(tickets, Ordering::SeqCst);
                 handle
@@ -7540,6 +7606,34 @@ mod bucket_bundles_tests {
         assert!(
             !sync_should_bundle(false, true, false),
             "bundle without pace or bucket: per-cell"
+        );
+    }
+
+    /// A fence-uncredited cell uploads per-cell even while the bundle loop
+    /// owns the rest; every other combination matches `sync_should_bundle`.
+    /// Fail-before: dropping the `|| fence_fallback` keeps the failed cell
+    /// in the bundle forever.
+    #[test]
+    fn sync_cell_fallback_exempts_fence_failed_cells() {
+        assert!(
+            sync_cell_fallback(false, false, true, true),
+            "fence failure exempts the cell under bucket bundling"
+        );
+        assert!(
+            !sync_cell_fallback(false, false, true, false),
+            "credited cells keep riding the bundle"
+        );
+        assert!(
+            sync_cell_fallback(false, false, false, false),
+            "gate closed: per-cell as today"
+        );
+        assert!(
+            !sync_cell_fallback(true, true, false, false),
+            "fleet bundling paces the rest: no per-cell"
+        );
+        assert!(
+            !sync_cell_fallback(true, true, true, false),
+            "bundling everywhere stops per-cell without a failure"
         );
     }
 

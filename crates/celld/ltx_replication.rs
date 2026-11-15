@@ -148,7 +148,7 @@ impl Replication {
         cell: &str,
         epoch: u64,
         position: u64,
-    ) -> anyhow::Result<(u64, celld_logic::ProofSource)> {
+    ) -> anyhow::Result<(u64, celld_logic::ProofSource, Option<u64>)> {
         self.ltx.await_durable(cell, epoch, position).await
     }
 

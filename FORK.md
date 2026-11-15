@@ -833,6 +833,39 @@ push to `ghcr.io/denoland`, but still. Pushing a branch named
   generation instead of per isolate: the projection lives on the shared
   `Arc<WorkerConfig>`, so N isolates project once; read-only semantics
   unchanged. Counter-based unit test proves one projection per config.
+- `0068` (sha TBD at merge) parity item (iv) layer 2, executor wiring: one
+  ownership-fence read per flush round instead of one per write, on the
+  bucket-posture group-commit credit path. After the bundle PUT succeeds,
+  `put_bundle_with_tickets` re-reads the session record and reads one fence
+  entry per distinct (cell, epoch) in the round CONCURRENTLY (the `own.json`
+  GET via the existing ownership store, backed by the `RoundFence` trait),
+  strictly after the PUT completed; `round_credit` decides per cell and a
+  `FenceRoundSettlement` goes to the output gate via a best-effort shell
+  sink (`Message::FenceRoundVerified`). Covers are waiter tickets, not gate
+  positions (barrier positions are SQLite fingerprints in unrelated units):
+  each cell's cover is the flush's gather request sequence, and
+  `await_durable` now returns the waiter's ticket with its proof, so the
+  shell labels a bucket proof `BucketBundle` exactly when its ticket is at
+  or below the round's cover — never for fallback-marked cells, ticketless
+  proofs, or with the operator kill switch `CELLD_FENCE_ROUNDS=0` (default
+  on). The core holds that gate for the settlement, matching holds by
+  ticket against the cover however the two events interleave — including a
+  latch of the latest verified cover per (cell, epoch), so a proof that
+  lands after its settlement was already processed settles at once instead
+  of waiting for a round that will never come again. Only verified rounds
+  latch: a failed or unordered round clears the cell, the key carries the
+  epoch (tickets restart per residency, so a new epoch never matches an old
+  cover), and the latch is pruned to live gates. No non-fence proof settles
+  a held gate. A lost settlement still settles: the operation deadline turns
+  the hold into a per-gate read. Fleet-posture bundles and non-bundle
+  uploads keep today's per-write `VerifyOwnership`, unchanged. Fail-before
+  per behaviour: per-cell fence reads (count), unconditional credit
+  (takeover and read-error verdicts), skipped record re-read (seal), dropped
+  errored cells (hang), the hold (per-gate read), the deadline fallback
+  (ambiguous failure), unpublished covers (label), ignored kill switch
+  (per-gate path), the fallback-mark shadow, the latch consult (late proof
+  holds), the failure/unordered clear (stale latch settles), the epoch key
+  (new-epoch gate settles), and unordered latching each turn their test red.
 
 Patches `0025`–`0034` are ported fixes from
 [meln1k/celld](https://github.com/meln1k/celld) by Nikita

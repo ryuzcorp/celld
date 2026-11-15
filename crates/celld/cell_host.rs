@@ -123,7 +123,7 @@ impl CellHost {
         cell: &str,
         epoch: u64,
         position: u64,
-    ) -> anyhow::Result<(u64, celld_logic::ProofSource)> {
+    ) -> anyhow::Result<(u64, celld_logic::ProofSource, Option<u64>)> {
         match self {
             Self::Engine(runtime) => runtime.await_durable(cell, epoch, position).await,
             #[cfg(all(test, celld_internal_tests))]

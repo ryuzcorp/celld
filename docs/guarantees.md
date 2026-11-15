@@ -184,8 +184,9 @@ before the source write is durable; a raw TCP connect, write, TLS upgrade, or
 shutdown; and each chunk of a streamed body. A client therefore cannot act on a
 value that a crash can still lose.
 
-After a bucket proof, celld reads the ownership record once and acknowledges
-only if it still names this node at this epoch. Concurrent writes on one cell
+After a bucket proof, celld reads the fence entries for the round's cells
+once and acknowledges only writes whose entry still names this node at this
+epoch. Concurrent writes on one cell
 share that read: a write whose proof lands while a read is in flight joins it
 when its position is at or below the position of the write that issued the
 read, and issues its own read at once otherwise, so sharing never delays a

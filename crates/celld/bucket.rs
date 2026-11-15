@@ -824,6 +824,22 @@ impl Bucket {
             read_deploy: None,
         })
     }
+    /// Test-only: this bucket with its object client swapped for a decorated
+    /// one (counting, fault-injecting). Pagination keeps the inner client:
+    /// listings bypass the decorator by construction.
+    /// Modified by ryuzcorp (ryuzcorp/celld): per-round fence reads (0068).
+    #[cfg(test)]
+    pub fn with_store(&self, store: Arc<dyn ObjectStore>) -> Self {
+        Self {
+            store: store.clone(),
+            paginated: self.paginated.clone(),
+            cas_store: store,
+            backend: self.backend,
+            name: self.name.clone(),
+            prefix: self.prefix.clone(),
+            read_deploy: self.read_deploy.clone(),
+        }
+    }
 
     /// The body of [`Self::open`], taking the cloud configuration instead
     /// of deriving it from the `GOOGLE_*` and `AZURE_*` environments. A

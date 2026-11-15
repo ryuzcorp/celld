@@ -473,11 +473,21 @@ impl Channel {
 /// Which mechanism proved a gated write durable. The fences differ: the
 /// fleet's follower ensemble arbitrates (a takeover seals a member first),
 /// the bucket only stores — so bucket proofs verify ownership before any
-/// reveal and fleet proofs do not need that extra read.
+/// reveal and fleet proofs do not need that extra read. A bucket proof that
+/// rode a fence-round-enabled bundle flush carries its own fence read: the
+/// gate holds for the round's settlement instead of opening a per-gate
+/// ownership read, falling back to one only if the round never settles.
+/// Modified by ryuzcorp (ryuzcorp/celld): fence-round hold (0068).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProofSource {
     Fleet,
     Bucket,
+    /// A bucket proof from a fence-round-enabled bundle flush whose round
+    /// settlement still owes this gate its verdict. The gate holds — no
+    /// `VerifyOwnership` — until `FenceRoundVerified` settles it or the
+    /// operation deadline turns the hold into a per-gate read.
+    /// Modified by ryuzcorp (ryuzcorp/celld): fence-round hold (0068).
+    BucketBundle,
 }
 
 /// Whether a failed operation definitely did not commit or may have committed
@@ -700,6 +710,16 @@ pub enum Event {
         op: OpId,
         result: Result<u64, Failure>,
         source: ProofSource,
+        /// The durability-waiter ticket the shell waited on, when the proof
+        /// came from a waiter (always in production). A fence-round-enabled
+        /// bundle proof holds its gate with this ticket, and the round's
+        /// settlement matches holds by ticket against its ticket cover —
+        /// barrier positions are SQLite fingerprints in unrelated units, so
+        /// they can never be compared against a cover. `None` only in tests
+        /// that drive the core without a shell; a ticketless hold is settled
+        /// by any same-cell settlement.
+        /// Modified by ryuzcorp (ryuzcorp/celld): fence-round hold (0068).
+        ticket: Option<u64>,
     },
     /// The ownership record still names this node at this epoch
     /// (`Ok`), or does not, or could not be read.

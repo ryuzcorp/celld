@@ -250,6 +250,8 @@ impl State {
                 cell: cell.clone(),
                 epoch,
                 position,
+                fence_pending: false,
+                fence_ticket: None,
                 followers: Vec::new(),
             },
         );
@@ -314,6 +316,7 @@ impl State {
         op: OpId,
         result: Result<u64, Failure>,
         source: ProofSource,
+        ticket: Option<u64>,
         effects: &mut Vec<Effect>,
     ) {
         let Some(gate) = self.barriers.get(&op) else {
@@ -327,8 +330,51 @@ impl State {
         // arbitrated it: a takeover seals a member before restoring, so a
         // stale owner's ack-all fails closed.
         if let Ok(durable) = result {
+            if durable >= position && source == ProofSource::BucketBundle {
+                // Either order resolves the gate: the settlement may already
+                // have been processed (the proof and the settlement travel
+                // separate actor paths), and the latch answers such a late
+                // proof at once instead of holding it for a round that will
+                // never come again. No latch covers the gate — a newer
+                // ticket, another cell or epoch, or no verified round yet —
+                // and the gate holds for the round still to come, or the
+                // operation deadline turns it into a per-gate read.
+                // Modified by ryuzcorp (ryuzcorp/celld): fence-round latch (0068).
+                if self.settle_from_fence_latch(op, ticket, effects) {
+                    return;
+                }
+                // The proof rode a fence-round-enabled bundle flush: the
+                // round's own fence read already covers this gate, so hold
+                // for `FenceRoundVerified` instead of opening a per-gate
+                // ownership read. The hold never hangs: the round normally
+                // settles it at once, and the operation deadline turns a
+                // lost round into a per-gate read (see `expire_operation`).
+                // Modified by ryuzcorp (ryuzcorp/celld): fence-round hold (0068).
+                self.probe(Probe::GateFenceWait);
+                if let Some(gate) = self.barriers.get_mut(&op) {
+                    gate.fence_pending = true;
+                    gate.fence_ticket = ticket;
+                }
+                return;
+            }
             if durable >= position && source == ProofSource::Bucket {
                 self.join_verify_round(op, cell, epoch, position, effects);
+                return;
+            }
+            // A fence-held gate is never settled by a non-fence proof: the
+            // round's own fence read already covers it, so only the round's
+            // settlement — or the operation deadline — may release it. The
+            // hold then depends on the round, not the posture: a duplicate
+            // or cross-posture completion cannot cut ahead of it. Unreachable
+            // today (a held gate's proof already landed), held here rather
+            // than failed so a stray completion cannot fail a write the
+            // round is about to credit.
+            // Modified by ryuzcorp (ryuzcorp/celld): fence-round hold (0068).
+            if self
+                .barriers
+                .get(&op)
+                .is_some_and(|gate| gate.fence_pending)
+            {
                 return;
             }
         }
@@ -339,6 +385,52 @@ impl State {
             Ok(_) => Probe::GateProvenByFleet,
         });
         self.settle_gate(op, proven, effects);
+    }
+    /// already resolved. Only a verified round latches — credited and
+    /// proof-then-read-ordered — and only a gate the latched cover reaches
+    /// settles: a newer ticket, another cell or epoch, or no latch yet
+    /// returns false so the caller holds the gate for the round still to
+    /// come (or the deadline turns it into a per-gate read). Ticketless
+    /// proofs (`None`, tests only) settle from any same-cell latch, exactly
+    /// as a settlement answers them. A latch-settled gate releases proven
+    /// with no per-gate read, like a settlement match.
+    /// Modified by ryuzcorp (ryuzcorp/celld): fence-round latch (0068).
+    fn settle_from_fence_latch(
+        &mut self,
+        op: OpId,
+        ticket: Option<u64>,
+        effects: &mut Vec<Effect>,
+    ) -> bool {
+        let Some(gate) = self.barriers.get(&op) else {
+            return false;
+        };
+        let covered = self
+            .fence_latched
+            .get(&(gate.cell.clone(), gate.epoch))
+            .is_some_and(|cover| ticket.is_none_or(|ticket| ticket <= *cover));
+        if !covered {
+            return false;
+        }
+        self.probe(Probe::GateProvenByFenceRound);
+        self.settle_gate(op, true, effects);
+        true
+    }
+
+    /// Drop the fence latch for one (cell, epoch) leaving the gate: a reset
+    /// or torn-down cell's cover must not linger past its residency. A later
+    /// residency runs at a new epoch, so the key could never match again —
+    /// this only bounds memory, one entry per live (cell, epoch).
+    /// Modified by ryuzcorp (ryuzcorp/celld): fence-round latch (0068).
+    pub(crate) fn drop_fence_latch(&mut self, cell: &str, epoch: Epoch) {
+        self.fence_latched.remove(&(cell.to_string(), epoch));
+    }
+
+    /// Drop every fence latch for a cell leaving the gate, all epochs: the
+    /// teardown path drains barriers without naming one epoch.
+    /// Modified by ryuzcorp (ryuzcorp/celld): fence-round latch (0068).
+    pub(crate) fn drop_fence_latch_cell(&mut self, cell: &str) {
+        self.fence_latched
+            .retain(|(key_cell, _), _| key_cell != cell);
     }
 
     /// Share bucket-posture ownership reads across a cell's concurrent gates.
@@ -354,7 +446,7 @@ impl State {
     /// exactly one read issued after a proof that captured it, and no gate
     /// waits longer than that one read, so sharing saves reads without
     /// adding latency.
-    fn join_verify_round(
+    pub(crate) fn join_verify_round(
         &mut self,
         op: OpId,
         cell: CellId,
@@ -452,43 +544,61 @@ impl State {
             }
         }
     }
-    /// Settle gates from a round-level fence read issued AFTER the round's
-    /// bundle proof completed, without a per-gate `VerifyOwnership` read.
-    /// The executor computes each cell's [`CellCredit`] with the two-arm
-    /// predicate (`log_tier::round_cell_credit`) and hands the round back
-    /// here; the gate settles exactly the gates the proof captured — live
-    /// barriers on the cell at the round's epoch with positions at or below
-    /// the cell's cover, the same cover rule a shared [`VerifyRound`] uses.
-    /// A credited cell settles its gates proven, like an `Ok` ownership
-    /// read; an uncredited cell fails them exactly like a refused one —
-    /// including the cell reset — so uncredited gates fail, never hang. A
-    /// round whose read predates its proof (`order` unordered) settles
-    /// nothing as credited: every gate it covers fails instead, so a fence
-    /// read issued before the proof is never accepted. Gates above a cell's
-    /// cover, on another cell, or on another epoch are untouched: a later
-    /// proof still owes them their own read.
-    /// Modified by ryuzcorp (ryuzcorp/celld): round-level fence settlement (0062).
+    /// Settle the gates a fence round's proof captured, in either arrival
+    /// order. Only gates the round holds — `BucketBundle` proofs held for
+    /// this settlement — are answered: a gate matches when its waiter ticket
+    /// is at or below the cell's ticket cover. Barrier positions are SQLite
+    /// fingerprints in unrelated units, so the round never compares them
+    /// against a cover; tickets are the commit-ordered link the flush
+    /// captured with the rows. A proof that lands after its settlement was
+    /// already processed settles from the latch instead of holding: each
+    /// verified round latches its cover per (cell, epoch), so both orders
+    /// resolve the gate. A failed or unordered round never raises the latch
+    /// — it clears the cell — and gates above the cover belong to later
+    /// rounds, gates on another cell or epoch are untouched, and a gate that
+    /// never held keeps the per-gate read its own proof opened: the round
+    /// answers nothing it does not hold, so a stray or replayed settlement
+    /// releases nothing new. Ticketless holds (`None`, tests only) are
+    /// settled by any same-cell settlement. Uncredited cells fail their
+    /// holds — never hang — and the rows fall back to per-cell upload; the
+    /// durable advance skips them, including the cell reset. The latch keeps
+    /// one entry per live (cell, epoch): a cell whose barriers all drained
+    /// is pruned with every round.
+    /// Modified by ryuzcorp (ryuzcorp/celld): fence-round latch (0068).
     pub(crate) fn fence_round_verified(
         &mut self,
         round: &FenceRoundSettlement,
         effects: &mut Vec<Effect>,
     ) {
         for cell in &round.cells {
+            // Latch only verified settlements: a credited, ordered round
+            // raises the cell to the highest cover it vouched for, so a
+            // later proof resolves from the latch however the two events
+            // interleave. A failed or unordered round clears the cell
+            // instead: ownership past a fence failure is uncertain, and a
+            // read issued before the proof is never accepted — so a stale
+            // cover can never credit after either.
+            if round.order.ordered() && cell.credit.credited() {
+                self.fence_latched
+                    .entry((cell.cell.clone(), cell.epoch))
+                    .and_modify(|cover| *cover = (*cover).max(cell.cover))
+                    .or_insert(cell.cover);
+            } else {
+                self.fence_latched.remove(&(cell.cell.clone(), cell.epoch));
+            }
             let covered: Vec<OpId> = self
                 .barriers
                 .iter()
                 .filter(|(_, barrier)| {
                     barrier.cell == cell.cell
                         && barrier.epoch == cell.epoch
-                        && barrier.position <= cell.cover
+                        && barrier.fence_pending
+                        && barrier
+                            .fence_ticket
+                            .is_none_or(|ticket| ticket <= cell.cover)
                 })
                 .map(|(op, _)| *op)
                 .collect();
-            // The fence read supersedes the gates' own in-flight ownership
-            // reads: detach the settled gates so a late `OwnershipVerified`
-            // finds no round and releases nothing, and drop rounds left with
-            // nothing to answer. A round never names a drained gate.
-            self.detach_gates_from_verify_rounds(&cell.cell, cell.epoch, &covered);
             if !round.order.ordered() {
                 self.probe(Probe::GateFenceRoundUnordered);
                 for op in covered {
@@ -511,28 +621,16 @@ impl State {
                 }
             }
         }
-    }
-
-    /// Detach settled gates from the per-gate ownership reads in flight, so
-    /// those reads answer only gates still waiting. Rounds drained entirely
-    /// are dropped: a late result for one releases nothing.
-    fn detach_gates_from_verify_rounds(&mut self, cell: &str, epoch: Epoch, ops: &[OpId]) {
-        let Some(reads) = self
-            .verify_rounds_by_cell
-            .get(&(cell.to_string(), epoch))
-            .cloned()
-        else {
-            return;
-        };
-        for read_op in reads {
-            let drained = self.verify_rounds.get_mut(&read_op).is_some_and(|round| {
-                round.members.retain(|member| !ops.contains(member));
-                round.members.is_empty()
-            });
-            if drained {
-                self.drop_verify_round(read_op);
-            }
-        }
+        // Bound the latch to live gates: a cell whose barriers all drained
+        // can never grow a hold its latch would answer — a later barrier is
+        // a newer write whose ticket exceeds every latched cover — so drop
+        // it. One entry per live (cell, epoch), no teardown scan needed.
+        let live: BTreeSet<(CellId, Epoch)> = self
+            .barriers
+            .values()
+            .map(|barrier| (barrier.cell.clone(), barrier.epoch))
+            .collect();
+        self.fence_latched.retain(|key, _| live.contains(key));
     }
 
     /// Release one withheld output, unpinning it first so the cleanup that
