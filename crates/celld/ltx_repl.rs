@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): an eviction skips the visibility LISTs its own uploads already prove and the time-based checkpoint before the handoff; an eviction deletes the per-cell L0/L1 objects its handoff snapshot supersedes; bucket-posture group commit: paged gate judges PAGED_FORMAT (0059).
+// Modified by ryuzcorp (ryuzcorp/celld): an eviction skips the visibility LISTs its own uploads already prove and the time-based checkpoint before the handoff; an eviction deletes the per-cell L0/L1 objects its handoff snapshot supersedes; bucket-posture group commit: paged gate judges PAGED_FORMAT (0059); bucket-posture group commit: bucket bundle gate, sync pacing and event-driven bundle flush (0060).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! In-process replication backend built on `celld-ltx`.
@@ -1018,6 +1018,80 @@ fn credit_percell_upload(handle: &Cell, txid: u64) {
     handle.percell_txid.fetch_max(txid, Ordering::SeqCst);
     handle.durable_txid.fetch_max(txid, Ordering::SeqCst);
 }
+/// Whether the operator enabled bucket-posture bundles (`CELLD_BUCKET_BUNDLES=1`).
+/// Off by default: until layers 3-5 merge, a partial stack must never ship enabled,
+/// so the format gate alone is not enough. Pure value helper keeps tests deterministic
+/// without touching the process environment.
+fn bucket_bundles_env_value(value: Option<&str>) -> bool {
+    matches!(value.map(str::trim), Some("1"))
+}
+
+/// Production read of the operator switch, per flush (not per process).
+pub(crate) fn bucket_bundles_env_on() -> bool {
+    bucket_bundles_env_value(std::env::var("CELLD_BUCKET_BUNDLES").ok().as_deref())
+}
+
+/// The longest linger `CELLD_BUCKET_BUNDLE_LINGER_MS` accepts: one bucket round
+/// trip's worth of extra ack latency is the point of the knob, and anything near
+/// the durability timeout would only turn into failed writes.
+const BUCKET_BUNDLE_LINGER_MAX_MS: u64 = 1_000;
+
+/// Parse `CELLD_BUCKET_BUNDLE_LINGER_MS`: absent, empty or unparsable is 0 (no
+/// linger), and values above the cap clamp to it.
+fn bucket_bundle_linger_value(value: Option<&str>) -> Duration {
+    let ms = value
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .unwrap_or(0)
+        .min(BUCKET_BUNDLE_LINGER_MAX_MS);
+    Duration::from_millis(ms)
+}
+
+fn bucket_bundle_linger() -> Duration {
+    bucket_bundle_linger_value(
+        std::env::var("CELLD_BUCKET_BUNDLE_LINGER_MS")
+            .ok()
+            .as_deref(),
+    )
+}
+/// Cap a bucket bundle by rows and bytes; the flush splits above the cap into one
+/// PUT per chunk, each with its own sequence. The limits are policy (triggers stay
+/// out of the core): small enough to bound one object, large enough that ordinary
+/// agent workloads flush in one PUT.
+const BUCKET_BUNDLE_MAX_ROWS: usize = 1024;
+const BUCKET_BUNDLE_MAX_BYTES: usize = 8 * 1024 * 1024;
+
+/// Split captured entries into PUT-sized chunks by rows and payload bytes. Empty
+/// input yields no chunks; the caller credits without a PUT in that case.
+fn split_bundle_entries(
+    entries: Vec<celld_ltx::bundle::BundleEntry>,
+) -> Vec<Vec<celld_ltx::bundle::BundleEntry>> {
+    let mut chunks: Vec<Vec<celld_ltx::bundle::BundleEntry>> = Vec::new();
+    let mut current: Vec<celld_ltx::bundle::BundleEntry> = Vec::new();
+    let mut current_bytes: usize = 0;
+    for entry in entries {
+        let entry_bytes = entry.bytes.len();
+        if !current.is_empty()
+            && (current.len() >= BUCKET_BUNDLE_MAX_ROWS
+                || current_bytes.saturating_add(entry_bytes) > BUCKET_BUNDLE_MAX_BYTES)
+        {
+            chunks.push(std::mem::take(&mut current));
+            current_bytes = 0;
+        }
+        current_bytes = current_bytes.saturating_add(entry_bytes);
+        current.push(entry);
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    chunks
+}
+/// Whether `sync_loop` must skip per-cell L0 uploads because the bundle loop owns
+/// them. Fleet bundling is paced (`paced && bundle_active`); bucket bundling stops
+/// per-cell uploads even though `paced` is false (no shipper) — the bundle PUT is
+/// the ack path there. Pure predicate so tests pin the pacing without a daemon.
+fn sync_should_bundle(paced: bool, bundle_active: bool, bucket_bundling: bool) -> bool {
+    (paced && bundle_active) || bucket_bundling
+}
 /// Cap the per-cell upload journal: entries are one upload round each, and a
 /// long-lived hot cell uploads far more rounds in one epoch than the trim can
 /// usefully delete in one pass (8192 entries ≈ 200 KiB). Every upload's max
@@ -1336,6 +1410,18 @@ pub struct LtxRepl {
     /// release cannot restore. `CELLD_LTX_PAGED` is the operator's switch;
     /// this one is the fleet's.
     paged_fleet: AtomicBool,
+    /// Whether every live lease reads bucket-posture bundle proofs
+    /// (`celld_logic::format::BUCKET_BUNDLES_FORMAT`). Off until the first
+    /// fleet sample (mirrors the paged gate): a failed or missing sample
+    /// closes it. The per-flush bundle path additionally requires the
+    /// operator switch `CELLD_BUCKET_BUNDLES=1`, so a partial stack never
+    /// ships enabled (see `bucket_bundles_enabled`).
+    bucket_bundles_fleet: AtomicBool,
+    /// Test-only override for the `CELLD_BUCKET_BUNDLES` leg, so deterministic
+    /// tests do not mutate the process environment. `None` (production) reads
+    /// the env per flush; `Some(on)` forces the answer.
+    #[cfg(test)]
+    bucket_env_override: Mutex<Option<bool>>,
     /// The chain size, in bytes, from which a restore pages instead of
     /// cloning (`CELLD_LTX_PAGED_MIN_MB`). Below it the clone is cheaper:
     /// one download the node can afford, no fault path, no hydration.
@@ -1353,6 +1439,12 @@ pub struct LtxRepl {
     /// Woken when a gate ticket arrives, so the ship loop group-commits
     /// without polling.
     dirty_ship: Arc<Notify>,
+    /// Woken when a gate ticket arrives, so the bucket-posture bundle loop
+    /// flushes without polling. Its own `Notify`, not `dirty`: `notify_one`
+    /// hands one permit to one waiter, and `sync_loop` always waits on
+    /// `dirty`, so a shared `Notify` would let the sync loop take the bundle
+    /// loop's wakeup and stall the bucket flush.
+    dirty_bundle: Arc<Notify>,
     /// Cells whose last epoch ended quietly with acked rows outside the
     /// per-cell layout (`note_undrained_tail`'s predicate). The ending
     /// itself cannot write — release serves fenced nodes — so the
@@ -1607,6 +1699,7 @@ impl LtxRepl {
         let cells: Arc<Mutex<BTreeMap<(String, u64), CellHandle>>> = Arc::default();
         let dirty = Arc::new(Notify::new());
         let dirty_ship = Arc::new(Notify::new());
+        let dirty_bundle = Arc::new(Notify::new());
         let registration: Arc<Mutex<RegistrationState>> = Arc::default();
         let stop = StopToken::new();
         let tasks = TaskGroup::new(stop.clone());
@@ -1642,7 +1735,13 @@ impl LtxRepl {
         );
         tasks.spawn_owned(
             "ltx_bundle",
-            bundle_loop(cells.clone(), registration.clone(), stop.clone(), flush_ms),
+            bundle_loop(
+                cells.clone(),
+                registration.clone(),
+                stop.clone(),
+                flush_ms,
+                dirty_bundle.clone(),
+            ),
         );
         let compaction_queue =
             compaction.map(|config| start_compaction_loop(config, tasks.clone()));
@@ -1671,11 +1770,15 @@ impl LtxRepl {
             compaction_min_bytes: compaction.map_or(u64::MAX, |config| config.min_bytes),
             paged_restore: AtomicBool::new(config.paged_restore),
             paged_fleet: AtomicBool::new(false),
+            bucket_bundles_fleet: AtomicBool::new(false),
+            #[cfg(test)]
+            bucket_env_override: Mutex::new(None),
             paged_min_bytes: AtomicU64::new(config.paged_min_bytes),
             hydrate_bytes_per_s: config.hydrate_bytes_per_s,
             hydrations: Arc::new(Semaphore::new(1)),
             preserved,
             dirty_ship,
+            dirty_bundle,
             dirty_tails: Mutex::new(BTreeMap::new()),
             registration,
             stop: stop.clone(),
@@ -1792,6 +1895,7 @@ impl LtxRepl {
         });
         drop(state);
         self.dirty_ship.notify_one();
+        self.dirty_bundle.notify_one();
         self.dirty.notify_one();
         Some(DurabilityRegistration {
             registration: Arc::downgrade(&self.registration),
@@ -3006,6 +3110,48 @@ impl LtxRepl {
         self.paged_fleet.load(Ordering::Relaxed)
     }
 
+    /// The fleet's answer to "may this node write bucket-posture bundle proofs".
+    /// The fleet sampler sets it from the leases via
+    /// `celld_logic::format::bucket_bundles_allowed`; returns the prior value so
+    /// the caller logs a transition once. Off until the first sample, mirroring
+    /// the paged gate: a failed or missing sample closes it. The per-flush path
+    /// additionally requires `CELLD_BUCKET_BUNDLES=1` (see `bucket_bundles_enabled`),
+    /// so a partial stack never ships enabled.
+    pub fn set_bucket_bundles_fleet(&self, ready: bool) -> bool {
+        self.bucket_bundles_fleet.swap(ready, Ordering::Relaxed)
+    }
+
+    /// Whether the fleet sample currently permits bucket bundles (format gate
+    /// only; the operator switch is checked per flush in `bucket_bundles_enabled`).
+    pub fn bucket_bundles_fleet(&self) -> bool {
+        self.bucket_bundles_fleet.load(Ordering::Relaxed)
+    }
+
+    /// Whether this flush may write bucket-posture bundles: the fleet gate
+    /// (set by the sampler, off until the first sample) AND the operator switch
+    /// `CELLD_BUCKET_BUNDLES=1`. Re-checked per flush, not per process: when the
+    /// gate closes, the node falls back at once to per-cell L0 uploads for new
+    /// writes. Already-credited bundle rows stay covered by the existing drain
+    /// and GC paths (layer 4 completes those).
+    pub(crate) fn bucket_bundles_enabled(&self) -> bool {
+        if !self.bucket_bundles_fleet.load(Ordering::Relaxed) {
+            return false;
+        }
+        #[cfg(test)]
+        if let Some(forced) = *self.bucket_env_override.lock().unwrap() {
+            return forced;
+        }
+        bucket_bundles_env_on()
+    }
+
+    /// Test override for the operator switch, so deterministic tests do not touch
+    /// the process environment. `Some(on)` forces the env leg; `None` restores the
+    /// real `CELLD_BUCKET_BUNDLES` read.
+    #[cfg(test)]
+    pub fn set_bucket_bundles_env_override_for_test(&self, on: Option<bool>) {
+        *self.bucket_env_override.lock().unwrap() = on;
+    }
+
     /// The VFS the actor's connection must open through, for a resident
     /// activation: `Some` when it paged, `None` when its file is whole. An
     /// activation that is no longer resident is an error, not `None`: a
@@ -3099,6 +3245,7 @@ impl LtxRepl {
         handle.record_durability_ticket_for_world(position, ticket);
         self.dirty.notify_one();
         self.dirty_ship.notify_one();
+        self.dirty_bundle.notify_one();
         let source = self
             .wait_for_durability_ticket(&handle, cell, epoch, ticket)
             .await?;
@@ -3135,6 +3282,7 @@ impl LtxRepl {
         handle.handoff_ticket.fetch_max(ticket, Ordering::SeqCst);
         self.dirty.notify_one();
         self.dirty_ship.notify_one();
+        self.dirty_bundle.notify_one();
         self.wait_for_durability_ticket(&handle, cell, epoch, ticket)
             .await
     }
@@ -4892,10 +5040,18 @@ async fn sync_loop(
         // entirely — one PUT per node-flush instead of one per cell. This
         // loop then serves only the unpaced (degraded) mode and the direct
         // sync_wait callers, which are the drain points.
-        let bundling = paced
-            && registered
-                .as_ref()
-                .is_some_and(|targets| targets.manager.bundle_active());
+        // Layer 2 bucket path: with no shipper, `paced` is false, but per-cell
+        // L0 uploads must still stop while bucket bundling is active — the bundle
+        // PUT is the ack path there, not the per-cell one. When the gate closes
+        // (or credit is refused and bundling stops), this falls back at once to
+        // today's per-cell uploads for new writes.
+        let bucket_bundling = registered
+            .as_ref()
+            .is_some_and(|targets| targets.manager.bucket_bundling());
+        let bundle_active = registered
+            .as_ref()
+            .is_some_and(|targets| targets.manager.bundle_active());
+        let bundling = sync_should_bundle(paced, bundle_active, bucket_bundling);
         let now = asyncrt::wall_ms().max(0) as u64;
         let work: Vec<CellHandle> = {
             let map = cells.lock().unwrap();
@@ -4987,22 +5143,84 @@ async fn bundle_loop(
     registration: Arc<Mutex<RegistrationState>>,
     stop: StopToken,
     flush_ms: u64,
+    dirty: Arc<Notify>,
 ) {
-    if flush_ms == 0 {
-        return;
-    }
-    let mut tick = asyncrt::interval(Duration::from_millis(flush_ms));
-    tick.set_missed_tick_behavior(asyncrt::MissedTickBehavior::Delay);
+    // Fleet path keeps its interval pacing; bucket path is event-driven: flush
+    // when dirty and no PUT is in flight, accumulating while one is in flight
+    // and flushing again as soon as it completes. The loop awaits each PUT, so
+    // writes arriving mid-PUT are captured by the next iteration — batching
+    // grows with load. An optional linger (`CELLD_BUCKET_BUNDLE_LINGER_MS`,
+    // default 0) holds each flush that long after the first dirty wake: at
+    // moderate load with spread-out writes, no linger means ~one bundle per
+    // write (the s3bench agent workload measured 1206 bundle PUTs for 1200
+    // writes), and a linger trades that much ack latency for fewer PUTs.
+    let bucket_linger = bucket_bundle_linger();
+    let fleet_tick_ms = flush_ms;
+    let mut fleet_tick = (fleet_tick_ms > 0).then(|| {
+        let mut tick = asyncrt::interval(Duration::from_millis(fleet_tick_ms));
+        tick.set_missed_tick_behavior(asyncrt::MissedTickBehavior::Delay);
+        tick
+    });
     loop {
-        asyncrt::select_biased! {
-            "a stop signal that ties the bundle tick prevents another bucket flush";
-            _ = stop.stopped() => break,
-            _ = tick.tick() => {},
+        // Choose the wait by posture: bucket waits on dirty (event-driven), fleet on
+        // its interval tick. Re-evaluate every iteration so a gate close/open flips
+        // at once without waiting out the other posture's cadence.
+        let bucket_wake = registered_durability(&registration)
+            .is_some_and(|targets| targets.manager.bucket_candidate());
+        if bucket_wake {
+            asyncrt::select_biased! {
+                "a stop signal that ties the bucket bundle wait prevents another flush";
+                _ = stop.stopped() => break,
+                _ = dirty.notified() => {},
+            }
+            if stop.is_stopped() {
+                break;
+            }
+            if !bucket_linger.is_zero() {
+                asyncrt::select_biased! {
+                    "a stop signal that ties the bucket bundle linger prevents another flush";
+                    _ = stop.stopped() => break,
+                    _ = asyncrt::sleep(bucket_linger) => {},
+                }
+            }
+        } else if let Some(tick) = fleet_tick.as_mut() {
+            asyncrt::select_biased! {
+                "a stop signal that ties the bundle tick prevents another bucket flush";
+                _ = stop.stopped() => break,
+                _ = tick.tick() => {},
+            }
+            if stop.is_stopped() {
+                break;
+            }
+        } else {
+            // No fleet interval and no bucket demand: park until dirty or stop, then
+            // re-evaluate. This keeps `flush_ms == 0` test topologies (which never
+            // pace) able to bundle event-driven while fleet stays off.
+            asyncrt::select_biased! {
+                "a stop signal that ties the idle bundle wait prevents another flush";
+                _ = stop.stopped() => break,
+                _ = dirty.notified() => {},
+            }
+            if stop.is_stopped() {
+                break;
+            }
+            continue;
         }
         let installed = registered_durability(&registration).map(|targets| targets.manager.clone());
-        let Some(active) = installed.filter(|sink| sink.bundle_active()) else {
+        let Some(active) = installed else {
             continue;
         };
+        // Bucket record-before-first-ack: the lease chain publishes the
+        // bucket-session record before any bundle-credited ack, and the record
+        // is never deleted. A fenced session, a failed lease write or a closed
+        // gate refuses here; `bucket_bundling` stays false, so `sync_loop`
+        // keeps uploading per cell and the acks ride those uploads.
+        if active.bucket_candidate() && !active.ensure_bucket_record().await.unwrap_or(false) {
+            continue;
+        }
+        if !active.bundle_active() {
+            continue;
+        }
         let work: Vec<((String, u64), CellHandle)> = {
             let map = cells.lock().unwrap();
             map.iter()
@@ -5061,7 +5279,25 @@ async fn bundle_loop(
             continue;
         }
         let count = entries.len();
-        if entries.is_empty() || active.put_bundle(entries).await {
+        // Cap a bundle by rows and bytes and split above the cap: one PUT per chunk,
+        // each with its own sequence, so a hot node never builds an unbounded object.
+        // Credit requires every chunk credited; any refusal falls back to per-cell.
+        let is_bucket = active.bucket_bundling();
+        let mut flushed_ok = false;
+        if entries.is_empty() {
+            flushed_ok = true;
+        } else if is_bucket {
+            flushed_ok = true;
+            for chunk in split_bundle_entries(entries) {
+                if !active.put_bundle(chunk).await {
+                    flushed_ok = false;
+                    break;
+                }
+            }
+        } else if active.put_bundle(entries).await {
+            flushed_ok = true;
+        }
+        if flushed_ok {
             if count > 0 {
                 info!(
                     event = "log_bundle_flush",
@@ -6523,6 +6759,150 @@ mod evict_trim_tests {
             assert_eq!(row_count(&db_path(&watch, "c", 2)), 1);
             shutdown(repl).await;
         });
+    }
+}
+/// Bucket-posture group-commit unit tests (layer 2, executor policy). Plain
+/// `#[cfg(test)]`: CI runs without `celld_internal_tests`. Deterministic, no
+/// sleeps or polling; each behaviour has a fail-before shown by reverting.
+#[cfg(test)]
+mod bucket_bundles_tests {
+    use super::*;
+    async fn shutdown(repl: LtxRepl) {
+        let owner = repl.take_task_owner();
+        drop(repl);
+        owner.join().await;
+    }
+    /// The operator switch is OFF by default: a partial stack never ships enabled.
+    /// Until layers 3-5 merge, the format gate alone is not enough. Fail-before:
+    /// defaulting to `true` enables bundles with no env set.
+    #[test]
+    fn bucket_env_is_off_by_default() {
+        assert!(!bucket_bundles_env_value(None), "absent env stays off");
+        assert!(!bucket_bundles_env_value(Some("")), "empty stays off");
+        assert!(!bucket_bundles_env_value(Some("0")), "explicit 0 stays off");
+        assert!(bucket_bundles_env_value(Some("1")), "explicit 1 opens");
+        assert!(
+            !bucket_bundles_env_value(Some("true")),
+            "only 1 opens, not truthy strings"
+        );
+    }
+
+    /// The linger defaults to none and clamps to its cap, so a typo can never
+    /// stretch every bucket ack toward the durability timeout.
+    #[test]
+    fn bucket_linger_defaults_to_zero_and_clamps() {
+        assert_eq!(bucket_bundle_linger_value(None), Duration::ZERO);
+        assert_eq!(bucket_bundle_linger_value(Some("")), Duration::ZERO);
+        assert_eq!(bucket_bundle_linger_value(Some("x")), Duration::ZERO);
+        assert_eq!(
+            bucket_bundle_linger_value(Some(" 200 ")),
+            Duration::from_millis(200)
+        );
+        assert_eq!(
+            bucket_bundle_linger_value(Some("60000")),
+            Duration::from_millis(BUCKET_BUNDLE_LINGER_MAX_MS)
+        );
+    }
+
+    /// Gate: off until the first fleet sample, and closed while any live reader is
+    /// format-2. The fleet flag mirrors `set_paged_fleet` (off until first sample;
+    /// failed sample publishes an empty view, which closes it). Fail-before: initial
+    /// `AtomicBool::new(true)` opens bundles before the first sample.
+    #[test]
+    fn bucket_gate_stays_closed_until_the_first_sample() {
+        let runtime = asyncrt::shared_test_runtime();
+        runtime.block_on(async {
+            let _temp = tempfile::tempdir().unwrap();
+            let watch = _temp.path().to_path_buf();
+            let store = Arc::new(celld_ltx::object_store::memory::InMemory::new());
+            let repl = LtxRepl::start_with_store_for_test(&watch, store);
+            repl.set_bucket_bundles_env_override_for_test(Some(true));
+            assert!(!repl.bucket_bundles_enabled(), "off until the first sample");
+            repl.set_bucket_bundles_fleet(true);
+            assert!(repl.bucket_bundles_enabled(), "own format-3 lease opens");
+            repl.set_bucket_bundles_fleet(false);
+            assert!(
+                !repl.bucket_bundles_enabled(),
+                "a live format-2 lease closes"
+            );
+            repl.set_bucket_bundles_env_override_for_test(Some(false));
+            repl.set_bucket_bundles_fleet(true);
+            assert!(!repl.bucket_bundles_enabled(), "operator switch off closes");
+            repl.set_bucket_bundles_env_override_for_test(None);
+            shutdown(repl).await;
+        });
+    }
+
+    /// `sync_loop` pacing: per-cell L0 uploads stop while bucket bundling is active
+    /// even though no shipper is installed (`paced` false) — the bundle PUT is the
+    /// ack path there. When the gate closes (or credit is refused), per-cell resumes
+    /// at once. Fail-before: `paced && bundle_active` alone keeps per-cell uploads
+    /// running under bucket bundling.
+    #[test]
+    fn sync_pacing_stops_per_cell_while_bucket_bundling() {
+        assert!(
+            sync_should_bundle(true, true, false),
+            "fleet paced bundling"
+        );
+        assert!(
+            sync_should_bundle(false, false, true),
+            "bucket bundling stops per-cell with no shipper"
+        );
+        assert!(
+            !sync_should_bundle(false, false, false),
+            "gate closed: per-cell as today"
+        );
+        assert!(
+            !sync_should_bundle(true, false, false),
+            "paced but no sink: per-cell"
+        );
+        assert!(
+            !sync_should_bundle(false, true, false),
+            "bundle without pace or bucket: per-cell"
+        );
+    }
+
+    fn bundle_entry(cell: &str, txid: u64, bytes: usize) -> celld_ltx::bundle::BundleEntry {
+        celld_ltx::bundle::BundleEntry {
+            cell: cell.to_string(),
+            cell_epoch: 1,
+            txid,
+            bytes: vec![0u8; bytes],
+        }
+    }
+
+    /// Cross-cell batching: N dirty cells under the cap ride ONE bundle PUT, where
+    /// per-cell flush would need N PUTs. Fail-before: flushing per-cell (one chunk
+    /// per entry) needs N PUTs here.
+    #[test]
+    fn four_cells_batch_into_one_bundle_put() {
+        let entries: Vec<_> = (0..4)
+            .map(|i| bundle_entry(&format!("c{i}"), 1, 100))
+            .collect();
+        let chunks = split_bundle_entries(entries);
+        assert_eq!(chunks.len(), 1, "four small cells share one PUT");
+        assert_eq!(chunks[0].len(), 4, "the chunk carries all four rows");
+    }
+
+    /// Cap and split: above the row cap the flush splits into one PUT per chunk.
+    /// Fail-before: a single unbounded PUT never splits.
+    #[test]
+    fn oversized_bundle_splits_above_the_cap() {
+        let entries: Vec<_> = (0..(BUCKET_BUNDLE_MAX_ROWS + 10))
+            .map(|i| bundle_entry("hot", (i as u64) + 1, 10))
+            .collect();
+        let chunks = split_bundle_entries(entries);
+        assert!(chunks.len() >= 2, "above-cap rows split");
+        assert!(
+            chunks.iter().all(|c| c.len() <= BUCKET_BUNDLE_MAX_ROWS),
+            "no chunk exceeds the row cap"
+        );
+        let total: usize = chunks.iter().map(|c| c.len()).sum();
+        assert_eq!(total, BUCKET_BUNDLE_MAX_ROWS + 10, "split loses no rows");
+        assert!(
+            split_bundle_entries(Vec::new()).is_empty(),
+            "empty captures credit without a PUT"
+        );
     }
 }
 

@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): cross-isolate RPC stubs and streams; operator token for the internal listener; D1 export operator-ingress marker; ported from meln1k/celld: report wake coverage after maintenance (e6cb9a3); staged activation; trusted cell RPC; WebSocket join tokens; --version reports the full build version; staged invoke operator route; non-dumpable serving process; bucket-posture group commit: paged gate judges PAGED_FORMAT (0059).
+// Modified by ryuzcorp (ryuzcorp/celld): cross-isolate RPC stubs and streams; operator token for the internal listener; D1 export operator-ingress marker; ported from meln1k/celld: report wake coverage after maintenance (e6cb9a3); staged activation; trusted cell RPC; WebSocket join tokens; --version reports the full build version; staged invoke operator route; non-dumpable serving process; bucket-posture group commit: paged gate judges PAGED_FORMAT (0059); bucket-posture group commit: bucket bundle gate plumbing (0060).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 // The binary contains connection, startup, shutdown, and V8 shell code. The
@@ -5007,6 +5007,10 @@ async fn async_main(
         let node = node.clone();
         let replication = explorer_replication.clone();
         let sample_ms = fleet_sample_ms;
+        // Bucket bundles are a bucket-posture proof only: a fleet node without
+        // a healthy ensemble must keep its fleet record and per-cell uploads,
+        // never become a bucket session.
+        let bucket_posture = durability == "bucket";
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(std::time::Duration::from_millis(sample_ms));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -5042,6 +5046,24 @@ async fn async_main(
                             live_leases = peers.iter().filter(|p| p.expires_ms > view_ms).count(),
                             view_age_ms = now_ms.saturating_sub(view_ms),
                             "every live lease reads a paged epoch, or one does not"
+                        );
+                    }
+                    // Bucket-posture bundle gate, next to the paged gate: write shared
+                    // bundles only while every live lease reads format 3. Off until the
+                    // first sample (a failed tick publishes an empty view, which closes
+                    // it), re-checked per flush via `bucket_bundles_enabled`, which
+                    // additionally requires `CELLD_BUCKET_BUNDLES=1` so a partial stack
+                    // never ships enabled. When the gate closes, the node falls back at
+                    // once to per-cell L0 uploads for new writes.
+                    let bundle_open = bucket_posture
+                        && celld_logic::format::bucket_bundles_allowed(&peers, view_ms);
+                    if replication.set_bucket_bundles_fleet(bundle_open) != bundle_open {
+                        tracing::info!(
+                            event = "bucket_bundles_gate",
+                            open = bundle_open,
+                            live_leases = peers.iter().filter(|p| p.expires_ms > view_ms).count(),
+                            view_age_ms = now_ms.saturating_sub(view_ms),
+                            "every live lease reads bucket bundles, or one does not"
                         );
                     }
                 }
