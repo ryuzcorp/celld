@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): node:crypto scrypt; container exec resize op; cross-isolate RPC stubs and streams; test-only fake exec ops; fake kill completion op; exec reads survive their subscribing event; per-node Workers Cache API ops; tenant egress policy; D1 export operator-ingress marker; stateless attribution tokens; reaction-aware request resources; fake close/signal completion ops; binding-forgery enforcement; trusted cell RPC; Queue DLQ forward host op; DLQ forward caller identity; WebSocket and TCP socket ownership; receiver-held stream lifetime; deployment cache scope key.
+// Modified by ryuzcorp (ryuzcorp/celld): node:crypto scrypt; container exec resize op; cross-isolate RPC stubs and streams; test-only fake exec ops; fake kill completion op; exec reads survive their subscribing event; per-node Workers Cache API ops; tenant egress policy; D1 export operator-ingress marker; stateless attribution tokens; reaction-aware request resources; fake close/signal completion ops; binding-forgery enforcement; trusted cell RPC; Queue DLQ forward host op; DLQ forward caller identity; WebSocket and TCP socket ownership; receiver-held stream lifetime; deployment cache scope key; share the /bundle tree per deployment generation.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 // The raw V8 adapter and its child modules remain outside the Actor execution
@@ -2125,6 +2125,11 @@ pub struct WorkerConfig {
     /// [`WorkerConfig::es_modules`], which hands a module and its scan out
     /// together so no caller can pair a module with another module's scan.
     module_imports: Vec<modules::ExternalImports>,
+    /// The shared `/bundle` projection of this config's modules, built on
+    /// first use. One `Arc<WorkerConfig>` backs every isolate of a
+    /// deployment generation, so one tree serves them all; a worker that
+    /// never reads its own bundle never pays to build it.
+    bundle_tree: OnceLock<Arc<BundleTree>>,
 }
 
 /// The `ModuleSource::EsModule` siblings of a worker, as (name, source).
@@ -2247,6 +2252,7 @@ impl WorkerConfig {
             cache_scope: None,
             main_imports,
             module_imports,
+            bundle_tree: OnceLock::new(),
         }
     }
 
@@ -2264,6 +2270,18 @@ impl WorkerConfig {
     pub fn with_generation(mut self, generation: crate::generation::GenerationId) -> Self {
         self.generation = generation;
         self
+    }
+
+    /// The shared `/bundle` projection of this config's modules, built on
+    /// first use and then shared by every isolate of the generation. One
+    /// `Arc<WorkerConfig>` backs all of those isolates, so projecting here
+    /// pays the walk and the text-module copies once per generation instead
+    /// of once per isolate. Read-only: every `BundleNode::File` is
+    /// immutable, so sharing needs no lock beyond the `OnceLock`.
+    fn bundle_tree(&self) -> Arc<BundleTree> {
+        self.bundle_tree
+            .get_or_init(|| Arc::new(BundleTree::project(self)))
+            .clone()
     }
 
     /// Stamp this Worker with its deployment's cache scope key. Only
@@ -6176,7 +6194,6 @@ impl Worker {
         // only this `Arc` clone.
         isolate.set_slot(Arc::new(BundleFs {
             config: config.clone(),
-            tree: OnceLock::new(),
         }));
         isolate.add_near_heap_limit_callback(near_heap_limit, heap_limit_state_ptr);
         let (context, fetch) = {
@@ -11962,12 +11979,18 @@ enum VfsNode {
     Directory { writable: bool },
 }
 
+/// Test-only count of `/bundle` materializations, for the sharing test at
+/// the bottom of this file.
+#[cfg(test)]
+static PROJECT_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 /// The read-only `/bundle` projection of a worker's own modules.
 ///
-/// This is isolate state, not request state. The bytes are immutable and
-/// identical for every request the isolate serves, so building the tree per
-/// request would repeat the work and re-copy every module body. `BundleFs`
-/// below keeps one `Arc` and hands a clone to each reader.
+/// This is deployment-generation state, not isolate or request state. The
+/// bytes are immutable and identical for every isolate built from one
+/// `Arc<WorkerConfig>`, so building the tree per isolate repeats the work
+/// and re-copies every module body. [`WorkerConfig::bundle_tree`] keeps one
+/// `Arc` per generation and hands a clone to each reader.
 struct BundleTree {
     nodes: HashMap<String, BundleNode>,
 }
@@ -11987,18 +12010,18 @@ enum BundleNode {
 /// calls `node:fs` must not pay to walk its module list or to copy a module
 /// body into the filesystem. Holding the `Arc<WorkerConfig>` keeps the source
 /// alive, so materialization does not need its own copy of a module name.
+/// The tree itself lives on the config, so every isolate of the generation
+/// shares one projection.
 struct BundleFs {
     config: Arc<WorkerConfig>,
-    tree: OnceLock<Arc<BundleTree>>,
 }
 
 impl BundleFs {
-    /// Materialize once, then share. Returns an `Arc` clone so a caller can
-    /// read without holding an isolate borrow across the read.
+    /// Materialize once per generation, then share. Returns an `Arc` clone
+    /// so a caller can read without holding an isolate borrow across the
+    /// read.
     fn tree(&self) -> Arc<BundleTree> {
-        self.tree
-            .get_or_init(|| Arc::new(BundleTree::project(&self.config)))
-            .clone()
+        self.config.bundle_tree()
     }
 }
 
@@ -12010,6 +12033,8 @@ impl BundleTree {
     /// intervening directory. The entry module is projected under the name it
     /// compiles as, matching workerd's `mainScriptName` entry.
     fn project(config: &WorkerConfig) -> Self {
+        #[cfg(test)]
+        PROJECT_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut nodes = HashMap::new();
         nodes.insert("/bundle".to_string(), BundleNode::Directory);
         let entry = std::iter::once((
@@ -12019,8 +12044,8 @@ impl BundleTree {
         let modules = config.modules.iter().map(|(name, source)| {
             let bytes = match source {
                 // A text or ES module body is a `String` in the config, so the
-                // projection copies it once per isolate. A wasm body is already
-                // `Bytes`, so it is shared rather than copied.
+                // projection copies it once per generation. A wasm body is
+                // already `Bytes`, so it is shared rather than copied.
                 ModuleSource::Text(source) | ModuleSource::EsModule(source) => {
                     bytes::Bytes::copy_from_slice(source.as_bytes())
                 }
@@ -14069,3 +14094,62 @@ pub fn init_engine_for_tests() {
 
 #[cfg(celld_internal_tests)]
 include!(env!("CELLD_INTERNAL_JS_OBSERVERS"));
+
+#[cfg(test)]
+mod bundle_tree_tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    fn test_config(src: &str) -> Arc<WorkerConfig> {
+        Arc::new(WorkerConfig::new(WorkerConfigOptions {
+            src: src.to_string(),
+            script_name: "worker.js".to_string(),
+            do_classes: Vec::new(),
+            bindings: Vec::new(),
+            r2_bindings: Vec::new(),
+            d1_bindings: Vec::new(),
+            kv_bindings: Vec::new(),
+            queue_bindings: Vec::new(),
+            queue_consumers: Vec::new(),
+            workflow_bindings: Vec::new(),
+            vars: Vec::new(),
+            node: String::new(),
+            modules: vec![(
+                "helper".to_string(),
+                ModuleSource::Text("export const x = 1;".to_string()),
+            )],
+            compat: Compat::default(),
+        }))
+    }
+
+    /// Two isolates built from one config share one projection: the first
+    /// `/bundle` use projects, the second reuses. A distinct config
+    /// projects again. Revert the sharing and the second `tree()` projects
+    /// a second time. One test, not three: the counter is process-global
+    /// and parallel tests would race it.
+    #[test]
+    fn bundle_tree_is_shared_per_config() {
+        PROJECT_COUNT.store(0, Ordering::Relaxed);
+        let config = test_config("export default { fetch() { return new Response('hi'); } }");
+        // One `BundleFs` per isolate, as `load_config` installs: two
+        // isolates, one generation.
+        let first = BundleFs {
+            config: config.clone(),
+        }
+        .tree();
+        let second = BundleFs {
+            config: config.clone(),
+        }
+        .tree();
+        assert!(Arc::ptr_eq(&first, &second));
+        assert!(first.nodes.contains_key("/bundle/worker.js"));
+        assert!(first.nodes.contains_key("/bundle/helper"));
+        assert_eq!(PROJECT_COUNT.load(Ordering::Relaxed), 1);
+        let other = BundleFs {
+            config: test_config("export default { fetch() { return new Response('bye'); } }"),
+        }
+        .tree();
+        assert!(!Arc::ptr_eq(&first, &other));
+        assert_eq!(PROJECT_COUNT.load(Ordering::Relaxed), 2);
+    }
+}
