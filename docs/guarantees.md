@@ -156,7 +156,17 @@ relies on the list-after-write consistency described above. A residency that
 uploaded nothing itself, such as one that resumed a local copy, and an eviction
 that falls back to the L0 chain, list the prefix instead. The capture before an
 eviction skips the time-based checkpoint, whose sealing write would upload one
-more object just before the snapshot that covers it.
+more object just before the snapshot that covers it. After the snapshot
+publishes, a background task deletes the epoch's per-cell L0 and L1 objects
+the snapshot supersedes (max txid at or below the snapshot's), addressed
+from the keys this residency uploaded, with no listing: one single-key
+DELETE per key at bounded concurrency, abandoning the rest on stop. The
+deleted objects are in no restore plan — the planner anchors on the
+snapshot and only extends past it — so the epoch still opens with its
+snapshot and still ends at the same cut whenever a DELETE lands, including
+after a successor activates at its own new epoch and prefix. Failed or
+abandoned deletes leave garbage for epoch GC and never fail the eviction.
+An eviction without a snapshot deletes nothing.
 
 ### The acknowledgement rule (RPO=0)
 

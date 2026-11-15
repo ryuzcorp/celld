@@ -664,6 +664,28 @@ push to `ghcr.io/denoland`, but still. Pushing a branch named
   the same throughput (1549 → 1514 writes). A first draft that queued
   past-cover gates behind the read in flight cut the reads to ~180 but
   lost a third of the throughput, so it was dropped.
+- `0057` (sha TBD at merge) an eviction deletes the per-cell L0 and L1
+  objects its handoff snapshot supersedes. After the snapshot PUT succeeds,
+  a background task deletes this epoch's journaled upload keys with max
+  txid at or below the snapshot's — the keys this residency itself uploaded
+  (sync L0s, compaction L1 outputs, same-epoch recovery uploads) — with no
+  LIST, one single-key `DeleteObject` per key (never bulk `POST ?delete`:
+  R2 prices only single `DeleteObject` as a free operation, S3 single
+  DELETEs are free) at bounded concurrency (8), abandoning the rest on
+  stop; the eviction itself returns at once and needs no deadline. The
+  snapshot and other epochs are never candidates, the L0-chain fallback
+  deletes nothing, and failed or abandoned DELETEs leave restore-invisible
+  garbage for epoch GC without failing the eviction. The restore planner
+  anchors on the snapshot and only extends past it, so a deleted object is
+  in no restore plan whenever its DELETE lands — including after release
+  and a successor's activation, which always takes a new epoch and prefix
+  (`next_writer_epoch`; the only same-epoch path, `resume_local`, needs
+  live local files that eviction removes and uploads only strictly-new
+  keys). The journal is capped at 8192 entries per cell epoch (≈200 KiB);
+  beyond that uploads stay unjournaled as restore-invisible garbage.
+  Measured on the same 200 short-lived Durable Objects: stored `cells/`
+  bytes 2.47 MB → 0.57 MB, objects 1800 → 400 (L0 1400 → 0; the 200
+  snapshots stay).
 
 Patches `0025`–`0034` are ported fixes from
 [meln1k/celld](https://github.com/meln1k/celld) by Nikita
