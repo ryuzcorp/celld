@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): an eviction skips the visibility LISTs its own uploads already prove and the time-based checkpoint before the handoff.
+// Modified by ryuzcorp (ryuzcorp/celld): an eviction skips the visibility LISTs its own uploads already prove and the time-based checkpoint before the handoff; an eviction deletes the per-cell L0/L1 objects its handoff snapshot supersedes.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! In-process replication backend built on `celld-ltx`.
@@ -164,6 +164,15 @@ impl ReplicaClient for SharedObjectStoreClient {
 
     async fn delete_all(&self) -> celld_ltx::Result<()> {
         self.0.delete_all().await
+    }
+}
+
+impl SharedObjectStoreClient {
+    /// Single-key deletes for the eviction trim (see
+    /// `ObjectStoreClient::delete_ltx_keys`): one `DeleteObject` per key,
+    /// never bulk `POST ?delete`.
+    async fn delete_ltx_keys(&self, files: &[celld_ltx::FileInfo], concurrency: usize) -> usize {
+        self.0.delete_ltx_keys(files, concurrency).await
     }
 }
 
@@ -922,6 +931,16 @@ struct Cell {
     /// seed, bundle credits, or recovered tails — so every other case keeps
     /// the LIST.
     uploaded_epoch_objects: AtomicBool,
+    /// Every per-cell object key this residency itself uploaded under this
+    /// cell epoch's prefix (level, min txid, max txid), in upload order,
+    /// capped at `EPOCH_UPLOAD_JOURNAL_MAX`. The eviction trim deletes the
+    /// entries its handoff snapshot supersedes from these keys alone, with
+    /// no LIST: the keys name only this epoch (sync L0s, compaction L1s,
+    /// same-epoch recovery uploads), so an older epoch's objects and this
+    /// epoch's snapshot are never candidates. A hot cell over a long epoch
+    /// uploads far more rounds than the cap; once full, later uploads stay
+    /// unjournaled and remain as restore-invisible garbage for epoch GC.
+    epoch_uploads: Mutex<Vec<(i32, u64, u64)>>,
     /// The newest handoff ticket (0: none). While `synced_seq` has not reached
     /// it, per-cell captures skip the time-based checkpoint
     /// (`Db::sync_before_close`): its sealing write would commit a
@@ -998,6 +1017,28 @@ fn percell_coverage(handle: &Cell) -> u64 {
 fn credit_percell_upload(handle: &Cell, txid: u64) {
     handle.percell_txid.fetch_max(txid, Ordering::SeqCst);
     handle.durable_txid.fetch_max(txid, Ordering::SeqCst);
+}
+/// Cap the per-cell upload journal: entries are one upload round each, and a
+/// long-lived hot cell uploads far more rounds in one epoch than the trim can
+/// usefully delete in one pass (8192 entries ≈ 200 KiB). Every upload's max
+/// is at or below the closing snapshot's, so every journaled entry is
+/// trimmable; once full, later uploads simply stay unjournaled and remain as
+/// restore-invisible garbage for epoch GC.
+const EPOCH_UPLOAD_JOURNAL_MAX: usize = 8192;
+
+/// Remember one per-cell object key this residency uploaded, so the eviction
+/// trim can delete it from the journal alone, with no LIST. Call only after
+/// the PUT's success response: a journaled key names an object the successor
+/// restore provably finds, and the trim filter keeps only keys the handoff
+/// snapshot supersedes.
+fn note_epoch_upload(handle: &Cell, level: i32, min_txid: u64, max_txid: u64) {
+    let mut journal = handle
+        .epoch_uploads
+        .lock()
+        .expect("epoch upload journal poisoned");
+    if journal.len() < EPOCH_UPLOAD_JOURNAL_MAX {
+        journal.push((level, min_txid, max_txid));
+    }
 }
 
 /// Whether the bucket covers every cell row in one shipped batch, so that
@@ -1323,6 +1364,11 @@ pub struct LtxRepl {
     registration: Arc<Mutex<RegistrationState>>,
     stop: StopToken,
     task_owner: Mutex<Option<LtxTaskOwner>>,
+    /// Background epoch trims in flight (evict hands off deletes and
+    /// returns). The pair lets tests await a trim deterministically;
+    /// production code never waits on it.
+    trim_inflight: Arc<AtomicU64>,
+    trim_changed: Arc<Notify>,
     #[cfg(celld_internal_tests)]
     activation_install_pause: Mutex<Option<Arc<LtxActivationInstallPause>>>,
     #[cfg(celld_internal_tests)]
@@ -1637,6 +1683,8 @@ impl LtxRepl {
                 tasks,
                 replica_close_tasks,
             })),
+            trim_inflight: Arc::new(AtomicU64::new(0)),
+            trim_changed: Arc::new(Notify::new()),
             #[cfg(celld_internal_tests)]
             activation_install_pause: Mutex::new(None),
             #[cfg(celld_internal_tests)]
@@ -2169,6 +2217,18 @@ impl LtxRepl {
                 anyhow!("upload recovered l0 {cell} e{epoch} t{min_txid}-{max_txid}: {error}")
             })?;
         self.note_covered(cell, epoch, max_txid);
+        // A same-epoch upload (a fold into a still-resident epoch) joins the
+        // trim journal; uploads into dead epochs have no resident handle and
+        // stay out of it, so the trim never names another epoch's objects.
+        if let Some(handle) = self
+            .cells
+            .lock()
+            .unwrap()
+            .get(&(cell.to_string(), epoch))
+            .cloned()
+        {
+            note_epoch_upload(&handle, 0, min_txid, max_txid);
+        }
         Ok(())
     }
 
@@ -2722,6 +2782,7 @@ impl LtxRepl {
             // per-cell coverage at open.
             percell_txid: AtomicU64::new(seed.map_or(0, |pos| pos.txid.0)),
             uploaded_epoch_objects: AtomicBool::new(marker_uploaded),
+            epoch_uploads: Mutex::new(Vec::new()),
             handoff_ticket: AtomicU64::new(0),
             syncing: AtomicBool::new(false),
             ready: Notify::new(),
@@ -3444,6 +3505,7 @@ impl LtxRepl {
         }
         let deadline = barrier_started_mono_ms.saturating_add(self.durability_timeout_ms);
         let mut artifact = None;
+        let mut trim_max: Option<u64> = None;
         if let Some(snapshot) = snapshot {
             let published = asyncrt::timeout_at(
                 deadline,
@@ -3467,6 +3529,7 @@ impl LtxRepl {
                 // A failed snapshot does not credit: the L0 fallback reads
                 // `durable_txid` to choose which rows to upload.
                 credit_percell_upload(&handle, snapshot.max_txid.0);
+                trim_max = Some(snapshot.max_txid.0);
                 artifact = Some(EvictionRestoreArtifact::Snapshot);
             } else {
                 handle.snapshot_declined.store(true, Ordering::Relaxed);
@@ -3507,6 +3570,22 @@ impl LtxRepl {
             elapsed_ms = asyncrt::mono_ms().saturating_sub(barrier_started_mono_ms),
             "final durability barrier passed"
         );
+        // The snapshot covers the whole closed database, so the journaled
+        // per-cell objects at or below its max are garbage no restore reads
+        // (the planner anchors on the snapshot and only extends past it).
+        // Hand their single-key DELETEs to a background task and return: the
+        // deletes may land at any time after the snapshot is visible,
+        // including after release and a successor's activation at its own new
+        // epoch and prefix. Best effort: leftovers stay as restore-invisible
+        // garbage for epoch GC and never fail the eviction.
+        if let Some(snapshot_max) = trim_max {
+            self.spawn_epoch_trim(
+                cell,
+                epoch,
+                handle.client.clone(),
+                Self::trim_candidates(&handle, snapshot_max),
+            );
+        }
 
         // Keep the local Db until one authoritative restore artifact is
         // remotely visible. A failed snapshot and failed L0 fallback retain
@@ -3519,6 +3598,137 @@ impl LtxRepl {
         }
         self.remove_local(cell, epoch, preserve_local);
         Ok(artifact)
+    }
+
+    /// Drain this handle's upload journal to the trim candidate list: only
+    /// keys with `max_txid <= snapshot_max` that are not the snapshot
+    /// itself. The restore planner anchors on the latest snapshot and only
+    /// extends past it, so a deleted object is in no restore plan — whenever
+    /// its DELETE lands, including after ownership is released and a
+    /// successor activated (always at a new epoch: `next_writer_epoch`;
+    /// the only same-epoch path, `resume_local` on a same-generation clean
+    /// reload, needs live local files that eviction removes and uploads only
+    /// strictly-new keys). Another epoch's objects are never journaled.
+    fn trim_candidates(handle: &CellHandle, snapshot_max: u64) -> Vec<celld_ltx::FileInfo> {
+        let uploads = std::mem::take(
+            &mut *handle
+                .epoch_uploads
+                .lock()
+                .expect("epoch upload journal poisoned"),
+        );
+        uploads
+            .into_iter()
+            .filter(|(level, _, max_txid)| {
+                *level != replica::SNAPSHOT_LEVEL && *max_txid <= snapshot_max
+            })
+            .map(|(level, min_txid, max_txid)| celld_ltx::FileInfo {
+                level,
+                min_txid: TXID(min_txid),
+                max_txid: TXID(max_txid),
+                ..Default::default()
+            })
+            .collect()
+    }
+
+    /// Hand the trim keys to a background task and return at once, so an
+    /// 8192-key journal never stalls the handoff or the shutdown drain (the
+    /// background trim needs no evict-level deadline). The task abandons
+    /// remaining keys on stop, and shutdown never waits on it beyond that;
+    /// whatever stays is restore-invisible garbage for epoch GC. Eviction
+    /// itself is unaffected: a refused spawn still returns its artifact.
+    fn spawn_epoch_trim(
+        &self,
+        cell: &str,
+        epoch: u64,
+        client: SharedObjectStoreClient,
+        files: Vec<celld_ltx::FileInfo>,
+    ) {
+        if files.is_empty() {
+            return;
+        }
+        let stop = self.tasks.stop_token();
+        // Count the trim before it can finish, so a waiter that sees zero
+        // never misses one handed off before it looked.
+        self.trim_inflight.fetch_add(1, Ordering::SeqCst);
+        let inflight = self.trim_inflight.clone();
+        let changed = self.trim_changed.clone();
+        let cell = cell.to_string();
+        let stopped_cell = cell.clone();
+        if !self.tasks.spawn_owned("ltx_epoch_trim", {
+            let inflight = inflight.clone();
+            let changed = changed.clone();
+            async move {
+                Self::run_epoch_trim(client, cell.clone(), epoch, files, stop).await;
+                if inflight.fetch_sub(1, Ordering::SeqCst) == 1 {
+                    changed.notify_waiters();
+                }
+            }
+        }) {
+            if inflight.fetch_sub(1, Ordering::SeqCst) == 1 {
+                changed.notify_waiters();
+            }
+            warn!(
+                event = "eviction_epoch_trim",
+                cell = stopped_cell,
+                epoch,
+                "node is stopping; superseded objects stay for epoch GC"
+            );
+        }
+    }
+
+    /// Delete trim keys in the background with bounded concurrency, abandoning
+    /// the rest on stop. Single-key DELETEs only (`DeleteObject`, free on S3
+    /// and R2); never bulk `POST ?delete`. Missing keys are ignored; other
+    /// failures are counted and reported, never retried here — the leftovers
+    /// stay as restore-invisible garbage for epoch GC.
+    async fn run_epoch_trim(
+        client: SharedObjectStoreClient,
+        cell: String,
+        epoch: u64,
+        files: Vec<celld_ltx::FileInfo>,
+        stop: StopToken,
+    ) {
+        const TRIM_KEYS_PER_CHUNK: usize = 64;
+        const TRIM_DELETE_CONCURRENCY: usize = 8;
+        let mut failed = 0_usize;
+        let mut done = 0_usize;
+        for chunk in files.chunks(TRIM_KEYS_PER_CHUNK) {
+            let chunk_failed = asyncrt::select_biased! {
+                "a stop signal abandons the remaining trim keys as GC garbage";
+                _ = stop.stopped() => {
+                    warn!(
+                        event = "eviction_epoch_trim",
+                        cell,
+                        epoch,
+                        done,
+                        files = files.len(),
+                        "node is stopping; abandoning the remaining trim keys"
+                    );
+                    return;
+                }
+                chunk_failed = client.delete_ltx_keys(chunk, TRIM_DELETE_CONCURRENCY) => chunk_failed,
+            };
+            done += chunk.len();
+            failed += chunk_failed;
+        }
+        if failed == 0 {
+            info!(
+                event = "eviction_epoch_trim",
+                cell,
+                epoch,
+                files = files.len(),
+                "deleted per-cell objects the handoff snapshot supersedes"
+            );
+        } else {
+            warn!(
+                event = "eviction_epoch_trim",
+                cell,
+                epoch,
+                files = files.len(),
+                failed,
+                "eviction trim left garbage for epoch GC"
+            );
+        }
     }
 
     async fn final_durability_barrier(&self, cell: &str, epoch: u64) -> anyhow::Result<()> {
@@ -4252,6 +4462,9 @@ async fn sync_cell(handle: CellHandle) -> Option<bool> {
             round_ordinal,
             LtxUploadRoundStatusForWorldV1::Completed,
         );
+        // The PUT acked: journal the key so the eviction trim can delete this
+        // L0 from the journal alone, with no LIST.
+        note_epoch_upload(&handle, 0, *min_txid, *max_txid);
     }
     // Every staged file uploaded: this residency holds bucket proof of its
     // own that the successor's LIST would find. Record it so the eviction
@@ -4460,6 +4673,11 @@ async fn compact_cell(
             // count toward the next one only approximately, which delays it
             // by at most one window.
             compaction.pending_bytes.store(0, Ordering::SeqCst);
+            // The L1 PUT acked inside the round: journal the key so the
+            // eviction trim can delete it from the journal alone, with no
+            // LIST. The trim filter keeps only keys the handoff snapshot
+            // supersedes.
+            note_epoch_upload(&handle, info.level, info.min_txid.0, info.max_txid.0);
             info!(
                 event = "ltx_compaction",
                 trigger,
@@ -5642,17 +5860,29 @@ mod evict_trim_tests {
     use celld_ltx::object_store::PutPayload;
     use celld_ltx::object_store::PutResult;
     use celld_ltx::object_store::Result as StoreResult;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::AtomicU64;
     use std::sync::atomic::AtomicUsize;
 
-    /// An in-memory store that counts PUTs and LISTs under one per-cell
-    /// prefix, so the tests below can assert the eviction's request cost.
-    /// Every other operation delegates to the inner store untouched.
+    /// An in-memory store that counts PUTs, LISTs, and DELETEs under one
+    /// per-cell prefix, and can fail DELETEs on demand, so the tests below
+    /// can assert the eviction trim's effect and its best-effort failure
+    /// mode. Every other operation delegates to the inner store untouched.
     #[derive(Debug)]
     struct CountingStore {
         inner: InMemory,
         prefix: String,
         puts: AtomicUsize,
         lists: AtomicUsize,
+        deletes: AtomicUsize,
+        fail_deletes: AtomicBool,
+        /// Counted deletes at or past this total fail. `u64::MAX` (the
+        /// default) fails nothing; `set_fail_after(n)` lets the next `n`
+        /// succeed.
+        fail_after: AtomicU64,
+        /// While set, deletes under the prefix park until `release_deletes`.
+        hold_deletes: AtomicBool,
+        deletes_released: Notify,
     }
 
     impl CountingStore {
@@ -5662,6 +5892,11 @@ mod evict_trim_tests {
                 prefix: prefix.to_string(),
                 puts: AtomicUsize::new(0),
                 lists: AtomicUsize::new(0),
+                deletes: AtomicUsize::new(0),
+                fail_deletes: AtomicBool::new(false),
+                fail_after: AtomicU64::new(u64::MAX),
+                hold_deletes: AtomicBool::new(false),
+                deletes_released: Notify::new(),
             }
         }
 
@@ -5670,6 +5905,28 @@ mod evict_trim_tests {
                 self.puts.load(Ordering::SeqCst),
                 self.lists.load(Ordering::SeqCst),
             )
+        }
+
+        fn deletes(&self) -> usize {
+            self.deletes.load(Ordering::SeqCst)
+        }
+
+        fn set_fail_deletes(&self, fail: bool) {
+            self.fail_deletes.store(fail, Ordering::SeqCst);
+        }
+
+        fn set_fail_after(&self, count: u64) {
+            let done = self.deletes.load(Ordering::SeqCst) as u64;
+            self.fail_after.store(done + count, Ordering::SeqCst);
+        }
+
+        fn hold_deletes(&self) {
+            self.hold_deletes.store(true, Ordering::SeqCst);
+        }
+
+        fn release_deletes(&self) {
+            self.hold_deletes.store(false, Ordering::SeqCst);
+            self.deletes_released.notify_waiters();
         }
 
         fn under(&self, location: &ObjPath) -> bool {
@@ -5717,6 +5974,28 @@ mod evict_trim_tests {
         }
 
         async fn delete(&self, location: &ObjPath) -> StoreResult<()> {
+            if self.fail_deletes.load(Ordering::SeqCst) {
+                return Err(celld_ltx::object_store::Error::Generic {
+                    store: "CountingStore",
+                    source: "injected delete failure".into(),
+                });
+            }
+            if self.under(location) {
+                loop {
+                    let released = self.deletes_released.notified();
+                    if !self.hold_deletes.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    released.await;
+                }
+                let call = self.deletes.fetch_add(1, Ordering::SeqCst);
+                if (call as u64) >= self.fail_after.load(Ordering::SeqCst) {
+                    return Err(celld_ltx::object_store::Error::Generic {
+                        store: "CountingStore",
+                        source: "injected delete failure".into(),
+                    });
+                }
+            }
             self.inner.delete(location).await
         }
 
@@ -5840,6 +6119,7 @@ mod evict_trim_tests {
             let (puts_before, lists_before) = store.counts();
             repl.handoff_gate("c", 1, true).await.unwrap();
             let artifact = repl.evict("c", 1, false, None).await.unwrap();
+            trim_idle(&repl).await;
             assert_eq!(artifact, EvictionRestoreArtifact::Snapshot);
             let (puts, lists) = store.counts();
             assert_eq!(
@@ -5893,6 +6173,7 @@ mod evict_trim_tests {
             let (puts_before, lists_before) = store.counts();
             repl.handoff_gate("c", 1, true).await.unwrap();
             let artifact = repl.evict("c", 1, false, None).await.unwrap();
+            trim_idle(&repl).await;
             assert_eq!(artifact, EvictionRestoreArtifact::L0Chain);
             let (puts, lists) = store.counts();
             assert_eq!(
@@ -5915,6 +6196,330 @@ mod evict_trim_tests {
             })
             .await
             .unwrap();
+            assert_eq!(row_count(&db_path(&watch, "c", 2)), 1);
+            shutdown(repl).await;
+        });
+    }
+
+    async fn ltx_level_files(
+        repl: &LtxRepl,
+        cell: &str,
+        epoch: u64,
+        level: i32,
+    ) -> Vec<celld_ltx::FileInfo> {
+        repl.client_for(cell, epoch)
+            .ltx_files(level, TXID(0))
+            .await
+            .unwrap()
+    }
+
+    async fn activate_epoch(repl: &LtxRepl, cell: &str, epoch: u64, fresh: bool) {
+        repl.activate(ActivationOptions {
+            cell,
+            epoch,
+            fresh,
+            took_over: false,
+            resume_local: false,
+            prior: None,
+        })
+        .await
+        .unwrap();
+    }
+
+    /// Await every background trim handed off so far. The spawn increments
+    /// the counter before `evict` returns, and each task decrements it when
+    /// done and wakes waiters only on the last one, so this is
+    /// deterministic: no sleep, no polling loop.
+    async fn trim_idle(repl: &LtxRepl) {
+        loop {
+            let notified = repl.trim_changed.notified();
+            if repl.trim_inflight.load(Ordering::SeqCst) == 0 {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    /// Three write+sync rounds, then eviction: the trim deletes exactly the
+    /// three covered L0 objects from the journal alone (no LIST), keeps the
+    /// snapshot, and the next epoch restores every row from the snapshot.
+    #[test]
+    fn evict_trims_covered_l0_and_restores() {
+        let runtime = asyncrt::shared_test_runtime();
+        runtime.block_on(async {
+            let _temp = test_watch();
+            let watch = _temp.path().to_path_buf();
+            let store = Arc::new(CountingStore::new("cells/c/ltx/"));
+            let repl = LtxRepl::start_with_store_for_test(&watch, store.clone());
+            activate_epoch(&repl, "c", 1, true).await;
+            for _ in 0..3 {
+                sql_write(&db_path(&watch, "c", 1));
+                assert!(matches!(
+                    repl.sync_wait("c", 1, Duration::from_secs(10)).await,
+                    SyncWait::Durable
+                ));
+            }
+            assert_puts(&store, 3);
+            let deletes_before = store.deletes();
+            repl.handoff_gate("c", 1, true).await.unwrap();
+            let artifact = repl.evict("c", 1, false, None).await.unwrap();
+            trim_idle(&repl).await;
+            assert_eq!(artifact, EvictionRestoreArtifact::Snapshot);
+            assert_eq!(
+                store.deletes() - deletes_before,
+                3,
+                "the trim deletes exactly the three journaled L0 objects"
+            );
+            assert!(
+                ltx_level_files(&repl, "c", 1, 0).await.is_empty(),
+                "the covered L0 objects are gone"
+            );
+            let snapshots = ltx_level_files(&repl, "c", 1, 9).await;
+            assert_eq!(snapshots.len(), 1, "the handoff snapshot remains");
+            assert_eq!(
+                (snapshots[0].min_txid, snapshots[0].max_txid),
+                (TXID(1), TXID(3)),
+                "the snapshot covers the whole closed database"
+            );
+            activate_epoch(&repl, "c", 2, false).await;
+            assert_eq!(row_count(&db_path(&watch, "c", 2)), 3);
+            shutdown(repl).await;
+        });
+    }
+
+    /// The trim runs after the eviction returns: with every DELETE parked,
+    /// `evict` still returns its snapshot artifact, the next epoch restores
+    /// from the snapshot while the superseded L0 objects still exist, and
+    /// the deletes land once released.
+    #[test]
+    fn evict_returns_before_the_trim_deletes_land() {
+        let runtime = asyncrt::shared_test_runtime();
+        runtime.block_on(async {
+            let _temp = test_watch();
+            let watch = _temp.path().to_path_buf();
+            let store = Arc::new(CountingStore::new("cells/c/ltx/"));
+            let repl = LtxRepl::start_with_store_for_test(&watch, store.clone());
+            activate_epoch(&repl, "c", 1, true).await;
+            for _ in 0..3 {
+                sql_write(&db_path(&watch, "c", 1));
+                assert!(matches!(
+                    repl.sync_wait("c", 1, Duration::from_secs(10)).await,
+                    SyncWait::Durable
+                ));
+            }
+            store.hold_deletes();
+            repl.handoff_gate("c", 1, true).await.unwrap();
+            let artifact = repl.evict("c", 1, false, None).await.unwrap();
+            assert_eq!(artifact, EvictionRestoreArtifact::Snapshot);
+            assert_eq!(
+                ltx_level_files(&repl, "c", 1, 0).await.len(),
+                3,
+                "the parked deletes have not landed when evict returns"
+            );
+            activate_epoch(&repl, "c", 2, false).await;
+            assert_eq!(row_count(&db_path(&watch, "c", 2)), 3);
+            store.release_deletes();
+            trim_idle(&repl).await;
+            assert!(
+                ltx_level_files(&repl, "c", 1, 0).await.is_empty(),
+                "the deletes land after release"
+            );
+            shutdown(repl).await;
+        });
+    }
+
+    /// The L0-chain fallback deletes nothing: without a snapshot no object
+    /// is provably superseded, so the L0 objects stay for the restore.
+    #[test]
+    fn evict_l0_fallback_deletes_nothing() {
+        let runtime = asyncrt::shared_test_runtime();
+        runtime.block_on(async {
+            let _temp = test_watch();
+            let watch = _temp.path().to_path_buf();
+            let store = Arc::new(CountingStore::new("cells/c/ltx/"));
+            let repl = LtxRepl::start_with_store_for_test(&watch, store.clone());
+            activate_epoch(&repl, "c", 1, true).await;
+            sql_write(&db_path(&watch, "c", 1));
+            assert!(matches!(
+                repl.sync_wait("c", 1, Duration::from_secs(10)).await,
+                SyncWait::Durable
+            ));
+            repl.set_handoff_snapshot_budget_for_world(1);
+            let deletes_before = store.deletes();
+            repl.handoff_gate("c", 1, true).await.unwrap();
+            let artifact = repl.evict("c", 1, false, None).await.unwrap();
+            trim_idle(&repl).await;
+            assert_eq!(artifact, EvictionRestoreArtifact::L0Chain);
+            assert_eq!(
+                store.deletes() - deletes_before,
+                0,
+                "the fallback path deletes nothing"
+            );
+            assert_eq!(
+                ltx_level_files(&repl, "c", 1, 0).await.len(),
+                1,
+                "the fallback restore keeps its L0 chain"
+            );
+            activate_epoch(&repl, "c", 2, false).await;
+            assert_eq!(row_count(&db_path(&watch, "c", 2)), 1);
+            shutdown(repl).await;
+        });
+    }
+
+    /// A failed DELETE leaves garbage but never fails the eviction: the
+    /// snapshot already proved durability, and the next epoch restores.
+    #[test]
+    fn evict_trim_failure_keeps_eviction() {
+        let runtime = asyncrt::shared_test_runtime();
+        runtime.block_on(async {
+            let _temp = test_watch();
+            let watch = _temp.path().to_path_buf();
+            let store = Arc::new(CountingStore::new("cells/c/ltx/"));
+            let repl = LtxRepl::start_with_store_for_test(&watch, store.clone());
+            activate_epoch(&repl, "c", 1, true).await;
+            sql_write(&db_path(&watch, "c", 1));
+            assert!(matches!(
+                repl.sync_wait("c", 1, Duration::from_secs(10)).await,
+                SyncWait::Durable
+            ));
+            store.set_fail_deletes(true);
+            repl.handoff_gate("c", 1, true).await.unwrap();
+            let artifact = repl.evict("c", 1, false, None).await.unwrap();
+            trim_idle(&repl).await;
+            assert_eq!(artifact, EvictionRestoreArtifact::Snapshot);
+            assert_eq!(
+                ltx_level_files(&repl, "c", 1, 0).await.len(),
+                1,
+                "a failed DELETE leaves the L0 object as garbage"
+            );
+            store.set_fail_deletes(false);
+            activate_epoch(&repl, "c", 2, false).await;
+            assert_eq!(row_count(&db_path(&watch, "c", 2)), 1);
+            shutdown(repl).await;
+        });
+    }
+
+    /// The journal is bounded: overfilling it keeps the first 8192 entries,
+    /// and the eviction still trims what was journaled.
+    #[test]
+    fn epoch_upload_journal_is_bounded() {
+        let runtime = asyncrt::shared_test_runtime();
+        runtime.block_on(async {
+            let _temp = test_watch();
+            let watch = _temp.path().to_path_buf();
+            let store = Arc::new(CountingStore::new("cells/c/ltx/"));
+            let repl = LtxRepl::start_with_store_for_test(&watch, store.clone());
+            activate_epoch(&repl, "c", 1, true).await;
+            sql_write(&db_path(&watch, "c", 1));
+            assert!(matches!(
+                repl.sync_wait("c", 1, Duration::from_secs(10)).await,
+                SyncWait::Durable
+            ));
+            let handle = repl
+                .cells
+                .lock()
+                .unwrap()
+                .get(&("c".to_string(), 1))
+                .cloned()
+                .unwrap();
+            for _ in 0..EPOCH_UPLOAD_JOURNAL_MAX + 100 {
+                note_epoch_upload(&handle, 0, 1, 1);
+            }
+            assert_eq!(
+                handle.epoch_uploads.lock().unwrap().len(),
+                EPOCH_UPLOAD_JOURNAL_MAX,
+                "the journal stops growing at the cap"
+            );
+            repl.handoff_gate("c", 1, true).await.unwrap();
+            let artifact = repl.evict("c", 1, false, None).await.unwrap();
+            trim_idle(&repl).await;
+            assert_eq!(artifact, EvictionRestoreArtifact::Snapshot);
+            assert!(
+                ltx_level_files(&repl, "c", 1, 0).await.is_empty(),
+                "the trim still deletes what was journaled"
+            );
+            activate_epoch(&repl, "c", 2, false).await;
+            assert_eq!(row_count(&db_path(&watch, "c", 2)), 1);
+            shutdown(repl).await;
+        });
+    }
+
+    /// Partial failure: the first delete succeeds, the rest fail, and the
+    /// epoch still restores fully; the leftovers stay as garbage.
+    #[test]
+    fn evict_trim_partial_failure_still_restores() {
+        let runtime = asyncrt::shared_test_runtime();
+        runtime.block_on(async {
+            let _temp = test_watch();
+            let watch = _temp.path().to_path_buf();
+            let store = Arc::new(CountingStore::new("cells/c/ltx/"));
+            let repl = LtxRepl::start_with_store_for_test(&watch, store.clone());
+            activate_epoch(&repl, "c", 1, true).await;
+            for _ in 0..3 {
+                sql_write(&db_path(&watch, "c", 1));
+                assert!(matches!(
+                    repl.sync_wait("c", 1, Duration::from_secs(10)).await,
+                    SyncWait::Durable
+                ));
+            }
+            store.set_fail_after(1);
+            repl.handoff_gate("c", 1, true).await.unwrap();
+            let artifact = repl.evict("c", 1, false, None).await.unwrap();
+            trim_idle(&repl).await;
+            assert_eq!(artifact, EvictionRestoreArtifact::Snapshot);
+            assert_eq!(
+                ltx_level_files(&repl, "c", 1, 0).await.len(),
+                2,
+                "two failed deletes stay as garbage"
+            );
+            activate_epoch(&repl, "c", 2, false).await;
+            assert_eq!(row_count(&db_path(&watch, "c", 2)), 3);
+            shutdown(repl).await;
+        });
+    }
+
+    /// An L1-shaped journal entry flows through the filter and the worker
+    /// like an L0 one. True compaction output cannot be forced
+    /// deterministically in CI (`start_with_compaction_for_test` is
+    /// `celld_internal_tests`-gated, and threshold timing is not
+    /// deterministic), so the test journals one L1 key directly; its
+    /// delete is attempted and its absence ignored.
+    #[test]
+    fn evict_trims_journaled_l1_keys() {
+        let runtime = asyncrt::shared_test_runtime();
+        runtime.block_on(async {
+            let _temp = test_watch();
+            let watch = _temp.path().to_path_buf();
+            let store = Arc::new(CountingStore::new("cells/c/ltx/"));
+            let repl = LtxRepl::start_with_store_for_test(&watch, store.clone());
+            activate_epoch(&repl, "c", 1, true).await;
+            sql_write(&db_path(&watch, "c", 1));
+            assert!(matches!(
+                repl.sync_wait("c", 1, Duration::from_secs(10)).await,
+                SyncWait::Durable
+            ));
+            let handle = repl
+                .cells
+                .lock()
+                .unwrap()
+                .get(&("c".to_string(), 1))
+                .cloned()
+                .unwrap();
+            note_epoch_upload(&handle, 1, 1, 1);
+            repl.handoff_gate("c", 1, true).await.unwrap();
+            let artifact = repl.evict("c", 1, false, None).await.unwrap();
+            trim_idle(&repl).await;
+            assert_eq!(artifact, EvictionRestoreArtifact::Snapshot);
+            assert_eq!(
+                store.deletes(),
+                2,
+                "both the L0 and the L1 journal keys are deleted"
+            );
+            assert!(
+                ltx_level_files(&repl, "c", 1, 0).await.is_empty(),
+                "the covered L0 object is gone"
+            );
+            activate_epoch(&repl, "c", 2, false).await;
             assert_eq!(row_count(&db_path(&watch, "c", 2)), 1);
             shutdown(repl).await;
         });

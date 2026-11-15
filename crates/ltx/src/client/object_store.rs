@@ -1,3 +1,4 @@
+// Modified by ryuzcorp (ryuzcorp/celld): single-key LTX deletes with bounded concurrency for the eviction trim.
 //! client::object_store — S3/R2/MinIO `ReplicaClient` via the `object_store` crate.
 //!
 //! Ported (behavior only) from litestream@v0.5.11 `s3/replica_client.go`. We do
@@ -1055,6 +1056,43 @@ impl ReplicaClient for ObjectStoreClient {
             delete_batch(store.as_ref(), batch, /*ignore_missing=*/ true).await?;
         }
         Ok(())
+    }
+}
+
+impl ObjectStoreClient {
+    /// Delete the LTX objects named by `files` with one single-key DELETE
+    /// each (`DeleteObject`), at most `concurrency` in flight. A bulk
+    /// `POST ?delete` (`DeleteObjects`) is deliberately not used: R2 prices
+    /// only single `DeleteObject` as a free operation
+    /// (https://developers.cloudflare.com/r2/pricing), and S3 single
+    /// DELETEs are free. Returns the number of failed deletes. A missing
+    /// key is ignored (delete is idempotent); any other per-key error
+    /// counts as failed but never stops the remaining keys.
+    pub async fn delete_ltx_keys(&self, files: &[FileInfo], concurrency: usize) -> usize {
+        if files.is_empty() {
+            return 0;
+        }
+        let Ok(store) = self.store().await else {
+            return files.len();
+        };
+        let keys: Vec<ObjPath> = files
+            .iter()
+            .map(|info| ObjPath::from(self.ltx_key(info.level, info.min_txid, info.max_txid)))
+            .collect();
+        futures_util::stream::iter(keys)
+            .map(|key| {
+                let store = store.clone();
+                async move {
+                    match store.delete(&key).await {
+                        Ok(()) => 0_usize,
+                        Err(object_store::Error::NotFound { .. }) => 0,
+                        Err(_) => 1,
+                    }
+                }
+            })
+            .buffered(concurrency.max(1))
+            .fold(0_usize, |failed, one| async move { failed + one })
+            .await
     }
 }
 
