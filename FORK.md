@@ -625,6 +625,27 @@ push to `ghcr.io/denoland`, but still. Pushing a branch named
   Measured on 200 short-lived Durable Objects (6 writes each,
   `CELLD_DURABILITY=bucket`): 12 Class A requests per cell before, 9 after
   (per 200 cells: `cells/*/ltx` PUTs 1600 → 1400, LISTs 600 → 200).
+- `0056` (sha TBD at merge) concurrent bucket-posture writes share
+  ownership reads instead of reading once per write. A gated write's
+  bucket proof used to emit its own `VerifyOwnership` (one GET of
+  `cells/<cell>/own.json` per write); now a proven gate joins a read in
+  flight on its cell and epoch whose cover (the issuing gate's own
+  position) reaches its position, and issues its own read at once
+  otherwise, so no write waits longer than before. Positions strictly
+  increase with every committing write, so a joiner committed before the
+  issuer and the issuer's completed proof captured it. A write at a
+  position a verified proof already covers releases with no new proof or
+  read. The read is always issued after a proof that captured every gate
+  it answers, a failed or refused read fails every gate it answered and
+  resets the cell exactly as before, fleet proofs never share reads, and
+  results for drained gates (fence, deadline, reset, epoch change) are
+  ignored.
+  Measured on one hot cell with 16 concurrent writers for 15 s against
+  RustFS with 40 ms store latency (`CELLD_DURABILITY=bucket`, debug builds
+  of the base and of this commit): GET `cells/*/own.json` 1550 → 553 at
+  the same throughput (1549 → 1514 writes). A first draft that queued
+  past-cover gates behind the read in flight cut the reads to ~180 but
+  lost a third of the throughput, so it was dropped.
 
 Patches `0025`–`0034` are ported fixes from
 [meln1k/celld](https://github.com/meln1k/celld) by Nikita

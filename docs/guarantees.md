@@ -169,7 +169,16 @@ shutdown; and each chunk of a streamed body. A client therefore cannot act on a
 value that a crash can still lose.
 
 After a bucket proof, celld reads the ownership record once and acknowledges
-only if it still names this node at this epoch. A partitioned node can commit
+only if it still names this node at this epoch. Concurrent writes on one cell
+share that read: a write whose proof lands while a read is in flight joins it
+when its position is at or below the position of the write that issued the
+read, and issues its own read at once otherwise, so sharing never delays a
+write. Positions strictly increase with every committing write, so a joiner
+committed before the issuer did and the issuer's completed proof captured it.
+A write at a position a verified proof already covers releases without a new
+read at all. The read is always issued after a proof that captured the writes
+it answers completed, so a takeover that orphans the prefix fails the gates it
+touches instead of acknowledging into them. A partitioned node can commit
 locally and replicate into its superseded prefix, but it does not acknowledge.
 The check reads the record instead of a clock, so a paused process or a skewed
 clock cannot pass it.

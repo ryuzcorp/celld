@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): ported from meln1k/celld: coordination-core fixes (ea471ee, e46a685, 6d61462, 18d3bf9, 9d4c163, 468b456, 01522b3, b026226, 65fdb13).
+// Modified by ryuzcorp (ryuzcorp/celld): ported from meln1k/celld: coordination-core fixes (ea471ee, e46a685, 6d61462, 18d3bf9, 9d4c163, 468b456, 01522b3, b026226, 65fdb13); shared bucket-posture ownership reads across concurrent gates (0056).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! Clean-sheet celld decision core.
@@ -389,6 +389,56 @@ struct Barrier {
     followers: Vec<Held>,
 }
 
+/// Gates sharing one bucket-posture ownership read on a cell at an epoch.
+///
+/// # The safety invariant
+///
+/// A bucket proof reveals nothing until an ownership read confirms the
+/// record still names this node at this epoch (docs/guarantees.md "The
+/// acknowledgement rule (RPO=0)"). The read must be ISSUED AFTER the gates'
+/// covering proofs completed: a read issued earlier can predate a takeover
+/// that orphans the prefix the proofs wrote into.
+///
+/// A read's `cover` is its issuing gate's own position, not the `durable`
+/// value the proof reported (the shell's `ltx_repl::await_durable` echoes
+/// the position back anyway: it waits for a sync whose capture began after
+/// the gate's commit and reports no watermark). A gate may join that read
+/// only at a position `<= cover`. Positions are the cell connection's
+/// change fingerprint (`storage.rs`: `total_changes + data_version +
+/// schema_cookie`), which strictly increases with every committing write
+/// and never moves otherwise, and application SQL cannot hold a
+/// transaction open, so a position samples committed state. A joiner at a
+/// position `<= cover` therefore either committed before the issuing gate
+/// did, so the issuer's completed proof captured it, or committed nothing
+/// new. Either way a proof covering it completed before the read was
+/// issued. This depends on that strictness: a position source that can
+/// repeat across a committing write, or a shell that reports a watermark
+/// in another unit, breaks the join rule. A gate past the cover of every
+/// read in flight issues its own read at once, so sharing never delays a
+/// gate: it waits for exactly one read issued after its proof, as it did
+/// when every gate owned its read.
+///
+/// A failed or refused read fails every gate it was answering and resets
+/// the cell exactly as an unshared read did. Fleet proofs never enter a
+/// round. Results for ops already drained (fence, deadline, reset, epoch
+/// change) are ignored, following the versioned-op discipline the rest of
+/// the core uses: settlement always removes the barrier first, so a gate
+/// settles at most once, and completion only settles gates still present.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct VerifyRound {
+    cell: CellId,
+    epoch: Epoch,
+    /// The issuing gate's own position. Every member's position is
+    /// `<= cover`, so a proof that captured every member completed before
+    /// the read was issued.
+    cover: u64,
+    /// Gates this read answers, including the issuing gate while it lives.
+    /// The issuing gate's barrier may already be drained (a quiesce cancels
+    /// output gates but leaves alarm gates), so completion settles the live
+    /// members rather than assuming the issuing op is still present.
+    members: Vec<OpId>,
+}
+
 /// One withheld output: which request raised it, and which way it leaves.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Held {
@@ -712,6 +762,15 @@ pub struct State {
     /// underneath it; a fence drains these to a failed response so a write is
     /// never acknowledged after the node loses authority.
     barriers: BTreeMap<OpId, Barrier>,
+    /// Bucket-posture ownership reads in flight, keyed by the gate op that
+    /// issued each read (the op its `OwnershipVerified` result carries).
+    /// Concurrent proven gates on one cell and epoch share a read instead of
+    /// issuing one each; see [`VerifyRound`].
+    verify_rounds: BTreeMap<OpId, VerifyRound>,
+    /// The reads in flight per cell and epoch, so a proven gate finds a read
+    /// to join, and a reset or teardown finds the reads to drop, without
+    /// scanning every cell's reads.
+    verify_rounds_by_cell: BTreeMap<(CellId, Epoch), BTreeSet<OpId>>,
     /// Requests whose activity ended while a write of theirs was still on the
     /// output gate. The pin outlives the activity: it keeps the cell from being
     /// evicted under the gate, and keeps a later write of the same request able
@@ -884,6 +943,8 @@ impl State {
             admitted_gates: BTreeSet::new(),
             admitted_gate_cells: BTreeMap::new(),
             barriers: BTreeMap::new(),
+            verify_rounds: BTreeMap::new(),
+            verify_rounds_by_cell: BTreeMap::new(),
             gate_pinned: BTreeSet::new(),
             worker_cursor: None,
             activity: ActivitySnapshot::default(),
@@ -1708,6 +1769,63 @@ impl State {
             // never trails one.
             for held in &barrier.followers {
                 Self::validate_held(held, op, barrier, &self.active_requests, &mut held_outputs)?;
+            }
+        }
+        for (read_op, round) in &self.verify_rounds {
+            let (cell, epoch) = (&round.cell, round.epoch);
+            if round.members.is_empty() {
+                return Err(format!(
+                    "verify read {read_op} for {cell:?} epoch {epoch} answers nothing"
+                ));
+            }
+            if !self
+                .verify_rounds_by_cell
+                .get(&(cell.clone(), epoch))
+                .is_some_and(|reads| reads.contains(read_op))
+            {
+                return Err(format!(
+                    "verify read {read_op} for {cell:?} epoch {epoch} is missing from the per-cell index"
+                ));
+            }
+            for member in &round.members {
+                match self.barriers.get(member) {
+                    // The joining rule keeps every member at or below the
+                    // cover, so its covering proof completed before the read
+                    // was issued.
+                    Some(barrier)
+                        if barrier.cell == *cell
+                            && barrier.epoch == epoch
+                            && barrier.position <= round.cover => {}
+                    Some(_) => {
+                        return Err(format!(
+                            "verify read {read_op} for {cell:?} epoch {epoch} answers {member} past its cover {} or on another cell",
+                            round.cover
+                        ));
+                    }
+                    None => {
+                        return Err(format!(
+                            "verify read {read_op} for {cell:?} epoch {epoch} names drained gate {member}"
+                        ));
+                    }
+                }
+            }
+        }
+        for ((cell, epoch), reads) in &self.verify_rounds_by_cell {
+            if reads.is_empty() {
+                return Err(format!(
+                    "empty verify index entry for {cell:?} epoch {epoch}"
+                ));
+            }
+            for read_op in reads {
+                if !self
+                    .verify_rounds
+                    .get(read_op)
+                    .is_some_and(|round| round.cell == *cell && round.epoch == *epoch)
+                {
+                    return Err(format!(
+                        "verify index entry {read_op} for {cell:?} epoch {epoch} names no read"
+                    ));
+                }
             }
         }
         for (id, cell) in &self.cells {
@@ -5722,6 +5840,28 @@ impl State {
                 self.release_held(follower, Err(RequestError::DurabilityUnproven), effects);
             }
         }
+        // Output gates are gone for this cell; alarm gates may survive with a
+        // read still naming them. Prune each read to live barriers so a late
+        // result settles only gates that still wait, and drop a read when
+        // nothing does — its result then releases nothing.
+        let reads: Vec<OpId> = self
+            .verify_rounds_by_cell
+            .iter()
+            .filter(|((cell, _), _)| cell == id)
+            .flat_map(|(_, reads)| reads.iter().copied())
+            .collect();
+        for read_op in reads {
+            let empty = {
+                let barriers = &self.barriers;
+                self.verify_rounds.get_mut(&read_op).is_some_and(|round| {
+                    round.members.retain(|op| barriers.contains_key(op));
+                    round.members.is_empty()
+                })
+            };
+            if empty {
+                self.drop_verify_round(read_op);
+            }
+        }
     }
 
     /// The drain pump, run after every event once draining: keep
@@ -6516,6 +6656,14 @@ impl State {
     /// to it are in doubt, and re-reading durable state is how they are
     /// discarded.
     fn reset_cell(&mut self, id: &str, epoch: Epoch, effects: &mut Vec<Effect>) {
+        // The sweep below removes every barrier for this cell and epoch, so
+        // the reads they share go with them: a late result finds no read and
+        // releases nothing.
+        if let Some(reads) = self.verify_rounds_by_cell.remove(&(id.to_string(), epoch)) {
+            for read_op in reads {
+                self.verify_rounds.remove(&read_op);
+            }
+        }
         if !matches!(
             self.cells.get(id).map(|cell| &cell.phase),
             Some(Phase::Resident { epoch: current }) if *current == epoch
@@ -6774,6 +6922,10 @@ impl State {
         // must fail rather than be acknowledged — the fence and the fail are
         // atomic. A late DurableReached for a drained op is ignored.
         self.gate_pinned.clear();
+        // Every barrier is drained below, so no round has anything left to
+        // answer: a late read result finds no round and releases nothing.
+        self.verify_rounds.clear();
+        self.verify_rounds_by_cell.clear();
         for (_, gate) in std::mem::take(&mut self.barriers) {
             // An alarm has no output to fail, and unlike `reset_cell` it is not
             // replayed either. The per-cell teardown below retires its firing

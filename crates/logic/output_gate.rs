@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): ported from meln1k/celld: 51 code probes on the core's rare branches (b026226).
+// Modified by ryuzcorp (ryuzcorp/celld): ported from meln1k/celld: 51 code probes on the core's rare branches (b026226); shared bucket-posture ownership reads across concurrent gates (0056).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! The output gate: one choke point every egress passes through.
@@ -217,6 +217,29 @@ impl State {
             });
             return;
         };
+        // A verified proof already covers this write: a read confirmed the
+        // record still named this node at this epoch after a proof captured
+        // every commit up to the round's cover (its issuing gate's own
+        // position). Positions strictly increase with every committing write
+        // and never move otherwise, so a write at or below the cover
+        // committed nothing that proof did not capture. The write needs no
+        // new proof and no read; it releases with the verdict the round
+        // already reached. This changes neither fleet-proof nor alarm-barrier
+        // semantics: fleet proofs are verified by the ensemble seal rather
+        // than a read, so the same cover argument releases them, and alarm
+        // barriers are opened by `alarm_finished`, not here, so they always
+        // take their own proof. (`hold_observed` only calls here when no
+        // verified proof covers the observation, so this branch is dead for
+        // that path.)
+        if self.proven_covers(&cell, epoch, position) {
+            self.probe(Probe::GateReleasedProven);
+            effects.push(Effect::Release {
+                request,
+                channel: held.channel,
+                result: Ok(()),
+            });
+            return;
+        }
         let op = self.op();
         self.barriers.insert(
             op,
@@ -294,18 +317,20 @@ impl State {
         let Some(gate) = self.barriers.get(&op) else {
             return;
         };
-        let proven = matches!(result, Ok(durable) if durable >= gate.position);
+        let (cell, epoch, position) = (gate.cell.clone(), gate.epoch, gate.position);
         // A bucket proof reveals nothing until an ownership read confirms the
         // record still names this node at this epoch: "durable in `e<epoch>/`" is not
         // durable if the prefix was orphaned, and the bucket cannot refuse a
         // stale writer. A fleet proof needs no read — the ensemble
         // arbitrated it: a takeover seals a member before restoring, so a
         // stale owner's ack-all fails closed.
-        if proven && source == ProofSource::Bucket {
-            let (cell, epoch) = (gate.cell.clone(), gate.epoch);
-            effects.push(Effect::VerifyOwnership { op, cell, epoch });
-            return;
+        if let Ok(durable) = result {
+            if durable >= position && source == ProofSource::Bucket {
+                self.join_verify_round(op, cell, epoch, position, effects);
+                return;
+            }
         }
+        let proven = matches!(result, Ok(durable) if durable >= position);
         self.probe(match result {
             Err(_) => Probe::GateProofFailed,
             Ok(_) if !proven => Probe::GateProofShort,
@@ -314,24 +339,116 @@ impl State {
         self.settle_gate(op, proven, effects);
     }
 
-    /// Ownership verification for a bucket-proof gate. A record that no longer
-    /// names this node at this epoch fails the write exactly like an unproven
-    /// durability result: refuse and reset, never acknowledge into an
-    /// orphaned lineage.
+    /// Share bucket-posture ownership reads across a cell's concurrent gates.
+    /// A read's cover is its issuing gate's own position, never the reported
+    /// `durable`: the shell echoes the position back rather than a watermark,
+    /// and a future watermark in another unit must not widen the join. A gate
+    /// at a position `<= cover` committed before the issuer did (positions
+    /// strictly increase with every committing write) or committed nothing
+    /// new, so the issuer's completed proof captured it and the read, issued
+    /// now, follows that proof (`VerifyRound` states the full argument). A
+    /// gate joins a read in flight whose cover reaches its position;
+    /// otherwise it issues its own read at once. Every gate is answered by
+    /// exactly one read issued after a proof that captured it, and no gate
+    /// waits longer than that one read, so sharing saves reads without
+    /// adding latency.
+    fn join_verify_round(
+        &mut self,
+        op: OpId,
+        cell: CellId,
+        epoch: Epoch,
+        position: u64,
+        effects: &mut Vec<Effect>,
+    ) {
+        let key = (cell, epoch);
+        let joinable = self.verify_rounds_by_cell.get(&key).and_then(|reads| {
+            reads
+                .iter()
+                .copied()
+                .find(|read| self.verify_rounds[read].cover >= position)
+        });
+        if let Some(read_op) = joinable {
+            self.probe(Probe::GateJoinedVerifyRound);
+            self.verify_rounds
+                .get_mut(&read_op)
+                .expect("indexed read is in flight")
+                .members
+                .push(op);
+            return;
+        }
+        let (cell, epoch) = key;
+        self.verify_rounds.insert(
+            op,
+            VerifyRound {
+                cell: cell.clone(),
+                epoch,
+                cover: position,
+                members: vec![op],
+            },
+        );
+        self.verify_rounds_by_cell
+            .entry((cell.clone(), epoch))
+            .or_default()
+            .insert(op);
+        effects.push(Effect::VerifyOwnership { op, cell, epoch });
+    }
+
+    /// Forget an in-flight read in both indexes. Its result, if it still
+    /// arrives, then finds nothing and releases nothing.
+    pub(crate) fn drop_verify_round(&mut self, read_op: OpId) -> Option<VerifyRound> {
+        let round = self.verify_rounds.remove(&read_op)?;
+        let key = (round.cell.clone(), round.epoch);
+        if let Some(reads) = self.verify_rounds_by_cell.get_mut(&key) {
+            reads.remove(&read_op);
+            if reads.is_empty() {
+                self.verify_rounds_by_cell.remove(&key);
+            }
+        }
+        Some(round)
+    }
+
+    /// An in-flight ownership read answered. On success every live gate it
+    /// answered is proven and its cover becomes the verified position; on
+    /// failure or refusal every live gate it answered fails exactly like an
+    /// unproven durability result, and the first failure resets the cell,
+    /// which also drops the cell's other reads in flight. A record that no
+    /// longer names this node at this epoch therefore never acknowledges into
+    /// an orphaned lineage. A result for a read already dropped — fence,
+    /// deadline, reset, or epoch change — releases nothing.
     pub(crate) fn ownership_verified(
         &mut self,
         op: OpId,
         result: Result<(), Failure>,
         effects: &mut Vec<Effect>,
     ) {
-        if !self.barriers.contains_key(&op) {
+        let Some(round) = self.drop_verify_round(op) else {
             return;
+        };
+        let members = round
+            .members
+            .iter()
+            .copied()
+            .filter(|member| self.barriers.contains_key(member))
+            .collect::<Vec<_>>();
+        match result {
+            Ok(()) => {
+                self.probe(Probe::GateProvenByBucket);
+                for member in members {
+                    self.settle_gate(member, true, effects);
+                }
+                // Every member sits at or below the cover, so the cover is
+                // the verified position: a later write or observation at or
+                // below it was captured by a proof this read followed, and
+                // needs no proof of its own.
+                self.note_proven(&round.cell, round.epoch, round.cover);
+            }
+            Err(_) => {
+                self.probe(Probe::GateOwnershipRefused);
+                for member in members {
+                    self.settle_gate(member, false, effects);
+                }
+            }
         }
-        self.probe(match result {
-            Ok(()) => Probe::GateProvenByBucket,
-            Err(_) => Probe::GateOwnershipRefused,
-        });
-        self.settle_gate(op, result.is_ok(), effects);
     }
 
     /// Release one withheld output, unpinning it first so the cleanup that

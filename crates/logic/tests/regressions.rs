@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): ported from meln1k/celld: scripted core-bug reproductions (ea471ee, e46a685, 6d61462, 18d3bf9, 9d4c163, 468b456, 01522b3, 65fdb13).
+// Modified by ryuzcorp (ryuzcorp/celld): ported from meln1k/celld: scripted core-bug reproductions (ea471ee, e46a685, 6d61462, 18d3bf9, 9d4c163, 468b456, 01522b3, 65fdb13); shared bucket-posture ownership reads (0056).
 //! Scripted reproductions of core bugs the deterministic simulator
 //! (`crates/sim`) found. Each drives the core through a minimal shell that
 //! answers every effect at once, except the ones a test holds back to
@@ -12,7 +12,7 @@ use celld_logic::wake::{AlarmSnapshot, AlarmSource, PublicationId};
 use celld_logic::{
     on_event, pressure, CasOutcome, Channel, Config, Effect, Event, Failure, LeaseCasOutcome,
     LocalCell, NodeLeaseRecord, NodeLeaseSpec, OwnerRecord, OwnershipOnEvict, Probe, ProofSource,
-    RestoreOutcome, State, Timer, WakeHintScope, WebSocketKind,
+    RequestError, RestoreOutcome, State, Timer, WakeHintScope, WebSocketKind,
 };
 use std::collections::{BTreeMap, VecDeque};
 
@@ -188,6 +188,21 @@ impl Shell {
             },
             Effect::Publish { op, .. } => Event::Published { op, result: Ok(()) },
             Effect::EnsureDurable { op, .. } => Event::DurabilityChecked { op, result: Ok(()) },
+            // The bucket-posture ownership read: confirmed exactly when the
+            // record still names this node at this epoch, as the shell does.
+            Effect::VerifyOwnership { op, cell, epoch } => {
+                let owned = self.owners.get(&cell).is_some_and(|record| {
+                    record.node.as_deref() == Some("n0") && record.epoch == epoch
+                });
+                Event::OwnershipVerified {
+                    op,
+                    result: if owned {
+                        Ok(())
+                    } else {
+                        Err(Failure::Definite)
+                    },
+                }
+            }
             Effect::StopRuntime { op, .. } => Event::RuntimeStopped { op },
             Effect::Complete { .. }
             | Effect::Release { .. }
@@ -850,5 +865,358 @@ fn a_covered_alarm_change_still_cancels_an_eviction() {
         }
     }
     assert!(!stopped, "the cancelled eviction stops nothing");
+    shell.state.validate().expect("state invariant");
+}
+
+/// Route one request per position on cell "a" and hold each response at the
+/// output gate, so every request owns an open barrier waiting on its proof.
+fn open_gated_writes(shell: &mut Shell, positions: &[u64]) {
+    for (index, position) in positions.iter().enumerate() {
+        let request = index as u64 + 1;
+        shell.send(Event::RequestAt {
+            request,
+            cell: "a".into(),
+            now_mono_ms: MONO_MS,
+        });
+        shell.send(Event::OutputAt {
+            request,
+            channel: Channel::Response,
+            position: Some(*position),
+            observed: None,
+            epoch: None,
+            now_mono_ms: MONO_MS,
+        });
+    }
+}
+
+/// Find the held durability gate proving `position`.
+fn held_gate_op_for_position(held: &[Effect], position: u64) -> u64 {
+    held.iter()
+        .find_map(|effect| match effect {
+            Effect::AwaitDurable {
+                op, position: p, ..
+            } if *p == position => Some(*op),
+            _ => None,
+        })
+        .expect("the write waits for its proof")
+}
+
+/// Hold every durability proof and ownership read, so the test drives the
+/// bucket-posture acknowledgement interleaving by hand.
+fn bucket_gate_shell() -> Shell {
+    Shell::new(4, |effect| {
+        matches!(
+            effect,
+            Effect::AwaitDurable { .. } | Effect::VerifyOwnership { .. }
+        )
+    })
+}
+
+/// Prove one gate and append the effects the proof produced.
+fn prove_gate(shell: &mut Shell, seen: &mut Vec<Effect>, position: u64) {
+    let op = held_gate_op_for_position(&shell.held, position);
+    seen.extend(shell.send(Event::DurableReached {
+        op,
+        result: Ok(position),
+        source: ProofSource::Bucket,
+    }));
+}
+
+fn verify_reads(seen: &[Effect]) -> Vec<u64> {
+    seen.iter()
+        .filter_map(|effect| match effect {
+            Effect::VerifyOwnership { op, .. } => Some(*op),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Concurrent bucket-proof gates on one cell share a single ownership read:
+/// the first proof to land opens the round, and every gate at or below its
+/// cover joins it instead of issuing a read of its own.
+#[test]
+fn bucket_proof_gates_share_one_ownership_read() {
+    const N: u64 = 8;
+    let mut shell = bucket_gate_shell();
+    shell.start();
+    open_gated_writes(&mut shell, &(1..=N).collect::<Vec<_>>());
+    // Proofs land largest-first, so the first one covers every gate and the
+    // round never grows a queue.
+    let mut seen = Vec::new();
+    for position in (1..=N).rev() {
+        prove_gate(&mut shell, &mut seen, position);
+    }
+    let reads = verify_reads(&seen);
+    assert_eq!(
+        reads.len(),
+        1,
+        "eight proven gates share one read: {seen:?}"
+    );
+    let released = shell.send(Event::OwnershipVerified {
+        op: reads[0],
+        result: Ok(()),
+    });
+    for request in 1..=N {
+        assert!(
+            released.iter().any(|effect| matches!(
+                effect,
+                Effect::Release {
+                    request: r,
+                    result: Ok(()),
+                    ..
+                } if *r == request
+            )),
+            "write {request} is acknowledged after the shared read: {released:?}"
+        );
+    }
+    let joined = shell
+        .state
+        .probes()
+        .find(|(probe, _)| *probe == Probe::GateJoinedVerifyRound)
+        .map(|(_, count)| count);
+    assert_eq!(joined, Some(N - 1), "every later gate joined the round");
+    let proven = shell
+        .state
+        .probes()
+        .find(|(probe, _)| *probe == Probe::GateProvenByBucket)
+        .map(|(_, count)| count);
+    assert_eq!(proven, Some(1), "one read proves every gate");
+    shell.state.validate().expect("state invariant");
+}
+
+/// A gate past the in-flight read's cover does not join it: it issues its own
+/// read at once instead of waiting for the first to finish, so sharing adds
+/// no latency. Each read releases only the gates it answers, in either
+/// completion order.
+#[test]
+fn a_gate_past_the_in_flight_read_gets_its_own_round() {
+    let mut shell = bucket_gate_shell();
+    shell.start();
+    open_gated_writes(&mut shell, &[1, 2]);
+    let mut seen = Vec::new();
+    prove_gate(&mut shell, &mut seen, 1);
+    let first = verify_reads(&seen);
+    assert_eq!(first.len(), 1, "the first proof opens a round: {seen:?}");
+    prove_gate(&mut shell, &mut seen, 2);
+    let reads = verify_reads(&seen);
+    assert_eq!(
+        reads.len(),
+        2,
+        "the past-cover gate reads at once instead of queueing: {seen:?}"
+    );
+    let second = held_gate_op_for_position(&shell.held, 2);
+    assert_eq!(
+        reads[1], second,
+        "the second read answers the past-cover gate"
+    );
+    shell.state.validate().expect("state invariant");
+    let seen = shell.send(Event::OwnershipVerified {
+        op: reads[1],
+        result: Ok(()),
+    });
+    assert!(
+        seen.iter().any(|effect| matches!(
+            effect,
+            Effect::Release {
+                request: 2,
+                result: Ok(()),
+                ..
+            }
+        )),
+        "the second read releases its gate: {seen:?}"
+    );
+    assert!(
+        !seen
+            .iter()
+            .any(|effect| matches!(effect, Effect::Release { request: 1, .. })),
+        "the first gate still waits for the read issued after its proof: {seen:?}"
+    );
+    let seen = shell.send(Event::OwnershipVerified {
+        op: reads[0],
+        result: Ok(()),
+    });
+    assert!(
+        seen.iter().any(|effect| matches!(
+            effect,
+            Effect::Release {
+                request: 1,
+                result: Ok(()),
+                ..
+            }
+        )),
+        "the first read releases its gate: {seen:?}"
+    );
+    shell.state.validate().expect("state invariant");
+}
+
+/// A read's cover is its issuing gate's own position, not the `durable` the
+/// proof reported. A proof reporting more than its gate's position names no
+/// capture of later commits, so a later gate must not join the read it
+/// triggered.
+#[test]
+fn a_reported_watermark_does_not_widen_a_read_cover() {
+    let mut shell = bucket_gate_shell();
+    shell.start();
+    open_gated_writes(&mut shell, &[1, 2]);
+    let op = held_gate_op_for_position(&shell.held, 1);
+    let mut seen = shell.send(Event::DurableReached {
+        op,
+        result: Ok(5),
+        source: ProofSource::Bucket,
+    });
+    prove_gate(&mut shell, &mut seen, 2);
+    assert_eq!(
+        verify_reads(&seen).len(),
+        2,
+        "the later gate reads for itself: {seen:?}"
+    );
+    shell.state.validate().expect("state invariant");
+}
+
+/// A refused ownership read fails every gate it answered and resets the
+/// cell; a stale result after the reset releases nothing.
+#[test]
+fn a_refused_read_fails_every_joined_gate_and_resets() {
+    let mut shell = bucket_gate_shell();
+    shell.start();
+    open_gated_writes(&mut shell, &[1, 2, 3]);
+    let mut seen = Vec::new();
+    for position in [3, 2, 1] {
+        prove_gate(&mut shell, &mut seen, position);
+    }
+    let reads = verify_reads(&seen);
+    assert_eq!(reads.len(), 1, "the joined gates share one read: {seen:?}");
+    let seen = shell.send(Event::OwnershipVerified {
+        op: reads[0],
+        result: Err(Failure::Definite),
+    });
+    for request in 1..=3 {
+        assert!(
+            seen.iter().any(|effect| matches!(
+                effect,
+                Effect::Release {
+                    request: r,
+                    result: Err(RequestError::DurabilityUnproven),
+                    ..
+                } if *r == request
+            )),
+            "write {request} fails after the refused read: {seen:?}"
+        );
+    }
+    assert!(
+        seen.iter()
+            .any(|effect| matches!(effect, Effect::StopRuntime { cell, .. } if cell == "a")),
+        "the refused read resets the cell: {seen:?}"
+    );
+    let refused = shell
+        .state
+        .probes()
+        .find(|(probe, _)| *probe == Probe::GateOwnershipRefused)
+        .map(|(_, count)| count);
+    assert_eq!(refused, Some(1), "the refused round is counted once");
+    // A stale result after the reset releases nothing.
+    let seen = shell.send(Event::OwnershipVerified {
+        op: reads[0],
+        result: Err(Failure::Definite),
+    });
+    assert!(
+        !seen
+            .iter()
+            .any(|effect| matches!(effect, Effect::Release { .. })),
+        "the stale read result releases nothing: {seen:?}"
+    );
+    let swept = held_gate_op_for_position(&shell.held, 1);
+    let seen = shell.send(Event::DurableReached {
+        op: swept,
+        result: Ok(1),
+        source: ProofSource::Bucket,
+    });
+    assert!(
+        !seen
+            .iter()
+            .any(|effect| matches!(effect, Effect::Release { .. })),
+        "a proof for a swept gate releases nothing: {seen:?}"
+    );
+    shell.state.validate().expect("state invariant");
+}
+
+/// A write at a position a verified proof already covers releases with no
+/// new proof and no read; a write at a newer position still waits for its
+/// own.
+#[test]
+fn a_write_at_a_verified_position_releases_without_a_new_read() {
+    let mut shell = bucket_gate_shell();
+    shell.start();
+    open_gated_writes(&mut shell, &[5]);
+    let mut seen = Vec::new();
+    prove_gate(&mut shell, &mut seen, 5);
+    let reads = verify_reads(&seen);
+    assert_eq!(reads.len(), 1, "the proof opens a round: {seen:?}");
+    shell.send(Event::OwnershipVerified {
+        op: reads[0],
+        result: Ok(()),
+    });
+    // A write the verified proof already covered releases at once.
+    shell.send(Event::RequestAt {
+        request: 2,
+        cell: "a".into(),
+        now_mono_ms: MONO_MS,
+    });
+    let seen = shell.send(Event::OutputAt {
+        request: 2,
+        channel: Channel::Response,
+        position: Some(3),
+        observed: None,
+        epoch: None,
+        now_mono_ms: MONO_MS,
+    });
+    assert!(
+        seen.iter().any(|effect| matches!(
+            effect,
+            Effect::Release {
+                request: 2,
+                result: Ok(()),
+                ..
+            }
+        )),
+        "the covered write releases at once: {seen:?}"
+    );
+    assert!(
+        !seen
+            .iter()
+            .any(|effect| matches!(effect, Effect::AwaitDurable { .. })),
+        "the covered write proves nothing anew: {seen:?}"
+    );
+    let fast = shell
+        .state
+        .probes()
+        .find(|(probe, _)| *probe == Probe::GateReleasedProven)
+        .map(|(_, count)| count);
+    assert_eq!(fast, Some(1), "the fast path is counted");
+    // A write past the verified position still waits for its own proof.
+    shell.send(Event::RequestAt {
+        request: 3,
+        cell: "a".into(),
+        now_mono_ms: MONO_MS,
+    });
+    let seen = shell.send(Event::OutputAt {
+        request: 3,
+        channel: Channel::Response,
+        position: Some(6),
+        observed: None,
+        epoch: None,
+        now_mono_ms: MONO_MS,
+    });
+    assert!(
+        seen.iter()
+            .any(|effect| matches!(effect, Effect::AwaitDurable { position: 6, .. })),
+        "the newer write waits for its proof: {seen:?}"
+    );
+    assert!(
+        !seen
+            .iter()
+            .any(|effect| matches!(effect, Effect::Release { request: 3, .. })),
+        "the newer write is not released: {seen:?}"
+    );
     shell.state.validate().expect("state invariant");
 }
