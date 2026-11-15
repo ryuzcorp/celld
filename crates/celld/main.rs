@@ -5052,9 +5052,9 @@ async fn async_main(
                     // bundles only while every live lease reads format 3. Off until the
                     // first sample (a failed tick publishes an empty view, which closes
                     // it), re-checked per flush via `bucket_bundles_enabled`, which
-                    // additionally requires `CELLD_BUCKET_BUNDLES=1` so a partial stack
-                    // never ships enabled. When the gate closes, the node falls back at
-                    // once to per-cell L0 uploads for new writes.
+                    // additionally requires the operator switch (on by default;
+                    // `CELLD_BUCKET_BUNDLES=0` disables it). When the gate closes,
+                    // the node falls back at once to per-cell L0 uploads for new writes.
                     let bundle_open = bucket_posture
                         && celld_logic::format::bucket_bundles_allowed(&peers, view_ms);
                     if replication.set_bucket_bundles_fleet(bundle_open) != bundle_open {

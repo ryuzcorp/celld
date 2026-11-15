@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): an eviction skips the visibility LISTs its own uploads already prove and the time-based checkpoint before the handoff; an eviction deletes the per-cell L0/L1 objects its handoff snapshot supersedes; bucket-posture group commit: paged gate judges PAGED_FORMAT (0059); bucket-posture group commit: bucket bundle gate, sync pacing and event-driven bundle flush (0060); the eviction guard proves a journaled epoch with a HEAD on the newest journaled key, falling back to the listing on a miss, an error, or an empty journal (0061); bucket-posture group commit: bundled-cell eviction guard, graceful-close per-cell drain, bundle GC without ensemble, linger holds only while the dirty set is shared (0064).
+// Modified by ryuzcorp (ryuzcorp/celld): an eviction skips the visibility LISTs its own uploads already prove and the time-based checkpoint before the handoff; an eviction deletes the per-cell L0/L1 objects its handoff snapshot supersedes; bucket-posture group commit: paged gate judges PAGED_FORMAT (0059); bucket-posture group commit: bucket bundle gate, sync pacing and event-driven bundle flush (0060); the eviction guard proves a journaled epoch with a HEAD on the newest journaled key, falling back to the listing on a miss, an error, or an empty journal (0061); bucket-posture group commit: bundled-cell eviction guard, graceful-close per-cell drain, bundle GC without ensemble, linger holds only while the dirty set is shared (0064).; bucket-posture group commit: bundle switch on by default (0070).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! In-process replication backend built on `celld-ltx`.
@@ -1018,12 +1018,14 @@ fn credit_percell_upload(handle: &Cell, txid: u64) {
     handle.percell_txid.fetch_max(txid, Ordering::SeqCst);
     handle.durable_txid.fetch_max(txid, Ordering::SeqCst);
 }
-/// Whether the operator enabled bucket-posture bundles (`CELLD_BUCKET_BUNDLES=1`).
-/// Off by default: until layers 3-5 merge, a partial stack must never ship enabled,
-/// so the format gate alone is not enough. Pure value helper keeps tests deterministic
-/// without touching the process environment.
+/// Whether the operator enabled bucket-posture bundles: on by default (layer 5
+/// rolls the stack out), and `CELLD_BUCKET_BUNDLES=0` disables it. Only an
+/// explicit `0` disables; the format-3 fleet gate still governs (see
+/// `bucket_bundles_enabled`). Pure value helper keeps tests deterministic
+/// without touching the process environment; startup rejects any other value
+/// before a flush can read it (`env_vars::validate`).
 fn bucket_bundles_env_value(value: Option<&str>) -> bool {
-    matches!(value.map(str::trim), Some("1"))
+    !matches!(value.map(str::trim), Some("0"))
 }
 
 /// Production read of the operator switch, per flush (not per process).
@@ -1427,8 +1429,8 @@ pub struct LtxRepl {
     /// (`celld_logic::format::BUCKET_BUNDLES_FORMAT`). Off until the first
     /// fleet sample (mirrors the paged gate): a failed or missing sample
     /// closes it. The per-flush bundle path additionally requires the
-    /// operator switch `CELLD_BUCKET_BUNDLES=1`, so a partial stack never
-    /// ships enabled (see `bucket_bundles_enabled`).
+    /// operator switch (on by default; `CELLD_BUCKET_BUNDLES=0` disables),
+    /// see `bucket_bundles_enabled`.
     bucket_bundles_fleet: AtomicBool,
     /// Test-only override for the `CELLD_BUCKET_BUNDLES` leg, so deterministic
     /// tests do not mutate the process environment. `None` (production) reads
@@ -3156,8 +3158,8 @@ impl LtxRepl {
     /// `celld_logic::format::bucket_bundles_allowed`; returns the prior value so
     /// the caller logs a transition once. Off until the first sample, mirroring
     /// the paged gate: a failed or missing sample closes it. The per-flush path
-    /// additionally requires `CELLD_BUCKET_BUNDLES=1` (see `bucket_bundles_enabled`),
-    /// so a partial stack never ships enabled.
+    /// additionally requires the operator switch (on by default;
+    /// `CELLD_BUCKET_BUNDLES=0` disables), see `bucket_bundles_enabled`.
     pub fn set_bucket_bundles_fleet(&self, ready: bool) -> bool {
         self.bucket_bundles_fleet.swap(ready, Ordering::Relaxed)
     }
@@ -3170,10 +3172,10 @@ impl LtxRepl {
 
     /// Whether this flush may write bucket-posture bundles: the fleet gate
     /// (set by the sampler, off until the first sample) AND the operator switch
-    /// `CELLD_BUCKET_BUNDLES=1`. Re-checked per flush, not per process: when the
-    /// gate closes, the node falls back at once to per-cell L0 uploads for new
-    /// writes. Already-credited bundle rows stay covered by the existing drain
-    /// and GC paths (layer 4 completes those).
+    /// (on by default; `CELLD_BUCKET_BUNDLES=0` disables it). Re-checked per
+    /// flush, not per process: when the gate closes, the node falls back at once
+    /// to per-cell L0 uploads for new writes. Already-credited bundle rows stay
+    /// covered by the existing drain and GC paths.
     pub(crate) fn bucket_bundles_enabled(&self) -> bool {
         if !self.bucket_bundles_fleet.load(Ordering::Relaxed) {
             return false;
@@ -7453,18 +7455,22 @@ mod bucket_bundles_tests {
         drop(repl);
         owner.join().await;
     }
-    /// The operator switch is OFF by default: a partial stack never ships enabled.
-    /// Until layers 3-5 merge, the format gate alone is not enough. Fail-before:
-    /// defaulting to `true` enables bundles with no env set.
+    /// The operator switch is ON by default (layer 5 rolls the stack out);
+    /// only an explicit `CELLD_BUCKET_BUNDLES=0` disables it. The format-3
+    /// fleet gate still governs (see `bucket_gate_stays_closed_until_the_first_sample`).
+    /// Fail-before: `matches!(Some("1"))` leaves bundles off with no env set.
     #[test]
-    fn bucket_env_is_off_by_default() {
-        assert!(!bucket_bundles_env_value(None), "absent env stays off");
-        assert!(!bucket_bundles_env_value(Some("")), "empty stays off");
-        assert!(!bucket_bundles_env_value(Some("0")), "explicit 0 stays off");
-        assert!(bucket_bundles_env_value(Some("1")), "explicit 1 opens");
+    fn bucket_env_is_on_by_default_until_explicit_zero() {
+        assert!(bucket_bundles_env_value(None), "absent env enables");
+        assert!(bucket_bundles_env_value(Some("")), "empty enables");
         assert!(
-            !bucket_bundles_env_value(Some("true")),
-            "only 1 opens, not truthy strings"
+            bucket_bundles_env_value(Some("1")),
+            "explicit 1 still enables"
+        );
+        assert!(!bucket_bundles_env_value(Some("0")), "explicit 0 disables");
+        assert!(
+            !bucket_bundles_env_value(Some(" 0 ")),
+            "surrounding whitespace does not save a 0"
         );
     }
 

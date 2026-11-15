@@ -853,6 +853,31 @@ push to `ghcr.io/denoland`, but still. Pushing a branch named
   measured counts match the serial driver. The README notes that agents
   are concurrent and suggests `DELAY_MS=100` for realistic batching numbers
   (R2 answers a PUT in ~100–200 ms from a VPS).
+- `0070` (sha TBD at merge) rollout for bucket-posture group commit
+  (layer 5): group commit is ON by default in bucket posture.
+  `CELLD_BUCKET_BUNDLES` defaults to on and `=0` disables it; any other
+  value stops startup (`env_vars::validate`). The format-3 fleet gate still
+  governs: bundles are written only while every live lease reads format 3,
+  off until the first fleet sample, re-checked per flush with instant
+  per-cell fallback. Default linger stays 0; `CELLD_BUCKET_BUNDLE_LINGER_MS`
+  (cap 1000) holds a round open only while more than one cell is dirty, so a
+  lone cell never waits. Defence in depth: the lease publish path asserts
+  its own advertised `bucket_format == BUCKET_FORMAT` before the first
+  publish (a fleet-split build fails loudly instead of silently closing the
+  gate). Docs: takeover-gate and bucket-proof paragraphs in
+  `docs/guarantees.md` (record-before-first-ack, sealed-means-per-cell,
+  gate rule, downgrade-by-recovery, L4 eviction snapshot), the two knobs in
+  `docs/README.md` and `celld -h`. Measured on the concurrent agent
+  workload (1 node, 200 agents x 6 writes, `DELAY_MS=100`), Class A
+  PUT/POST/LIST (L4 reference OFF 1934 / ON linger 0 1120 / ON linger 200
+  986): OFF 1934, default (no switch) 1136 with bundling engaged, linger
+  200 982 — 1200/1200 turns every run. Kill-and-restart with the default
+  config (concurrent workload, kill -9 at T+25s): 692 acked turns, every one
+  restorable (200/200 probes, chains intact). Downgrade drill: the new binary
+  acked 1200 turns into bundles and was killed; the `.10` image binary (fresh
+  watch dir, different node, same bucket) took every cell over, folded the
+  whole bundle prefix with no loss declared, and served 200/200 probes with
+  every acked row restorable.
 
 Patches `0025`–`0034` are ported fixes from
 [meln1k/celld](https://github.com/meln1k/celld) by Nikita

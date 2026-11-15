@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): bucket-posture group commit: bucket-session node-log wire marker (0059).
+// Modified by ryuzcorp (ryuzcorp/celld): bucket-posture group commit: bucket-session node-log wire marker (0059). bucket-posture group commit: published-format boot self-check (0070).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! Bucket ownership effect adapter, over either conditional-write dialect.
@@ -1273,7 +1273,7 @@ pub(crate) fn process_load(live: &LiveLoad) -> NodeLoadWire {
     let rss_bytes = sample.rss_bytes.max(1);
     let in_use_bytes = sample.in_use_bytes.max(1).min(rss_bytes);
 
-    NodeLoadWire {
+    let load = NodeLoadWire {
         // Version the whole record, including live counters. Reusing the resource
         // sample's time would retain peers' capacity reservations across renewals.
         sampled_ms: now_ms(),
@@ -1298,5 +1298,10 @@ pub(crate) fn process_load(live: &LiveLoad) -> NodeLoadWire {
         // Published each renewal, so a peer sees a start or stop within a
         // renewal and a sample refresh. Empty on a node with no engine.
         container_instances: crate::container::running_instances_by_class(),
-    }
+    };
+    // Boot self-check on the assembled record, not the constant: a future
+    // refactor that drops or mistypes the stamp must fail loudly (before
+    // the first lease publish) instead of silently closing the fleet gate.
+    celld_logic::format::assert_published_bucket_format(load.bucket_format);
+    load
 }

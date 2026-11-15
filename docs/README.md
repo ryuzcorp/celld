@@ -1,4 +1,4 @@
-<!-- Modified by ryuzcorp (ryuzcorp/celld): CELLD_MEMORY_SCOPE; deploy --sourcemap writes the bundle's external map; operator token for the internal listener; r2 list --delimiter, the --page shape, and --cursor continuation; Workers Cache API page; deployment cache scope; deploy --sourcemap collects the no_bundle sibling map; staged invoke docs; deploy confines esbuild reads to the project; deploy --read-root; CELLD_SQLITE_CACHE_KB; CELLD_C_TRIM_MB. -->
+<!-- Modified by ryuzcorp (ryuzcorp/celld): CELLD_MEMORY_SCOPE; deploy --sourcemap writes the bundle's external map; operator token for the internal listener; r2 list --delimiter, the --page shape, and --cursor continuation; Workers Cache API page; deployment cache scope; deploy --sourcemap collects the no_bundle sibling map; staged invoke docs; deploy confines esbuild reads to the project; deploy --read-root; CELLD_SQLITE_CACHE_KB; CELLD_C_TRIM_MB; bucket-posture group commit docs: bundle switch default-on, linger, guarantees (0070). -->
 # celld
 
 celld is a stateful distributed system. It runs server-side JavaScript on
@@ -67,6 +67,16 @@ store write. Run two or more nodes if write latency
 matters. A fleet that loses all but one node falls back to the bucket in the
 same way, and it stays correct. Set `bucket` to wait for the bucket on every
 write, even when peers are available.
+
+In bucket posture, writes are grouped: once per flush round the node writes
+one shared bundle object carrying every dirty cell's new rows, and that PUT
+is the durability proof for every row it carries — instead of one upload per
+write. Grouping is on by default and needs every live lease to read format 3
+(see [guarantees](guarantees.md#bucket-posture-bundle-proofs)); while an older
+lease is live the node uploads per-cell as before. Set
+`CELLD_BUCKET_BUNDLES=0` to upload per-cell always. `CELLD_BUCKET_BUNDLE_LINGER_MS`
+holds a round open so concurrent writes share one PUT, but only while more
+than one cell is dirty.
 
 When a node stops, another node takes its cells over, and first collects
 the data that the stopped node had not uploaded. See
@@ -712,6 +722,8 @@ unset variable selects its default. A Boolean variable accepts only `0` or
 | `CELLD_MEMORY_SCOPE` | Which cgroup the pressure sample and limit read: `container` (default) measures the cgroupfs root, `self` the process's own cgroup v2 leaf, falling back to the root with a warning on cgroup v1 or where the leaf is unreadable. With `self` and an unset `CELLD_MAX_RSS_MB`, the threshold defaults to 80% of the leaf's `memory.max` |
 | `CELLD_C_TRIM_MB` | Freed C-heap growth, in MiB, that earns another `malloc_trim` on the sampler tick (default: 8). Lower returns glibc free pages sooner after eviction batches |
 | `CELLD_DURABILITY` | `fleet` (default): the node sends each write to one or two other nodes and answers when they hold it on disk or the bucket upload finishes. A single node has no peer, so every write waits for the bucket. `bucket`: always wait for the bucket |
+| `CELLD_BUCKET_BUNDLES` | `1` (default): in bucket posture, group each flush round's dirty rows into shared bundle proofs (`log/<node>/<generation>/bundle/`). Set `0` to upload per-cell L0 objects as before. Bundling additionally needs every live lease to read format 3 (see [guarantees](guarantees.md#bucket-posture-bundle-proofs)); any other value stops startup |
+| `CELLD_BUCKET_BUNDLE_LINGER_MS` | Hold a bundle round open this many milliseconds after the first dirty wake so concurrent writes share one PUT (default: `0`; values above `1000` clamp to `1000`). The window applies only while more than one cell is dirty: a lone dirty cell flushes at once, so the linger costs latency only when it also saves PUTs. Measured on 200 agents × 6 writes (Class A PUT/POST/LIST): `1934` with bundling off, `1120`–`1136` with the default (two runs), `982`–`986` with `200` |
 | `CELLD_LOG_PIPELINE` | Fleet log rounds in flight (default: 4) |
 | `CELLD_LOG_HEDGE_MS` | The wait before a second copy of a slow log append. The default is adaptive: 4 times the slowest recent append, at least 250 ms. `0` disables the copy |
 | `CELLD_LTX_TRUNCATE_PAGES` | The WAL size, in pages, at which celld truncates the WAL at the next checkpoint (default: 128, 512 KiB). A database larger than 4 MiB waits until the WAL is larger than the database. `0` disables it |

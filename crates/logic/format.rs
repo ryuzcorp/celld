@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): bucket-posture group commit: BUCKET_FORMAT 3 and the bundle-write gate (0059).
+// Modified by ryuzcorp (ryuzcorp/celld): bucket-posture group commit: BUCKET_FORMAT 3 and the bundle-write gate (0059). bucket-posture group commit: published-format boot self-check (0070).
 //! The bucket format a node can read, and the fleet-wide gate that keeps a
 //! node from writing what a live peer cannot read.
 //!
@@ -71,6 +71,23 @@ pub fn fleet_reads(peers: &[CapacityPeer], now_ms: u64, format: u16) -> bool {
 /// the gate; callers stay closed until the first sample, mirroring the paged gate.
 pub fn bucket_bundles_allowed(peers: &[CapacityPeer], now_ms: u64) -> bool {
     fleet_reads(peers, now_ms, BUCKET_BUNDLES_FORMAT)
+}
+
+/// Boot self-check (defence in depth): the lease this binary publishes must
+/// advertise the newest bucket format it reads. A binary that advertised
+/// less would hold the whole fleet's bundle gate closed — or split it, with
+/// some nodes bundling while others cannot read the bundles — so the publish
+/// path asserts instead of running degraded. `process_load` (the single
+/// stamp point, read before the first lease publish) calls this on the
+/// assembled record, not on the constant, so a future refactor that drops
+/// or mistypes the stamp fails loudly instead of silently closing the gate.
+pub fn assert_published_bucket_format(bucket_format: Option<u16>) {
+    assert_eq!(
+        bucket_format,
+        Some(BUCKET_FORMAT),
+        "this binary reads bucket format {BUCKET_FORMAT} but would publish \
+         {bucket_format:?}: refusing to run a fleet-split build",
+    );
 }
 
 #[cfg(test)]
@@ -177,5 +194,29 @@ mod bucket_gate_tests {
         let peers = [peer("n0", live, Some(3)), peer("n1", live, Some(2))];
         assert!(fleet_reads(&peers, NOW_MS, PAGED_FORMAT));
         assert!(!bucket_bundles_allowed(&peers, NOW_MS));
+    }
+
+    /// The boot self-check accepts the format this binary reads: the
+    /// publish path calls it on the assembled lease record.
+    #[test]
+    fn published_format_check_accepts_the_current_format() {
+        assert_published_bucket_format(Some(BUCKET_FORMAT));
+    }
+
+    /// The boot self-check refuses an older advertisement: a binary that
+    /// stamped this would hold the fleet's bundle gate closed (or split
+    /// it). Fail-before: neutering the assertion lets this publish.
+    #[test]
+    #[should_panic(expected = "fleet-split")]
+    fn published_format_check_refuses_an_older_advertisement() {
+        assert_published_bucket_format(Some(BUCKET_BUNDLES_FORMAT - 1));
+    }
+
+    /// The boot self-check refuses a missing advertisement for the same
+    /// reason: an unstamped lease reads as format 1 to old peers.
+    #[test]
+    #[should_panic(expected = "fleet-split")]
+    fn published_format_check_refuses_a_missing_advertisement() {
+        assert_published_bucket_format(None);
     }
 }
