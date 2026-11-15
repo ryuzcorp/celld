@@ -1,3 +1,4 @@
+// Modified by ryuzcorp (ryuzcorp/celld): round-level fence settlement (0062).
 // Modified by ryuzcorp (ryuzcorp/celld): ported from meln1k/celld: 51 code probes on the core's rare branches (b026226); keep-the-unfolded-tail probe (65fdb13); shared bucket-posture ownership reads across concurrent gates (0056).
 //! Code probes: rare branches of the core, named and counted when taken.
 //!
@@ -49,6 +50,16 @@ probes! {
     GateProofFailed,
     /// An ownership read refused a bucket proof.
     GateOwnershipRefused,
+    /// A round-level fence read credited a cell: its gates settle proven
+    /// with no per-gate ownership read.
+    GateProvenByFenceRound,
+    /// A round-level fence read left a cell uncredited: its gates fail
+    /// exactly like a refused ownership read.
+    GateFenceRoundRefused,
+    /// A round-level fence read issued at or before its proof failed the
+    /// gates it covered instead of settling them: a read that predates the
+    /// proof is never accepted.
+    GateFenceRoundUnordered,
     /// A bucket-proof gate joined an ownership read already in flight whose
     /// cover reaches its position, instead of issuing a read of its own.
     GateJoinedVerifyRound,

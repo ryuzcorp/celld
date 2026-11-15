@@ -1,3 +1,4 @@
+// Modified by ryuzcorp (ryuzcorp/celld): round-level fence settlement (0062).
 // Modified by ryuzcorp (ryuzcorp/celld): ported from meln1k/celld: seal a dead lease that never opened a log (01522b3); shared bucket-posture ownership reads across concurrent gates (0056).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
@@ -705,6 +706,18 @@ pub enum Event {
     OwnershipVerified {
         op: OpId,
         result: Result<(), Failure>,
+    },
+    /// A round-level fence read answered, without any per-gate
+    /// `VerifyOwnership` read: for each cell of a flush round, the fence
+    /// entry read AFTER the round's bundle proof completed, with the
+    /// proof-then-read ordering witness. Credited cells settle their covered
+    /// gates proven; uncredited cells fail them exactly like a refused
+    /// ownership read. A round whose read predates its proof fails the gates
+    /// it covers. Layer 2 produces this (per-cell `own.json` reads now,
+    /// shard reads later); layer 1 only settles it.
+    /// Modified by ryuzcorp (ryuzcorp/celld): round-level fence settlement (0062).
+    FenceRoundVerified {
+        round: log_tier::FenceRoundSettlement,
     },
     WebSocketOpened {
         cell: CellId,

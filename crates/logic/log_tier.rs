@@ -1,3 +1,4 @@
+// Modified by ryuzcorp (ryuzcorp/celld): per-round fence credit (0062).
 // Modified by ryuzcorp (ryuzcorp/celld): ported from meln1k/celld: seal a dead lease that never opened a log (01522b3); lone-node repair backoff schedule; bucket-posture group commit: bucket session flavour, loss/witness predicates (0059).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
@@ -26,6 +27,7 @@
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 
+use crate::CellId;
 use crate::Epoch;
 use crate::NodeId;
 
@@ -438,6 +440,195 @@ pub fn graceful_seal_allowed(
 pub fn bundle_credit_allowed(record: Option<&LogRecord>, epoch: Epoch) -> bool {
     record.is_some_and(|record| record.epoch == epoch && record.state == LogState::Open)
 }
+/// Proof-then-read ordering witness for one flush round's fence check. The
+/// executor mints both markers from one monotonic completion counter: the
+/// bundle PUT's completion side and the fence-entries read's issue side. A
+/// fence read credits only when issued strictly after the proof it follows.
+/// `read_seq <= proof_seq` names a read that can predate the proof — or the
+/// takeover the proof raced — so it proves nothing and never credits.
+// Modified by ryuzcorp (ryuzcorp/celld): per-round fence credit (0062).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProofThenRead {
+    /// Completion marker of the round's bundle PUT (the proof).
+    pub proof_seq: u64,
+    /// Issue marker of the round's fence-entries read.
+    pub read_seq: u64,
+}
+
+impl ProofThenRead {
+    /// True only when the fence read was issued after the proof completed.
+    pub fn ordered(self) -> bool {
+        self.read_seq > self.proof_seq
+    }
+}
+
+/// What one fence-entry read returned for one cell of a flush round. The
+/// entry is the cell's ownership record (`cells/<cell>/own.json` today, one
+/// shard object per shard once ownership shards land); the shape is the same
+/// either way, so the credit path does not change when the backend does.
+// Modified by ryuzcorp (ryuzcorp/celld): per-round fence credit (0062).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RoundFenceOutcome {
+    /// The entry exists and names this owner at this cell epoch.
+    Entry { node: NodeId, epoch: Epoch },
+    /// The entry is gone: the cell was released, or was never claimed here.
+    /// Either way the prefix may be orphaned, so this fails, never credits.
+    Missing,
+    /// The entry could not be read (refused GET, timeout, torn body). A read
+    /// error fails exactly like a refused entry: the round is uncredited.
+    ReadError,
+}
+
+/// The reader abstraction for a flush round's fence entries: one outcome per
+/// cell the round's bundle carries. Layer 2 backs this with per-cell
+/// `own.json` reads issued after the bundle PUT; ownership shards back it
+/// with one shard read per shard afterwards. The predicate only sees
+/// outcomes, so swapping the backend touches no credit logic.
+// Modified by ryuzcorp (ryuzcorp/celld): per-round fence credit (0062).
+pub trait RoundFence {
+    /// The fence outcome for `cell`: its entry, or why there is none.
+    fn entry(&self, cell: &str) -> RoundFenceOutcome;
+}
+
+/// Map-backed fences for tests and callers that already hold the round's
+/// entries. A cell with no entry reads as `Missing`, like a 404 from the
+/// bucket: absent is a verdict, not a gap.
+// Modified by ryuzcorp (ryuzcorp/celld): per-round fence credit (0062).
+impl RoundFence for BTreeMap<CellId, RoundFenceOutcome> {
+    fn entry(&self, cell: &str) -> RoundFenceOutcome {
+        self.get(cell)
+            .cloned()
+            .unwrap_or(RoundFenceOutcome::Missing)
+    }
+}
+
+/// Per-cell credit verdict for one flush round. `Credit` acknowledges the
+/// cell's covered writes; `Uncredited` fails their gates exactly like a
+/// failed ownership read today — never a blind ack, never a hang.
+// Modified by ryuzcorp (ryuzcorp/celld): per-round fence credit (0062).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CellCredit {
+    Credit,
+    Uncredited,
+}
+
+impl CellCredit {
+    /// True only for `Credit`.
+    pub fn credited(self) -> bool {
+        matches!(self, CellCredit::Credit)
+    }
+}
+
+/// Per-cell arm of the round credit check: the fence entry read AFTER the
+/// round's bundle PUT must still name this node at this cell epoch. Pair
+/// with the session-record arm ([`bundle_credit_allowed`]); see
+/// [`round_cell_credit`].
+// Modified by ryuzcorp (ryuzcorp/celld): per-round fence credit (0062).
+pub fn fence_cell_credit(
+    node: &str,
+    cell_epoch: Epoch,
+    fence: RoundFenceOutcome,
+    order: ProofThenRead,
+) -> CellCredit {
+    if !order.ordered() {
+        return CellCredit::Uncredited;
+    }
+    match fence {
+        RoundFenceOutcome::Entry { node: owner, epoch } if owner == node && epoch == cell_epoch => {
+            CellCredit::Credit
+        }
+        _ => CellCredit::Uncredited,
+    }
+}
+
+/// A flush round's credit predicate, both arms. The session-record arm
+/// ([`bundle_credit_allowed`]) covers the whole round: a record no longer
+/// `Open` at the shipper's epoch after the PUT means a recovery sealed the
+/// session mid-flight, and no cell of the round credits. The per-cell fence
+/// arm ([`fence_cell_credit`]) covers each cell: a live-donor single-cell
+/// takeover never seals the session (`fold_cell` leaves it `Open`), so the
+/// record arm still passes for the stale writer and only the fence entry —
+/// read after the PUT — refuses its round. Either arm refuses, and a refused
+/// cell's gates fail rather than hang. Proof-then-read ordering is part of
+/// the verdict: a fence read issued at or before the proof never credits.
+// Modified by ryuzcorp (ryuzcorp/celld): per-round fence credit (0062).
+pub fn round_cell_credit(
+    record: Option<&LogRecord>,
+    shipper_epoch: Epoch,
+    node: &str,
+    cell_epoch: Epoch,
+    fence: RoundFenceOutcome,
+    order: ProofThenRead,
+) -> CellCredit {
+    if !bundle_credit_allowed(record, shipper_epoch) {
+        return CellCredit::Uncredited;
+    }
+    fence_cell_credit(node, cell_epoch, fence, order)
+}
+
+/// Credit for every cell of a flush round, in input order, through one
+/// fence reader. Mixed rounds stay mixed: a bumped cell goes uncredited
+/// while its intact neighbours credit, and the executor fails only the
+/// uncredited cells' gates.
+// Modified by ryuzcorp (ryuzcorp/celld): per-round fence credit (0062).
+pub fn round_credit(
+    record: Option<&LogRecord>,
+    shipper_epoch: Epoch,
+    node: &str,
+    cells: &[(CellId, Epoch)],
+    fence: &impl RoundFence,
+    order: ProofThenRead,
+) -> Vec<(CellId, CellCredit)> {
+    cells
+        .iter()
+        .map(|(cell, cell_epoch)| {
+            (
+                cell.clone(),
+                round_cell_credit(
+                    record,
+                    shipper_epoch,
+                    node,
+                    *cell_epoch,
+                    fence.entry(cell),
+                    order,
+                ),
+            )
+        })
+        .collect()
+}
+
+/// One cell's share of a round-level fence settlement handed to the output
+/// gate. The executor computes `credit` with [`round_cell_credit`] (both
+/// arms, proof-then-read ordering included) and the gate settles only the
+/// gates this round's proof captured — positions at or below `cover`.
+// Modified by ryuzcorp (ryuzcorp/celld): per-round fence credit (0062).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FenceCellSettlement {
+    /// The cell the fence entry was read for.
+    pub cell: CellId,
+    /// The cell epoch the round served.
+    pub epoch: Epoch,
+    /// Highest gate position this round's proof captured for the cell.
+    /// Gates above it were committed after the proof (or never covered by
+    /// it), so this settlement never answers them.
+    pub cover: u64,
+    /// The two-arm verdict for the cell.
+    pub credit: CellCredit,
+}
+
+/// A round-level fence read handed back to the output gate: every fence
+/// entry it carries was read AFTER the round's bundle proof completed, and
+/// `order` witnesses that. An unordered round (read issued at or before the
+/// proof) settles nothing as credited: covered gates fail instead, so a
+/// read that predates the proof is never accepted.
+// Modified by ryuzcorp (ryuzcorp/celld): per-round fence credit (0062).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FenceRoundSettlement {
+    /// The proof-then-read ordering witness for this round.
+    pub order: ProofThenRead,
+    /// One settlement per cell the round's bundle carried.
+    pub cells: Vec<FenceCellSettlement>,
+}
 
 /// A bundle object is deletable exactly when every row it carries is
 /// covered by the per-cell layout — the watermark that keeps recovery's
@@ -792,5 +983,216 @@ mod bucket_session_tests {
         bucket_with_ensemble.ensemble.insert(NodeId::from("n9"));
         assert!(!may_declare_bounded_loss(&bucket_with_ensemble, true));
         assert!(!requires_fleet_witness(&bucket_with_ensemble, true));
+    }
+}
+
+#[cfg(test)]
+mod fence_credit_tests {
+    use super::*;
+
+    const NODE: &str = "n0";
+    const SHIPPER_EPOCH: Epoch = 7;
+    const CELL_EPOCH: Epoch = 3;
+
+    fn open_record() -> LogRecord {
+        let mut record = create_bucket_record();
+        record.epoch = SHIPPER_EPOCH;
+        record
+    }
+
+    fn sealed_record() -> LogRecord {
+        let mut record = open_record();
+        record.state = LogState::Sealed;
+        record
+    }
+
+    fn intact_entry() -> RoundFenceOutcome {
+        RoundFenceOutcome::Entry {
+            node: NodeId::from(NODE),
+            epoch: CELL_EPOCH,
+        }
+    }
+
+    fn ordered() -> ProofThenRead {
+        ProofThenRead {
+            proof_seq: 11,
+            read_seq: 12,
+        }
+    }
+
+    fn credit(
+        record: Option<&LogRecord>,
+        fence: RoundFenceOutcome,
+        order: ProofThenRead,
+    ) -> CellCredit {
+        round_cell_credit(record, SHIPPER_EPOCH, NODE, CELL_EPOCH, fence, order)
+    }
+
+    /// The credit table: both arms must pass. The session-record arm covers
+    /// the round (sealed/recovering/wrong-epoch/absent refuses everything);
+    /// the fence arm covers the cell (a bumped, missing, or unreadable entry
+    /// refuses it); and a read issued at or before the proof never credits.
+    #[test]
+    fn round_credit_truth_table() {
+        let open = open_record();
+        // Baseline: open record, intact entry, ordered read.
+        assert_eq!(
+            credit(Some(&open), intact_entry(), ordered()),
+            CellCredit::Credit
+        );
+        // Session-record arm: a seal (or recovery, or epoch move, or absence)
+        // after the PUT refuses the round even with an intact entry.
+        assert_eq!(
+            credit(Some(&sealed_record()), intact_entry(), ordered()),
+            CellCredit::Uncredited,
+            "a record sealed after the PUT refuses the credit"
+        );
+        let mut recovering = open_record();
+        recovering.state = LogState::Recovering;
+        assert_eq!(
+            credit(Some(&recovering), intact_entry(), ordered()),
+            CellCredit::Uncredited
+        );
+        assert_eq!(
+            credit(None, intact_entry(), ordered()),
+            CellCredit::Uncredited
+        );
+        assert_eq!(
+            round_cell_credit(
+                Some(&open),
+                SHIPPER_EPOCH + 1,
+                NODE,
+                CELL_EPOCH,
+                intact_entry(),
+                ordered()
+            ),
+            CellCredit::Uncredited,
+            "a shipper-epoch move refuses the credit"
+        );
+        // Per-cell fence arm: with an open record, only an entry still
+        // naming this node at this cell epoch credits.
+        assert_eq!(
+            credit(
+                Some(&open),
+                RoundFenceOutcome::Entry {
+                    node: NodeId::from("n1"),
+                    epoch: CELL_EPOCH,
+                },
+                ordered()
+            ),
+            CellCredit::Uncredited,
+            "a live-donor takeover uncredits the stale writer"
+        );
+        assert_eq!(
+            credit(
+                Some(&open),
+                RoundFenceOutcome::Entry {
+                    node: NodeId::from(NODE),
+                    epoch: CELL_EPOCH + 1,
+                },
+                ordered()
+            ),
+            CellCredit::Uncredited,
+            "a superseded cell epoch uncredits the stale writer"
+        );
+        assert_eq!(
+            credit(Some(&open), RoundFenceOutcome::Missing, ordered()),
+            CellCredit::Uncredited,
+            "a missing entry fails, never hangs"
+        );
+        assert_eq!(
+            credit(Some(&open), RoundFenceOutcome::ReadError, ordered()),
+            CellCredit::Uncredited,
+            "a read error fails, never hangs"
+        );
+        // Ordering: a fence read issued at or before the proof never credits,
+        // even with an open record and an intact entry.
+        for order in [
+            ProofThenRead {
+                proof_seq: 12,
+                read_seq: 12,
+            },
+            ProofThenRead {
+                proof_seq: 13,
+                read_seq: 12,
+            },
+        ] {
+            assert!(
+                !order.ordered(),
+                "the witness must refuse a read that predates the proof"
+            );
+            assert_eq!(
+                credit(Some(&open), intact_entry(), order),
+                CellCredit::Uncredited,
+                "a fence read issued before the proof is never accepted"
+            );
+        }
+        assert!(ordered().ordered());
+    }
+
+    /// The live-donor hole from parity §3 scenario 1: `fold_cell` never seals
+    /// the donor session, so the session-record arm still passes for the
+    /// stale writer after a single-cell takeover. Only the fence entry —
+    /// read after the PUT — refuses the stale round. Without the fence arm
+    /// this test credits a lost acknowledged write.
+    #[test]
+    fn live_donor_takeover_uncredits_the_stale_writer() {
+        let open = open_record();
+        assert!(
+            bundle_credit_allowed(Some(&open), SHIPPER_EPOCH),
+            "the fold leaves the session open, so the record arm still passes"
+        );
+        assert_eq!(
+            credit(
+                Some(&open),
+                RoundFenceOutcome::Entry {
+                    node: NodeId::from("n1"),
+                    epoch: CELL_EPOCH,
+                },
+                ordered()
+            ),
+            CellCredit::Uncredited,
+            "the post-PUT entry read names the donor, not the stale writer"
+        );
+    }
+
+    /// Mixed rounds stay mixed: the bumped cell goes uncredited while its
+    /// intact neighbours credit, in input order, through one reader.
+    #[test]
+    fn round_credit_fans_out_per_cell() {
+        let open = open_record();
+        let cells = vec![
+            (CellId::from("c0"), CELL_EPOCH),
+            (CellId::from("c1"), CELL_EPOCH),
+            (CellId::from("c2"), CELL_EPOCH),
+        ];
+        let fence: BTreeMap<CellId, RoundFenceOutcome> = BTreeMap::from([
+            (CellId::from("c0"), intact_entry()),
+            // c1's entry names the live donor after a single-cell takeover.
+            (
+                CellId::from("c1"),
+                RoundFenceOutcome::Entry {
+                    node: NodeId::from("n1"),
+                    epoch: CELL_EPOCH,
+                },
+            ),
+            // c2 has no entry at all: absent reads as Missing, not as a gap.
+        ]);
+        assert_eq!(
+            fence.entry("c2"),
+            RoundFenceOutcome::Missing,
+            "a cell the reader never saw reads as Missing"
+        );
+        let verdicts = round_credit(Some(&open), SHIPPER_EPOCH, NODE, &cells, &fence, ordered());
+        assert_eq!(
+            verdicts,
+            vec![
+                (CellId::from("c0"), CellCredit::Credit),
+                (CellId::from("c1"), CellCredit::Uncredited),
+                (CellId::from("c2"), CellCredit::Uncredited),
+            ]
+        );
+        assert!(verdicts[0].1.credited());
+        assert!(!verdicts[1].1.credited());
     }
 }

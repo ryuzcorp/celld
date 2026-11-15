@@ -732,6 +732,23 @@ push to `ghcr.io/denoland`, but still. Pushing a branch named
   decodes the new record (unknown key ignored) and either folds the whole bundle
   prefix with no loss declaration or refuses the fold; never complete, never a
   dropped row. Downgrade safety rests on that recovery-correctness, not on refusal.
+- `0062` (sha TBD at merge) parity item (iv) layer 1, core-only: the per-round
+  fence credit predicate plus the output-gate settlement it feeds. `log_tier`
+  gains a two-arm credit check per flush-round cell — the session-record arm
+  (`bundle_credit_allowed`, still `Open` at the shipper's epoch after the PUT)
+  and the per-cell fence arm (the entry read after the PUT still names this
+  node at this cell epoch) — with the proof-then-read ordering witness
+  (`ProofThenRead`) part of the verdict: a fence read issued at or before the
+  proof never credits. The reader abstraction is the `RoundFence` trait (one
+  outcome per cell: entry, missing, or read error), so layer 2 can back it
+  with per-cell `own.json` reads now and shard reads later without touching
+  the predicate. The gate settles `Event::FenceRoundVerified` with no
+  per-gate `VerifyOwnership` read: credited cells release proven, uncredited
+  cells fail exactly like a refused ownership read (fail, never hang), and an
+  unordered round fails what it covers. No `crates/celld` change yet, so no
+  runtime behaviour changes. Fail-before per arm: a sealed record crediting
+  (record arm), a live-donor bump crediting (fence arm), a pre-proof read
+  crediting (ordering) each turn their test red.
 
 Patches `0025`–`0034` are ported fixes from
 [meln1k/celld](https://github.com/meln1k/celld) by Nikita

@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): ported from meln1k/celld: scripted core-bug reproductions (ea471ee, e46a685, 6d61462, 18d3bf9, 9d4c163, 468b456, 01522b3, 65fdb13); shared bucket-posture ownership reads (0056).
+// Modified by ryuzcorp (ryuzcorp/celld): ported from meln1k/celld: scripted core-bug reproductions (ea471ee, e46a685, 6d61462, 18d3bf9, 9d4c163, 468b456, 01522b3, 65fdb13); shared bucket-posture ownership reads (0056); round-level fence settlement (0062).
 //! Scripted reproductions of core bugs the deterministic simulator
 //! (`crates/sim`) found. Each drives the core through a minimal shell that
 //! answers every effect at once, except the ones a test holds back to
@@ -8,6 +8,7 @@
 //! these tests rely on; they also call it directly so a release build still
 //! checks the final state.
 
+use celld_logic::log_tier::{CellCredit, FenceCellSettlement, FenceRoundSettlement, ProofThenRead};
 use celld_logic::wake::{AlarmSnapshot, AlarmSource, PublicationId};
 use celld_logic::{
     on_event, pressure, CasOutcome, Channel, Config, Effect, Event, Failure, LeaseCasOutcome,
@@ -1219,4 +1220,213 @@ fn a_write_at_a_verified_position_releases_without_a_new_read() {
         "the newer write is not released: {seen:?}"
     );
     shell.state.validate().expect("state invariant");
+}
+
+/// Find the held durability gate proving `position` on `cell`.
+fn held_gate_op_for_cell_position(held: &[Effect], cell: &str, position: u64) -> u64 {
+    held.iter()
+        .find_map(|effect| match effect {
+            Effect::AwaitDurable {
+                op,
+                cell: c,
+                position: p,
+                ..
+            } if c == cell && *p == position => Some(*op),
+            _ => None,
+        })
+        .expect("the write waits for its proof")
+}
+
+/// The epoch a bucket proof's ownership round names for `cell`.
+fn verify_epoch_for_cell(held: &[Effect], cell: &str) -> u64 {
+    held.iter()
+        .find_map(|effect| match effect {
+            Effect::VerifyOwnership { cell: c, epoch, .. } if c == cell => Some(*epoch),
+            _ => None,
+        })
+        .expect("a proof opened an ownership read for the cell")
+}
+
+/// Prove one gate on `cell` and append the effects the proof produced.
+fn prove_cell_gate(shell: &mut Shell, seen: &mut Vec<Effect>, cell: &str, position: u64) {
+    let op = held_gate_op_for_cell_position(&shell.held, cell, position);
+    seen.extend(shell.send(Event::DurableReached {
+        op,
+        result: Ok(position),
+        source: ProofSource::Bucket,
+    }));
+}
+
+/// A round-level fence read settles the gates its proof captured with no
+/// per-gate ownership answer: the credited cell's writes release proven
+/// while the uncredited cell's writes fail, and a gate past the cover keeps
+/// waiting. The trapped per-gate reads stay unanswered, and a late answer to
+/// one releases nothing.
+#[test]
+fn fence_round_verified_settles_covered_gates_without_per_gate_reads() {
+    let mut shell = bucket_gate_shell();
+    shell.start();
+    open_gated_writes(&mut shell, &[1, 2, 9]);
+    // One gated write on a second cell.
+    shell.send(Event::RequestAt {
+        request: 100,
+        cell: "b".into(),
+        now_mono_ms: MONO_MS,
+    });
+    shell.send(Event::OutputAt {
+        request: 100,
+        channel: Channel::Response,
+        position: Some(7),
+        observed: None,
+        epoch: None,
+        now_mono_ms: MONO_MS,
+    });
+    let mut seen = Vec::new();
+    prove_cell_gate(&mut shell, &mut seen, "a", 1);
+    prove_cell_gate(&mut shell, &mut seen, "a", 2);
+    prove_cell_gate(&mut shell, &mut seen, "b", 7);
+    let reads = verify_reads(&seen);
+    assert_eq!(reads.len(), 3, "every proof opens its own round: {seen:?}");
+    let epoch_a = verify_epoch_for_cell(&shell.held, "a");
+    let epoch_b = verify_epoch_for_cell(&shell.held, "b");
+    let settled = shell.send(Event::FenceRoundVerified {
+        round: FenceRoundSettlement {
+            order: ProofThenRead {
+                proof_seq: 1,
+                read_seq: 2,
+            },
+            cells: vec![
+                FenceCellSettlement {
+                    cell: "a".into(),
+                    epoch: epoch_a,
+                    cover: 2,
+                    credit: CellCredit::Credit,
+                },
+                FenceCellSettlement {
+                    cell: "b".into(),
+                    epoch: epoch_b,
+                    cover: 7,
+                    credit: CellCredit::Uncredited,
+                },
+            ],
+        },
+    });
+    for request in [1, 2] {
+        assert!(
+            settled.iter().any(|effect| matches!(
+                effect,
+                Effect::Release {
+                    request: r,
+                    result: Ok(()),
+                    ..
+                } if *r == request
+            )),
+            "credited write {request} is acknowledged: {settled:?}"
+        );
+    }
+    assert!(
+        settled.iter().any(|effect| matches!(
+            effect,
+            Effect::Release {
+                request: 100,
+                result: Err(RequestError::DurabilityUnproven),
+                ..
+            }
+        )),
+        "the uncredited write fails instead of hanging: {settled:?}"
+    );
+    assert!(
+        !settled
+            .iter()
+            .any(|effect| matches!(effect, Effect::Release { request: 3, .. })),
+        "the gate past the cover keeps waiting: {settled:?}"
+    );
+    assert!(
+        !settled
+            .iter()
+            .any(|effect| matches!(effect, Effect::VerifyOwnership { .. })),
+        "the round settles with no per-gate ownership read: {settled:?}"
+    );
+    for probe in [Probe::GateProvenByFenceRound, Probe::GateFenceRoundRefused] {
+        let count = shell
+            .state
+            .probes()
+            .find(|(found, _)| *found == probe)
+            .map(|(_, count)| count);
+        assert_eq!(count, Some(1), "the round outcome is counted once");
+    }
+    // The trapped per-gate reads stay unanswered, and a late answer to one
+    // releases nothing: the fence read superseded them.
+    assert_eq!(
+        shell
+            .held
+            .iter()
+            .filter(|effect| matches!(effect, Effect::VerifyOwnership { .. }))
+            .count(),
+        3,
+        "no per-gate read was answered"
+    );
+    for op in reads {
+        let quiet = shell.send(Event::OwnershipVerified { op, result: Ok(()) });
+        assert!(
+            !quiet
+                .iter()
+                .any(|effect| matches!(effect, Effect::Release { .. })),
+            "a late read answers nothing: {quiet:?}"
+        );
+    }
+    shell.state.validate().expect("state invariant");
+}
+
+/// A fence read issued at or before the proof is never accepted: even a
+/// `Credit` verdict on the cell fails the covered gates instead of
+/// acknowledging them.
+#[test]
+fn fence_round_before_its_proof_is_never_accepted() {
+    for order in [
+        ProofThenRead {
+            proof_seq: 5,
+            read_seq: 5,
+        },
+        ProofThenRead {
+            proof_seq: 6,
+            read_seq: 5,
+        },
+    ] {
+        let mut shell = bucket_gate_shell();
+        shell.start();
+        open_gated_writes(&mut shell, &[1]);
+        let mut seen = Vec::new();
+        prove_gate(&mut shell, &mut seen, 1);
+        let epoch = verify_epoch_for_cell(&shell.held, "a");
+        let settled = shell.send(Event::FenceRoundVerified {
+            round: FenceRoundSettlement {
+                order,
+                cells: vec![FenceCellSettlement {
+                    cell: "a".into(),
+                    epoch,
+                    cover: 1,
+                    credit: CellCredit::Credit,
+                }],
+            },
+        });
+        assert!(
+            settled.iter().any(|effect| matches!(
+                effect,
+                Effect::Release {
+                    request: 1,
+                    result: Err(RequestError::DurabilityUnproven),
+                    ..
+                }
+            )),
+            "a read issued before the proof never settles as proven ({order:?}): {settled:?}"
+        );
+        let unordered = shell
+            .state
+            .probes()
+            .find(|(probe, _)| *probe == Probe::GateFenceRoundUnordered)
+            .map(|(_, count)| count);
+        assert_eq!(unordered, Some(1), "the refused order is counted");
+        shell.state.validate().expect("state invariant");
+    }
 }
