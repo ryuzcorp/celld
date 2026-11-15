@@ -806,6 +806,10 @@ push to `ghcr.io/denoland`, but still. Pushing a branch named
   (takeover and restart now fold bundle-credited rows per-cell instead of
   orphaning them); the eviction/handoff/drain side is layer 4. Still behind
   `CELLD_BUCKET_BUNDLES=1` — do not enable in production until layers 4-5.
+- `0067` (sha TBD at merge) share the `/bundle` tree per deployment
+  generation instead of per isolate: the projection lives on the shared
+  `Arc<WorkerConfig>`, so N isolates project once; read-only semantics
+  unchanged. Counter-based unit test proves one projection per config.
 
 Patches `0025`–`0034` are ported fixes from
 [meln1k/celld](https://github.com/meln1k/celld) by Nikita
