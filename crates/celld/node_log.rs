@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): operator token for the internal listener; list_page resume is a cursor; ported from meln1k/celld: seal a dead lease that never opened a log (01522b3); seal_absent_log regression tests; lone-node repair backoff; bucket-posture group commit: bucket-session record encoding + old-reader interop tests (0059); bucket-posture group commit: bucket executor without ensemble (0060); bucket-posture group commit: successor fold of bucket bundles (0063); bucket-posture group commit: bucket-session drain, per-cell seal, bundle GC without ensemble, linger holds only while the dirty set is shared (0064).
+// Modified by ryuzcorp (ryuzcorp/celld): operator token for the internal listener; list_page resume is a cursor; ported from meln1k/celld: seal a dead lease that never opened a log (01522b3); seal_absent_log regression tests; lone-node repair backoff; bucket-posture group commit: bucket-session record encoding + old-reader interop tests (0059); bucket-posture group commit: bucket executor without ensemble (0060); bucket-posture group commit: successor fold of bucket bundles (0063); bucket-posture group commit: bucket-session drain, per-cell seal, bundle GC without ensemble, linger holds only while the dirty set is shared (0064); bucket-posture group commit: lone-cell-per-cell vs shared-bundle executor tests, and idle bucket sessions skip empty bundle-GC scans (0071).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! v0 of the in-fleet replicated log tier (`CELLD_DURABILITY=fleet`).
@@ -3956,6 +3956,19 @@ pub struct NodeLogManager {
     /// Resume after examined bundles, including those not yet covered.
     /// Serialize passes so overlapping callers cannot move the cursor back.
     bundle_gc_cursor: tokio::sync::Mutex<Option<String>>,
+    /// Bundles this session attempted to PUT (including failed or ambiguous
+    /// attempts, which may have landed) minus confirmed GC deletes. With
+    /// `bundle_gc_clean` lets an idle bucket session skip its GC LIST: only
+    /// this node writes its own session's bundle prefix, so zero
+    /// outstanding plus a clean last scan means the LIST could find nothing.
+    /// Fleet sessions never skip (a fenced ex-leader's rows share the
+    /// prefix). Process-local; a restart re-lists once because both start
+    /// reset.
+    bundle_gc_outstanding: std::sync::atomic::AtomicU64,
+    /// The last full-prefix GC scan left zero bundles remaining. Set only
+    /// by scans that started at the prefix head and reached its end; any
+    /// PUT attempt re-arms via `bundle_gc_outstanding`.
+    bundle_gc_clean: std::sync::atomic::AtomicBool,
     /// Sessions whose bundle subtree one sweep pass confirmed empty:
     /// a permanent tombstone (dead-lease GC never deletes a folded
     /// record) must not cost a bundle LIST on every sweep tick forever
@@ -4553,6 +4566,8 @@ impl NodeLogManager {
             bundle_seq: std::sync::atomic::AtomicU64::new(0),
             bundle_index: Mutex::new(BundleIndex::default()),
             bundle_gc_cursor: tokio::sync::Mutex::new(None),
+            bundle_gc_outstanding: std::sync::atomic::AtomicU64::new(0),
+            bundle_gc_clean: std::sync::atomic::AtomicBool::new(false),
             bundle_cache: tokio::sync::Mutex::new(None),
             health: Arc::new(Mutex::new(celld_logic::log_evict::FollowerHealth::default())),
             policy: Arc::new(policy),
@@ -6537,12 +6552,27 @@ impl NodeLogManager {
     }
 
     pub async fn gc_bundles(&self) -> anyhow::Result<()> {
+        // An idle bucket node must not LIST every 30 s forever: only this
+        // node writes its own session's bundle prefix, so zero attempted
+        // PUTs outstanding plus a clean last full scan means the LIST could
+        // find nothing, and the whole tick is skipped. Both flags start
+        // reset, so the first scan after boot, recovery or takeover always
+        // runs and discovers retained bundles from older sessions or folds.
+        // Fleet sessions never skip: a fenced ex-leader's rows share the
+        // prefix, and this node's count cannot see them.
+        if self.is_bucket_session().await
+            && self.bundle_gc_clean.load(Ordering::SeqCst)
+            && self.bundle_gc_outstanding.load(Ordering::SeqCst) == 0
+        {
+            return Ok(());
+        }
         // Bound both the listing and the work. Restarting at the prefix
         // every tick starved newer, covered bundles behind an undrained
         // prefix forever. Advance after every examination, even a failed GET,
         // and wrap only when the page reaches the end of the session.
         const TICK_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
         let mut cursor = self.bundle_gc_cursor.lock().await;
+        let from_start = cursor.is_none();
         let started = mono_ms();
         let prefix = format!("log/{}/bundle/", self.session);
         let page = self
@@ -6554,6 +6584,7 @@ impl NodeLogManager {
                 None,
             )
             .await?;
+        let seen = page.objects.len();
         let mut covered: HashMap<(String, u64), u64> = HashMap::new();
         let mut deletable: Vec<(String, usize)> = Vec::new();
         let mut exhausted = true;
@@ -6616,7 +6647,18 @@ impl NodeLogManager {
         if exhausted && !page.truncated {
             *cursor = None;
         }
+        // A full-prefix scan (started at the head, reached the end) is the
+        // only one that can declare the prefix clean. A partial page that
+        // stopped on budget leaves the flag as it was; the next wrap keeps
+        // ticking until a full pass confirms.
+        let fully_observed = from_start && exhausted && !page.truncated;
         if deletable.is_empty() {
+            // Nothing deleted: zero remaining exactly when nothing was seen.
+            if fully_observed && seen == 0 {
+                self.bundle_gc_clean.store(true, Ordering::SeqCst);
+            } else if seen != 0 {
+                self.bundle_gc_clean.store(false, Ordering::SeqCst);
+            }
             return Ok(());
         }
         // One single-key `DeleteObject` per bundle, never bulk `POST
@@ -6649,10 +6691,21 @@ impl NodeLogManager {
         drop(deletes);
         if !gone.is_empty() {
             self.bundle_index.lock().unwrap().remove(&gone);
+            self.bundle_gc_outstanding
+                .fetch_sub(gone.len() as u64, Ordering::SeqCst);
+
             info!(
                 bundles = gone.len(),
                 rows, "bundle GC: drained bundles deleted"
             );
+        }
+        // Zero remaining exactly when every seen bundle was confirmed
+        // deleted: a failed delete retries next tick, so it retains. As
+        // above, only a full-prefix scan can declare clean.
+        if fully_observed && seen == gone.len() {
+            self.bundle_gc_clean.store(true, Ordering::SeqCst);
+        } else if seen != gone.len() {
+            self.bundle_gc_clean.store(false, Ordering::SeqCst);
         }
         Ok(())
     }
@@ -7017,6 +7070,11 @@ impl NodeLogManager {
             }
         };
         let key = format!("log/{}/bundle/e{epoch}-{seq:08}.ltxb", self.session);
+        // Re-arm bundle GC even if this PUT fails or is ambiguous: it may
+        // have landed, and only a scan can tell. Definite refusals above
+        // return before this point, having attempted nothing.
+        self.bundle_gc_outstanding.fetch_add(1, Ordering::SeqCst);
+
         match self.bucket.put(&key, body).await {
             Ok(()) => {
                 // The credit check: the PUT is unconditional, so by
@@ -7151,6 +7209,14 @@ impl NodeLogManager {
             self.bucket_fenced.store(true, Ordering::SeqCst);
         }
         self.bucket_epoch.store(0, Ordering::SeqCst);
+    }
+
+    /// A failed lone-cell upload must fall back like a failed bundle PUT:
+    /// drop bundling so the scan re-spawns a sync worker that retries with
+    /// backoff, instead of parking the round with the scan suppressed. The
+    /// transient arm leaves the session re-armable from a fresh bucket read.
+    pub(crate) fn note_bucket_bundle_stalled(&self) {
+        self.stop_bucket_bundling(false);
     }
 
     /// Publish the bucket-session record through the live-session lease chain
@@ -8387,6 +8453,230 @@ mod bucket_executor_tests {
         });
     }
 
+    /// An in-memory store that counts LISTs under the bundle prefix, so the
+    /// GC-quiet test can see skipped scans. Every other operation delegates
+    /// to the inner store untouched.
+    #[derive(Debug)]
+    struct ListCountingStore {
+        inner: celld_ltx::object_store::memory::InMemory,
+        lists: std::sync::atomic::AtomicUsize,
+        /// Per-cell PUTs still to refuse: a failing store for the lone-cell
+        /// fallback test. Lease and bundle traffic is untouched.
+        fail_puts: std::sync::atomic::AtomicU64,
+    }
+
+    impl ListCountingStore {
+        fn new() -> Self {
+            Self {
+                inner: celld_ltx::object_store::memory::InMemory::new(),
+                lists: std::sync::atomic::AtomicUsize::new(0),
+                fail_puts: std::sync::atomic::AtomicU64::new(0),
+            }
+        }
+
+        fn lists(&self) -> usize {
+            self.lists.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn fail_next_puts(&self, count: u64) {
+            self.fail_puts
+                .store(count, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    type BundleListStream = std::pin::Pin<
+        Box<
+            dyn futures_util::Stream<
+                    Item = celld_ltx::object_store::Result<celld_ltx::object_store::ObjectMeta>,
+                > + Send
+                + 'static,
+        >,
+    >;
+
+    impl std::fmt::Display for ListCountingStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "ListCountingStore(log/)")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl celld_ltx::object_store::ObjectStore for ListCountingStore {
+        async fn put_opts(
+            &self,
+            location: &celld_ltx::object_store::path::Path,
+            payload: celld_ltx::object_store::PutPayload,
+            opts: celld_ltx::object_store::PutOptions,
+        ) -> celld_ltx::object_store::Result<celld_ltx::object_store::PutResult> {
+            if location.as_ref().starts_with("cells/") {
+                let mut remaining = self.fail_puts.load(std::sync::atomic::Ordering::SeqCst);
+                while remaining > 0 {
+                    match self.fail_puts.compare_exchange_weak(
+                        remaining,
+                        remaining - 1,
+                        std::sync::atomic::Ordering::SeqCst,
+                        std::sync::atomic::Ordering::SeqCst,
+                    ) {
+                        Ok(_) => {
+                            return Err(celld_ltx::object_store::Error::Generic {
+                                store: "ListCountingStore",
+                                source: "injected per-cell put failure".into(),
+                            });
+                        }
+                        Err(actual) => remaining = actual,
+                    }
+                }
+            }
+            self.inner.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &celld_ltx::object_store::path::Path,
+            opts: celld_ltx::object_store::PutMultipartOptions,
+        ) -> celld_ltx::object_store::Result<Box<dyn celld_ltx::object_store::MultipartUpload>>
+        {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &celld_ltx::object_store::path::Path,
+            options: celld_ltx::object_store::GetOptions,
+        ) -> celld_ltx::object_store::Result<celld_ltx::object_store::GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+
+        async fn head(
+            &self,
+            location: &celld_ltx::object_store::path::Path,
+        ) -> celld_ltx::object_store::Result<celld_ltx::object_store::ObjectMeta> {
+            self.inner.head(location).await
+        }
+
+        async fn delete(
+            &self,
+            location: &celld_ltx::object_store::path::Path,
+        ) -> celld_ltx::object_store::Result<()> {
+            self.inner.delete(location).await
+        }
+
+        fn list(&self, prefix: Option<&celld_ltx::object_store::path::Path>) -> BundleListStream {
+            if prefix.is_some_and(|p| p.as_ref().starts_with("log/")) {
+                self.lists.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&celld_ltx::object_store::path::Path>,
+        ) -> celld_ltx::object_store::Result<celld_ltx::object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy(
+            &self,
+            from: &celld_ltx::object_store::path::Path,
+            to: &celld_ltx::object_store::path::Path,
+        ) -> celld_ltx::object_store::Result<()> {
+            self.inner.copy(from, to).await
+        }
+
+        async fn copy_if_not_exists(
+            &self,
+            from: &celld_ltx::object_store::path::Path,
+            to: &celld_ltx::object_store::path::Path,
+        ) -> celld_ltx::object_store::Result<()> {
+            self.inner.copy_if_not_exists(from, to).await
+        }
+    }
+
+    /// A manager over a list-counting store, mirroring
+    /// `test_manager_with_nudge` but sharing one store between the bundle
+    /// paths (the manager's bucket) and the per-cell paths (the `LtxRepl`
+    /// loops): `Replication::start` rebuilds a store from backend and name,
+    /// so it cannot carry an injected wrapper.
+    fn test_manager_with_store(
+        dir: &std::path::Path,
+        bucket: Arc<Bucket>,
+        store: Arc<ListCountingStore>,
+    ) -> NodeLogManager {
+        let ltx = Arc::new(crate::ltx_repl::LtxRepl::start_with_store_for_test(
+            &dir.join("watch"),
+            store as Arc<dyn celld_ltx::object_store::ObjectStore>,
+        ));
+        let ownership = Arc::new(crate::ownership_store::BucketOwnership::new(
+            bucket.as_ref().clone(),
+            bucket.as_ref().clone(),
+            "n0".into(),
+            "test-probe-key".into(),
+        ));
+        let own_log = Arc::new(OwnLog {
+            ownership,
+            nudge: Box::new(|| {}),
+            write_lock: tokio::sync::Mutex::new(()),
+        });
+        let auth = Arc::new(PeerAuth::new([0u8; 32], "n0").expect("auth works"));
+        NodeLogManager::new(
+            "n0/gen1",
+            bucket.clone(),
+            own_log,
+            ltx,
+            auth,
+            celld_logic::log_evict::EvictionPolicy::default(),
+        )
+    }
+
+    /// `gc_bundles` skips its LIST once a full scan leaves nothing remaining
+    /// and no bundle PUT was attempted since; any PUT re-arms the scan, and
+    /// a retained bundle keeps ticking until a covering scan deletes it and
+    /// quiets again. Fail-before: without the skip the second scan lists
+    /// again; without the PUT arm the re-armed scan stays skipped; without
+    /// the delete drain the final scan keeps listing.
+    #[test]
+    fn gc_bundles_quiet_until_a_put_re_arms() {
+        let runtime = crate::asyncrt::shared_test_runtime();
+        runtime.block_on(async {
+            let dir = tempfile::tempdir().expect("test dir");
+            let store = Arc::new(ListCountingStore::new());
+            let bucket = Arc::new(Bucket::with_store_for_test(
+                store.clone() as Arc<dyn celld_ltx::object_store::ObjectStore>
+            ));
+            let manager = test_manager_with_store(dir.path(), bucket.clone(), store.clone());
+            open_gate(&manager);
+            publish_bucket_open(&manager, &bucket).await;
+            manager.gc_bundles().await.expect("gc runs");
+            assert_eq!(store.lists(), 1, "the first scan always LISTs");
+            manager.gc_bundles().await.expect("gc runs");
+            assert_eq!(store.lists(), 1, "an idle node issues no second LIST");
+            assert!(
+                manager.put_bundle(vec![bundle_entry("c0", 1)]).await,
+                "open record credits"
+            );
+            manager.gc_bundles().await.expect("gc runs");
+            assert_eq!(store.lists(), 2, "a PUT re-arms the scan");
+            // The bundle is uncovered, so the scan retains it and the next
+            // tick keeps listing.
+            manager.gc_bundles().await.expect("gc runs");
+            assert_eq!(store.lists(), 3, "a retained bundle keeps ticking");
+            // Cover the row per-cell and drain: the delete drains the count
+            // and the empty scan quiets the next tick again.
+            activate_cell(&manager, "c0", 1, true).await;
+            sql_write(&cell_db(&dir.path().join("watch"), "c0", 1));
+            assert!(matches!(
+                manager
+                    .ltx
+                    .sync_wait("c0", 1, std::time::Duration::from_secs(10))
+                    .await,
+                crate::replication::SyncWait::Durable
+            ));
+            manager.gc_bundles().await.expect("gc runs");
+            assert_eq!(store.lists(), 4, "the covering scan deletes");
+            manager.gc_bundles().await.expect("gc runs");
+            assert_eq!(store.lists(), 4, "drained and clean: quiet again");
+        });
+    }
+
     /// A graceful close with bundle rows no drain can cover leaves the record
     /// Open: the bundle belongs to a cell this node never activated, so no
     /// local database can snapshot it. Fail-before: without the retained-scan
@@ -8469,13 +8759,14 @@ mod bucket_executor_tests {
         });
     }
 
-    /// Loop-level executor wiring: a write's gate ticket wakes `bundle_loop`,
-    /// which takes the bucket record path (`ensure_bucket_record` finds the
-    /// installed session), flushes one shared bundle, and credits the ack —
-    /// with no per-cell upload. Fail-before: without the registration the
-    /// loop never fires and the wait times out.
+    /// Loop-level executor wiring, lone cell: a single dirty cell uploads
+    /// per-cell even while bundling is armed — a one-cell bundle would save
+    /// no PUT but add a record re-read, a GC delete and bookkeeping. The ack
+    /// still returns `ProofSource::Bucket` behind the unchanged ownership
+    /// read. Fail-before: routing every round to bundles (revert) writes a
+    /// bundle object and no per-cell L0 here.
     #[test]
-    fn bundle_loop_flushes_dirty_writes_end_to_end() {
+    fn bundle_loop_uploads_a_lone_cell_per_cell() {
         let runtime = crate::asyncrt::shared_test_runtime();
         runtime.block_on(async {
             let dir = tempfile::tempdir().expect("test dir");
@@ -8493,20 +8784,198 @@ mod bucket_executor_tests {
                 .ltx
                 .await_durable("c0", 1, 1)
                 .await
-                .expect("bundle proof credits");
+                .expect("per-cell proof credits");
             assert_eq!(
                 source,
                 celld_logic::ProofSource::Bucket,
-                "bucket posture acks on the bundle proof"
+                "bucket posture acks on the per-cell proof"
             );
+            assert!(
+                bundle_keys(&bucket, "log/n0/gen1/bundle/").await.is_empty(),
+                "a lone cell never writes a bundle"
+            );
+            assert!(
+                !bundle_keys(&bucket, "cells/c0/ltx/").await.is_empty(),
+                "the round uploads the cell per-cell"
+            );
+        });
+    }
+
+    /// A failed lone-cell upload falls back like a failed bundle PUT: the
+    /// stall drops bundling so the scan re-spawns a sync worker that
+    /// retries, and the write acks without a timeout. Fail-before: without
+    /// the stall the loop parks with the scan suppressed and the await
+    /// times out.
+    #[test]
+    fn lone_cell_per_cell_failure_heals_through_retry() {
+        let runtime = crate::asyncrt::shared_test_runtime();
+        runtime.block_on(async {
+            let dir = tempfile::tempdir().expect("test dir");
+            let store = Arc::new(ListCountingStore::new());
+            store.fail_next_puts(1);
+            let bucket = Arc::new(Bucket::with_store_for_test(
+                store.clone() as Arc<dyn celld_ltx::object_store::ObjectStore>
+            ));
+            let manager = test_manager_with_store(dir.path(), bucket.clone(), store.clone());
+            let manager = Arc::new(manager);
+            let _registration = manager
+                .ltx
+                .register_durability(manager.clone())
+                .expect("registration installs");
+            open_gate(&manager);
+            publish_bucket_open(&manager, &bucket).await;
+            activate_cell(&manager, "c0", 1, true).await;
+            sql_write(&cell_db(&dir.path().join("watch"), "c0", 1));
+            // The first per-cell PUT fails; the stall drops bundling and the
+            // retrying scan worker uploads the row a moment later — one
+            // await, no timeout, no second ticket.
+            let (_, source) = crate::asyncrt::timeout(
+                std::time::Duration::from_secs(10),
+                manager.ltx.await_durable("c0", 1, 1),
+            )
+            .await
+            .expect("no timeout")
+            .expect("per-cell retry credits");
+            assert_eq!(
+                source,
+                celld_logic::ProofSource::Bucket,
+                "the healed write still acks on the per-cell proof"
+            );
+        });
+    }
+
+    /// A lone-cell round whose sync claim is held — a pre-arm worker between
+    /// its CAS and its yield to the bundle loop, which then exits without
+    /// uploading and nudges only the bundling-suppressed scan — still
+    /// credits the ticket through a one-cell bundle. Fail-before: skipping
+    /// the round on a failed claim parks the ticket until the next write, so
+    /// the await times out.
+    #[test]
+    fn lone_cell_round_with_a_held_claim_still_credits() {
+        let runtime = crate::asyncrt::shared_test_runtime();
+        runtime.block_on(async {
+            let dir = tempfile::tempdir().expect("test dir");
+            let (manager, bucket) = test_manager(dir.path());
+            let manager = Arc::new(manager);
+            let _registration = manager
+                .ltx
+                .register_durability(manager.clone())
+                .expect("registration installs");
+            open_gate(&manager);
+            publish_bucket_open(&manager, &bucket).await;
+            activate_cell(&manager, "c0", 1, true).await;
+            assert!(
+                manager.ltx.set_sync_claim_for_test("c0", 1, true),
+                "the test holds the claim a yielding worker would"
+            );
+            sql_write(&cell_db(&dir.path().join("watch"), "c0", 1));
+            let (_, source) = crate::asyncrt::timeout(
+                std::time::Duration::from_secs(10),
+                manager.ltx.await_durable("c0", 1, 1),
+            )
+            .await
+            .expect("no timeout")
+            .expect("the round credits");
+            assert_eq!(source, celld_logic::ProofSource::Bucket);
             assert_eq!(
                 bundle_keys(&bucket, "log/n0/gen1/bundle/").await.len(),
                 1,
-                "one shared bundle PUT carries the write"
+                "the held claim routes the lone cell into a one-cell bundle"
+            );
+            assert!(manager.ltx.set_sync_claim_for_test("c0", 1, false));
+        });
+    }
+
+    /// Loop-level executor wiring, shared round: two dirty cells ride ONE
+    /// bundle PUT with no per-cell uploads. Fail-before: routing every round
+    /// per-cell (revert) writes two L0s and no bundle here.
+    #[test]
+    fn bundle_loop_shares_one_bundle_between_two_cells() {
+        let runtime = crate::asyncrt::shared_test_runtime();
+        runtime.block_on(async {
+            let dir = tempfile::tempdir().expect("test dir");
+            let (manager, bucket) = test_manager(dir.path());
+            let manager = Arc::new(manager);
+            let _registration = manager
+                .ltx
+                .register_durability(manager.clone())
+                .expect("registration installs");
+            open_gate(&manager);
+            publish_bucket_open(&manager, &bucket).await;
+            activate_cell(&manager, "c0", 1, true).await;
+            activate_cell(&manager, "c1", 1, true).await;
+            sql_write(&cell_db(&dir.path().join("watch"), "c0", 1));
+            sql_write(&cell_db(&dir.path().join("watch"), "c1", 1));
+            // Both tickets land before the loop's capture: the awaits only
+            // yield after bumping, and the loop's record re-read yields first.
+            let (a, b) = futures_util::future::join(
+                manager.ltx.await_durable("c0", 1, 1),
+                manager.ltx.await_durable("c1", 1, 1),
+            )
+            .await;
+            for (_, source) in [a.expect("c0 credits"), b.expect("c1 credits")] {
+                assert_eq!(source, celld_logic::ProofSource::Bucket);
+            }
+            assert_eq!(
+                bundle_keys(&bucket, "log/n0/gen1/bundle/").await.len(),
+                1,
+                "one shared bundle PUT carries both cells"
             );
             assert!(
                 bundle_keys(&bucket, "cells/").await.is_empty(),
-                "no per-cell L0 PUTs while bundling"
+                "no per-cell L0 PUTs in a shared round"
+            );
+        });
+    }
+
+    /// Loop-level executor wiring, hot lone cell: one cell with three
+    /// pending tickets still bundles — batching those rows into one PUT is
+    /// the point, and the per-cell fast path is only for a single pending
+    /// ticket with nothing to batch. Fail-before: routing every lone round
+    /// per-cell (drop the pending gate) writes an L0 here and no bundle.
+    #[test]
+    fn bundle_loop_bundles_a_hot_lone_cell_with_pending_writes() {
+        let runtime = crate::asyncrt::shared_test_runtime();
+        runtime.block_on(async {
+            let dir = tempfile::tempdir().expect("test dir");
+            let (manager, bucket) = test_manager(dir.path());
+            let manager = Arc::new(manager);
+            let _registration = manager
+                .ltx
+                .register_durability(manager.clone())
+                .expect("registration installs");
+            open_gate(&manager);
+            publish_bucket_open(&manager, &bucket).await;
+            activate_cell(&manager, "c0", 1, true).await;
+            sql_write(&cell_db(&dir.path().join("watch"), "c0", 1));
+            sql_write(&cell_db(&dir.path().join("watch"), "c0", 1));
+            sql_write(&cell_db(&dir.path().join("watch"), "c0", 1));
+            // All three tickets land before the loop's capture: the awaits
+            // only yield after bumping, and the loop's record re-read yields
+            // first — the same ordering the shared-round test relies on.
+            // One txid serves all three: the tickets (req_seq) are what the
+            // pending gate counts, not the txids.
+            let (a, b, c) = futures_util::future::join3(
+                manager.ltx.await_durable("c0", 1, 1),
+                manager.ltx.await_durable("c0", 1, 1),
+                manager.ltx.await_durable("c0", 1, 1),
+            )
+            .await;
+            for (_, source) in [
+                a.expect("ticket 1 credits"),
+                b.expect("ticket 2 credits"),
+                c.expect("ticket 3 credits"),
+            ] {
+                assert_eq!(source, celld_logic::ProofSource::Bucket);
+            }
+            assert_eq!(
+                bundle_keys(&bucket, "log/n0/gen1/bundle/").await.len(),
+                1,
+                "one bundle PUT batches the hot cell's pending rows"
+            );
+            assert!(
+                bundle_keys(&bucket, "cells/").await.is_empty(),
+                "no per-cell L0 PUT when there is batching to do"
             );
         });
     }

@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): R2 startAfter compares decoded keys; listing pages carry walk-ordered rows; staged activation; separate CELLD_DEPLOY_AWS_* credentials for deployment-artifact reads.
+// Modified by ryuzcorp (ryuzcorp/celld): R2 startAfter compares decoded keys; listing pages carry walk-ordered rows; staged activation; separate CELLD_DEPLOY_AWS_* credentials for deployment-artifact reads; bucket-posture group commit: inject a store for GC-quiet tests (0071).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! The engine's single object-store client: the `object_store` crate
@@ -2465,6 +2465,21 @@ impl Bucket {
             cas_store: store,
             backend: StorageBackend::S3,
             name: "list-test".to_string(),
+            prefix: String::new(),
+            read_deploy: None,
+        }
+    }
+
+    /// An in-memory bucket over an injected store, so GC-quiet tests can
+    /// count listings through a wrapper. `TestUnpaginated` serves the
+    /// paginated side, which the bundle paths never touch.
+    pub(crate) fn with_store_for_test(store: Arc<dyn ObjectStore>) -> Self {
+        Self {
+            store: store.clone(),
+            paginated: Arc::new(TestUnpaginated),
+            cas_store: store,
+            backend: StorageBackend::S3,
+            name: "gc-test".to_string(),
             prefix: String::new(),
             read_deploy: None,
         }
