@@ -9,7 +9,7 @@ README below is kept intact; this file documents the fork.
 
 - `main` mirrors upstream `main` and carries no patches.
 - `ryuzcorp/v<version>` is a line branch: the upstream tag `v<version>`
-  plus our patches as commits, one commit per patch, in `0001`-`0054`
+  plus our patches as commits, one commit per patch, in `0001`-`0057`
   order. Each patch commit is self-contained and carries its own tests.
 
 Upstream's `.github/workflows/release.yml` targets `ghcr.io/denoland` and
@@ -609,7 +609,7 @@ push to `ghcr.io/denoland`, but still. Pushing a branch named
   of the fleet's variables reaches them. The conformance suites read the
   node's announce lines from the `celld dev` supervisor's stderr instead
   of `/proc/<pid>/fd`, which a non-dumpable process no longer exposes.
-- `0054` (sha TBD at merge) a bucket-posture eviction costs fewer bucket
+- `0054` (`8bbd865`) a bucket-posture eviction costs fewer bucket
   requests. The eviction's visibility LISTs of `cells/<cell>/ltx/e<epoch>/`
   (the revocable handoff gate's and the one after the snapshot PUT) are
   skipped when this residency itself uploaded into that prefix and got a
@@ -625,7 +625,7 @@ push to `ghcr.io/denoland`, but still. Pushing a branch named
   Measured on 200 short-lived Durable Objects (6 writes each,
   `CELLD_DURABILITY=bucket`): 12 Class A requests per cell before, 9 after
   (per 200 cells: `cells/*/ltx` PUTs 1600 → 1400, LISTs 600 → 200).
-- `0055` (sha TBD at merge) a lone fleet node slows its posture-repair
+- `0055` (`dc51ff2`) a lone fleet node slows its posture-repair
   scan: while a `maintain` pass finds no eligible peer, the wait before the
   next pass doubles from one second up to the maintenance tick (thirty
   seconds) instead of retrying every second forever. Each pass lists
@@ -643,7 +643,7 @@ push to `ghcr.io/denoland`, but still. Pushing a branch named
   node that starts next to a lone node is recruited by it within about
   thirty seconds instead of about one (the new node recruits the old one
   itself at once).
-- `0056` (sha TBD at merge) concurrent bucket-posture writes share
+- `0056` (`4d9955a`) concurrent bucket-posture writes share
   ownership reads instead of reading once per write. A gated write's
   bucket proof used to emit its own `VerifyOwnership` (one GET of
   `cells/<cell>/own.json` per write); now a proven gate joins a read in
@@ -664,7 +664,7 @@ push to `ghcr.io/denoland`, but still. Pushing a branch named
   the same throughput (1549 → 1514 writes). A first draft that queued
   past-cover gates behind the read in flight cut the reads to ~180 but
   lost a third of the throughput, so it was dropped.
-- `0057` (sha TBD at merge) an eviction deletes the per-cell L0 and L1
+- `0057` (`e199983`) an eviction deletes the per-cell L0 and L1
   objects its handoff snapshot supersedes. After the snapshot PUT succeeds,
   a background task deletes this epoch's journaled upload keys with max
   txid at or below the snapshot's — the keys this residency itself uploaded
@@ -778,7 +778,7 @@ source commit; the commits keep the original author with a
     packages are hoisted above its config, names the checkout; with it,
     an absolute or `..` Dockerfile path inside the read root builds again.
     Without the flag, `.7`'s project-only bounds are unchanged.
-- `v0.6.3-ryuzcorp.9` (the commit that adds this entry): adds `0052`–`0053`.
+- `v0.6.3-ryuzcorp.9` (`4b0b387`): adds `0052`–`0053`.
   Upgrade notes:
   - No behavior changes with `CELLD_DEPLOY_AWS_*` unset. A platform that
     sets the trio must give the deployment credential read access to both
@@ -807,6 +807,25 @@ source commit; the commits keep the original author with a
     reaches them. `celld dev`'s container engine CLI (projects with
     `containers`) still inherits the environment; a production node never
     builds.
+- `v0.6.3-ryuzcorp.10` (the commit that adds this entry): adds
+  `0054`–`0057`, all bucket-request and storage savings; no format or API
+  change, so nodes on `.9` and `.10` can share a bucket.
+  Upgrade notes:
+  - A bucket-posture eviction makes fewer requests (`0054`). An eviction
+    that publishes a handoff snapshot then deletes, in the background, the
+    per-cell L0/L1 objects the snapshot supersedes, one single-key
+    `DeleteObject` per key (`0057`).
+    The bucket credential therefore needs `s3:DeleteObject` on `cells/`,
+    which the read-write state grant already covers; a failed delete only
+    leaves garbage behind and never fails the eviction.
+  - Concurrent bucket-posture writes on one cell share ownership reads
+    (`0056`): fewer `cells/<cell>/own.json` GETs on hot cells at the same
+    acknowledgement rule. The probes `GateProvenByBucket` and
+    `GateOwnershipRefused` now count once per read, not per write.
+  - A fleet-posture node with no peer it could ever recruit backs its
+    `nodes/` scan off to the 30 s maintenance tick (`0055`), so a node that
+    starts next to it is recruited within ~30 s instead of ~1 s (the new
+    node recruits the old one itself at once).
 
 ## License
 
