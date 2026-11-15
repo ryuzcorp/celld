@@ -686,6 +686,32 @@ push to `ghcr.io/denoland`, but still. Pushing a branch named
   Measured on the same 200 short-lived Durable Objects: stored `cells/`
   bytes 2.47 MB → 0.57 MB, objects 1800 → 400 (L0 1400 → 0; the 200
   snapshots stay).
+- `0058` (sha TBD at merge) a reproducible S3 request-cost harness in
+  `tools/s3bench/`, so cost claims in PRs can be re-measured instead of
+  quoted. `proxy.py` is a threaded HTTP reverse proxy in front of the S3
+  endpoint logging one JSON line per request (method, path, query, status,
+  bytes in/out) with optional `DELAY_MS` latency; it forwards Host as the
+  client sent it, so SigV4-signed requests still verify upstream.
+  `count.py` classifies the log into `METHOD x key-family` counts with an
+  R2 Class A/B summary (listings count as LIST by their `prefix` param;
+  bulk `POST ?delete` stays POST, Class A — only single-key DELETEs are
+  free). `stored.py` inventories stored
+  `cells/` objects and bytes per family. `app/` is a minimal Worker +
+  SQLite-backed Durable Object app with `/agent/<id>/write` and
+  `/hot/write` routes. `run.sh` creates the bucket in a local
+  `rustfs/rustfs` container (bucket names lowercase; create accepts 200 or
+  409 and aborts otherwise), starts the proxy and N celld nodes
+  (`CELLD_BIN`, ports offset by `OFF`) pointed at it, deploys the app,
+  drives the agent workload (or one hot cell with `HOT=1`), prints the
+  counts and the stored inventory, then kills its proxy and nodes and
+  removes its container on exit. Measured with a debug build of the tip:
+  agent workload (`1 200 60 10 60 120`, bucket, 30 s evict) 1200 ok turns,
+  PUT `cells/*/ltx` 1400, LIST `cells/*/ltx` 200, GET `cells/*/own.json`
+  1400, PUT `cells/*/own.json` 200, DELETE `cells/*/ltx` 1200, stored
+  `cells/` 400 objects / 581188 bytes; hot workload (`HOT=1 DELAY_MS=40`,
+  16 writers, 15 s) 1489 writes, PUT `cells/*/ltx` 259, GET
+  `cells/*/own.json` ~520. New files only, so no `Modified by` notice;
+  nothing under `tools/` runs in CI.
 - `0059` (sha TBD at merge) the sans-I/O core for bucket-posture group commit
   (layer 1; no executor or fold wiring yet). `BUCKET_FORMAT` becomes 3, and a
   bucket node writes shared bundle proofs only while `bucket_bundles_allowed`
