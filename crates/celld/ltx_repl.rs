@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): an eviction skips the visibility LISTs its own uploads already prove and the time-based checkpoint before the handoff; an eviction deletes the per-cell L0/L1 objects its handoff snapshot supersedes; bucket-posture group commit: paged gate judges PAGED_FORMAT (0059); bucket-posture group commit: bucket bundle gate, sync pacing and event-driven bundle flush (0060); the eviction guard proves a journaled epoch with a HEAD on the newest journaled key, falling back to the listing on a miss, an error, or an empty journal (0061).
+// Modified by ryuzcorp (ryuzcorp/celld): an eviction skips the visibility LISTs its own uploads already prove and the time-based checkpoint before the handoff; an eviction deletes the per-cell L0/L1 objects its handoff snapshot supersedes; bucket-posture group commit: paged gate judges PAGED_FORMAT (0059); bucket-posture group commit: bucket bundle gate, sync pacing and event-driven bundle flush (0060); the eviction guard proves a journaled epoch with a HEAD on the newest journaled key, falling back to the listing on a miss, an error, or an empty journal (0061); bucket-posture group commit: bundled-cell eviction guard, graceful-close per-cell drain, bundle GC without ensemble, linger holds only while the dirty set is shared (0064).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! In-process replication backend built on `celld-ltx`.
@@ -1092,6 +1092,19 @@ fn split_bundle_entries(
 fn sync_should_bundle(paced: bool, bundle_active: bool, bucket_bundling: bool) -> bool {
     (paced && bundle_active) || bucket_bundling
 }
+
+/// Cells with uncredited tickets, for the bucket linger gate: the linger is a
+/// batching window, and batching needs concurrency. Holding it while a lone
+/// cell is dirty would add the whole window to one ack for no fewer PUTs.
+fn dirty_cells(cells: &Mutex<BTreeMap<(String, u64), CellHandle>>) -> usize {
+    cells
+        .lock()
+        .unwrap()
+        .values()
+        .filter(|cell| cell.req_seq.load(Ordering::SeqCst) > cell.synced_seq.load(Ordering::SeqCst))
+        .count()
+}
+
 /// Cap the per-cell upload journal: entries are one upload round each, and a
 /// long-lived hot cell uploads far more rounds in one epoch than the trim can
 /// usefully delete in one pass (8192 entries ≈ 200 KiB). Every upload's max
@@ -3363,12 +3376,17 @@ impl LtxRepl {
         let proof = self.handoff_wait(cell, epoch).await?;
         // A bucket proof this residency's own uploads earned carries its own
         // visibility proof: the successful PUT responses already prove what
-        // the LIST would check, so it goes. Anything else — a resumed copy,
-        // recovered tails, an upload-free residency — keeps the LIST, which
+        // the LIST would check, so it goes. A cell whose acked rows sit
+        // outside the per-cell layout holds bundle-credited rows the LIST
+        // cannot see and the coming handoff snapshot covers, so it also goes:
+        // the snapshot attempt — and the L0 fallback with its own LIST —
         // stays the fail-closed guard for state the bucket cannot restore.
+        // Anything else — a resumed copy, recovered tails, an upload-free
+        // residency — keeps the LIST.
         if revocable
             && matches!(proof, celld_logic::ProofSource::Bucket)
             && !self.residency_uploaded(cell, epoch)
+            && !self.has_bundle_only_rows(cell, epoch)
             && !self.epoch_replicated(cell, epoch).await
         {
             return Err(anyhow!(
@@ -3377,6 +3395,25 @@ impl LtxRepl {
             ));
         }
         Ok(())
+    }
+
+    /// Whether this residency holds acked rows outside the per-cell layout:
+    /// `durable_txid` past everything any per-cell object covers. Only the
+    /// bundle path credits durable without per-cell coverage (the per-cell
+    /// sync and the compaction drain both publish per-cell objects and feed
+    /// the same coverage watermark), so the gap names bundle-credited rows.
+    /// Deliberately flag-free: rows bundled while the gate was open stay
+    /// bundle rows after it closes, and the eviction this defers to covers
+    /// them either way — by snapshot, or by its L0 fallback which refuses
+    /// when neither artifact lands.
+    fn has_bundle_only_rows(&self, cell: &str, epoch: u64) -> bool {
+        self.cells
+            .lock()
+            .unwrap()
+            .get(&(cell.to_string(), epoch))
+            .is_some_and(|handle| {
+                handle.durable_txid.load(Ordering::SeqCst) > percell_coverage(handle)
+            })
     }
 
     async fn wait_for_durability_ticket(
@@ -3704,9 +3741,23 @@ impl LtxRepl {
                 // records a false undrained tail without the per-cell credit.
                 // A failed snapshot does not credit: the L0 fallback reads
                 // `durable_txid` to choose which rows to upload.
-                credit_percell_upload(&handle, snapshot.max_txid.0);
-                trim_max = Some(snapshot.max_txid.0);
-                artifact = Some(EvictionRestoreArtifact::Snapshot);
+                //
+                // A row credited past the image is not in it: the snapshot
+                // cannot be the authoritative artifact. Fall through to the
+                // L0 chain, which covers every credited row or refuses.
+                if handle.durable_txid.load(Ordering::SeqCst) <= snapshot.max_txid.0 {
+                    credit_percell_upload(&handle, snapshot.max_txid.0);
+                    trim_max = Some(snapshot.max_txid.0);
+                    artifact = Some(EvictionRestoreArtifact::Snapshot);
+                } else {
+                    warn!(
+                        event = "eviction_snapshot_stale",
+                        cell,
+                        epoch,
+                        max_txid = snapshot.max_txid.0,
+                        "a credited row advanced past the snapshot, so the handoff requires its L0 chain"
+                    );
+                }
             } else {
                 handle.snapshot_declined.store(true, Ordering::Relaxed);
                 warn!(
@@ -3774,6 +3825,104 @@ impl LtxRepl {
         }
         self.remove_local(cell, epoch, preserve_local);
         Ok(artifact)
+    }
+
+    /// Resident cells holding acked rows outside the per-cell layout
+    /// (bundle-credited), for the graceful-close drain. Each is one
+    /// per-cell snapshot away from covering its bundle rows; the seal scan
+    /// decides, this only lists the work.
+    pub(crate) fn bundle_drain_candidates(&self) -> Vec<(String, u64)> {
+        self.cells
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, handle)| {
+                handle.durable_txid.load(Ordering::SeqCst) > percell_coverage(handle)
+            })
+            .map(|(key, _)| key.clone())
+            .collect()
+    }
+
+    /// Cover one bundled cell per-cell without giving up the handle: publish
+    /// the same authoritative snapshot the eviction publishes and feed the
+    /// same `covered_txid` watermark the fleet path uses, so the graceful
+    /// seal's retained scan can see the rows. A snapshot the store cannot
+    /// carry (paged, over budget) or cannot publish falls back to the direct
+    /// per-cell drain, exactly like the eviction's L0 fallback. Returns
+    /// whether the cell is per-cell-covered now; anything uncovered keeps the
+    /// record Open for successor recovery, which folds the bundles.
+    pub(crate) async fn drain_bundled_cell(&self, cell: &str, epoch: u64) -> bool {
+        let Some(handle) = self
+            .cells
+            .lock()
+            .unwrap()
+            .get(&(cell.to_string(), epoch))
+            .cloned()
+        else {
+            // Raced away: an eviction covered it or nothing was ever acked.
+            // The retained tail, not the missing handle, decides.
+            return !self
+                .dirty_tails
+                .lock()
+                .unwrap()
+                .get(cell)
+                .is_some_and(|epochs| epochs.contains_key(&epoch));
+        };
+        if handle.durable_txid.load(Ordering::SeqCst) <= percell_coverage(&handle) {
+            return true;
+        }
+        match self.prepare_handoff_snapshot(&handle).await {
+            Ok((Some(snapshot), pause)) => {
+                let published = self
+                    .publish_handoff_snapshot(cell, epoch, &snapshot)
+                    .await
+                    .is_ok();
+                // A row credited past the image is not in it: report
+                // uncovered and let the L0 fallback below cover it, instead
+                // of certifying a snapshot that stops short of an ack.
+                let covered =
+                    published && handle.durable_txid.load(Ordering::SeqCst) <= snapshot.max_txid.0;
+                if covered {
+                    handle.uploaded_epoch_objects.store(true, Ordering::SeqCst);
+                    credit_percell_upload(&handle, snapshot.max_txid.0);
+                }
+                drop(pause);
+                if covered {
+                    return true;
+                }
+            }
+            Ok((None, _pause)) => {}
+            Err(_) => {}
+        }
+        // The snapshot cannot carry this cell: drain per-cell like the
+        // eviction fallback, under the same barrier budget. A failed drain
+        // leaves the rows uncovered and the record Open.
+        if !matches!(
+            self.sync_wait(cell, epoch, Duration::from_secs(10)).await,
+            SyncWait::Durable
+        ) {
+            return false;
+        }
+        handle.durable_txid.load(Ordering::SeqCst) <= percell_coverage(&handle)
+    }
+
+    /// Test-only: stage the bundle-loop credit for one cell without a
+    /// per-cell upload, exactly as `bundle_loop` advances the handle after a
+    /// credited `put_bundle`: durable and ticket watermarks move, per-cell
+    /// coverage does not. Lets close/eviction tests build bundle-credited
+    /// rows deterministically.
+    #[cfg(test)]
+    pub(crate) fn stage_bundle_credit_for_test(&self, cell: &str, epoch: u64, position: u64) {
+        if let Some(handle) = self
+            .cells
+            .lock()
+            .unwrap()
+            .get(&(cell.to_string(), epoch))
+            .cloned()
+        {
+            handle.durable_txid.fetch_max(position, Ordering::SeqCst);
+            handle.ready.notify_waiters();
+        }
     }
 
     /// Drain this handle's upload journal to the trim candidate list: only
@@ -5178,10 +5327,13 @@ async fn bundle_loop(
     // and flushing again as soon as it completes. The loop awaits each PUT, so
     // writes arriving mid-PUT are captured by the next iteration — batching
     // grows with load. An optional linger (`CELLD_BUCKET_BUNDLE_LINGER_MS`,
-    // default 0) holds each flush that long after the first dirty wake: at
-    // moderate load with spread-out writes, no linger means ~one bundle per
-    // write (the s3bench agent workload measured 1206 bundle PUTs for 1200
-    // writes), and a linger trades that much ack latency for fewer PUTs.
+    // default 0) holds a shared round open that long after the first dirty
+    // wake — but only while batching can help: a lone dirty cell has nothing
+    // to batch with, so it flushes at once instead of paying the full linger
+    // for no fewer PUTs. At moderate load with spread-out writes, no linger
+    // means ~one bundle per write (the s3bench agent workload measured 1206
+    // bundle PUTs for 1200 writes); a linger batches concurrent dirt into
+    // fewer PUTs at that much ack latency each.
     let bucket_linger = bucket_bundle_linger();
     let fleet_tick_ms = flush_ms;
     let mut fleet_tick = (fleet_tick_ms > 0).then(|| {
@@ -5204,7 +5356,12 @@ async fn bundle_loop(
             if stop.is_stopped() {
                 break;
             }
-            if !bucket_linger.is_zero() {
+            // The linger is a batching window, not a pacing delay: hold it
+            // open only while more than one cell is dirty. A lone cell
+            // flushes at once — waiting would add the whole linger to one
+            // ack without batching anything (writes arriving mid-PUT still
+            // join the next round).
+            if !bucket_linger.is_zero() && dirty_cells(&cells) > 1 {
                 asyncrt::select_biased! {
                     "a stop signal that ties the bucket bundle linger prevents another flush";
                     _ = stop.stopped() => break,
@@ -6129,9 +6286,10 @@ mod evict_trim_tests {
     use std::sync::atomic::AtomicUsize;
 
     /// An in-memory store that counts PUTs, LISTs, HEADs, and DELETEs under
-    /// one per-cell prefix, and can fail DELETEs on demand, so the tests
-    /// below can assert the eviction trim's effect and its best-effort
-    /// failure mode, and the guard's HEAD-before-LIST discipline. Every other
+    /// one per-cell prefix, and can fail PUTs and DELETEs on demand, so the
+    /// tests below can assert the eviction trim's effect and its best-effort
+    /// failure mode, the guard's HEAD-before-LIST discipline, and the
+    /// eviction barrier's refusal when no artifact can land. Every other
     /// operation delegates to the inner store untouched.
     #[derive(Debug)]
     struct CountingStore {
@@ -6141,6 +6299,7 @@ mod evict_trim_tests {
         lists: AtomicUsize,
         heads: AtomicUsize,
         deletes: AtomicUsize,
+        fail_puts: AtomicBool,
         fail_deletes: AtomicBool,
         /// Counted deletes at or past this total fail. `u64::MAX` (the
         /// default) fails nothing; `set_fail_after(n)` lets the next `n`
@@ -6160,6 +6319,7 @@ mod evict_trim_tests {
                 lists: AtomicUsize::new(0),
                 heads: AtomicUsize::new(0),
                 deletes: AtomicUsize::new(0),
+                fail_puts: AtomicBool::new(false),
                 fail_deletes: AtomicBool::new(false),
                 fail_after: AtomicU64::new(u64::MAX),
                 hold_deletes: AtomicBool::new(false),
@@ -6180,6 +6340,10 @@ mod evict_trim_tests {
 
         fn deletes(&self) -> usize {
             self.deletes.load(Ordering::SeqCst)
+        }
+
+        fn set_fail_puts(&self, fail: bool) {
+            self.fail_puts.store(fail, Ordering::SeqCst);
         }
 
         fn set_fail_deletes(&self, fail: bool) {
@@ -6221,6 +6385,12 @@ mod evict_trim_tests {
         ) -> StoreResult<PutResult> {
             if self.under(location) {
                 self.puts.fetch_add(1, Ordering::SeqCst);
+                if self.fail_puts.load(Ordering::SeqCst) {
+                    return Err(celld_ltx::object_store::Error::Generic {
+                        store: "CountingStore",
+                        source: "injected put failure".into(),
+                    });
+                }
             }
             self.inner.put_opts(location, payload, opts).await
         }
@@ -6232,6 +6402,12 @@ mod evict_trim_tests {
         ) -> StoreResult<Box<dyn MultipartUpload>> {
             if self.under(location) {
                 self.puts.fetch_add(1, Ordering::SeqCst);
+                if self.fail_puts.load(Ordering::SeqCst) {
+                    return Err(celld_ltx::object_store::Error::Generic {
+                        store: "CountingStore",
+                        source: "injected put failure".into(),
+                    });
+                }
             }
             self.inner.put_multipart_opts(location, opts).await
         }
@@ -6715,6 +6891,228 @@ mod evict_trim_tests {
                     .await
                     .unwrap(),
                 "the probe names the snapshot key too"
+            );
+            shutdown(repl).await;
+        });
+    }
+
+    /// A bundle-only epoch evicts through one snapshot PUT with no LIST: the
+    /// rows were acked by bundle proofs, so no per-cell objects exist for the
+    /// revocable gate to find — and the gate must not demand them. The staged
+    /// credit mirrors `bundle_loop` after a credited `put_bundle` (durable
+    /// and tickets advance, per-cell coverage stays zero). Fail-before:
+    /// without the `has_bundle_only_rows` skip the gate LISTs and refuses
+    /// with "no replica objects".
+    #[test]
+    fn bundle_only_eviction_costs_one_snapshot_put_no_list() {
+        let runtime = asyncrt::shared_test_runtime();
+        runtime.block_on(async {
+            let _temp = test_watch();
+            let watch = _temp.path().to_path_buf();
+            let store = Arc::new(CountingStore::new("cells/c/ltx/"));
+            let repl = LtxRepl::start_with_store_for_test(&watch, store.clone());
+            repl.set_bucket_bundles_env_override_for_test(Some(true));
+            repl.set_bucket_bundles_fleet(true);
+            activate_epoch(&repl, "c", 1, true).await;
+            sql_write(&db_path(&watch, "c", 1));
+            {
+                let handle = repl
+                    .cells
+                    .lock()
+                    .unwrap()
+                    .get(&("c".to_string(), 1))
+                    .cloned()
+                    .unwrap();
+                handle.durable_txid.store(1, Ordering::SeqCst);
+                handle.synced_seq.store(1, Ordering::SeqCst);
+            }
+            let (puts_before, lists_before) = store.counts();
+            repl.handoff_gate("c", 1, true).await.unwrap();
+            let (puts_gated, lists_gated) = store.counts();
+            assert_eq!(
+                (puts_gated - puts_before, lists_gated - lists_before),
+                (0, 0),
+                "the revocable gate proves a bundled cell with no LIST"
+            );
+            let artifact = repl.evict("c", 1, false, None).await.unwrap();
+            trim_idle(&repl).await;
+            assert_eq!(artifact, EvictionRestoreArtifact::Snapshot);
+            let (puts, lists) = store.counts();
+            assert_eq!(
+                (puts - puts_before, lists - lists_before),
+                (1, 0),
+                "eviction must cost exactly the snapshot PUT"
+            );
+            repl.activate(ActivationOptions {
+                cell: "c",
+                epoch: 2,
+                fresh: false,
+                took_over: false,
+                resume_local: false,
+                prior: None,
+            })
+            .await
+            .unwrap();
+            assert_eq!(row_count(&db_path(&watch, "c", 2)), 1);
+            shutdown(repl).await;
+        });
+    }
+
+    /// A bundle-only eviction whose snapshot PUT cannot land refuses instead
+    /// of giving up the last copy: with every PUT failing the L0 fallback
+    /// cannot materialize its chain either, so the barrier fails closed at
+    /// the final durability pass. Fail-before: without the
+    /// `has_bundle_only_rows` skip the gate refuses first with "no replica
+    /// objects" instead of this barrier error.
+    #[test]
+    fn bundle_only_eviction_refuses_when_no_artifact_lands() {
+        let runtime = asyncrt::shared_test_runtime();
+        runtime.block_on(async {
+            let _temp = test_watch();
+            let watch = _temp.path().to_path_buf();
+            let store = Arc::new(CountingStore::new("cells/c/ltx/"));
+            let repl = LtxRepl::start_with_store_for_test(&watch, store.clone());
+            repl.set_bucket_bundles_env_override_for_test(Some(true));
+            repl.set_bucket_bundles_fleet(true);
+            activate_epoch(&repl, "c", 1, true).await;
+            sql_write(&db_path(&watch, "c", 1));
+            {
+                let handle = repl
+                    .cells
+                    .lock()
+                    .unwrap()
+                    .get(&("c".to_string(), 1))
+                    .cloned()
+                    .unwrap();
+                handle.durable_txid.store(1, Ordering::SeqCst);
+                handle.synced_seq.store(1, Ordering::SeqCst);
+            }
+            store.set_fail_puts(true);
+            repl.handoff_gate("c", 1, true).await.unwrap();
+            let error = repl
+                .evict("c", 1, false, None)
+                .await
+                .expect_err("no snapshot and no L0 chain must refuse");
+            assert!(
+                error.to_string().contains("final durability failed"),
+                "the evict-time barrier fails closed, not the gate: {error:#}"
+            );
+            shutdown(repl).await;
+        });
+    }
+
+    /// A bundled cell the snapshot budget cannot carry still drains per-cell
+    /// through the L0 fallback, which proves its upload with the journaled-key
+    /// HEAD (`0061`; LIST only without a journal). Pins the
+    /// fallback for bundle-credited rows: the snapshot is the cheap path,
+    /// not the only one. Fail-before: without the `has_bundle_only_rows`
+    /// skip the gate refuses before the fallback runs.
+    #[test]
+    fn bundle_only_eviction_falls_back_to_l0_chain() {
+        let runtime = asyncrt::shared_test_runtime();
+        runtime.block_on(async {
+            let _temp = test_watch();
+            let watch = _temp.path().to_path_buf();
+            let store = Arc::new(CountingStore::new("cells/c/ltx/"));
+            let repl = LtxRepl::start_with_store_for_test(&watch, store.clone());
+            repl.set_bucket_bundles_env_override_for_test(Some(true));
+            repl.set_bucket_bundles_fleet(true);
+            activate_epoch(&repl, "c", 1, true).await;
+            sql_write(&db_path(&watch, "c", 1));
+            {
+                let handle = repl
+                    .cells
+                    .lock()
+                    .unwrap()
+                    .get(&("c".to_string(), 1))
+                    .cloned()
+                    .unwrap();
+                handle.durable_txid.store(1, Ordering::SeqCst);
+                handle.synced_seq.store(1, Ordering::SeqCst);
+            }
+            repl.set_handoff_snapshot_budget_for_world(1);
+            let (puts_before, lists_before) = store.counts();
+            let heads_before = store.heads();
+            repl.handoff_gate("c", 1, true).await.unwrap();
+            let artifact = repl.evict("c", 1, false, None).await.unwrap();
+            trim_idle(&repl).await;
+            assert_eq!(artifact, EvictionRestoreArtifact::L0Chain);
+            let (puts, lists) = store.counts();
+            assert!(
+                puts - puts_before > 0,
+                "the L0 fallback drains the rows per-cell"
+            );
+            // `0061`: the fallback drain journaled its upload, so the barrier
+            // proves visibility with one HEAD on that key instead of a LIST.
+            assert_eq!(
+                (lists - lists_before, store.heads() - heads_before),
+                (0, 1),
+                "the L0 fallback proves its upload with one HEAD and no LIST"
+            );
+            repl.activate(ActivationOptions {
+                cell: "c",
+                epoch: 2,
+                fresh: false,
+                took_over: false,
+                resume_local: false,
+                prior: None,
+            })
+            .await
+            .unwrap();
+            assert_eq!(row_count(&db_path(&watch, "c", 2)), 1);
+            shutdown(repl).await;
+        });
+    }
+
+    /// A snapshot that stops short of a credited row is not authoritative: a
+    /// row credited past the image routes through the L0 fallback and its
+    /// visibility guard instead of releasing the snapshot. Fail-before: without the
+    /// post-publish re-check the eviction certifies the stale snapshot.
+    #[test]
+    fn bundle_only_eviction_refuses_a_stale_snapshot() {
+        let runtime = asyncrt::shared_test_runtime();
+        runtime.block_on(async {
+            let _temp = test_watch();
+            let watch = _temp.path().to_path_buf();
+            let store = Arc::new(CountingStore::new("cells/c/ltx/"));
+            let repl = LtxRepl::start_with_store_for_test(&watch, store.clone());
+            repl.set_bucket_bundles_env_override_for_test(Some(true));
+            repl.set_bucket_bundles_fleet(true);
+            activate_epoch(&repl, "c", 1, true).await;
+            sql_write(&db_path(&watch, "c", 1));
+            {
+                let handle = repl
+                    .cells
+                    .lock()
+                    .unwrap()
+                    .get(&("c".to_string(), 1))
+                    .cloned()
+                    .unwrap();
+                // A credit that landed past the image the handoff will
+                // capture: the local database holds txid 1, the ack covers
+                // through 5.
+                handle.durable_txid.store(5, Ordering::SeqCst);
+                handle.synced_seq.store(1, Ordering::SeqCst);
+            }
+            let (puts_before, lists_before) = store.counts();
+            let heads_before = store.heads();
+            repl.handoff_gate("c", 1, true).await.unwrap();
+            let artifact = repl.evict("c", 1, false, None).await.unwrap();
+            trim_idle(&repl).await;
+            assert_eq!(
+                artifact,
+                EvictionRestoreArtifact::L0Chain,
+                "a stale snapshot must not be the handoff artifact"
+            );
+            let (puts, lists) = store.counts();
+            assert_eq!(
+                (lists - lists_before, store.heads() - heads_before),
+                (0, 1),
+                "the L0 fallback proves its upload with one HEAD and no LIST"
+            );
+            assert!(
+                puts - puts_before > 1,
+                "the snapshot PUT plus the L0 fallback drain both land"
             );
             shutdown(repl).await;
         });

@@ -806,6 +806,25 @@ push to `ghcr.io/denoland`, but still. Pushing a branch named
   (takeover and restart now fold bundle-credited rows per-cell instead of
   orphaning them); the eviction/handoff/drain side is layer 4. Still behind
   `CELLD_BUCKET_BUNDLES=1` — do not enable in production until layers 4-5.
+- `0064` (sha TBD at merge) drain, GC, and graceful close for bucket sessions
+  (layer 4; still behind `CELLD_BUCKET_BUNDLES=1`, still do-not-enable until the
+  stack completes). Eviction of a bundled cell writes ONE per-cell snapshot from
+  the complete local DB — never a per-cell L0 re-upload — and the guard proves
+  durability through that snapshot (`residency_uploaded`), so no LIST and no
+  per-cell L0 at eviction; the fallback keeps its LIST and refuses when neither
+  artifact lands. The revocable gate no longer LISTs for (or refuses) cells
+  whose acked rows sit outside the per-cell layout (`durable_txid` past per-cell
+  coverage), fixing the measured "no replica objects" refusals. The snapshot
+  feeds the same `covered_txid` watermark the fleet path uses, so
+  `bundle_deletable` sees it. `gc_bundles` runs for bucket sessions (maintenance
+  tick, no ensemble) and deletes only fully-covered bundles with single-key
+  `DeleteObject`s, never bulk `POST ?delete` (free on R2, as the 0057 trim).
+  `close_gracefully` seals a bucket session only when every acked row is
+  per-cell: it first snapshots each bundled cell within the shutdown budget,
+  and otherwise leaves the record Open for successor recovery. The bucket
+  linger (`CELLD_BUCKET_BUNDLE_LINGER_MS`) holds the window open only while
+  more than one cell is dirty — a lone cell flushes at once, since waiting
+  would add the whole linger to one ack without batching anything.
 - `0067` (sha TBD at merge) share the `/bundle` tree per deployment
   generation instead of per isolate: the projection lives on the shared
   `Arc<WorkerConfig>`, so N isolates project once; read-only semantics
