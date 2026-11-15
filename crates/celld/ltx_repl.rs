@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): an eviction skips the visibility LISTs its own uploads already prove and the time-based checkpoint before the handoff; an eviction deletes the per-cell L0/L1 objects its handoff snapshot supersedes; bucket-posture group commit: paged gate judges PAGED_FORMAT (0059); bucket-posture group commit: bucket bundle gate, sync pacing and event-driven bundle flush (0060).
+// Modified by ryuzcorp (ryuzcorp/celld): an eviction skips the visibility LISTs its own uploads already prove and the time-based checkpoint before the handoff; an eviction deletes the per-cell L0/L1 objects its handoff snapshot supersedes; bucket-posture group commit: paged gate judges PAGED_FORMAT (0059); bucket-posture group commit: bucket bundle gate, sync pacing and event-driven bundle flush (0060); the eviction guard proves a journaled epoch with a HEAD on the newest journaled key, falling back to the listing on a miss, an error, or an empty journal (0061).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! In-process replication backend built on `celld-ltx`.
@@ -2463,8 +2463,36 @@ impl LtxRepl {
     /// eviction gate: never delete the last local copy of state the bucket
     /// cannot restore.
     pub async fn epoch_replicated(&self, cell: &str, epoch: u64) -> bool {
+        if self.journaled_key_replicated(cell, epoch).await {
+            return true;
+        }
         let client = self.client_for(cell, epoch);
         matches!(client.has_any_object().await, Ok(true))
+    }
+
+    /// Whether the bucket holds the newest key this residency's upload
+    /// journal names, via a HEAD on that exact key — the same key the
+    /// uploader wrote and the eviction trim deletes. A miss or an error, or
+    /// an empty journal (an upload-free or resumed residency with no handle
+    /// entry), answers false so the caller falls back to the listing, which
+    /// stays the fail-closed proof. Costs one Class-B HEAD instead of one
+    /// Class-A LIST when the journal names the epoch's objects.
+    async fn journaled_key_replicated(&self, cell: &str, epoch: u64) -> bool {
+        let journaled = self
+            .cells
+            .lock()
+            .unwrap()
+            .get(&(cell.to_string(), epoch))
+            .and_then(|handle| handle.epoch_uploads.lock().unwrap().last().copied());
+        let Some((level, min_txid, max_txid)) = journaled else {
+            return false;
+        };
+        matches!(
+            self.client_for(cell, epoch)
+                .ltx_file_exists(level, TXID(min_txid), TXID(max_txid))
+                .await,
+            Ok(true)
+        )
     }
 
     /// Whether this residency itself PUT an object under the cell epoch's
@@ -6100,16 +6128,18 @@ mod evict_trim_tests {
     use std::sync::atomic::AtomicU64;
     use std::sync::atomic::AtomicUsize;
 
-    /// An in-memory store that counts PUTs, LISTs, and DELETEs under one
-    /// per-cell prefix, and can fail DELETEs on demand, so the tests below
-    /// can assert the eviction trim's effect and its best-effort failure
-    /// mode. Every other operation delegates to the inner store untouched.
+    /// An in-memory store that counts PUTs, LISTs, HEADs, and DELETEs under
+    /// one per-cell prefix, and can fail DELETEs on demand, so the tests
+    /// below can assert the eviction trim's effect and its best-effort
+    /// failure mode, and the guard's HEAD-before-LIST discipline. Every other
+    /// operation delegates to the inner store untouched.
     #[derive(Debug)]
     struct CountingStore {
         inner: InMemory,
         prefix: String,
         puts: AtomicUsize,
         lists: AtomicUsize,
+        heads: AtomicUsize,
         deletes: AtomicUsize,
         fail_deletes: AtomicBool,
         /// Counted deletes at or past this total fail. `u64::MAX` (the
@@ -6128,6 +6158,7 @@ mod evict_trim_tests {
                 prefix: prefix.to_string(),
                 puts: AtomicUsize::new(0),
                 lists: AtomicUsize::new(0),
+                heads: AtomicUsize::new(0),
                 deletes: AtomicUsize::new(0),
                 fail_deletes: AtomicBool::new(false),
                 fail_after: AtomicU64::new(u64::MAX),
@@ -6141,6 +6172,10 @@ mod evict_trim_tests {
                 self.puts.load(Ordering::SeqCst),
                 self.lists.load(Ordering::SeqCst),
             )
+        }
+
+        fn heads(&self) -> usize {
+            self.heads.load(Ordering::SeqCst)
         }
 
         fn deletes(&self) -> usize {
@@ -6207,6 +6242,13 @@ mod evict_trim_tests {
             options: GetOptions,
         ) -> StoreResult<GetResult> {
             self.inner.get_opts(location, options).await
+        }
+
+        async fn head(&self, location: &ObjPath) -> StoreResult<ObjectMeta> {
+            if self.under(location) {
+                self.heads.fetch_add(1, Ordering::SeqCst);
+            }
+            self.inner.head(location).await
         }
 
         async fn delete(&self, location: &ObjPath) -> StoreResult<()> {
@@ -6379,10 +6421,11 @@ mod evict_trim_tests {
         });
     }
 
-    /// A failed snapshot keeps the L0 fallback and its visibility LIST: the
-    /// trim never skips the proof the bucket did not already give.
+    /// A failed snapshot keeps the L0 fallback, but the fallback proves the
+    /// epoch through the journaled L0 with one HEAD instead of a visibility
+    /// LIST: the sync upload journaled the exact key the guard probes.
     #[test]
-    fn evict_snapshot_fallback_still_lists() {
+    fn evict_snapshot_fallback_proves_through_the_journal() {
         let runtime = asyncrt::shared_test_runtime();
         runtime.block_on(async {
             let _temp = test_watch();
@@ -6407,6 +6450,7 @@ mod evict_trim_tests {
             assert_puts(&store, 1);
             repl.set_handoff_snapshot_budget_for_world(1);
             let (puts_before, lists_before) = store.counts();
+            let heads_before = store.heads();
             repl.handoff_gate("c", 1, true).await.unwrap();
             let artifact = repl.evict("c", 1, false, None).await.unwrap();
             trim_idle(&repl).await;
@@ -6419,8 +6463,13 @@ mod evict_trim_tests {
             );
             assert_eq!(
                 lists - lists_before,
+                0,
+                "the journaled fallback proves the epoch without a LIST"
+            );
+            assert_eq!(
+                store.heads() - heads_before,
                 1,
-                "the L0 fallback keeps its visibility LIST"
+                "the fallback HEADs the journaled L0 key once"
             );
             repl.activate(ActivationOptions {
                 cell: "c",
@@ -6433,6 +6482,240 @@ mod evict_trim_tests {
             .await
             .unwrap();
             assert_eq!(row_count(&db_path(&watch, "c", 2)), 1);
+            shutdown(repl).await;
+        });
+    }
+
+    /// The handoff gate proves a journaled epoch with one HEAD and no LIST.
+    /// The sync upload journaled its key, and the test clears the
+    /// self-uploaded mark to reach the guard the way a residency the fast
+    /// path cannot skip does (recovered tails, compaction output): without
+    /// the journaled probe this gate costs a LIST.
+    #[test]
+    fn handoff_gate_proves_journaled_epoch_with_one_head() {
+        let runtime = asyncrt::shared_test_runtime();
+        runtime.block_on(async {
+            let _temp = test_watch();
+            let watch = _temp.path().to_path_buf();
+            let store = Arc::new(CountingStore::new("cells/c/ltx/"));
+            let repl = LtxRepl::start_with_store_for_test(&watch, store.clone());
+            activate_epoch(&repl, "c", 1, true).await;
+            sql_write(&db_path(&watch, "c", 1));
+            assert!(matches!(
+                repl.sync_wait("c", 1, Duration::from_secs(10)).await,
+                SyncWait::Durable
+            ));
+            let handle = repl
+                .cells
+                .lock()
+                .unwrap()
+                .get(&("c".to_string(), 1))
+                .cloned()
+                .unwrap();
+            assert_eq!(
+                handle.epoch_uploads.lock().unwrap().len(),
+                1,
+                "the sync upload journaled its key"
+            );
+            handle.uploaded_epoch_objects.store(false, Ordering::SeqCst);
+            let (_, lists_before) = store.counts();
+            let heads_before = store.heads();
+            repl.handoff_gate("c", 1, true).await.unwrap();
+            let (_, lists) = store.counts();
+            assert_eq!(
+                lists - lists_before,
+                0,
+                "a journaled guard proves the epoch without a LIST"
+            );
+            assert_eq!(
+                store.heads() - heads_before,
+                1,
+                "a journaled guard HEADs the newest journaled key once"
+            );
+            shutdown(repl).await;
+        });
+    }
+
+    /// Without a journal the guard keeps the LIST: `epoch_replicated` on a
+    /// write-free residency lists once and answers false, then answers true
+    /// with one HEAD and no further LIST once the first upload journals a key.
+    #[test]
+    fn epoch_replicated_lists_only_without_a_journal() {
+        let runtime = asyncrt::shared_test_runtime();
+        runtime.block_on(async {
+            let _temp = test_watch();
+            let watch = _temp.path().to_path_buf();
+            let store = Arc::new(CountingStore::new("cells/c/ltx/"));
+            let repl = LtxRepl::start_with_store_for_test(&watch, store.clone());
+            activate_epoch(&repl, "c", 1, true).await;
+            let (_, lists_before) = store.counts();
+            assert!(
+                !repl.epoch_replicated("c", 1).await,
+                "an empty prefix is not replicated"
+            );
+            let (_, lists) = store.counts();
+            assert_eq!(
+                lists - lists_before,
+                1,
+                "an upload-free residency keeps the LIST"
+            );
+            assert_eq!(store.heads(), 0, "no journal means no HEAD");
+            sql_write(&db_path(&watch, "c", 1));
+            assert!(matches!(
+                repl.sync_wait("c", 1, Duration::from_secs(10)).await,
+                SyncWait::Durable
+            ));
+            let (_, lists_before) = store.counts();
+            let heads_before = store.heads();
+            assert!(
+                repl.epoch_replicated("c", 1).await,
+                "the journaled upload is replicated"
+            );
+            let (_, lists) = store.counts();
+            assert_eq!(
+                lists - lists_before,
+                0,
+                "a journaled residency skips the LIST"
+            );
+            assert_eq!(
+                store.heads() - heads_before,
+                1,
+                "a journaled residency HEADs the journaled key once"
+            );
+            shutdown(repl).await;
+        });
+    }
+
+    /// A journaled key the bucket lost falls back to the LIST, and the gate
+    /// still refuses on an empty prefix: the test deletes the journaled L0
+    /// through the trim's own single-key path, so the HEAD misses, the LIST
+    /// finds nothing, and the gate fails closed.
+    #[test]
+    fn handoff_gate_falls_back_to_list_on_journal_miss_and_refuses() {
+        let runtime = asyncrt::shared_test_runtime();
+        runtime.block_on(async {
+            let _temp = test_watch();
+            let watch = _temp.path().to_path_buf();
+            let store = Arc::new(CountingStore::new("cells/c/ltx/"));
+            let repl = LtxRepl::start_with_store_for_test(&watch, store.clone());
+            activate_epoch(&repl, "c", 1, true).await;
+            sql_write(&db_path(&watch, "c", 1));
+            assert!(matches!(
+                repl.sync_wait("c", 1, Duration::from_secs(10)).await,
+                SyncWait::Durable
+            ));
+            let handle = repl
+                .cells
+                .lock()
+                .unwrap()
+                .get(&("c".to_string(), 1))
+                .cloned()
+                .unwrap();
+            let (level, min_txid, max_txid) = handle
+                .epoch_uploads
+                .lock()
+                .unwrap()
+                .last()
+                .copied()
+                .expect("the sync upload journaled its key");
+            let gone = celld_ltx::FileInfo {
+                level,
+                min_txid: TXID(min_txid),
+                max_txid: TXID(max_txid),
+                ..Default::default()
+            };
+            assert_eq!(
+                repl.client_for("c", 1).delete_ltx_keys(&[gone], 1).await,
+                0,
+                "the trim's single-key path deletes the journaled L0"
+            );
+            handle.uploaded_epoch_objects.store(false, Ordering::SeqCst);
+            let (_, lists_before) = store.counts();
+            let heads_before = store.heads();
+            assert!(
+                repl.handoff_gate("c", 1, true).await.is_err(),
+                "a missed HEAD with an empty prefix refuses the eviction"
+            );
+            let (_, lists) = store.counts();
+            assert_eq!(
+                lists - lists_before,
+                1,
+                "a missed HEAD falls back to the LIST"
+            );
+            assert_eq!(
+                store.heads() - heads_before,
+                1,
+                "the guard HEADs the journaled key before the LIST"
+            );
+            shutdown(repl).await;
+        });
+    }
+
+    /// The probe, the uploader, and the trim share one key constructor: the
+    /// journaled L0 the sync wrote probes true, and after the snapshot's
+    /// trim it probes false while the snapshot itself probes true.
+    #[test]
+    fn journal_probe_round_trips_uploader_and_trim_keys() {
+        let runtime = asyncrt::shared_test_runtime();
+        runtime.block_on(async {
+            let _temp = test_watch();
+            let watch = _temp.path().to_path_buf();
+            let store = Arc::new(CountingStore::new("cells/c/ltx/"));
+            let repl = LtxRepl::start_with_store_for_test(&watch, store.clone());
+            activate_epoch(&repl, "c", 1, true).await;
+            sql_write(&db_path(&watch, "c", 1));
+            assert!(matches!(
+                repl.sync_wait("c", 1, Duration::from_secs(10)).await,
+                SyncWait::Durable
+            ));
+            let handle = repl
+                .cells
+                .lock()
+                .unwrap()
+                .get(&("c".to_string(), 1))
+                .cloned()
+                .unwrap();
+            let (level, min_txid, max_txid) = handle
+                .epoch_uploads
+                .lock()
+                .unwrap()
+                .last()
+                .copied()
+                .expect("the sync upload journaled its key");
+            let client = repl.client_for("c", 1);
+            assert!(
+                client
+                    .ltx_file_exists(level, TXID(min_txid), TXID(max_txid))
+                    .await
+                    .unwrap(),
+                "the probe names the key the uploader wrote"
+            );
+            repl.handoff_gate("c", 1, true).await.unwrap();
+            assert_eq!(
+                repl.evict("c", 1, false, None).await.unwrap(),
+                EvictionRestoreArtifact::Snapshot
+            );
+            trim_idle(&repl).await;
+            assert!(
+                !client
+                    .ltx_file_exists(level, TXID(min_txid), TXID(max_txid))
+                    .await
+                    .unwrap(),
+                "the trim deletes the key the probe named"
+            );
+            let snapshots = ltx_level_files(&repl, "c", 1, 9).await;
+            assert_eq!(snapshots.len(), 1, "the handoff snapshot remains");
+            assert!(
+                client
+                    .ltx_file_exists(
+                        snapshots[0].level,
+                        snapshots[0].min_txid,
+                        snapshots[0].max_txid
+                    )
+                    .await
+                    .unwrap(),
+                "the probe names the snapshot key too"
+            );
             shutdown(repl).await;
         });
     }

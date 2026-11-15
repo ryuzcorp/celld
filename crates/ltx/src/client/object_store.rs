@@ -1,5 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): single-key LTX deletes with bounded concurrency for the eviction trim.
-//! client::object_store — S3/R2/MinIO `ReplicaClient` via the `object_store` crate.
+// Modified by ryuzcorp (ryuzcorp/celld): single-key LTX deletes with bounded concurrency for the eviction trim; the eviction guard proves replication with a HEAD on a journaled key instead of a prefix LIST.
 //!
 //! Ported (behavior only) from litestream@v0.5.11 `s3/replica_client.go`. We do
 //! **not** use the Go AWS SDK; instead the five `ReplicaClient` operations are
@@ -709,6 +708,27 @@ impl ObjectStoreClient {
             .transpose()
             .map(|object| object.is_some())
             .map_err(map_os_error)
+    }
+
+    /// Whether the exact LTX object for this key exists, via a HEAD on the
+    /// key `ltx_key` builds — the one constructor the uploader, the eviction
+    /// trim, and this probe share. The eviction guard calls this with the
+    /// newest journaled key instead of listing the prefix; a miss or an
+    /// error answers false so the caller falls back to the listing. HEAD is
+    /// Class B like GET, with no body.
+    pub async fn ltx_file_exists(
+        &self,
+        level: i32,
+        min_txid: TXID,
+        max_txid: TXID,
+    ) -> Result<bool> {
+        let store = self.store().await?;
+        let key = ObjPath::from(self.ltx_key(level, min_txid, max_txid));
+        match store.head(&key).await {
+            Ok(_) => Ok(true),
+            Err(object_store::Error::NotFound { .. }) => Ok(false),
+            Err(error) => Err(map_os_error(error)),
+        }
     }
 
     /// Build the S3 key for an LTX file: `{path}/{level:04x}/{min}-{max}.ltx`.
