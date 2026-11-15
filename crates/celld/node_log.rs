@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): operator token for the internal listener; list_page resume is a cursor; ported from meln1k/celld: seal a dead lease that never opened a log (01522b3); seal_absent_log regression tests; lone-node repair backoff; bucket-posture group commit: bucket-session record encoding + old-reader interop tests (0059).
+// Modified by ryuzcorp (ryuzcorp/celld): operator token for the internal listener; list_page resume is a cursor; ported from meln1k/celld: seal a dead lease that never opened a log (01522b3); seal_absent_log regression tests; lone-node repair backoff; bucket-posture group commit: bucket-session record encoding + old-reader interop tests (0059); bucket-posture group commit: bucket executor without ensemble (0060).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! v0 of the in-fleet replicated log tier (`CELLD_DURABILITY=fleet`).
@@ -3996,6 +3996,19 @@ pub struct NodeLogManager {
     /// A bundle flush between its PUT and its credit; the graceful seal
     /// waits this out after latching `closing`.
     flush_in_flight: std::sync::atomic::AtomicBool,
+    /// Bucket-posture session epoch once `ensure_bucket_record` publishes the
+    /// bucket-session record through the live-session lease chain (0 = none).
+    /// The record is created before the first bundle-credited ack and never
+    /// deleted; the epoch keys bundle objects (`log/<session>/bundle/...`).
+    /// A bucket session stays ensemble-less for life: `maintain` never steps it
+    /// into an ensemble, and the posture watch never starts for it.
+    bucket_epoch: std::sync::atomic::AtomicU64,
+    /// Latched once the bucket answered that this session's record is no
+    /// longer `Open` at its epoch (a successor's recovery moved it). The
+    /// process-local record can still read `Open`, so re-arming from it would
+    /// suppress per-cell uploads again and repeat the refused PUT; the latch
+    /// keeps this session on per-cell uploads for the rest of its life.
+    bucket_fenced: std::sync::atomic::AtomicBool,
     #[cfg(all(test, celld_internal_tests))]
     close_transition_pause: Mutex<Option<Arc<NodeLogTransitionPause>>>,
     #[cfg(all(test, celld_internal_tests))]
@@ -4062,23 +4075,28 @@ pub struct DurabilityOwner {
 impl DurabilityOwner {
     /// Creates the unique owner for a runtime durability stack.
     ///
-    /// Set `fleet` to install the coupled node-log registration.
+    /// The coupled node-log registration is always installed: fleet posture uses
+    /// it for shipping + bundle tiering, bucket posture for bundle proofs without
+    /// an ensemble (layer 2: `bundle_active` fires with a session and record but
+    /// no shipper). `fleet` only controls the maintenance phases (fleet recruit /
+    /// repair + posture watch run on fleet nodes; bucket nodes run epoch GC plus
+    /// bucket-record registration ticks).
     /// The fleet shipper and bundle sink are always installed together.
     ///
     /// # Panics
     ///
     /// The function panics if another owner controls the LTX task set. It also
-    /// panics if a fleet registration targets a stopped LTX service.
+    /// panics if a registration targets a stopped LTX service.
     pub fn new(manager: Arc<NodeLogManager>, fleet: bool) -> Self {
         let ltx = manager.ltx.clone();
         // Claim the unique lifecycle capability before changing the coupled
         // registration. A duplicate construction fails here, so its unwind
         // cannot supersede and then clear the live owner's generation.
         let ltx_tasks = ltx.take_task_owner();
-        let registration = fleet.then(|| {
+        let registration = Some(
             ltx.register_durability(manager.clone())
-                .expect("a new durability owner cannot install on a stopped LTX service")
-        });
+                .expect("a new durability owner cannot install on a stopped LTX service"),
+        );
         Self::from_claimed_registration(manager, fleet, ltx, ltx_tasks, registration)
     }
 
@@ -4538,6 +4556,8 @@ impl NodeLogManager {
             shortfall_logged_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             closing: std::sync::atomic::AtomicBool::new(false),
             flush_in_flight: std::sync::atomic::AtomicBool::new(false),
+            bucket_epoch: std::sync::atomic::AtomicU64::new(0),
+            bucket_fenced: std::sync::atomic::AtomicBool::new(false),
             #[cfg(all(test, celld_internal_tests))]
             close_transition_pause: Mutex::new(None),
             #[cfg(all(test, celld_internal_tests))]
@@ -5791,6 +5811,26 @@ impl NodeLogManager {
         if self.task_stop.is_stopped() {
             return Ok(MaintainOutcome::Other);
         }
+        // A bucket session never recruits and never reconfigures into an
+        // ensemble: no silent bucket-to-fleet conversion. The bucket posture
+        // never starts the posture watch or recruits; the bundle prefix is the
+        // only witness it ever had. Fleet `maintain` must not offer a bucket
+        // record here at all (the `kind` carry in `plan_reconfigure` keeps the
+        // flavour visible if it ever is).
+        if self.bucket_epoch.load(Ordering::SeqCst) != 0 {
+            return Ok(MaintainOutcome::Other);
+        }
+        // Defence in depth: a bucket record present but not yet (or no longer)
+        // mirrored in `bucket_epoch` — after a credit refusal clears the epoch,
+        // or before the first registration tick mirrors it — must still never
+        // recruit. The live record is the authority, not the in-memory epoch.
+        if let Some(current) = self.live_log.lock().await.current() {
+            if let Ok(record) = log_from_wire(&current) {
+                if record.kind == log_tier::SessionKind::Bucket {
+                    return Ok(MaintainOutcome::Other);
+                }
+            }
+        }
         // A healthy ensemble below the recruitment target still reads peers.
         // Returning on `healthy` alone kept a one-follower ensemble at one
         // forever, because one follower is healthy: a third node that was not
@@ -6802,18 +6842,41 @@ impl NodeLogManager {
         }
         self.flush_in_flight.store(true, Ordering::SeqCst);
         let _flush = FlushGuard(&self.flush_in_flight);
-        let (epoch, flusher) = {
+        // Fleet path keeps its shipper epoch; bucket path uses the published
+        // bucket-session epoch with no shipper. Both reuse the same PUT then
+        // bucket re-read then `bundle_credit_allowed` credit check verbatim, so
+        // credit advances the same counters and `wait_for_durability_ticket`
+        // returns `ProofSource::Bucket` for either path.
+        enum FlushOwner {
+            Fleet(Arc<FleetShipper>, u64),
+            Bucket(u64),
+        }
+        let owner = {
             let inner = self.inner.lock().unwrap();
             match inner.as_ref() {
-                Some(shipper) => (shipper.epoch, shipper.clone()),
-                None => return false,
+                Some(shipper) => FlushOwner::Fleet(shipper.clone(), shipper.epoch),
+                None => {
+                    let epoch = self.bucket_epoch.load(Ordering::SeqCst);
+                    if epoch == 0 || !self.ltx.bucket_bundles_enabled() {
+                        return false;
+                    }
+                    FlushOwner::Bucket(epoch)
+                }
             }
         };
+        let epoch = match &owner {
+            FlushOwner::Fleet(_, epoch) => *epoch,
+            FlushOwner::Bucket(epoch) => *epoch,
+        };
         let seq = self.bundle_seq.fetch_add(1, Ordering::SeqCst);
+        let bucket_owner = matches!(owner, FlushOwner::Bucket(_));
         let body = match celld_ltx::bundle::encode(&entries) {
             Ok(body) => body,
             Err(error) => {
                 warn!(%error, "bundle encode failed");
+                if bucket_owner {
+                    self.stop_bucket_bundling(false);
+                }
                 return false;
             }
         };
@@ -6821,6 +6884,9 @@ impl NodeLogManager {
             Ok(rows) => rows,
             Err(error) => {
                 warn!(%error, "bundle self-decode failed");
+                if bucket_owner {
+                    self.stop_bucket_bundling(false);
+                }
                 return false;
             }
         };
@@ -6840,26 +6906,37 @@ impl NodeLogManager {
                 // A BUCKET read on purpose: the hazard is a peer's
                 // recovery CAS fencing this record, which the
                 // in-process copy cannot see.
+                let read = read_record(&self.bucket, &self.session).await;
                 let credit = log_tier::bundle_credit_allowed(
-                    read_record(&self.bucket, &self.session)
-                        .await
+                    read.as_ref()
                         .ok()
-                        .flatten()
-                        .as_ref()
+                        .and_then(Option::as_ref)
                         .map(|folded| &folded.record),
                     epoch,
                 );
                 if !credit {
-                    // Degrade the shipper that OWNED this flush's
-                    // epoch, not whichever is installed now: a flush
-                    // racing a legitimate reconfiguration must not
-                    // poison the successor ensemble it knows nothing
-                    // about. For a true zombie the flusher IS the
-                    // installed shipper and stops exactly as before;
-                    // for a swap race this degrades a retired object,
-                    // which is the correct no-op — the lab measured
-                    // the alternative as an epoch-churn loop.
-                    flusher.degrade("record moved under a bundle flush");
+                    match &owner {
+                        FlushOwner::Fleet(flusher, _) => {
+                            // Degrade the shipper that OWNED this flush's
+                            // epoch, not whichever is installed now: a flush
+                            // racing a legitimate reconfiguration must not
+                            // poison the successor ensemble it knows nothing
+                            // about. For a true zombie the flusher IS the
+                            // installed shipper and stops exactly as before;
+                            // for a swap race this degrades a retired object,
+                            // which is the correct no-op — the lab measured
+                            // the alternative as an epoch-churn loop.
+                            flusher.degrade("record moved under a bundle flush");
+                        }
+                        FlushOwner::Bucket(_) => {
+                            // Fenced mid-flight (record no longer Open at epoch):
+                            // stop bundling so uncredited rows fall back to per-cell
+                            // uploads, never acked on the bundle. A read the bucket
+                            // answered is definitive and latches the session; a read
+                            // error is transient and leaves it re-armable.
+                            self.stop_bucket_bundling(read.is_ok());
+                        }
+                    }
                     warn!(key, "bundle flush not credited: record moved");
                     return false;
                 }
@@ -6868,6 +6945,13 @@ impl NodeLogManager {
             }
             Err(error) => {
                 warn!(%error, key, "bundle put failed");
+                // The loop consumed this flush's wake, so no new write may come to
+                // retry it. Stop bundling: `sync_loop` (fallback tick) uploads the
+                // pending rows per cell, and the next flush re-arms from a fresh
+                // bucket read of the record.
+                if bucket_owner {
+                    self.stop_bucket_bundling(false);
+                }
                 false
             }
         }
@@ -6884,7 +6968,122 @@ impl NodeLogManager {
         // once the graceful close begins its seal scan, a new flush could
         // credit rows the scan never saw, so `closing` quiesces the sink
         // and late writes ride per-cell acks instead.
-        !self.closing.load(Ordering::SeqCst) && self.inner.lock().unwrap().is_some()
+        // Layer 2 adds the bucket path: a bucket session with a published
+        // record and an open gate bundles with no shipper at all. The gate
+        // (fleet sample + `CELLD_BUCKET_BUNDLES=1`) is re-checked per flush
+        // via `bucket_bundling`, so closing the gate falls back at once to
+        // per-cell L0 uploads for new writes.
+        if self.closing.load(Ordering::SeqCst) {
+            return false;
+        }
+        if self.inner.lock().unwrap().is_some() {
+            return true;
+        }
+        self.bucket_bundling()
+    }
+
+    /// Whether this node may run the bucket bundle path at all: not closing,
+    /// no shipper (a fleet ensemble owns tiering otherwise), and the gate is
+    /// open (fleet sample + `CELLD_BUCKET_BUNDLES=1`; the sampler opens it only
+    /// in bucket posture). The bundle loop uses this to reach
+    /// [`Self::ensure_bucket_record`], which publishes the record and only
+    /// then lets [`Self::bucket_bundling`] turn true.
+    pub(crate) fn bucket_candidate(&self) -> bool {
+        !self.closing.load(Ordering::SeqCst)
+            && self.inner.lock().unwrap().is_none()
+            && self.ltx.bucket_bundles_enabled()
+    }
+
+    /// Bucket-only bundling: a published bucket-session record, no shipper,
+    /// and an open gate. Fleet bundling is `inner.is_some()` above; this is
+    /// the layer-2 registration without an ensemble. `sync_loop` uses this to
+    /// stop per-cell L0 uploads while bundling is active, and `put_bundle`'s
+    /// split path uses it to recognise a bucket flush.
+    pub(crate) fn bucket_bundling(&self) -> bool {
+        self.bucket_epoch.load(Ordering::SeqCst) != 0 && self.bucket_candidate()
+    }
+
+    /// Stop bucket bundling so pending rows fall back to per-cell uploads
+    /// (`sync_loop` picks them up on its next wake; it has a fallback tick, so
+    /// no new write is needed), never acked on the bundle. `fenced` latches a
+    /// definitive refusal (the bucket read the record and it moved); a
+    /// transient failure (PUT or read error) leaves the session re-armable, and
+    /// re-arming re-reads the record from the bucket.
+    fn stop_bucket_bundling(&self, fenced: bool) {
+        if fenced {
+            self.bucket_fenced.store(true, Ordering::SeqCst);
+        }
+        self.bucket_epoch.store(0, Ordering::SeqCst);
+    }
+
+    /// Publish the bucket-session record through the live-session lease chain
+    /// before the first bundle-credited ack (record-before-first-ack). The
+    /// record is never deleted. Never persists `active == true` (bucket sessions
+    /// never carry fleet acks), never converts to an ensemble: callers with an
+    /// installed shipper (fleet posture) do nothing, and a present fleet record
+    /// is left alone. Returns `true` when a bucket record is installed afterwards.
+    ///
+    /// Fencing: a failed lease write means this session is fenced; the caller
+    /// must not bundle. Gate: while the bundle gate is closed no record is
+    /// created, so "no record" keeps proving the bucket complete.
+    pub(crate) async fn ensure_bucket_record(&self) -> anyhow::Result<bool> {
+        if self.inner.lock().unwrap().is_some() {
+            return Ok(false);
+        }
+        if !self.ltx.bucket_bundles_enabled() {
+            return Ok(false);
+        }
+        if self.bucket_fenced.load(Ordering::SeqCst) {
+            return Ok(false);
+        }
+        if self.bucket_epoch.load(Ordering::SeqCst) != 0 {
+            // Already armed; every flush still re-reads the record after its PUT.
+            return Ok(true);
+        }
+        let transition = self.live_log.lock().await;
+        if !transition.is_running() {
+            return Ok(false);
+        }
+        if let Some(current) = transition.current() {
+            drop(transition);
+            let record = log_from_wire(&current)?;
+            // A bucket session never converts: a fleet record here means fleet
+            // posture (or a downgraded binary's recovery); leave it alone.
+            if record.kind != log_tier::SessionKind::Bucket {
+                return Ok(false);
+            }
+            // A record no longer Open at its epoch (a successor's recovery
+            // moved it) fences this session: re-arming would PUT bundles the
+            // post-PUT check refuses on every flush.
+            if record.state != LogState::Open {
+                return Ok(false);
+            }
+            // Never persist fleet acks on a bucket session: the marker stays false.
+            debug_assert!(
+                !current.may_have_fleet_acks,
+                "bucket session must never carry fleet acks"
+            );
+            // Re-arming after a stop: the process-local record can still read
+            // Open after a successor's recovery moved the bucket copy, so the
+            // bucket answers, not the local copy. A read error retries on the
+            // next flush; a definitive answer that the record moved latches.
+            let fresh = read_record(&self.bucket, &self.session).await?;
+            let open_here = fresh.as_ref().is_some_and(|folded| {
+                folded.record.kind == log_tier::SessionKind::Bucket
+                    && log_tier::bundle_credit_allowed(Some(&folded.record), record.epoch)
+            });
+            if !open_here {
+                self.stop_bucket_bundling(true);
+                return Ok(false);
+            }
+            self.bucket_epoch.store(record.epoch, Ordering::SeqCst);
+            return Ok(true);
+        }
+        let record = log_tier::create_bucket_record();
+        let epoch = record.epoch;
+        transition.write(Some(log_to_wire(&record, false))).await?;
+        self.bucket_epoch.store(epoch, Ordering::SeqCst);
+        Ok(true)
     }
 
     /// One cell epoch's retained bundle rows, for the compaction overlay.
@@ -7460,9 +7659,8 @@ mod bucket_session_interop_tests {
     #[test]
     fn old_reader_stays_closed_on_a_corrupted_marker() {
         let mut record = log_tier::create_bucket_record();
-        let json = serde_json::to_vec(&log_to_wire(&record, true)).expect("wire encodes");
         record.state = LogState::Recovering;
-        let _ = record;
+        let json = serde_json::to_vec(&log_to_wire(&record, true)).expect("wire encodes");
         let old: V10LogWire = serde_json::from_slice(&json).expect(".10 accepts");
         assert!(old.may_have_fleet_acks, "the corrupted marker survives");
         assert!(
@@ -7473,5 +7671,435 @@ mod bucket_session_interop_tests {
             !v10_fold_proceeds(old.may_have_fleet_acks, 0),
             "the fold refuses without a follower tail instead of losing rows"
         );
+    }
+}
+
+/// Bucket-posture executor tests (layer 2). Plain `#[cfg(test)]`: CI runs without
+/// `celld_internal_tests`. Deterministic, no sleeps or polling; each behaviour has a
+/// fail-before shown by reverting. Uses the `seal_absent` harness shape (a local
+/// bucket and a real `LtxRepl`) and drives `put_bundle` directly, so the
+/// bundle-vs-per-cell contrast does not depend on background-loop timing.
+#[cfg(test)]
+mod bucket_executor_tests {
+    use super::*;
+    use crate::ownership_store::{NodeLeaseWire, NodeLoadWire};
+
+    fn test_manager(dir: &std::path::Path) -> (NodeLogManager, Arc<Bucket>) {
+        let database = dir.join("objects.sqlite3");
+        let bucket = Arc::new(crate::dev::open_local_bucket(&database).expect("dev bucket"));
+        let replication = crate::ltx_replication::Replication::start(
+            bucket.as_ref().clone(),
+            &dir.join("watch"),
+            None,
+            "test".into(),
+            None,
+        )
+        .expect("replication starts");
+        let ownership = Arc::new(crate::ownership_store::BucketOwnership::new(
+            bucket.as_ref().clone(),
+            bucket.as_ref().clone(),
+            "n0".into(),
+            "test-probe-key".into(),
+        ));
+        let own_log = Arc::new(OwnLog {
+            ownership,
+            nudge: Box::new(|| {}),
+            write_lock: tokio::sync::Mutex::new(()),
+        });
+        let auth = Arc::new(PeerAuth::new([0u8; 32], "n0").expect("test auth"));
+        let manager = NodeLogManager::new(
+            "n0/gen1",
+            bucket.clone(),
+            own_log,
+            replication.ltx(),
+            auth,
+            celld_logic::log_evict::EvictionPolicy::default(),
+        );
+        (manager, bucket)
+    }
+
+    fn open_gate(manager: &NodeLogManager) {
+        manager.ltx.set_bucket_bundles_fleet(true);
+        manager
+            .ltx
+            .set_bucket_bundles_env_override_for_test(Some(true));
+    }
+
+    fn close_gate(manager: &NodeLogManager) {
+        manager.ltx.set_bucket_bundles_fleet(false);
+    }
+
+    /// Publish a bucket-session lease directly (simulating the live-session lease
+    /// chain without a running lease writer) and mirror the epoch in memory, as
+    /// `ensure_bucket_record` does after its `transition.write` applies.
+    async fn publish_bucket_open(manager: &NodeLogManager, bucket: &Bucket) {
+        let record = log_tier::create_bucket_record();
+        let wire = NodeLeaseWire {
+            node: "n0".into(),
+            expires_ms: crate::ownership_store::now_ms() + 3_600_000,
+            addr: String::new(),
+            probe_public_key: String::new(),
+            peer_protocol: 1,
+            paced_handoff: false,
+            generation: "gen1".into(),
+            log: Some(log_to_wire(&record, false)),
+            load: NodeLoadWire::default(),
+        };
+        bucket
+            .put(
+                &lease_key("n0"),
+                serde_json::to_vec(&wire).expect("lease encodes"),
+            )
+            .await
+            .expect("lease publishes");
+        manager.bucket_epoch.store(record.epoch, Ordering::SeqCst);
+    }
+
+    async fn publish_bucket_sealed(_manager: &NodeLogManager, bucket: &Bucket) {
+        let mut record = log_tier::create_bucket_record();
+        record.state = LogState::Sealed;
+        let wire = NodeLeaseWire {
+            node: "n0".into(),
+            expires_ms: crate::ownership_store::now_ms() + 3_600_000,
+            addr: String::new(),
+            probe_public_key: String::new(),
+            peer_protocol: 1,
+            paced_handoff: false,
+            generation: "gen1".into(),
+            log: Some(log_to_wire(&record, false)),
+            load: NodeLoadWire::default(),
+        };
+        bucket
+            .put(
+                &lease_key("n0"),
+                serde_json::to_vec(&wire).expect("lease encodes"),
+            )
+            .await
+            .expect("seal publishes");
+    }
+
+    fn bundle_entry(cell: &str, txid: u64) -> celld_ltx::bundle::BundleEntry {
+        celld_ltx::bundle::BundleEntry {
+            cell: cell.to_string(),
+            cell_epoch: 1,
+            txid,
+            bytes: vec![0xA5u8; 64],
+        }
+    }
+
+    async fn bundle_keys(bucket: &Bucket, prefix: &str) -> Vec<String> {
+        bucket
+            .list(prefix)
+            .await
+            .expect("list works")
+            .into_iter()
+            .map(|meta| meta.location.as_ref().to_string())
+            .collect()
+    }
+
+    /// Single-node bucket contrast: with the gate open, one bundle PUT carries the
+    /// write; the per-cell prefix gets no L0 PUTs. Fail-before: without the install
+    /// (`publish_bucket_open` removed) `put_bundle` refuses and no bundle appears.
+    #[test]
+    fn bucket_bundles_carry_writes_without_per_cell_uploads() {
+        let runtime = crate::asyncrt::shared_test_runtime();
+        runtime.block_on(async {
+            let dir = tempfile::tempdir().expect("test dir");
+            let (manager, bucket) = test_manager(dir.path());
+            open_gate(&manager);
+            assert!(!manager.bundle_active(), "no record yet: no bundling");
+            assert!(
+                !manager.put_bundle(vec![bundle_entry("c0", 1)]).await,
+                "no epoch: refused"
+            );
+            publish_bucket_open(&manager, &bucket).await;
+            assert!(
+                manager.bundle_active(),
+                "session + record + open gate bundles"
+            );
+            assert!(manager.bucket_bundling(), "bucket path, no shipper");
+            assert!(
+                manager.put_bundle(vec![bundle_entry("c0", 1)]).await,
+                "open record credits"
+            );
+            let bundles = bundle_keys(&bucket, "log/n0/gen1/bundle/").await;
+            assert_eq!(
+                bundles.len(),
+                1,
+                "one shared PUT lands in the bundle prefix"
+            );
+            let per_cell = bundle_keys(&bucket, "cells/").await;
+            assert!(
+                per_cell.is_empty(),
+                "no per-cell L0 PUTs until drain or eviction"
+            );
+            // Ack still rides `ProofSource::Bucket` (hence the unchanged `own.json`
+            // ownership read, 0056-shared): no fleet proof was ever installed.
+            assert!(
+                manager.inner.lock().unwrap().is_none(),
+                "no shipper: proof is bucket, not fleet"
+            );
+        });
+    }
+
+    /// Cross-cell batching: four dirty cells ride ONE bundle PUT. Fail-before: a
+    /// per-cell flush needs four PUTs here.
+    #[test]
+    fn concurrent_cells_share_one_bundle_put() {
+        let runtime = crate::asyncrt::shared_test_runtime();
+        runtime.block_on(async {
+            let dir = tempfile::tempdir().expect("test dir");
+            let (manager, bucket) = test_manager(dir.path());
+            open_gate(&manager);
+            publish_bucket_open(&manager, &bucket).await;
+            let entries: Vec<_> = (0..4).map(|i| bundle_entry(&format!("c{i}"), 1)).collect();
+            assert!(
+                manager.put_bundle(entries).await,
+                "one flush carries all four"
+            );
+            let bundles = bundle_keys(&bucket, "log/n0/gen1/bundle/").await;
+            assert_eq!(
+                bundles.len(),
+                1,
+                "N cells share ONE bundle PUT while one is in flight"
+            );
+        });
+    }
+
+    /// Gate closed (a live format-2 lease in the sample): no bundles, per-cell L0 as
+    /// today. Fail-before: judging the gate open here writes bundles under a live old
+    /// reader.
+    #[test]
+    fn closed_gate_writes_no_bundles() {
+        let runtime = crate::asyncrt::shared_test_runtime();
+        runtime.block_on(async {
+            let dir = tempfile::tempdir().expect("test dir");
+            let (manager, bucket) = test_manager(dir.path());
+            // Even with a published record and the operator switch on, a live
+            // format-2 lease (fleet flag false) holds the gate closed: the node must
+            // not write bundles under a reader that could misread absence.
+            manager
+                .ltx
+                .set_bucket_bundles_env_override_for_test(Some(true));
+            publish_bucket_open(&manager, &bucket).await;
+            close_gate(&manager);
+            assert!(!manager.bundle_active(), "closed gate never bundles");
+            assert!(
+                !manager.bucket_bundling(),
+                "closed gate falls back to per-cell"
+            );
+            assert!(
+                !manager.put_bundle(vec![bundle_entry("c0", 1)]).await,
+                "closed gate refuses"
+            );
+            // One bundle from the open-gate publish would already exist if the gate
+            // had been open; here the publish wrote the lease but no bundle object.
+            let bundles = bundle_keys(&bucket, "log/n0/gen1/bundle/").await;
+            assert!(bundles.is_empty(), "gate closed: no bundle objects");
+        });
+    }
+
+    /// Record-before-ack: the first bundle-credited ack happens only after the record
+    /// exists in the lease. Fail-before: PUT-before-record credits (reorder the two
+    /// steps and this goes red).
+    #[test]
+    fn first_bundle_credit_waits_for_the_record() {
+        let runtime = crate::asyncrt::shared_test_runtime();
+        runtime.block_on(async {
+            let dir = tempfile::tempdir().expect("test dir");
+            let (manager, bucket) = test_manager(dir.path());
+            open_gate(&manager);
+            assert!(
+                !manager.put_bundle(vec![bundle_entry("c0", 1)]).await,
+                "no record: no credit"
+            );
+            assert!(
+                read_record(&bucket, "n0/gen1")
+                    .await
+                    .expect("read works")
+                    .is_none(),
+                "no record yet"
+            );
+            // An epoch mirrored without the lease (a buggy ensure that sets the in-memory
+            // epoch before the lease write applies) must still not credit: the PUT is
+            // unconditional, so only the post-PUT bucket re-read proves durability.
+            manager.bucket_epoch.store(1, Ordering::SeqCst);
+            assert!(
+                !manager.put_bundle(vec![bundle_entry("c0", 1)]).await,
+                "epoch without lease: no credit"
+            );
+            manager.bucket_epoch.store(0, Ordering::SeqCst);
+            publish_bucket_open(&manager, &bucket).await;
+            assert!(
+                read_record(&bucket, "n0/gen1")
+                    .await
+                    .expect("read works")
+                    .is_some(),
+                "record before ack"
+            );
+            assert!(
+                manager.put_bundle(vec![bundle_entry("c0", 1)]).await,
+                "record first, then credit"
+            );
+        });
+    }
+
+    /// Zombie credit after seal is refused: a PUT that completes after recovery sealed
+    /// the session is never credited, the node stops bundling, and the write is
+    /// re-proven per cell or failed — never acked on the bundle.
+    #[test]
+    fn zombie_put_after_seal_is_never_credited() {
+        let runtime = crate::asyncrt::shared_test_runtime();
+        runtime.block_on(async {
+            let dir = tempfile::tempdir().expect("test dir");
+            let (manager, bucket) = test_manager(dir.path());
+            open_gate(&manager);
+            publish_bucket_open(&manager, &bucket).await;
+            assert!(
+                manager.put_bundle(vec![bundle_entry("c0", 1)]).await,
+                "open record credits"
+            );
+            publish_bucket_sealed(&manager, &bucket).await;
+            assert!(
+                !manager.put_bundle(vec![bundle_entry("c0", 2)]).await,
+                "sealed record refuses the zombie"
+            );
+            assert_eq!(
+                manager.bucket_epoch.load(Ordering::SeqCst),
+                0,
+                "refusal stops bundling for per-cell fallback"
+            );
+            assert!(
+                !manager.bundle_active(),
+                "fenced node falls back to per-cell"
+            );
+        });
+    }
+
+    /// Mirror an Open bucket record into the process-local lease state, as the
+    /// lease writer does after `ensure_bucket_record`'s write applies.
+    fn mirror_local_open(manager: &NodeLogManager) {
+        let record = log_tier::create_bucket_record();
+        manager
+            .live_log
+            .own_log
+            .ownership
+            .set_own_log(Some(log_to_wire(&record, false)));
+    }
+
+    /// A refused session never re-arms from its stale process-local record: the
+    /// local copy still reads Open after a successor sealed the bucket copy, and
+    /// re-arming from it would suppress per-cell uploads and repeat the refused
+    /// PUT on every flush. Fail-before: re-arming from the local record returns
+    /// true here.
+    #[test]
+    fn refused_session_never_rearms_from_stale_local_record() {
+        let runtime = crate::asyncrt::shared_test_runtime();
+        runtime.block_on(async {
+            let dir = tempfile::tempdir().expect("test dir");
+            let (manager, bucket) = test_manager(dir.path());
+            open_gate(&manager);
+            publish_bucket_open(&manager, &bucket).await;
+            mirror_local_open(&manager);
+            assert!(
+                manager.put_bundle(vec![bundle_entry("c0", 1)]).await,
+                "open record credits"
+            );
+            publish_bucket_sealed(&manager, &bucket).await;
+            assert!(
+                !manager.put_bundle(vec![bundle_entry("c0", 2)]).await,
+                "sealed record refuses"
+            );
+            assert!(
+                !manager.ensure_bucket_record().await.expect("ensure runs"),
+                "the stale local Open record must not re-arm a fenced session"
+            );
+            assert_eq!(manager.bucket_epoch.load(Ordering::SeqCst), 0);
+            assert!(!manager.bucket_bundling(), "per-cell uploads stay on");
+        });
+    }
+
+    /// A failed bundle PUT falls back at once instead of waiting for another
+    /// write: the loop consumed the flush's wake, so a still-armed session would
+    /// keep per-cell uploads suppressed and the pending ack would time out. Once
+    /// the store answers again, the session re-arms from a fresh bucket read.
+    /// Fail-before: without the stop, `bucket_bundling` stays true after the
+    /// failed PUT.
+    #[test]
+    fn failed_bundle_put_falls_back_then_rearms_from_the_bucket() {
+        let runtime = crate::asyncrt::shared_test_runtime();
+        runtime.block_on(async {
+            let dir = tempfile::tempdir().expect("test dir");
+            let (manager, bucket) = test_manager(dir.path());
+            open_gate(&manager);
+            publish_bucket_open(&manager, &bucket).await;
+            mirror_local_open(&manager);
+            let store = rusqlite::Connection::open(dir.path().join("objects.sqlite3"))
+                .expect("store opens");
+            store
+                .execute("ALTER TABLE objects RENAME TO objects_offline", [])
+                .expect("store goes offline");
+            assert!(
+                !manager.put_bundle(vec![bundle_entry("c0", 1)]).await,
+                "an offline store refuses the PUT"
+            );
+            assert!(
+                !manager.bucket_bundling(),
+                "pending rows fall back to per-cell uploads at once"
+            );
+            assert!(
+                !manager.ensure_bucket_record().await.unwrap_or(false),
+                "no re-arm while the record cannot be read"
+            );
+            store
+                .execute("ALTER TABLE objects_offline RENAME TO objects", [])
+                .expect("store comes back");
+            assert!(
+                manager.ensure_bucket_record().await.expect("ensure runs"),
+                "a transient failure re-arms from the bucket's Open record"
+            );
+            assert!(
+                manager.put_bundle(vec![bundle_entry("c0", 1)]).await,
+                "bundling resumes"
+            );
+        });
+    }
+
+    /// A bucket session never carries `active == true` and never becomes an ensemble:
+    /// `maintain` leaves it alone. Fail-before: removing the guard recruits.
+    #[test]
+    fn bucket_session_never_recruits_or_marks_fleet_acks() {
+        let runtime = crate::asyncrt::shared_test_runtime();
+        runtime.block_on(async {
+            let dir = tempfile::tempdir().expect("test dir");
+            let (manager, bucket) = test_manager(dir.path());
+            open_gate(&manager);
+            publish_bucket_open(&manager, &bucket).await;
+            let folded = read_record(&bucket, "n0/gen1")
+                .await
+                .expect("read works")
+                .expect("record present");
+            assert_eq!(
+                folded.record.kind,
+                log_tier::SessionKind::Bucket,
+                "bucket flavour"
+            );
+            assert!(folded.record.ensemble.is_empty(), "no ensemble, ever");
+            assert!(!folded.may_have_fleet_acks, "never active == true");
+            // Mirror into the live lease so `maintain` sees the bucket flavour.
+            manager
+                .ownership
+                .set_own_log(Some(log_to_wire(&folded.record, false)));
+            let outcome = manager.maintain().await.expect("maintain runs");
+            assert_eq!(
+                outcome,
+                MaintainOutcome::Other,
+                "bucket session never recruits"
+            );
+            assert!(
+                manager.inner.lock().unwrap().is_none(),
+                "no silent bucket-to-fleet conversion"
+            );
+        });
     }
 }

@@ -29,6 +29,19 @@ impl Replication {
         self.ltx.paged_fleet()
     }
 
+    /// See `LtxRepl::set_bucket_bundles_fleet`: the fleet sampler's answer to
+    /// whether every live lease reads bucket-posture bundle proofs (format 3).
+    /// Off until the first sample; the per-flush path additionally requires
+    /// `CELLD_BUCKET_BUNDLES=1`.
+    pub fn set_bucket_bundles_fleet(&self, ready: bool) -> bool {
+        self.ltx.set_bucket_bundles_fleet(ready)
+    }
+
+    /// Whether the fleet sample currently permits bucket bundles (format gate only).
+    pub fn bucket_bundles_fleet(&self) -> bool {
+        self.ltx.bucket_bundles_fleet()
+    }
+
     pub fn start(
         bucket: crate::bucket::Bucket,
         watch: &Path,

@@ -732,6 +732,24 @@ push to `ghcr.io/denoland`, but still. Pushing a branch named
   decodes the new record (unknown key ignored) and either folds the whole bundle
   prefix with no loss declaration or refuses the fold; never complete, never a
   dropped row. Downgrade safety rests on that recovery-correctness, not on refusal.
+- `0060` (sha TBD at merge) the bucket-posture executor (layer 2): a bucket node with
+  an open gate installs a registration without an ensemble, publishes its bucket-session
+  record through the live-session lease chain before the first bundle-credited ack (never
+  deleted, never `active == true`), and `bundle_active` fires with no shipper. Reuses
+  `put_bundle` verbatim (PUT → bucket re-read → `bundle_credit_allowed` → credit or
+  degrade); credit advances the same `synced_seq`/`durable_txid`, so acks return
+  `ProofSource::Bucket` behind the unchanged `own.json` ownership read. Gate: bundles only
+  while `bucket_bundles_allowed` (off until the first fleet sample, re-checked per flush;
+  `main.rs` mirrors the paged gate) AND `CELLD_BUCKET_BUNDLES=1` — OFF by default, so a
+  partial stack never ships enabled until layers 3-5 merge. Gate closed (or credit refused
+  after a seal/zombie) falls back at once to per-cell L0 uploads for uncredited rows.
+  Group commit is event-driven: flush at once when dirty and no PUT is in flight, again as
+  soon as one completes, on a dedicated `Notify` the sync loop cannot steal; optional
+  `CELLD_BUCKET_BUNDLE_LINGER_MS` (default 0, cap 1000) holds a round open to batch more;
+  capped by rows/bytes and split above the cap; fleet path unchanged. Bucket posture only
+  (`CELLD_DURABILITY=bucket`). `maintain` never converts a bucket session to an ensemble; no
+  posture watch or recruit on bucket posture. Layers 3-5 still pending (successor fold of
+  bucket bundles, drain/GC/graceful seal for bucket sessions) — do not enable in production.
 - `0062` (sha TBD at merge) parity item (iv) layer 1, core-only: the per-round
   fence credit predicate plus the output-gate settlement it feeds. `log_tier`
   gains a two-arm credit check per flush-round cell — the session-record arm
