@@ -686,6 +686,26 @@ push to `ghcr.io/denoland`, but still. Pushing a branch named
   Measured on the same 200 short-lived Durable Objects: stored `cells/`
   bytes 2.47 MB → 0.57 MB, objects 1800 → 400 (L0 1400 → 0; the 200
   snapshots stay).
+- `0059` (sha TBD at merge) the sans-I/O core for bucket-posture group commit
+  (layer 1; no executor or fold wiring yet). `BUCKET_FORMAT` becomes 3, and a
+  bucket node writes shared bundle proofs only while `bucket_bundles_allowed`
+  (every live lease reads format 3; a single-node fleet's own lease opens it,
+  no live lease at all stays closed). Each feature judges the fleet against its
+  own minimum — `PAGED_FORMAT` (2) for the paged-epoch gate, `BUCKET_BUNDLES_FORMAT`
+  (3) for bundles — so the bump never closes paged epochs on a mixed fleet. The
+  node-log record gains a bucket-session flavour (`SessionKind::Bucket`, wire key
+  `"bucket"`; old records read as fleet, old binaries ignore the key) with a
+  `create_bucket_record` constructor for the record-before-first-ack rule;
+  `takeover_gate` already recovers-first on any live record and is pinned so a
+  bucket session is never complete unless sealed; credit
+  still demands `Open`-at-epoch after the PUT (`bundle_credit_allowed`) and the
+  seal still demands an empty retained-bundle scan (`graceful_seal_allowed`). Two
+  pure predicates for the layer-3 fold — `may_declare_bounded_loss` and
+  `requires_fleet_witness` — are always false for bucket sessions and preserve
+  today's fleet behaviour exactly. Proven fail-closed for a format-2 reader: it
+  decodes the new record (unknown key ignored) and either folds the whole bundle
+  prefix with no loss declaration or refuses the fold; never complete, never a
+  dropped row. Downgrade safety rests on that recovery-correctness, not on refusal.
 
 Patches `0025`–`0034` are ported fixes from
 [meln1k/celld](https://github.com/meln1k/celld) by Nikita

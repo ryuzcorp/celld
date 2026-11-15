@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): operator token for the internal listener; list_page resume is a cursor; ported from meln1k/celld: seal a dead lease that never opened a log (01522b3); seal_absent_log regression tests; lone-node repair backoff.
+// Modified by ryuzcorp (ryuzcorp/celld): operator token for the internal listener; list_page resume is a cursor; ported from meln1k/celld: seal a dead lease that never opened a log (01522b3); seal_absent_log regression tests; lone-node repair backoff; bucket-posture group commit: bucket-session record encoding + old-reader interop tests (0059).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! v0 of the in-fleet replicated log tier (`CELLD_DURABILITY=fleet`).
@@ -551,6 +551,12 @@ fn log_from_wire(log: &crate::ownership_store::NodeLogWire) -> anyhow::Result<lo
             "sealed" => LogState::Sealed,
             other => return Err(anyhow!("unknown log record state {other:?}")),
         },
+        // Absent on every record older releases wrote: those read as fleet.
+        kind: if log.bucket {
+            log_tier::SessionKind::Bucket
+        } else {
+            log_tier::SessionKind::Fleet
+        },
         claimant: log.claimant.clone(),
         claimed_ms: log.claimed_ms,
     })
@@ -571,6 +577,7 @@ pub(crate) fn log_to_wire(
         ensemble: record.ensemble.iter().cloned().collect(),
         tiered: record.tiered,
         may_have_fleet_acks,
+        bucket: record.kind == log_tier::SessionKind::Bucket,
         claimant: record.claimant.clone(),
         claimed_ms: record.claimed_ms,
     }
@@ -5903,6 +5910,9 @@ impl NodeLogManager {
                 ensemble: ensemble.clone(),
                 tiered: 0,
                 state: LogState::Open,
+                // Fleet maintain path only: bucket sessions never reopen into
+                // an ensemble (layer-2 contract; see bundles.contracts.md §5).
+                kind: log_tier::SessionKind::Fleet,
                 claimant: None,
                 claimed_ms: None,
             },
@@ -7169,6 +7179,7 @@ mod seal_absent_log_tests {
             ensemble: Vec::new(),
             tiered: 0,
             may_have_fleet_acks: false,
+            bucket: false,
             claimant: None,
             claimed_ms: None,
         }
@@ -7308,5 +7319,159 @@ mod seal_absent_log_tests {
             .expect("cas runs");
             assert!(applied.is_none(), "a stale token loses the CAS race");
         });
+    }
+}
+
+/// Invariant (d): a format-2 (`.10`) reader fails closed on a bucket-session
+/// record. `.10` has no `deny_unknown_fields` and no log version field, so it
+/// silently accepts the `bucket` key — this module freezes the `.10` wire shape
+/// and the `.10` gate/guard logic beside the new encoder and proves the silent
+/// acceptance is safe: never `BucketComplete`, never a loss declaration, and a
+/// fold that either proceeds on bundle coverage (marker false) or refuses
+/// (marker corrupted true). Plain `#[cfg(test)]`: CI runs without the
+/// `celld_internal_tests` cfg.
+#[cfg(test)]
+mod bucket_session_interop_tests {
+    use super::*;
+    use crate::ownership_store::NodeLogWire;
+
+    /// Frozen copy of the `.10` (format-2) node-log wire shape: no `bucket`
+    /// key, no `deny_unknown_fields`. Decoding the new record with this is what
+    /// a `.10` binary does with these bytes.
+    #[derive(serde::Deserialize)]
+    struct V10LogWire {
+        state: String,
+        epoch: u64,
+        ensemble: Vec<String>,
+        tiered: u64,
+        #[serde(default, rename = "active")]
+        may_have_fleet_acks: bool,
+        #[serde(default)]
+        claimant: Option<String>,
+        #[serde(default)]
+        claimed_ms: Option<u64>,
+    }
+
+    /// Frozen `.10` state match (`log_from_wire`): unknown states error.
+    fn v10_state(state: &str) -> anyhow::Result<LogState> {
+        match state {
+            "open" => Ok(LogState::Open),
+            "recovering" => Ok(LogState::Recovering),
+            "sealed" => Ok(LogState::Sealed),
+            other => anyhow::bail!("unknown log record state {other:?}"),
+        }
+    }
+
+    /// Frozen `.10` takeover gate: `None`/sealed is complete, else recover.
+    fn v10_takeover_gate(state: Option<&LogState>) -> log_tier::TakeoverGate {
+        match state {
+            None => log_tier::TakeoverGate::BucketComplete,
+            Some(state) if *state == LogState::Sealed => log_tier::TakeoverGate::BucketComplete,
+            Some(_) => log_tier::TakeoverGate::RecoverFirst,
+        }
+    }
+
+    /// Frozen `.10` bounded-loss guard static part (`recover_serial`): with zero
+    /// complete witnesses, only an active non-empty ensemble declares.
+    fn v10_may_declare_loss(
+        complete_witnesses: usize,
+        may_have_fleet_acks: bool,
+        ensemble: &[String],
+    ) -> bool {
+        complete_witnesses == 0 && may_have_fleet_acks && !ensemble.is_empty()
+    }
+
+    /// Frozen `.10` fold witness guard (`fold_cell`): an epoch without fleet
+    /// acks proceeds without a follower tail.
+    fn v10_fold_proceeds(may_have_fleet_acks: bool, complete_witnesses: usize) -> bool {
+        !may_have_fleet_acks || complete_witnesses > 0
+    }
+
+    fn bucket_wire(state: LogState) -> Vec<u8> {
+        let mut record = log_tier::create_bucket_record();
+        record.state = state;
+        // Bucket sessions never carry fleet acks: the marker stays false.
+        let wire = log_to_wire(&record, false);
+        assert!(wire.bucket, "the new encoder names the bucket flavour");
+        serde_json::to_vec(&wire).expect("wire encodes")
+    }
+
+    /// The current decoder round-trips the flavour; the `.10` shape accepts the
+    /// same bytes (unknown key ignored) and reads open / ensemble-less / no
+    /// fleet acks.
+    #[test]
+    fn old_reader_accepts_and_misreads_nothing() {
+        let json = bucket_wire(LogState::Open);
+        let current: NodeLogWire = serde_json::from_slice(&json).expect("current decodes");
+        assert_eq!(
+            log_from_wire(&current).expect("current maps").kind,
+            log_tier::SessionKind::Bucket
+        );
+        let old: V10LogWire = serde_json::from_slice(&json).expect(".10 accepts the bytes");
+        assert_eq!(old.state, "open");
+        assert!(old.ensemble.is_empty());
+        assert!(!old.may_have_fleet_acks);
+        // Every frozen field is read: the shape must stay byte-compatible with
+        // what `.10` parsed, not just the fields the gate consults.
+        assert_eq!(old.epoch, 1);
+        assert_eq!(old.tiered, 0);
+        assert_eq!(old.claimant, None);
+        assert_eq!(old.claimed_ms, None);
+        assert_eq!(v10_state(&old.state).expect("state maps"), LogState::Open);
+    }
+
+    /// Invariant (d): `.10` never treats a bucket-session record as complete —
+    /// open or recovering recovers first (whole-prefix fold, no loss), sealed
+    /// proves complete. So a `.10` successor or a `.10` restart either folds
+    /// every bundle or refuses; it never takes the bucket as complete.
+    #[test]
+    fn old_reader_never_treats_a_bucket_record_as_complete() {
+        for (state, complete) in [
+            (LogState::Open, false),
+            (LogState::Recovering, false),
+            (LogState::Sealed, true),
+        ] {
+            let json = bucket_wire(state);
+            let old: V10LogWire = serde_json::from_slice(&json).expect(".10 accepts");
+            let mapped = v10_state(&old.state).expect("state maps");
+            let gate = v10_takeover_gate(Some(&mapped));
+            assert_eq!(
+                gate == log_tier::TakeoverGate::BucketComplete,
+                complete,
+                ".10 gate on {state:?}"
+            );
+            // Zero witnesses (empty ensemble has none): no loss declared, and
+            // the fold proceeds on bundle coverage alone.
+            assert!(
+                !v10_may_declare_loss(0, old.may_have_fleet_acks, &old.ensemble),
+                ".10 declares no loss for {state:?}"
+            );
+            assert!(
+                v10_fold_proceeds(old.may_have_fleet_acks, 0),
+                ".10 folds without a follower tail for {state:?}"
+            );
+        }
+    }
+
+    /// Defence in depth: even with a corrupted ack-history marker (`active`
+    /// true, which bucket sessions never persist), `.10` stays fail-closed —
+    /// the empty ensemble still exempts the loss declaration, and the fold
+    /// refuses instead of restoring past unwitnessed rows.
+    #[test]
+    fn old_reader_stays_closed_on_a_corrupted_marker() {
+        let mut record = log_tier::create_bucket_record();
+        let json = serde_json::to_vec(&log_to_wire(&record, true)).expect("wire encodes");
+        record.state = LogState::Recovering;
+        let _ = record;
+        let old: V10LogWire = serde_json::from_slice(&json).expect(".10 accepts");
+        assert!(old.may_have_fleet_acks, "the corrupted marker survives");
+        assert!(
+            !v10_may_declare_loss(0, old.may_have_fleet_acks, &old.ensemble),
+            "empty ensemble exempts the loss declaration"
+        );
+        assert!(
+            !v10_fold_proceeds(old.may_have_fleet_acks, 0),
+            "the fold refuses without a follower tail instead of losing rows"
+        );
     }
 }

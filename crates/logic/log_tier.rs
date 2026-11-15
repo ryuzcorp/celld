@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): ported from meln1k/celld: seal a dead lease that never opened a log (01522b3); lone-node repair backoff schedule.
+// Modified by ryuzcorp (ryuzcorp/celld): ported from meln1k/celld: seal a dead lease that never opened a log (01522b3); lone-node repair backoff schedule; bucket-posture group commit: bucket session flavour, loss/witness predicates (0059).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! Decision core for the in-fleet replicated log tier (design stage; not
@@ -38,6 +38,23 @@ pub enum LogState {
     Sealed,
 }
 
+/// Which durability proof a session's acknowledgements ride. Readers branch
+/// recovery on it: a bucket session never declares fleet-style bounded loss and
+/// never demands follower witnesses (see [`may_declare_bounded_loss`] and
+/// [`requires_fleet_witness`]). There is deliberately no `Default`: every
+/// constructor names the kind it creates, so a new session flavour cannot
+/// silently inherit the wrong recovery rule.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SessionKind {
+    /// Fleet posture: frames stream to a follower ensemble, and a durable ack
+    /// means every member holds the frame.
+    Fleet,
+    /// Bucket posture: rows ride shared bundle PUTs proven by the
+    /// bucket-session record. There is no follower ensemble and never was;
+    /// recovery drains the bundle prefix and nothing else.
+    Bucket,
+}
+
 /// `log/<node>.json`. Every mutation is a conditional write; the executor
 /// must treat a lost CAS as anothers' turn, never retry blindly.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -47,6 +64,7 @@ pub struct LogRecord {
     /// Offsets at or below this are durable in the bucket.
     pub tiered: Offset,
     pub state: LogState,
+    pub kind: SessionKind,
     /// The node recovering this log while `state` is `Recovering`, and the
     /// last instant it said so. A recovery reads every retained bundle of
     /// the dead session, which takes minutes on a loaded fleet, and every
@@ -70,9 +88,32 @@ pub fn create_record(ensemble: BTreeSet<NodeId>, bucket_end: Offset) -> Option<L
         ensemble,
         tiered: bucket_end,
         state: LogState::Open,
+        kind: SessionKind::Fleet,
         claimant: None,
         claimed_ms: None,
     })
+}
+
+/// Created before the first bundle-credited ack of a bucket-posture node: a
+/// bucket node with format 3 writes this record first, so "no record" keeps
+/// proving the bucket complete (invariant (a)) while the format gate
+/// ([`crate::format::bucket_bundles_allowed`]) keeps any reader that could
+/// misread absence from ever being live. The ensemble is empty and stays
+/// empty: a bucket session never recruits followers, and the maintenance loop
+/// must never reconfigure it into an ensemble — no silent bucket-to-fleet
+/// conversion. `tiered` is 0: a bucket session has no log fragment, so there
+/// is no fragment base to anchor; per-cell watermarks bound its rows, and
+/// recovery folds the whole bundle prefix regardless of this floor.
+pub fn create_bucket_record() -> LogRecord {
+    LogRecord {
+        epoch: 1,
+        ensemble: BTreeSet::new(),
+        tiered: 0,
+        state: LogState::Open,
+        kind: SessionKind::Bucket,
+        claimant: None,
+        claimed_ms: None,
+    }
 }
 
 /// One follower's copy of one node log: the open fragment `(base, end]` at
@@ -172,6 +213,11 @@ pub fn plan_reconfigure(
             ensemble,
             tiered: log_end,
             state: LogState::Open,
+            // Carried through, never converted: a reconfiguration must not
+            // silently turn a bucket session into a fleet one (or back). The
+            // maintenance loop must never offer a bucket session here at all;
+            // the carry keeps the flavour visible if it ever is.
+            kind: current.kind,
             claimant: None,
             claimed_ms: None,
         },
@@ -266,10 +312,18 @@ pub fn finish_recovery(record: &LogRecord, cert: Offset) -> Option<LogRecord> {
 
 /// May a per-cell takeover of this node's cells treat the bucket as
 /// complete? Absence is a proof, not a guess: the record is created before
-/// the first fleet-durable ack and never deleted, so no record means the
+/// the first fleet-durable ack — and, for bucket-posture group commit, before
+/// the first bundle-credited ack — and never deleted, so no record means the
 /// node never acknowledged anything the bucket does not hold. It stays a
 /// proof only while no record can appear, so a takeover first seals an
 /// expired lease that carries none ([`sealed_absent`]).
+///
+/// A bucket session is never `BucketComplete` while its record exists:
+/// acked rows may live only in `log/<node>/bundle/`, so every live bucket
+/// record (`SessionKind::Bucket`) recovers first, and only a sealed one
+/// proves the bucket complete. The absence leg of invariant (a) is upheld
+/// outside this function, by record-before-first-ack plus the format gate
+/// ([`crate::format::bucket_bundles_allowed`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TakeoverGate {
     BucketComplete,
@@ -286,6 +340,9 @@ pub fn sealed_absent() -> LogRecord {
         ensemble: BTreeSet::new(),
         tiered: 0,
         state: LogState::Sealed,
+        // Fleet-shaped by construction: this seals a lease that carries no
+        // log at all, so there is no bucket session to name.
+        kind: SessionKind::Fleet,
         claimant: None,
         claimed_ms: None,
     }
@@ -297,6 +354,29 @@ pub fn takeover_gate(record: Option<&LogRecord>) -> TakeoverGate {
         Some(record) if record.state == LogState::Sealed => TakeoverGate::BucketComplete,
         Some(_) => TakeoverGate::RecoverFirst,
     }
+}
+
+/// May recovery of this session declare fleet-style bounded loss? This is the
+/// static part of the `recover_serial` witness verdict, lifted into a pure
+/// predicate so layer 3 calls it instead of inlining a second copy: with zero
+/// complete witnesses, a fleet session whose epoch may hold fleet acks and whose
+/// ensemble could still hide them must declare the loss as a record before it
+/// seals. A bucket session must never: its acks rode bundle PUTs, there are no
+/// follower fragments to be missing, and the empty-ensemble conjunct keeps even
+/// a corrupted ack-history marker from declaring. The drain either finds the rows
+/// in the bundle prefix or the session never acked them.
+pub fn may_declare_bounded_loss(record: &LogRecord, may_have_fleet_acks: bool) -> bool {
+    record.kind == SessionKind::Fleet && may_have_fleet_acks && !record.ensemble.is_empty()
+}
+
+/// Must a single-cell fold of this session see a complete follower tail before
+/// restoring? This is the static part of the `fold_cell` witness demand: an epoch
+/// with possible fleet acknowledgements needs a ranged tail proving a current
+/// member returned every retained sequence. A bucket session never demands one:
+/// the bundle prefix is the only witness it ever had, so the fold proceeds on
+/// bundle coverage alone.
+pub fn requires_fleet_witness(record: &LogRecord, may_have_fleet_acks: bool) -> bool {
+    record.kind == SessionKind::Fleet && may_have_fleet_acks
 }
 
 /// What the maintenance loop must do with its OWN session's record before
@@ -575,5 +655,142 @@ mod repair_interval_tests {
             10_000,
             "a stepped pass keeps the 10 s cap even when it also found no peer"
         );
+    }
+}
+
+#[cfg(test)]
+mod bucket_session_tests {
+    use super::*;
+
+    fn fleet_record(state: LogState) -> LogRecord {
+        let mut ensemble = BTreeSet::new();
+        ensemble.insert(NodeId::from("n1"));
+        LogRecord {
+            epoch: 7,
+            ensemble,
+            tiered: 100,
+            state,
+            kind: SessionKind::Fleet,
+            claimant: None,
+            claimed_ms: None,
+        }
+    }
+
+    fn bucket_record(state: LogState) -> LogRecord {
+        let mut record = create_bucket_record();
+        record.state = state;
+        record
+    }
+
+    /// The constructor names the flavour: open, ensemble-less, bucket.
+    #[test]
+    fn bucket_record_is_created_open_and_ensemble_less() {
+        let record = create_bucket_record();
+        assert_eq!(record.state, LogState::Open);
+        assert_eq!(record.kind, SessionKind::Bucket);
+        assert!(record.ensemble.is_empty());
+        assert_eq!(record.epoch, 1);
+    }
+
+    /// Invariant (a), record leg: no live record flavour is ever "complete"
+    /// while bundles may exist. A bucket record recovers first unless sealed;
+    /// absence stays complete only via record-before-first-ack + the format
+    /// gate, which this gate cannot see.
+    #[test]
+    fn takeover_gate_never_completes_a_live_bucket_session() {
+        assert_eq!(takeover_gate(None), TakeoverGate::BucketComplete);
+        assert_eq!(
+            takeover_gate(Some(&fleet_record(LogState::Open))),
+            TakeoverGate::RecoverFirst
+        );
+        assert_eq!(
+            takeover_gate(Some(&bucket_record(LogState::Open))),
+            TakeoverGate::RecoverFirst,
+            "an open bucket session may hold the only copy of acked rows"
+        );
+        assert_eq!(
+            takeover_gate(Some(&bucket_record(LogState::Recovering))),
+            TakeoverGate::RecoverFirst,
+            "a recovering bucket session is mid-fold, not complete"
+        );
+        assert_eq!(
+            takeover_gate(Some(&bucket_record(LogState::Sealed))),
+            TakeoverGate::BucketComplete,
+            "only a sealed bucket record proves the bucket complete"
+        );
+    }
+
+    /// Invariant (b): credit only under an Open record at the shipper's epoch,
+    /// after the PUT. A sealed record (zombie fenced mid-flight), a recovering
+    /// one, a wrong epoch, or no record at all refuses the credit.
+    #[test]
+    fn credit_is_open_at_epoch_after_the_put() {
+        let open = bucket_record(LogState::Open);
+        assert!(bundle_credit_allowed(Some(&open), open.epoch));
+        let fleet_open = fleet_record(LogState::Open);
+        assert!(bundle_credit_allowed(Some(&fleet_open), fleet_open.epoch));
+
+        let sealed = bucket_record(LogState::Sealed);
+        assert!(
+            !bundle_credit_allowed(Some(&sealed), sealed.epoch),
+            "a zombie PUT that lands after the seal must never credit"
+        );
+        let recovering = bucket_record(LogState::Recovering);
+        assert!(!bundle_credit_allowed(Some(&recovering), recovering.epoch));
+        assert!(!bundle_credit_allowed(Some(&open), open.epoch + 1));
+        assert!(!bundle_credit_allowed(None, open.epoch));
+    }
+
+    /// Invariant (c): Sealed implies every acked row is per-cell. The seal
+    /// demands the retained-bundle scan be empty; an Open record with an
+    /// undrained bundle is always safe to leave open.
+    #[test]
+    fn seal_demands_per_cell_complete() {
+        let open = bucket_record(LogState::Open);
+        assert!(graceful_seal_allowed(&open, open.epoch, false, true));
+        assert!(
+            !graceful_seal_allowed(&open, open.epoch, false, false),
+            "sealing over an undrained bundle would orphan acked rows"
+        );
+        assert!(!graceful_seal_allowed(&open, open.epoch, true, false));
+        assert!(!graceful_seal_allowed(&open, open.epoch + 1, false, true));
+        let sealed = bucket_record(LogState::Sealed);
+        assert!(!graceful_seal_allowed(&sealed, sealed.epoch, false, true));
+    }
+
+    /// Layer-3 contract: a bucket session never declares fleet-style bounded
+    /// loss and never demands follower witnesses — even with a corrupted
+    /// ack-history marker and a non-empty ensemble. The fleet rows pin today's
+    /// behaviour unchanged, so the predicates are safe to swap in.
+    #[test]
+    fn bucket_sessions_never_declare_loss_or_demand_witnesses() {
+        // Fleet behaviour is preserved exactly: marker + ensemble declares;
+        // marker alone demands a witness.
+        let fleet_active = fleet_record(LogState::Recovering);
+        assert!(may_declare_bounded_loss(&fleet_active, true));
+        assert!(requires_fleet_witness(&fleet_active, true));
+        assert!(!may_declare_bounded_loss(&fleet_active, false));
+        assert!(!requires_fleet_witness(&fleet_active, false));
+        let mut bare = fleet_active.clone();
+        bare.ensemble.clear();
+        assert!(!may_declare_bounded_loss(&bare, true));
+        // Bucket sessions: never, under any marker or ensemble.
+        for state in [LogState::Open, LogState::Recovering, LogState::Sealed] {
+            let bucket = bucket_record(state);
+            assert!(
+                !may_declare_bounded_loss(&bucket, true),
+                "a bucket session must drain bundles, never declare loss ({state:?})"
+            );
+            assert!(
+                !requires_fleet_witness(&bucket, true),
+                "a bucket session folds on bundle coverage alone ({state:?})"
+            );
+            assert!(!may_declare_bounded_loss(&bucket, false));
+            assert!(!requires_fleet_witness(&bucket, false));
+        }
+        let mut bucket_with_ensemble = bucket_record(LogState::Recovering);
+        bucket_with_ensemble.ensemble.insert(NodeId::from("n9"));
+        assert!(!may_declare_bounded_loss(&bucket_with_ensemble, true));
+        assert!(!requires_fleet_witness(&bucket_with_ensemble, true));
     }
 }
