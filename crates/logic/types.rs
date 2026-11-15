@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): ported from meln1k/celld: seal a dead lease that never opened a log (01522b3).
+// Modified by ryuzcorp (ryuzcorp/celld): ported from meln1k/celld: seal a dead lease that never opened a log (01522b3); shared bucket-posture ownership reads across concurrent gates (0056).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! The vocabulary the core is written in: what it is told, what it
@@ -1188,7 +1188,9 @@ pub enum Effect {
     /// For bucket-proof acknowledgements, read `own.json` and answer whether it
     /// still names this node at this epoch. The core holds the gated write
     /// until `Event::OwnershipVerified` returns. Fleet-proof acks never
-    /// emit this — the ensemble seal is their fence.
+    /// emit this — the ensemble seal is their fence. Reads are shared: a
+    /// proven gate whose position a read in flight already covers joins it
+    /// instead of emitting another, so one effect may settle several gates.
     VerifyOwnership {
         op: OpId,
         cell: CellId,
