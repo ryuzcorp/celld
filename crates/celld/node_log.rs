@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): operator token for the internal listener; list_page resume is a cursor; ported from meln1k/celld: seal a dead lease that never opened a log (01522b3); seal_absent_log regression tests; lone-node repair backoff; bucket-posture group commit: bucket-session record encoding + old-reader interop tests (0059); bucket-posture group commit: bucket executor without ensemble (0060).
+// Modified by ryuzcorp (ryuzcorp/celld): operator token for the internal listener; list_page resume is a cursor; ported from meln1k/celld: seal a dead lease that never opened a log (01522b3); seal_absent_log regression tests; lone-node repair backoff; bucket-posture group commit: bucket-session record encoding + old-reader interop tests (0059); bucket-posture group commit: bucket executor without ensemble (0060); bucket-posture group commit: successor fold of bucket bundles (0063).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! v0 of the in-fleet replicated log tier (`CELLD_DURABILITY=fleet`).
@@ -5141,6 +5141,12 @@ impl NodeLogManager {
 
             let now = crate::ownership_store::now_ms();
             let pass_started = mono_ms();
+            // A bucket session has no ensemble and never recruits one, so no
+            // member can hold a fragment: skip the seal/tail loop outright —
+            // no `post_seal`/`post_tail` RPCs for bucket recovery — and let
+            // the whole-prefix bundle drain below do the entire fold.
+            let bucket_session = record.kind == log_tier::SessionKind::Bucket;
+            let members = (!bucket_session).then_some(&record.ensemble);
             let mut complete_witnesses = 0_usize;
             // A member is CONCLUSIVE when its fate is known: lease provably
             // expired and unreachable, reachable with a different fragment
@@ -5159,7 +5165,7 @@ impl NodeLogManager {
             // sweep (which, under the fold, judges the record's own
             // published expiry with no grace).
             let grace_ms = (self.ownership.lease_ttl_ms() * 3).max(20_000);
-            for member in &record.ensemble {
+            for member in members.into_iter().flatten() {
                 self.beat_claim(dead, &mut beat).await?;
                 let lease = self.ownership.read_node_lease(member).await;
                 let lease_live = matches!(&lease, Ok(Some(lease)) if lease.expires_ms > now);
@@ -5320,8 +5326,13 @@ impl NodeLogManager {
             // drain and the seal. "Loss is a record, never a prompt." The
             // verdict rests on the members alone, so it is reached before
             // the bundle drain: a pass that must refuse to seal refuses
-            // before it reads the session, not after.
-            if complete_witnesses == 0 && may_have_fleet_acks && !record.ensemble.is_empty() {
+            // before it reads the session, not after. The verdict itself is
+            // `may_declare_bounded_loss`: identical to the fleet guard it
+            // replaces, and never true for a bucket session — a bucket pass
+            // drains bundles, never declares.
+            if complete_witnesses == 0
+                && log_tier::may_declare_bounded_loss(&record, may_have_fleet_acks)
+            {
                 anyhow::ensure!(
                     inconclusive == 0,
                     "node-log recovery for {dead}: no complete true witness among {:?} and \
@@ -7206,10 +7217,11 @@ impl NodeLogManager {
     /// fleet ack proves follower fsync, not a bundle flush, so the member
     /// gather is the one the field incident needed. No seal: the leader
     /// is alive, the cell's epoch is closed, and rows at or below the ack
-    /// are immutable. An epoch with possible fleet acknowledgements needs a
+    /// are immutable. A fleet epoch with possible fleet acknowledgements needs a
     /// ranged tail proving that a current member returned every retained
     /// sequence. Without that proof, activation fails rather than exposing a
-    /// database that is missing acknowledged data.
+    /// database that is missing acknowledged data. A bucket session has no
+    /// members: the fold is its own retained bundles for the cell alone.
     /// `upload_gathered` skips rows the per-cell watermark covers and
     /// merges the contiguous tail into one object, so a re-run after a
     /// partial failure repeats no upload.
@@ -7219,8 +7231,14 @@ impl NodeLogManager {
             .await?
             .ok_or_else(|| anyhow!("fold session {} has no log record", self.session))?;
         let record = folded.record;
+        // A bucket session has no ensemble and never recruits one: the only
+        // witness this fold will ever have is the live session's own
+        // retained bundles, folded below. Skip the member-tail loop outright
+        // (no `post_tail` RPCs) rather than iterating an empty ensemble.
+        let bucket_session = record.kind == log_tier::SessionKind::Bucket;
+        let members = (!bucket_session).then_some(&record.ensemble);
         let mut complete_witnesses = 0_usize;
-        for member in &record.ensemble {
+        for member in members.into_iter().flatten() {
             let addr = match self.ownership.read_node_lease(member).await {
                 Ok(Some(lease)) => lease.addr,
                 Ok(None) => {
@@ -7292,16 +7310,27 @@ impl NodeLogManager {
         // epoch without fleet acknowledgements can credit a bundle PUT without
         // appending to any follower, so requiring a follower would strand a
         // bucket-only tail. Possible fleet acknowledgements need the proof.
-        anyhow::ensure!(
-            !folded.may_have_fleet_acks || complete_witnesses > 0,
-            "fold session {} has no complete follower tail for {cell}",
-            self.session
-        );
+        // The demand is `requires_fleet_witness`: identical to the inline
+        // guard it replaces for fleet sessions, and never true for a bucket
+        // session — the bundle prefix below is its only witness, so the fold
+        // proceeds on bundle coverage alone.
+        if log_tier::requires_fleet_witness(&record, folded.may_have_fleet_acks) {
+            anyhow::ensure!(
+                complete_witnesses > 0,
+                "fold session {} has no complete follower tail for {cell}",
+                self.session
+            );
+        }
         // Read the bundle index after the epoch and follower observations.
         // Publishing a bundle can permit epoch replacement or truncation of
         // the old fragments. An earlier snapshot could miss that bundle and
         // then accept a newer inactive epoch or already-truncated tail as
         // empty, losing the acknowledged rows that enabled the transition.
+        // For a bucket prior this IS the donor fold: the live donor session's
+        // (`<node>/<generation>`, which is this node's own session on the
+        // only path that reaches here — the same-node quiet-predecessor
+        // activation) retained uncovered bundle rows for the cell, folded
+        // before the restore so the per-cell listing can never miss them.
         gathered.extend(self.uncovered_bundle_rows_for(Some(cell)).await?);
         if gathered.is_empty() {
             return Ok(());
@@ -8099,6 +8128,488 @@ mod bucket_executor_tests {
             assert!(
                 manager.inner.lock().unwrap().is_none(),
                 "no silent bucket-to-fleet conversion"
+            );
+        });
+    }
+}
+
+/// Successor-fold tests for bucket-posture group commit (layer 3). Plain
+/// `#[cfg(test)]`: CI runs without the `celld_internal_tests` cfg.
+/// Deterministic, no sleeps or polling; each behaviour has a fail-before
+/// shown by reverting. A donor manager writes real bundle objects through
+/// `put_bundle` (the credited rows are the acked rows), then goes quiet with
+/// an expired lease; a successor manager over the same bucket recovers.
+/// Every test asserts the two invariants: no acked row is lost (the
+/// per-cell prefix covers every credited txid) and activation is unblocked.
+#[cfg(test)]
+mod bucket_recovery_tests {
+    use super::*;
+    use crate::ownership_store::{NodeLeaseWire, NodeLoadWire};
+
+    fn bucket_in(dir: &std::path::Path) -> Arc<Bucket> {
+        let database = dir.join("objects.sqlite3");
+        Arc::new(crate::dev::open_local_bucket(&database).expect("dev bucket"))
+    }
+
+    fn manager_for(
+        bucket: &Arc<Bucket>,
+        local: &std::path::Path,
+        session: &str,
+        node: &str,
+    ) -> NodeLogManager {
+        let replication = crate::ltx_replication::Replication::start(
+            bucket.as_ref().clone(),
+            &local.join("watch"),
+            None,
+            "test".into(),
+            None,
+        )
+        .expect("replication starts");
+        let ownership = Arc::new(crate::ownership_store::BucketOwnership::new(
+            bucket.as_ref().clone(),
+            bucket.as_ref().clone(),
+            node.into(),
+            "test-probe-key".into(),
+        ));
+        let own_log = Arc::new(OwnLog {
+            ownership,
+            nudge: Box::new(|| {}),
+            write_lock: tokio::sync::Mutex::new(()),
+        });
+        let auth = Arc::new(PeerAuth::new([0u8; 32], node).expect("test auth"));
+        NodeLogManager::new(
+            session,
+            bucket.clone(),
+            own_log,
+            replication.ltx(),
+            auth,
+            celld_logic::log_evict::EvictionPolicy::default(),
+        )
+    }
+
+    fn open_gate(manager: &NodeLogManager) {
+        manager.ltx.set_bucket_bundles_fleet(true);
+        manager
+            .ltx
+            .set_bucket_bundles_env_override_for_test(Some(true));
+    }
+
+    async fn publish_lease(
+        bucket: &Bucket,
+        node: &str,
+        generation: &str,
+        expires_ms: u64,
+        record: Option<(&log_tier::LogRecord, bool)>,
+    ) {
+        let wire = NodeLeaseWire {
+            node: node.into(),
+            expires_ms,
+            addr: String::new(),
+            probe_public_key: String::new(),
+            peer_protocol: 1,
+            paced_handoff: false,
+            generation: generation.into(),
+            log: record.map(|(record, marker)| log_to_wire(record, marker)),
+            load: NodeLoadWire::default(),
+        };
+        bucket
+            .put(
+                &lease_key(node),
+                serde_json::to_vec(&wire).expect("lease encodes"),
+            )
+            .await
+            .expect("lease publishes");
+    }
+
+    /// A minimal but fully valid LTX file carrying one row: the recovery
+    /// upload parses the header (`write_ltx_file`) and the tail merge
+    /// decodes it (`Compactor`), so arbitrary bytes cannot stand in.
+    /// Checksum tracking is off (as for the staged files the merge already
+    /// handles), with the encoder-computed file checksum intact.
+    fn ltx_row(txid: u64) -> Vec<u8> {
+        let header = celld_ltx::ltx::Header {
+            version: celld_ltx::ltx::VERSION,
+            flags: celld_ltx::ltx::HEADER_FLAG_NO_CHECKSUM,
+            page_size: 4096,
+            commit: 1,
+            min_txid: celld_ltx::TXID(txid),
+            max_txid: celld_ltx::TXID(txid),
+            timestamp: 1_700_000_000_000,
+            ..Default::default()
+        };
+        let mut page = vec![0u8; 4096];
+        page[0..8].copy_from_slice(&txid.to_be_bytes());
+        page[8..16].copy_from_slice(&txid.to_be_bytes());
+        celld_ltx::ltx::encode_file(&header, &[(1, page)], 0).expect("synthetic ltx row encodes")
+    }
+
+    fn bundle_row(cell: &str, txid: u64) -> celld_ltx::bundle::BundleEntry {
+        celld_ltx::bundle::BundleEntry {
+            cell: cell.into(),
+            cell_epoch: 1,
+            txid,
+            bytes: ltx_row(txid),
+        }
+    }
+
+    fn loss_key(session: &str, epoch: u64) -> String {
+        format!("log/{session}.e{epoch}.loss.json")
+    }
+
+    /// Whole-node death plus a successor sweep: the dead bucket session's
+    /// open record, one shared bundle PUT per round, no per-cell coverage —
+    /// then `recover` folds every bundle row per-cell and seals, with no
+    /// loss declared. Fail-before: without the whole-prefix bundle gather
+    /// the per-cell prefix stays empty and the coverage asserts go red.
+    #[test]
+    fn successor_sweep_folds_bucket_bundles() {
+        let runtime = crate::asyncrt::shared_test_runtime();
+        runtime.block_on(async {
+            let shared = tempfile::tempdir().expect("test dir");
+            let bucket = bucket_in(shared.path());
+            let donor_local = tempfile::tempdir().expect("test dir");
+            let donor = manager_for(&bucket, donor_local.path(), "dead/gen9", "dead");
+            open_gate(&donor);
+            let record = log_tier::create_bucket_record();
+            publish_lease(
+                &bucket,
+                "dead",
+                "gen9",
+                crate::ownership_store::now_ms() + 3_600_000,
+                Some((&record, false)),
+            )
+            .await;
+            donor.bucket_epoch.store(1, Ordering::SeqCst);
+            let mut entries = Vec::new();
+            for cell in ["c0", "c1", "c2"] {
+                for txid in 1..=3 {
+                    entries.push(bundle_row(cell, txid));
+                }
+            }
+            assert!(
+                donor.put_bundle(entries).await,
+                "the shared PUT credits: every row is acked"
+            );
+            // The node dies with its rows only in bundles: expire the lease,
+            // per-cell coverage never uploaded.
+            publish_lease(&bucket, "dead", "gen9", 1, Some((&record, false))).await;
+            assert!(
+                bucket.list("cells/").await.expect("list works").is_empty(),
+                "death before any per-cell drain"
+            );
+            let successor_local = tempfile::tempdir().expect("test dir");
+            let successor = manager_for(&bucket, successor_local.path(), "n1/gen7", "n1");
+            successor.recover("dead/gen9").await.expect("sweep folds");
+            for cell in ["c0", "c1", "c2"] {
+                assert_eq!(
+                    successor.ltx.covered_txid(cell, 1, u64::MAX).await,
+                    3,
+                    "no acked row lost for {cell}"
+                );
+            }
+            assert!(
+                !bucket
+                    .list("cells/c0/")
+                    .await
+                    .expect("list works")
+                    .is_empty(),
+                "folded rows land in the per-cell prefix"
+            );
+            let folded = read_record(&bucket, "dead/gen9")
+                .await
+                .expect("read works")
+                .expect("record present");
+            assert_eq!(folded.record.state, LogState::Sealed, "the sweep seals");
+            assert!(
+                bucket
+                    .get(&loss_key("dead/gen9", record.epoch))
+                    .await
+                    .expect("read works")
+                    .is_none(),
+                "a bucket pass drains bundles, never declares loss"
+            );
+            successor
+                .ensure_recovered(Some("dead"))
+                .await
+                .expect("activation is unblocked past the sealed record");
+        });
+    }
+
+    /// Crash between the bundle PUT and per-cell coverage, met through the
+    /// takeover interlock (`ensure_recovered`): two bundle rounds acked,
+    /// nothing drained, then the successor's activation-time recovery folds
+    /// both bundles and seals. Fail-before: without the bundle gather the
+    /// second round's rows never reach the per-cell prefix.
+    #[test]
+    fn takeover_interlock_recovers_bundle_rounds_acked_before_the_crash() {
+        let runtime = crate::asyncrt::shared_test_runtime();
+        runtime.block_on(async {
+            let shared = tempfile::tempdir().expect("test dir");
+            let bucket = bucket_in(shared.path());
+            let donor_local = tempfile::tempdir().expect("test dir");
+            let donor = manager_for(&bucket, donor_local.path(), "dead/gen9", "dead");
+            open_gate(&donor);
+            let record = log_tier::create_bucket_record();
+            publish_lease(
+                &bucket,
+                "dead",
+                "gen9",
+                crate::ownership_store::now_ms() + 3_600_000,
+                Some((&record, false)),
+            )
+            .await;
+            donor.bucket_epoch.store(1, Ordering::SeqCst);
+            assert!(
+                donor
+                    .put_bundle(vec![bundle_row("c0", 1), bundle_row("c0", 2)])
+                    .await,
+                "first round acked"
+            );
+            assert!(
+                donor
+                    .put_bundle(vec![bundle_row("c0", 3), bundle_row("c0", 4)])
+                    .await,
+                "second round acked, still no per-cell coverage"
+            );
+            publish_lease(&bucket, "dead", "gen9", 1, Some((&record, false))).await;
+            let successor_local = tempfile::tempdir().expect("test dir");
+            let successor = manager_for(&bucket, successor_local.path(), "n1/gen7", "n1");
+            successor
+                .ensure_recovered(Some("dead"))
+                .await
+                .expect("the interlock recovers before activation");
+            assert_eq!(
+                successor.ltx.covered_txid("c0", 1, u64::MAX).await,
+                4,
+                "both acked rounds are restorable per-cell"
+            );
+            let folded = read_record(&bucket, "dead/gen9")
+                .await
+                .expect("read works")
+                .expect("record present");
+            assert_eq!(folded.record.state, LogState::Sealed, "recovery seals");
+            assert!(
+                bucket
+                    .get(&loss_key("dead/gen9", record.epoch))
+                    .await
+                    .expect("read works")
+                    .is_none(),
+                "no loss declared"
+            );
+        });
+    }
+
+    /// Same-node restart: the new generation recovers its predecessor
+    /// session's open bucket record through `recover_self`, folding the
+    /// retained bundles before the stale-generation GC may delete them.
+    /// Fail-before: without the bundle gather the restart seals over rows
+    /// that only ever lived in bundles.
+    #[test]
+    fn same_node_restart_recovers_the_predecessor_session() {
+        let runtime = crate::asyncrt::shared_test_runtime();
+        runtime.block_on(async {
+            let shared = tempfile::tempdir().expect("test dir");
+            let bucket = bucket_in(shared.path());
+            let donor_local = tempfile::tempdir().expect("test dir");
+            let donor = manager_for(&bucket, donor_local.path(), "n0/gen1", "n0");
+            open_gate(&donor);
+            let record = log_tier::create_bucket_record();
+            publish_lease(
+                &bucket,
+                "n0",
+                "gen1",
+                crate::ownership_store::now_ms() + 3_600_000,
+                Some((&record, false)),
+            )
+            .await;
+            donor.bucket_epoch.store(1, Ordering::SeqCst);
+            assert!(
+                donor
+                    .put_bundle(vec![bundle_row("c0", 1), bundle_row("c0", 2)])
+                    .await,
+                "rows acked before the restart"
+            );
+            // The process restarts as a new generation; its lease still
+            // carries the predecessor generation until the install, and the
+            // predecessor's expiry has passed.
+            publish_lease(&bucket, "n0", "gen1", 1, Some((&record, false))).await;
+            let successor_local = tempfile::tempdir().expect("test dir");
+            let restarted = manager_for(&bucket, successor_local.path(), "n0/gen2", "n0");
+            restarted.recover_self().await.expect("restart recovers");
+            assert_eq!(
+                restarted.ltx.covered_txid("c0", 1, u64::MAX).await,
+                2,
+                "no acked row lost across the restart"
+            );
+            let folded = read_record(&bucket, "n0/gen1")
+                .await
+                .expect("read works")
+                .expect("record present");
+            assert_eq!(
+                folded.record.state,
+                LogState::Sealed,
+                "the predecessor session seals"
+            );
+            assert!(
+                bucket
+                    .get(&loss_key("n0/gen1", record.epoch))
+                    .await
+                    .expect("read works")
+                    .is_none(),
+                "no loss declared"
+            );
+            restarted
+                .recover_self()
+                .await
+                .expect("the clean latch makes recovery done-once");
+        });
+    }
+
+    /// Live-donor single cell, reachable case: the same-node
+    /// quiet-predecessor activation folds the live session's retained
+    /// bundles for the cell before restoring. The routing pin (logic crate)
+    /// proves a live donor is never taken from; when the fold IS reachable
+    /// it uploads the bundle rows per-cell. Fail-before: without the donor
+    /// fold the activation restores past the bundle-only rows.
+    #[test]
+    fn fold_cell_folds_the_live_session_bundles() {
+        let runtime = crate::asyncrt::shared_test_runtime();
+        runtime.block_on(async {
+            let shared = tempfile::tempdir().expect("test dir");
+            let bucket = bucket_in(shared.path());
+            let local = tempfile::tempdir().expect("test dir");
+            let manager = manager_for(&bucket, local.path(), "n0/gen1", "n0");
+            open_gate(&manager);
+            let record = log_tier::create_bucket_record();
+            publish_lease(
+                &bucket,
+                "n0",
+                "gen1",
+                crate::ownership_store::now_ms() + 3_600_000,
+                Some((&record, false)),
+            )
+            .await;
+            manager.bucket_epoch.store(1, Ordering::SeqCst);
+            assert!(
+                manager
+                    .put_bundle(vec![
+                        bundle_row("c0", 1),
+                        bundle_row("c0", 2),
+                        bundle_row("c0", 3),
+                    ])
+                    .await,
+                "rows acked into bundles"
+            );
+            manager.fold_cell("c0").await.expect("the fold proceeds");
+            assert_eq!(
+                manager.ltx.covered_txid("c0", 1, u64::MAX).await,
+                3,
+                "the live session's bundle rows land per-cell before restore"
+            );
+        });
+    }
+
+    /// Defence in depth for the loss predicate: even with a corrupted
+    /// ack-history marker (`active == true`, which bucket sessions never
+    /// persist), the sweep still drains bundles and seals without declaring
+    /// loss. Fail-before: judging the marker alone (dropping the
+    /// session-kind gate) writes the loss record here.
+    #[test]
+    fn bucket_recovery_ignores_a_corrupted_fleet_marker() {
+        let runtime = crate::asyncrt::shared_test_runtime();
+        runtime.block_on(async {
+            let shared = tempfile::tempdir().expect("test dir");
+            let bucket = bucket_in(shared.path());
+            let donor_local = tempfile::tempdir().expect("test dir");
+            let donor = manager_for(&bucket, donor_local.path(), "dead/gen9", "dead");
+            open_gate(&donor);
+            let record = log_tier::create_bucket_record();
+            publish_lease(
+                &bucket,
+                "dead",
+                "gen9",
+                crate::ownership_store::now_ms() + 3_600_000,
+                Some((&record, false)),
+            )
+            .await;
+            donor.bucket_epoch.store(1, Ordering::SeqCst);
+            assert!(
+                donor
+                    .put_bundle(vec![bundle_row("c0", 1), bundle_row("c0", 2)])
+                    .await,
+                "rows acked"
+            );
+            publish_lease(&bucket, "dead", "gen9", 1, Some((&record, true))).await;
+            let successor_local = tempfile::tempdir().expect("test dir");
+            let successor = manager_for(&bucket, successor_local.path(), "n1/gen7", "n1");
+            successor.recover("dead/gen9").await.expect("sweep folds");
+            assert_eq!(
+                successor.ltx.covered_txid("c0", 1, u64::MAX).await,
+                2,
+                "no acked row lost"
+            );
+            assert!(
+                bucket
+                    .get(&loss_key("dead/gen9", record.epoch))
+                    .await
+                    .expect("read works")
+                    .is_none(),
+                "a corrupted marker never makes a bucket session declare loss"
+            );
+            let folded = read_record(&bucket, "dead/gen9")
+                .await
+                .expect("read works")
+                .expect("record present");
+            assert_eq!(folded.record.state, LogState::Sealed, "recovery seals");
+        });
+    }
+
+    /// Defence in depth for the witness predicate: with a corrupted
+    /// ack-history marker and no follower tail, the fold still proceeds on
+    /// bundle coverage — requiring a witness would strand activation behind
+    /// a tail that can never come. Fail-before: the old inline guard
+    /// (`!marker || witnesses > 0`) refuses here instead of folding.
+    #[test]
+    fn fold_cell_proceeds_on_bundle_coverage_with_a_corrupted_marker() {
+        let runtime = crate::asyncrt::shared_test_runtime();
+        runtime.block_on(async {
+            let shared = tempfile::tempdir().expect("test dir");
+            let bucket = bucket_in(shared.path());
+            let local = tempfile::tempdir().expect("test dir");
+            let manager = manager_for(&bucket, local.path(), "n0/gen1", "n0");
+            open_gate(&manager);
+            let record = log_tier::create_bucket_record();
+            publish_lease(
+                &bucket,
+                "n0",
+                "gen1",
+                crate::ownership_store::now_ms() + 3_600_000,
+                Some((&record, false)),
+            )
+            .await;
+            manager.bucket_epoch.store(1, Ordering::SeqCst);
+            assert!(
+                manager
+                    .put_bundle(vec![bundle_row("c0", 1), bundle_row("c0", 2)])
+                    .await,
+                "rows acked into bundles"
+            );
+            publish_lease(
+                &bucket,
+                "n0",
+                "gen1",
+                crate::ownership_store::now_ms() + 3_600_000,
+                Some((&record, true)),
+            )
+            .await;
+            manager
+                .fold_cell("c0")
+                .await
+                .expect("a bucket fold needs no follower tail");
+            assert_eq!(
+                manager.ltx.covered_txid("c0", 1, u64::MAX).await,
+                2,
+                "bundle coverage alone restores the rows"
             );
         });
     }

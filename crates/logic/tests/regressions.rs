@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): ported from meln1k/celld: scripted core-bug reproductions (ea471ee, e46a685, 6d61462, 18d3bf9, 9d4c163, 468b456, 01522b3, 65fdb13); shared bucket-posture ownership reads (0056); round-level fence settlement (0062).
+// Modified by ryuzcorp (ryuzcorp/celld): ported from meln1k/celld: scripted core-bug reproductions (ea471ee, e46a685, 6d61462, 18d3bf9, 9d4c163, 468b456, 01522b3, 65fdb13); shared bucket-posture ownership reads (0056); round-level fence settlement (0062); bucket-posture group commit: live-lease routing pin (0063).
 //! Scripted reproductions of core bugs the deterministic simulator
 //! (`crates/sim`) found. Each drives the core through a minimal shell that
 //! answers every effect at once, except the ones a test holds back to
@@ -1429,4 +1429,62 @@ fn fence_round_before_its_proof_is_never_accepted() {
         assert_eq!(unordered, Some(1), "the refused order is counted");
         shell.state.validate().expect("state invariant");
     }
+}
+/// A live owner lease that still names the cell's owner routes remotely: the
+/// core never claims a cell — and never runs the takeover interlock — while
+/// the owner is alive. A single-cell takeover from a live donor is refused
+/// here, not folded: the fold only runs after whole-session recovery fences
+/// the donor (see `NodeLogManager::{recover_serial, fold_cell}`). Fail-before:
+/// claiming on a live lease routes `Local` (or emits `RecoverNodeLog`) here.
+#[test]
+fn a_live_matching_owner_lease_routes_remote_without_a_claim() {
+    let mut shell = Shell::new(2, |effect| matches!(effect, Effect::ReadNodeLease { .. }));
+    shell.start();
+    shell.owners.insert(
+        "c".into(),
+        OwnerRecord {
+            node: Some("n1".into()),
+            epoch: 3,
+            etag: "owned".into(),
+        },
+    );
+    shell.send(Event::RequestAt {
+        request: 1,
+        cell: "c".into(),
+        now_mono_ms: MONO_MS,
+    });
+    let Some(Effect::ReadNodeLease { op, .. }) = shell.held.pop() else {
+        panic!("expected a lease read: {:?}", shell.held);
+    };
+    let effects = shell.send(Event::NodeLeaseRead {
+        op,
+        now_ms: NOW_MS,
+        result: Ok(Some(NodeLeaseRecord {
+            node: "n1".into(),
+            addr: "n1".into(),
+            expires_ms: NOW_MS + TTL_MS,
+            peer_protocol: 1,
+            generation: "g1".into(),
+            log_state: None,
+            etag: "lease-n1".into(),
+        })),
+    });
+    assert!(
+        effects.iter().any(|effect| matches!(
+            effect,
+            Effect::Complete {
+                request: 1,
+                result: Ok(celld_logic::Route::Remote { .. }),
+            }
+        )),
+        "a live matching owner routes remote: {effects:?}"
+    );
+    assert!(
+        !effects.iter().any(|effect| matches!(
+            effect,
+            Effect::RecoverNodeLog { .. } | Effect::CasOwner { .. }
+        )),
+        "no claim and no takeover interlock while the owner is live: {effects:?}"
+    );
+    shell.state.validate().expect("state invariant");
 }

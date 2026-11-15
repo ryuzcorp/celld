@@ -781,6 +781,31 @@ push to `ghcr.io/denoland`, but still. Pushing a branch named
   runtime behaviour changes. Fail-before per arm: a sealed record crediting
   (record arm), a live-donor bump crediting (fence arm), a pre-proof read
   crediting (ordering) each turn their test red.
+- `0063` (sha TBD at merge) the successor fold for bucket-posture group commit
+  (layer 3): a bucket session's acked rows are restorable after death, restart,
+  or a quiet handoff. `recover_serial` branches on the session kind — bucket
+  passes skip the member loop outright (no `post_tail`/`post_seal` RPCs for a
+  session that has no ensemble) and judge loss with
+  `may_declare_bounded_loss` (fleet guard unchanged: the witness conjunct
+  stays; the predicate is never true for bucket, so a bucket pass drains
+  bundles and never declares); the whole-prefix bundle gather, windows,
+  `upload_gathered` and the seal are byte-identical. `fold_cell` branches the
+  same way: the witness demand is `requires_fleet_witness` (fleet behaviour
+  identical, bucket never demands a follower tail) and the live donor
+  session's (`<node>/<generation>`) retained uncovered bundle rows for the
+  cell fold before the restore, keeping the snapshot-after-observations
+  ordering. Routing is pinned, not changed: a live matching owner lease gives
+  `Route::Remote` and never a claim/takeover effect, so no path takes a
+  single cell from a live bundling donor without whole-session recovery
+  (new regression test in `crates/logic/tests/regressions.rs`). Six plain
+  `#[cfg(test)]` recovery tests (no sleeps): whole-node death plus successor
+  sweep, crash between bundle PUT and per-cell coverage via the takeover
+  interlock, same-node restart via `recover_self`, the live-session fold,
+  and corrupted-marker variants pinning both predicates. `ensure_recovered` /
+  `recover_self` wiring needed no change. This is the read side of the L2 gap
+  (takeover and restart now fold bundle-credited rows per-cell instead of
+  orphaning them); the eviction/handoff/drain side is layer 4. Still behind
+  `CELLD_BUCKET_BUNDLES=1` — do not enable in production until layers 4-5.
 
 Patches `0025`–`0034` are ported fixes from
 [meln1k/celld](https://github.com/meln1k/celld) by Nikita
