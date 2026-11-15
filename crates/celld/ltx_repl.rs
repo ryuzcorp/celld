@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): an eviction skips the visibility LISTs its own uploads already prove and the time-based checkpoint before the handoff; an eviction deletes the per-cell L0/L1 objects its handoff snapshot supersedes; bucket-posture group commit: paged gate judges PAGED_FORMAT (0059); bucket-posture group commit: bucket bundle gate, sync pacing and event-driven bundle flush (0060); the eviction guard proves a journaled epoch with a HEAD on the newest journaled key, falling back to the listing on a miss, an error, or an empty journal (0061); bucket-posture group commit: bundled-cell eviction guard, graceful-close per-cell drain, bundle GC without ensemble, linger holds only while the dirty set is shared (0064).; bucket-posture group commit: bundle switch on by default (0070).
+// Modified by ryuzcorp (ryuzcorp/celld): an eviction skips the visibility LISTs its own uploads already prove and the time-based checkpoint before the handoff; an eviction deletes the per-cell L0/L1 objects its handoff snapshot supersedes; bucket-posture group commit: paged gate judges PAGED_FORMAT (0059); bucket-posture group commit: bucket bundle gate, sync pacing and event-driven bundle flush (0060); the eviction guard proves a journaled epoch with a HEAD on the newest journaled key, falling back to the listing on a miss, an error, or an empty journal (0061); bucket-posture group commit: bundled-cell eviction guard, graceful-close per-cell drain, bundle GC without ensemble, linger holds only while the dirty set is shared (0064).; bucket-posture group commit: bucket switch on by default (0070); bucket-posture group commit: a sync worker yields once the bundle loop owns tiering, and a lone-cell round uploads per-cell instead of bundling (0071).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! In-process replication backend built on `celld-ltx`.
@@ -1093,6 +1093,20 @@ fn split_bundle_entries(
 /// the ack path there. Pure predicate so tests pin the pacing without a daemon.
 fn sync_should_bundle(paced: bool, bundle_active: bool, bucket_bundling: bool) -> bool {
     (paced && bundle_active) || bucket_bundling
+}
+
+/// Whether the bundle loop currently owns tiering, for a sync worker to yield
+/// to. Mirrors the scan's `sync_should_bundle` predicate exactly (same inputs,
+/// same order): a worker spawned before the arm must observe the same answer
+/// the next scan would give, not a second convention that can drift.
+fn bundle_owns_tiering(registration: &Arc<Mutex<RegistrationState>>, paced: bool) -> bool {
+    registered_durability(registration).is_some_and(|targets| {
+        sync_should_bundle(
+            paced,
+            targets.manager.bundle_active(),
+            targets.manager.bucket_bundling(),
+        )
+    })
 }
 
 /// Cells with uncredited tickets, for the bucket linger gate: the linger is a
@@ -3927,6 +3941,24 @@ impl LtxRepl {
         }
     }
 
+    /// Test-only: hold (or release) one cell's sync claim, as a sync worker
+    /// does between its CAS and its exit, so loop tests can pin what the
+    /// bundle loop does when the claim is taken. Returns whether the claim
+    /// changed hands.
+    #[cfg(test)]
+    pub(crate) fn set_sync_claim_for_test(&self, cell: &str, epoch: u64, held: bool) -> bool {
+        self.cells
+            .lock()
+            .unwrap()
+            .get(&(cell.to_string(), epoch))
+            .is_some_and(|handle| {
+                handle
+                    .syncing
+                    .compare_exchange(!held, held, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+            })
+    }
+
     /// Drain this handle's upload journal to the trim candidate list: only
     /// keys with `max_txid <= snapshot_max` that are not the snapshot
     /// itself. The restore planner anchors on the latest snapshot and only
@@ -5257,6 +5289,7 @@ async fn sync_loop(
             let slots = slots.clone();
             let dirty = dirty.clone();
             let worker_stop = stop.clone();
+            let worker_registration = registration.clone();
             sync_tasks.spawn_owned("ltx_cell_sync", async move {
                 // Keep syncing this cell while it stays dirty, rather than
                 // notifying the main loop to re-scan every completion — that made
@@ -5267,6 +5300,18 @@ async fn sync_loop(
                 // ones that actually uploaded.
                 loop {
                     if worker_stop.is_stopped() {
+                        break;
+                    }
+                    // The bundle loop owns tiering while armed: a worker spawned
+                    // before the arm (or during a gap) must yield once the bundle
+                    // path takes over, or it uploads per-cell L0s beside every
+                    // bundle flush. A continuously-dirty cell never catches up to
+                    // break on clean, so without this the two loops duplicate
+                    // every row (measured on the hot workload with store
+                    // latency). Breaking is safe: the bundle loop credits the
+                    // same watermarks, and if bundling drops the next scan
+                    // re-spawns this worker.
+                    if bundle_owns_tiering(&worker_registration, paced) {
                         break;
                     }
                     let ok = {
@@ -5419,6 +5464,56 @@ async fn bundle_loop(
         };
         if work.is_empty() {
             continue;
+        }
+
+        // A round whose dirty set is a single cell with a single pending
+        // ticket uploads that cell per-cell, exactly as the gate-closed
+        // fallback does today: a one-cell bundle saves no PUT but adds a
+        // record re-read, a GC delete and bookkeeping. `sync_cell` IS that
+        // fallback's function (journal, uploaded flag, per-cell + durable
+        // credit, waiter notify), so there is no second upload convention.
+        // A lone cell with more pending rides a one-cell bundle as before:
+        // batching those rows into one PUT is the whole point, and the hot
+        // shape is one cell with many concurrent writers — routing it
+        // per-cell would serialize one PUT per round and never batch
+        // (measured: 135 per-cell PUTs and zero bundles). Rounds with two
+        // or more dirty cells bundle as now. Fleet posture is untouched:
+        // followers need the bundle rows, so the paced path keeps batching
+        // single cells into node bundles.
+        if active.bucket_bundling() && work.len() == 1 {
+            let pending = work[0]
+                .1
+                .req_seq
+                .load(Ordering::SeqCst)
+                .saturating_sub(work[0].1.synced_seq.load(Ordering::SeqCst));
+            if pending <= 1 {
+                let handle = work[0].1.clone();
+                // Claim the cell the way the sync scan does. A sync worker
+                // that already holds the claim may be about to yield to this
+                // loop (`bundle_owns_tiering`) without uploading, and its exit
+                // nudges only the scan, which bundling suppresses: skipping the
+                // round here would park the ticket until the next write or the
+                // durability timeout. So a failed claim falls through to a
+                // one-cell bundle instead; a worker upload that races it only
+                // duplicates rows the `fetch_max` watermarks absorb.
+                if handle
+                    .syncing
+                    .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+                {
+                    // The verdict needs no branch: credited rows ride per-cell
+                    // acks through `sync_cell`'s own notify, and anything still
+                    // dirty stays dirty for the next round.
+                    if sync_cell(handle.clone()).await != Some(true) {
+                        // A failed lone-cell upload must fall back like a failed bundle PUT:
+                        // drop bundling so the scan re-spawns a sync worker that retries with
+                        // backoff, instead of parking this round with the scan suppressed.
+                        active.note_bucket_bundle_stalled();
+                    }
+                    handle.syncing.store(false, Ordering::SeqCst);
+                    continue;
+                }
+            }
         }
         type Credits = Vec<(CellHandle, u64, u64)>;
         let (entries, credits): (Vec<celld_ltx::bundle::BundleEntry>, Credits) =
@@ -7116,6 +7211,89 @@ mod evict_trim_tests {
                 puts - puts_before > 1,
                 "the snapshot PUT plus the L0 fallback drain both land"
             );
+            shutdown(repl).await;
+        });
+    }
+
+    /// A mixed history evicts through one snapshot: row 1 is per-cell-covered
+    /// (compaction-style credit, no residency upload flag) and row 2 is
+    /// bundle-credited only, and the image from the complete local database
+    /// covers both — so the guard needs no LIST and the next epoch restores
+    /// every row. Fail-before: without the bundle-only skip the gate refuses,
+    /// because this residency never PUT a per-cell object for either row.
+    #[test]
+    fn bundle_mixed_history_evicts_through_one_snapshot() {
+        let runtime = asyncrt::shared_test_runtime();
+        runtime.block_on(async {
+            let _temp = test_watch();
+            let watch = _temp.path().to_path_buf();
+            let store = Arc::new(CountingStore::new("cells/c/ltx/"));
+            let repl = LtxRepl::start_with_store_for_test(&watch, store.clone());
+            repl.set_bucket_bundles_env_override_for_test(Some(true));
+            repl.set_bucket_bundles_fleet(true);
+            activate_epoch(&repl, "c", 1, true).await;
+            {
+                let sync_position = || {
+                    let handle = repl
+                        .cells
+                        .lock()
+                        .unwrap()
+                        .get(&("c".to_string(), 1))
+                        .cloned()
+                        .unwrap();
+                    let mut replica = handle.replica.lock().unwrap();
+                    let db = managed_db_mut(&mut replica).expect("managed db");
+                    db.sync().expect("sync advances the position");
+                };
+                // One sync per write: each capture mints its own txid, so the
+                // history below is txid 1 (per-cell-covered) then txid 2
+                // (bundle-credited), with nothing uploaded by this residency.
+                sql_write(&db_path(&watch, "c", 1));
+                sync_position();
+                sql_write(&db_path(&watch, "c", 1));
+                sync_position();
+                let handle = repl
+                    .cells
+                    .lock()
+                    .unwrap()
+                    .get(&("c".to_string(), 1))
+                    .cloned()
+                    .unwrap();
+                // Row 1 covered the way a compaction L1 covers rows: watermark
+                // without a residency upload. Row 2 is bundle-credited only.
+                credit_percell_upload(&handle, 1);
+                handle.durable_txid.store(2, Ordering::SeqCst);
+                handle.synced_seq.store(3, Ordering::SeqCst);
+            }
+
+            let (puts_before, lists_before) = store.counts();
+            repl.handoff_gate("c", 1, true).await.unwrap();
+            let (puts_gated, lists_gated) = store.counts();
+            assert_eq!(
+                (puts_gated - puts_before, lists_gated - lists_before),
+                (0, 0),
+                "a mixed history proves through the coming snapshot, with no LIST"
+            );
+            let artifact = repl.evict("c", 1, false, None).await.unwrap();
+            trim_idle(&repl).await;
+            assert_eq!(artifact, EvictionRestoreArtifact::Snapshot);
+            let (puts, lists) = store.counts();
+            assert_eq!(
+                (puts - puts_before, lists - lists_before),
+                (1, 0),
+                "eviction must cost exactly the snapshot PUT"
+            );
+            repl.activate(ActivationOptions {
+                cell: "c",
+                epoch: 2,
+                fresh: false,
+                took_over: false,
+                resume_local: false,
+                prior: None,
+            })
+            .await
+            .unwrap();
+            assert_eq!(row_count(&db_path(&watch, "c", 2)), 2);
             shutdown(repl).await;
         });
     }

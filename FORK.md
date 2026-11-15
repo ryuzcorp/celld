@@ -879,6 +879,67 @@ push to `ghcr.io/denoland`, but still. Pushing a branch named
   whole bundle prefix with no loss declared, and served 200/200 probes with
   every acked row restorable.
 
+- `0071` (sha TBD at merge) fix the bucket hot-cell double-write, and quiet
+  idle bundle GC. A `sync_loop` worker spawned before the bundle arm kept
+  uploading per-cell L0s beside every bundle flush: a continuously-dirty
+  cell never looks clean, so the worker never left its loop and every row
+  landed twice (hot shape: 132 per-cell PUTs beside 65 bundles, Class A 262
+  vs `.10` 190). The worker now checks `bundle_owns_tiering` — the scan's
+  `sync_should_bundle` predicate with the same inputs — each iteration and
+  yields once bundling owns tiering; the bundle loop credits the same
+  watermarks, and the next scan re-spawns the worker if bundling drops. A
+  round whose dirty set is a single cell with a single pending ticket
+  uploads that cell per-cell through `sync_cell` (journal, uploaded flag,
+  credits, waiter notify — the gate-closed fallback's function, no second
+  convention) instead of a one-cell bundle: the same PUT count, minus the
+  record re-read, the GC delete and the bookkeeping; a lone cell with more
+  pending rides a one-cell bundle as before, because the hot shape is one
+  cell with many concurrent writers and per-cell would serialize one PUT
+  per round and never batch (measured: 135 per-cell PUTs and zero bundles). A
+  failed lone-cell upload falls back like a failed bundle PUT: the stall
+  drops bundling so the scan re-spawns a sync worker that retries with
+  backoff, instead of parking the round with the scan suppressed. A lone
+  round whose sync claim is held (a pre-arm worker about to yield, whose exit
+  nudges only the suppressed scan) rides a one-cell bundle instead of
+  skipping, so the ticket never waits for the next write.
+  Fleet posture is untouched (followers need the bundle rows, so the paced
+  path keeps batching single cells into node bundles). `gc_bundles` skips
+  its LIST once a full-prefix scan leaves zero bundles remaining and no
+  bundle PUT was attempted since — any attempt, including a failed or
+  ambiguous one, re-arms; confirmed deletes drain the count; the first scan
+  after boot, recovery or takeover always LISTs; fleet sessions never skip
+  (a fenced ex-leader's rows share the prefix). An idle bucket node cost one
+  LIST per 30 s tick (~2880 Class A a day that `.10` never paid); now it
+  costs one discovery LIST and then nothing until it writes. Tests:
+  `bundle_loop_uploads_a_lone_cell_per_cell`,
+  `bundle_loop_shares_one_bundle_between_two_cells`,
+  `bundle_loop_bundles_a_hot_lone_cell_with_pending_writes`,
+  `lone_cell_per_cell_failure_heals_through_retry`,
+  `lone_cell_round_with_a_held_claim_still_credits`,
+  `bundle_mixed_history_evicts_through_one_snapshot`,
+  `gc_bundles_quiet_until_a_put_re_arms` (plus the 0064 eviction/gate/GC
+  tests it stacks on). Fail-before: every lone-vs-shared direction reverted
+  (always-bundle, always-per-cell, no pending gate) turns its test red; the
+  stall reverted parks the failed lone-cell round and its await times out;
+  skipping a lone round on a held claim parks its ticket the same way;
+  the gate skip reverted refuses all five bundle eviction tests with "no
+  replica objects"; the stale check reverted snapshots a stale image; each
+  GC-quiet arm reverted (no skip, no PUT arm, no delete drain) turns the
+  quiet test red at its own assert. Measured (concurrent harness,
+  `DELAY_MS=100`, default config, 1 node): hot (16 writers, 15 s) 563 ok /
+  0 failed, Class A 140 (`.10` 190, `.11` 262); agent-200 (200 agents x 6
+  writes) 1200/1200, Class A 1137 (`.10` 1934); agent-50 (50 agents x 6
+  writes) 300/300, Class A 571 (`.10` 555, +2.9% residual), Class B 633
+  (`.10` 619, +2.2%). The agent-50 A residual is structural at linger 0,
+  not a regression: the core (350 per-cell PUTs + 50 own.json + 50 LISTs)
+  and the fixed overhead (104) equal `.10` exactly, and the excess is 13
+  stray one-cell bundles plus 4 GC LISTs. At 5 arrivals/s with a
+  sub-200 ms loop every write needs its own artifact PUT — per-cell and
+  one-cell-bundle PUTs swap 1:1, re-reads are Class B, deletes are free —
+  so batching more would need a linger, which default config refuses (a
+  lone cell never waits). 555 is zero bundle ops plus one LIST, i.e. a run
+  with no multi-dirty capture at all; the floor with jitter is ~566-572.
+
 Patches `0025`–`0034` are ported fixes from
 [meln1k/celld](https://github.com/meln1k/celld) by Nikita
 Melkozerov (Apache-2.0, like upstream): coordination-core
