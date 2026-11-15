@@ -939,6 +939,11 @@ push to `ghcr.io/denoland`, but still. Pushing a branch named
   so batching more would need a linger, which default config refuses (a
   lone cell never waits). 555 is zero bundle ops plus one LIST, i.e. a run
   with no multi-dirty capture at all; the floor with jitter is ~566-572.
+- `0072` (sha TBD at merge) the s3bench agent and hot drivers report
+  per-turn latency (`mean`, `p50`, `p95`, `p99`, nearest-rank, whole ms),
+  timed per request in the worker's own thread after its pacing sleep and
+  recorded only for 2xx answers. Pass/fail semantics are unchanged; the
+  numbers make ack-latency regressions visible next to the request counts.
 
 Patches `0025`–`0034` are ported fixes from
 [meln1k/celld](https://github.com/meln1k/celld) by Nikita
