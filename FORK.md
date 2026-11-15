@@ -609,6 +609,22 @@ push to `ghcr.io/denoland`, but still. Pushing a branch named
   of the fleet's variables reaches them. The conformance suites read the
   node's announce lines from the `celld dev` supervisor's stderr instead
   of `/proc/<pid>/fd`, which a non-dumpable process no longer exposes.
+- `0054` (sha TBD at merge) a bucket-posture eviction costs fewer bucket
+  requests. The eviction's visibility LISTs of `cells/<cell>/ltx/e<epoch>/`
+  (the revocable handoff gate's and the one after the snapshot PUT) are
+  skipped when this residency itself uploaded into that prefix and got a
+  success response; a successor finds those objects by listing, as every
+  restore does (list-after-write consistency, see `docs/guarantees.md`). A
+  residency that uploaded nothing itself (a resumed local
+  copy, recovered tails, bundles) and the L0-chain fallback still list. The
+  capture that `handoff_wait` and the handoff snapshot run skips the
+  time-based checkpoint (`Db::sync_before_close`), whose sealing write
+  committed a content-free txid that the eviction uploaded as its own L0
+  just before the snapshot covering it; the size-based checkpoints still
+  run, and a cancelled eviction checkpoints at the next ordinary sync.
+  Measured on 200 short-lived Durable Objects (6 writes each,
+  `CELLD_DURABILITY=bucket`): 12 Class A requests per cell before, 9 after
+  (per 200 cells: `cells/*/ltx` PUTs 1600 → 1400, LISTs 600 → 200).
 
 Patches `0025`–`0034` are ported fixes from
 [meln1k/celld](https://github.com/meln1k/celld) by Nikita

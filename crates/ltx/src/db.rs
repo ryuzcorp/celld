@@ -1,3 +1,4 @@
+// Modified by ryuzcorp (ryuzcorp/celld): a capture before a handoff skips the time-based checkpoint.
 //! db.rs — SQLite database lifecycle: WAL-mode setup, the long-running read-lock
 //! checkpoint takeover, the WAL→LTX capture loop, and manual checkpointing.
 //! Ported from litestream@v0.5.11 `db.go`.
@@ -1003,14 +1004,29 @@ impl Db {
     /// Ported from `DB.Sync` (db.go:994-1056). The public entry point of the
     /// capture loop. This function is synchronous as described in the module docs.
     pub fn sync(&mut self) -> Result<()> {
-        self.sync_with_verify_hook(None)
+        self.sync_with_verify_hook(None, true)
+    }
+
+    /// `sync` for the capture that precedes a handoff: it skips the
+    /// time-based checkpoint. That checkpoint only bounds the WAL of a
+    /// database that keeps running, and its sealing write commits a txid
+    /// after the capture, so a handoff would upload that content-free txid
+    /// as its own L0 object just before the snapshot that supersedes it. The
+    /// size-based checkpoints still run. A handoff that is cancelled keeps
+    /// `synced_since_checkpoint`, so the next ordinary sync checkpoints.
+    pub fn sync_before_close(&mut self) -> Result<()> {
+        self.sync_with_verify_hook(None, false)
     }
 
     /// `sync` with an optional hook that runs between `verify` and the
     /// capture read — the window a concurrent WAL change would land in.
     /// Test-only through `internal::sync_with_verify_hook`; production
     /// passes `None`.
-    fn sync_with_verify_hook(&mut self, hook: Option<Box<dyn FnOnce()>>) -> Result<()> {
+    fn sync_with_verify_hook(
+        &mut self,
+        hook: Option<Box<dyn FnOnce()>>,
+        timed_checkpoint: bool,
+    ) -> Result<()> {
         self.last_sync_timing = SyncTiming::default();
         let phase = crate::host::telemetry_us();
         // Self-heal: recreate the control tables if something swept them out
@@ -1035,7 +1051,7 @@ impl Db {
         }
 
         let phase = crate::host::telemetry_us();
-        self.checkpoint_if_needed(orig_wal_size, new_wal_size)?;
+        self.checkpoint_if_needed(orig_wal_size, new_wal_size, timed_checkpoint)?;
         self.last_sync_timing.checkpoint_us = crate::host::telemetry_us().saturating_sub(phase);
 
         // Recompute the cached position (kept for parity with db.go:1037-1041).
@@ -1749,8 +1765,14 @@ impl Db {
     ///
     /// Ported from `DB.checkpointIfNeeded` (db.go:1092-1156). Checks
     /// in priority order: TruncatePageN (TRUNCATE, blocking) → MinCheckpointPageN
-    /// (PASSIVE) → CheckpointInterval (PASSIVE, gated on `synced_since_checkpoint`).
-    fn checkpoint_if_needed(&mut self, orig_wal_size: i64, new_wal_size: i64) -> Result<()> {
+    /// (PASSIVE) → CheckpointInterval (PASSIVE, gated on `synced_since_checkpoint`,
+    /// and skipped when `timed` is false).
+    fn checkpoint_if_needed(
+        &mut self,
+        orig_wal_size: i64,
+        new_wal_size: i64,
+        timed: bool,
+    ) -> Result<()> {
         if self.page_size == 0 {
             return Ok(());
         }
@@ -1795,7 +1817,7 @@ impl Db {
         // Priority 3: time-based PASSIVE, gated on data synced since last
         // checkpoint (#896). Uses the DB-file mtime and a logical-size guard so an
         // idle DB does not spin LTX files (db.go:1133-1153).
-        if self.checkpoint_interval > Duration::ZERO && self.synced_since_checkpoint {
+        if timed && self.checkpoint_interval > Duration::ZERO && self.synced_since_checkpoint {
             let elapsed = self.host.file_age(&self.path)?;
             if elapsed > self.checkpoint_interval && new_wal_size > calc_wal_size(self.page_size, 1)
             {
@@ -2465,7 +2487,7 @@ pub mod internal {
     /// read — the only window in which a WAL change can reach the
     /// previous-frame check without `verify` seeing it first.
     pub fn sync_with_verify_hook(db: &mut Db, hook: impl FnOnce() + 'static) -> Result<()> {
-        db.sync_with_verify_hook(Some(Box::new(hook)))
+        db.sync_with_verify_hook(Some(Box::new(hook)), true)
     }
 
     pub fn wal_journal_mode(db: &Db) -> Result<String> {
