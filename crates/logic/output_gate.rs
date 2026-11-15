@@ -1,4 +1,5 @@
 // Modified by ryuzcorp (ryuzcorp/celld): ported from meln1k/celld: 51 code probes on the core's rare branches (b026226); shared bucket-posture ownership reads across concurrent gates (0056).
+// Modified by ryuzcorp (ryuzcorp/celld): round-level fence settlement (0062).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! The output gate: one choke point every egress passes through.
@@ -69,6 +70,7 @@
 //! single pump that awaits each chunk's ticket before it asks for the next
 //! chunk, which is what keeps a held chunk from overtaking a released one.
 
+use crate::log_tier::{CellCredit, FenceRoundSettlement};
 use crate::*;
 
 impl State {
@@ -447,6 +449,88 @@ impl State {
                 for member in members {
                     self.settle_gate(member, false, effects);
                 }
+            }
+        }
+    }
+    /// Settle gates from a round-level fence read issued AFTER the round's
+    /// bundle proof completed, without a per-gate `VerifyOwnership` read.
+    /// The executor computes each cell's [`CellCredit`] with the two-arm
+    /// predicate (`log_tier::round_cell_credit`) and hands the round back
+    /// here; the gate settles exactly the gates the proof captured — live
+    /// barriers on the cell at the round's epoch with positions at or below
+    /// the cell's cover, the same cover rule a shared [`VerifyRound`] uses.
+    /// A credited cell settles its gates proven, like an `Ok` ownership
+    /// read; an uncredited cell fails them exactly like a refused one —
+    /// including the cell reset — so uncredited gates fail, never hang. A
+    /// round whose read predates its proof (`order` unordered) settles
+    /// nothing as credited: every gate it covers fails instead, so a fence
+    /// read issued before the proof is never accepted. Gates above a cell's
+    /// cover, on another cell, or on another epoch are untouched: a later
+    /// proof still owes them their own read.
+    /// Modified by ryuzcorp (ryuzcorp/celld): round-level fence settlement (0062).
+    pub(crate) fn fence_round_verified(
+        &mut self,
+        round: &FenceRoundSettlement,
+        effects: &mut Vec<Effect>,
+    ) {
+        for cell in &round.cells {
+            let covered: Vec<OpId> = self
+                .barriers
+                .iter()
+                .filter(|(_, barrier)| {
+                    barrier.cell == cell.cell
+                        && barrier.epoch == cell.epoch
+                        && barrier.position <= cell.cover
+                })
+                .map(|(op, _)| *op)
+                .collect();
+            // The fence read supersedes the gates' own in-flight ownership
+            // reads: detach the settled gates so a late `OwnershipVerified`
+            // finds no round and releases nothing, and drop rounds left with
+            // nothing to answer. A round never names a drained gate.
+            self.detach_gates_from_verify_rounds(&cell.cell, cell.epoch, &covered);
+            if !round.order.ordered() {
+                self.probe(Probe::GateFenceRoundUnordered);
+                for op in covered {
+                    self.settle_gate(op, false, effects);
+                }
+                continue;
+            }
+            match cell.credit {
+                CellCredit::Credit => {
+                    self.probe(Probe::GateProvenByFenceRound);
+                    for op in covered {
+                        self.settle_gate(op, true, effects);
+                    }
+                }
+                CellCredit::Uncredited => {
+                    self.probe(Probe::GateFenceRoundRefused);
+                    for op in covered {
+                        self.settle_gate(op, false, effects);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Detach settled gates from the per-gate ownership reads in flight, so
+    /// those reads answer only gates still waiting. Rounds drained entirely
+    /// are dropped: a late result for one releases nothing.
+    fn detach_gates_from_verify_rounds(&mut self, cell: &str, epoch: Epoch, ops: &[OpId]) {
+        let Some(reads) = self
+            .verify_rounds_by_cell
+            .get(&(cell.to_string(), epoch))
+            .cloned()
+        else {
+            return;
+        };
+        for read_op in reads {
+            let drained = self.verify_rounds.get_mut(&read_op).is_some_and(|round| {
+                round.members.retain(|member| !ops.contains(member));
+                round.members.is_empty()
+            });
+            if drained {
+                self.drop_verify_round(read_op);
             }
         }
     }
