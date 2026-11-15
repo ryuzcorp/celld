@@ -1,3 +1,4 @@
+// Modified by ryuzcorp (ryuzcorp/celld): an eviction skips the visibility LISTs its own uploads already prove and the time-based checkpoint before the handoff.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! In-process replication backend built on `celld-ltx`.
@@ -912,6 +913,23 @@ struct Cell {
     /// what a successor restore will actually see, which is what
     /// `note_undrained_tail` compares against (#473).
     percell_txid: AtomicU64,
+    /// Whether this residency itself PUT an object under this cell epoch's
+    /// per-cell prefix and got a success response. That response is the
+    /// same evidence the eviction visibility LISTs look for: on the
+    /// qualified stores the successor's LIST finds what our PUT acked, and
+    /// nothing deletes under a live epoch prefix, so the mark cannot go
+    /// stale. Set only by this handle's own uploads — never by the restore
+    /// seed, bundle credits, or recovered tails — so every other case keeps
+    /// the LIST.
+    uploaded_epoch_objects: AtomicBool,
+    /// The newest handoff ticket (0: none). While `synced_seq` has not reached
+    /// it, per-cell captures skip the time-based checkpoint
+    /// (`Db::sync_before_close`): its sealing write would commit a
+    /// content-free txid that this cell would upload as its own L0 just
+    /// before the snapshot that supersedes it. A ticket instead of a flag
+    /// keeps the exemption until a capture covers the handoff, even when a
+    /// capture that started before `handoff_wait` runs in between.
+    handoff_ticket: AtomicU64,
     /// Set while a sync for this cell is in flight, so the loop never runs two
     /// at once for one cell (they would serialize on the mutex and waste work).
     syncing: AtomicBool,
@@ -1356,14 +1374,14 @@ pub struct LtxRepl {
 
 impl LtxRepl {
     /// Cfg-gated constructor over an injected store.
-    #[cfg(celld_internal_tests)]
+    #[cfg(any(test, celld_internal_tests))]
     pub fn start_with_store_for_test(watch: &Path, store: Arc<dyn ObjectStore>) -> Self {
         Self::start_with_store(watch, store, None, 0)
     }
 
     /// Build the production loop topology over an injected object store,
     /// with the settings that production reads from the environment.
-    #[cfg(celld_internal_tests)]
+    #[cfg(any(test, celld_internal_tests))]
     pub fn start_with_store(
         watch: &Path,
         store: Arc<dyn ObjectStore>,
@@ -1401,7 +1419,7 @@ impl LtxRepl {
         )
     }
 
-    #[cfg(celld_internal_tests)]
+    #[cfg(any(test, celld_internal_tests))]
     fn start_with_store_and_optional_vfs(
         watch: &Path,
         store: Arc<dyn ObjectStore>,
@@ -2285,6 +2303,19 @@ impl LtxRepl {
         matches!(client.has_any_object().await, Ok(true))
     }
 
+    /// Whether this residency itself PUT an object under the cell epoch's
+    /// per-cell prefix. The mark is set only on a success response through
+    /// a per-cell epoch client of this handle, so it names the same objects
+    /// `epoch_replicated` would list. A missing handle (or an upload-free
+    /// one) answers false and keeps the LIST.
+    fn residency_uploaded(&self, cell: &str, epoch: u64) -> bool {
+        self.cells
+            .lock()
+            .unwrap()
+            .get(&(cell.to_string(), epoch))
+            .is_some_and(|handle| handle.uploaded_epoch_objects.load(Ordering::SeqCst))
+    }
+
     pub async fn activate(
         &self,
         options: ActivationOptions<'_>,
@@ -2611,6 +2642,10 @@ impl LtxRepl {
         .await?
         .map_err(|error| anyhow!("open managed db {}: {error}", dst.display()))?;
         let client = SharedObjectStoreClient(Arc::new(self.client_for(cell, epoch)));
+        // The epoch marker is this residency's own upload into the epoch
+        // prefix; record it with the handle below so the eviction gates can
+        // skip their visibility LISTs.
+        let marker_uploaded = marker.is_some();
         if let Some((txid, bytes)) = marker {
             client
                 .write_ltx_file(0, txid, txid, &bytes)
@@ -2686,6 +2721,8 @@ impl LtxRepl {
             // The restore read the per-cell prefix, so the seed IS the
             // per-cell coverage at open.
             percell_txid: AtomicU64::new(seed.map_or(0, |pos| pos.txid.0)),
+            uploaded_epoch_objects: AtomicBool::new(marker_uploaded),
+            handoff_ticket: AtomicU64::new(0),
             syncing: AtomicBool::new(false),
             ready: Notify::new(),
             #[cfg(all(test, celld_internal_tests))]
@@ -3027,7 +3064,14 @@ impl LtxRepl {
         else {
             anyhow::bail!("ltx cell not resident: {cell} epoch {epoch}");
         };
+        // Publish a lower bound before taking the ticket, so a capture that
+        // reads the new `req_seq` also sees a pending handoff, then raise it
+        // to the ticket itself.
+        handle
+            .handoff_ticket
+            .fetch_max(handle.req_seq.load(Ordering::SeqCst) + 1, Ordering::SeqCst);
         let ticket = handle.req_seq.fetch_add(1, Ordering::SeqCst) + 1;
+        handle.handoff_ticket.fetch_max(ticket, Ordering::SeqCst);
         self.dirty.notify_one();
         self.dirty_ship.notify_one();
         self.wait_for_durability_ticket(&handle, cell, epoch, ticket)
@@ -3080,8 +3124,14 @@ impl LtxRepl {
         revocable: bool,
     ) -> anyhow::Result<()> {
         let proof = self.handoff_wait(cell, epoch).await?;
+        // A bucket proof this residency's own uploads earned carries its own
+        // visibility proof: the successful PUT responses already prove what
+        // the LIST would check, so it goes. Anything else — a resumed copy,
+        // recovered tails, an upload-free residency — keeps the LIST, which
+        // stays the fail-closed guard for state the bucket cannot restore.
         if revocable
             && matches!(proof, celld_logic::ProofSource::Bucket)
+            && !self.residency_uploaded(cell, epoch)
             && !self.epoch_replicated(cell, epoch).await
         {
             return Err(anyhow!(
@@ -3179,7 +3229,7 @@ impl LtxRepl {
 
     /// Lower the handoff snapshot budget, so a test world can hand off a
     /// small database the way production hands off a whale.
-    #[cfg(all(test, celld_internal_tests))]
+    #[cfg(any(test, celld_internal_tests))]
     pub(crate) fn set_handoff_snapshot_budget_for_world(&self, bytes: u64) {
         self.snapshot_budget_bytes.store(bytes, Ordering::Relaxed);
     }
@@ -3400,7 +3450,13 @@ impl LtxRepl {
                 self.publish_handoff_snapshot(cell, epoch, &snapshot),
             )
             .await;
-            if matches!(published, Ok(Ok(()))) && self.epoch_replicated(cell, epoch).await {
+            // The snapshot PUT this residency just completed is itself the
+            // visibility proof the LIST used to supply: on the qualified
+            // stores the successor's LIST finds what our PUT acked, and
+            // nothing deletes under a live epoch prefix. The extra LIST
+            // therefore goes; the L0 fallback below keeps its own.
+            if matches!(published, Ok(Ok(()))) {
+                handle.uploaded_epoch_objects.store(true, Ordering::SeqCst);
                 // The snapshot is a per-cell object through its txid, so it
                 // covers every fleet-acked row of this closed database. No
                 // later sync or bundle flush credits a removed handle, so
@@ -3778,7 +3834,7 @@ impl LtxRepl {
             let db = replica
                 .db_mut()
                 .ok_or_else(|| anyhow!("handoff snapshot database is unavailable"))?;
-            db.sync()
+            db.sync_before_close()
                 .map_err(|error| anyhow!("capture handoff database: {error}"))?;
             let durable_txid = db.pos()?.txid;
             if durable_txid == TXID(0) {
@@ -4109,7 +4165,14 @@ async fn sync_cell(handle: CellHandle) -> Option<bool> {
         let mut replica = handle_.replica.lock().unwrap();
         let from = replica.as_mut()?.pos().txid.0 + 1;
         let db = replica.as_mut()?.db_mut()?;
-        if let Err(error) = db.sync() {
+        let handoff_pending = handle_.handoff_ticket.load(Ordering::SeqCst)
+            > handle_.synced_seq.load(Ordering::SeqCst);
+        let synced = if handoff_pending {
+            db.sync_before_close()
+        } else {
+            db.sync()
+        };
+        if let Err(error) = synced {
             warn!(%error, "ltx wal capture failed");
             return Some(Err(()));
         }
@@ -4189,6 +4252,13 @@ async fn sync_cell(handle: CellHandle) -> Option<bool> {
             round_ordinal,
             LtxUploadRoundStatusForWorldV1::Completed,
         );
+    }
+    // Every staged file uploaded: this residency holds bucket proof of its
+    // own that the successor's LIST would find. Record it so the eviction
+    // gates can skip their visibility LISTs. An empty stage uploaded
+    // nothing and marks nothing, so an upload-free residency keeps the LIST.
+    if !uploads.is_empty() {
+        handle.uploaded_epoch_objects.store(true, Ordering::SeqCst);
     }
     if let Some(last) = last {
         // Advance the replica's uploaded watermark; `syncing` serializes
@@ -5471,7 +5541,7 @@ fn production_ltx_host() -> LtxHost {
     execution_domain_ltx_host()
 }
 
-#[cfg(celld_internal_tests)]
+#[cfg(any(test, celld_internal_tests))]
 fn deterministic_ltx_host() -> LtxHost {
     execution_domain_ltx_host()
 }
@@ -5550,6 +5620,304 @@ fn close_replica_staged(handle: &CellHandle) -> (Option<u64>, anyhow::Result<()>
 impl Drop for LtxRepl {
     fn drop(&mut self) {
         self.shutdown_local_fallback();
+    }
+}
+#[cfg(test)]
+mod evict_trim_tests {
+    use super::*;
+    use celld_ltx::object_store::memory::InMemory;
+    use celld_ltx::object_store::path::Path as ObjPath;
+    // `futures::stream::BoxStream`, spelled out: the celld crate carries
+    // futures-util only, and this names the same object type.
+    type ListStream = std::pin::Pin<
+        Box<dyn futures_util::Stream<Item = StoreResult<ObjectMeta>> + Send + 'static>,
+    >;
+    use celld_ltx::object_store::GetOptions;
+    use celld_ltx::object_store::GetResult;
+    use celld_ltx::object_store::ListResult;
+    use celld_ltx::object_store::MultipartUpload;
+    use celld_ltx::object_store::ObjectMeta;
+    use celld_ltx::object_store::PutMultipartOptions;
+    use celld_ltx::object_store::PutOptions;
+    use celld_ltx::object_store::PutPayload;
+    use celld_ltx::object_store::PutResult;
+    use celld_ltx::object_store::Result as StoreResult;
+    use std::sync::atomic::AtomicUsize;
+
+    /// An in-memory store that counts PUTs and LISTs under one per-cell
+    /// prefix, so the tests below can assert the eviction's request cost.
+    /// Every other operation delegates to the inner store untouched.
+    #[derive(Debug)]
+    struct CountingStore {
+        inner: InMemory,
+        prefix: String,
+        puts: AtomicUsize,
+        lists: AtomicUsize,
+    }
+
+    impl CountingStore {
+        fn new(prefix: &str) -> Self {
+            Self {
+                inner: InMemory::new(),
+                prefix: prefix.to_string(),
+                puts: AtomicUsize::new(0),
+                lists: AtomicUsize::new(0),
+            }
+        }
+
+        fn counts(&self) -> (usize, usize) {
+            (
+                self.puts.load(Ordering::SeqCst),
+                self.lists.load(Ordering::SeqCst),
+            )
+        }
+
+        fn under(&self, location: &ObjPath) -> bool {
+            location.as_ref().starts_with(self.prefix.as_str())
+        }
+    }
+
+    impl std::fmt::Display for CountingStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "CountingStore({})", self.prefix)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for CountingStore {
+        async fn put_opts(
+            &self,
+            location: &ObjPath,
+            payload: PutPayload,
+            opts: PutOptions,
+        ) -> StoreResult<PutResult> {
+            if self.under(location) {
+                self.puts.fetch_add(1, Ordering::SeqCst);
+            }
+            self.inner.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &ObjPath,
+            opts: PutMultipartOptions,
+        ) -> StoreResult<Box<dyn MultipartUpload>> {
+            if self.under(location) {
+                self.puts.fetch_add(1, Ordering::SeqCst);
+            }
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &ObjPath,
+            options: GetOptions,
+        ) -> StoreResult<GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+
+        async fn delete(&self, location: &ObjPath) -> StoreResult<()> {
+            self.inner.delete(location).await
+        }
+
+        fn list(&self, prefix: Option<&ObjPath>) -> ListStream {
+            if prefix.is_some_and(|p| p.as_ref().starts_with(self.prefix.as_str())) {
+                self.lists.fetch_add(1, Ordering::SeqCst);
+            }
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(&self, prefix: Option<&ObjPath>) -> StoreResult<ListResult> {
+            if prefix.is_some_and(|p| p.as_ref().starts_with(self.prefix.as_str())) {
+                self.lists.fetch_add(1, Ordering::SeqCst);
+            }
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy(&self, from: &ObjPath, to: &ObjPath) -> StoreResult<()> {
+            self.inner.copy(from, to).await
+        }
+
+        async fn copy_if_not_exists(&self, from: &ObjPath, to: &ObjPath) -> StoreResult<()> {
+            self.inner.copy_if_not_exists(from, to).await
+        }
+    }
+
+    fn test_watch() -> tempfile::TempDir {
+        tempfile::tempdir().unwrap()
+    }
+
+    fn db_path(watch: &Path, cell: &str, epoch: u64) -> PathBuf {
+        watch
+            .join(cell)
+            .join("ltx")
+            .join(format!("e{epoch}"))
+            .join("db.sqlite")
+    }
+
+    /// Commit one row through a second connection, the way the isolate's
+    /// own connection writes beside the replicator's. The writer holds no
+    /// open transaction past the call, so the managed capture never blocks.
+    fn sql_write(db: &Path) {
+        let connection = rusqlite::Connection::open(db).unwrap();
+        connection.busy_timeout(Duration::from_secs(5)).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS t(x TEXT); INSERT INTO t(x) VALUES('hello');",
+            )
+            .unwrap();
+    }
+
+    fn row_count(db: &Path) -> i64 {
+        let connection = rusqlite::Connection::open(db).unwrap();
+        connection
+            .query_row("SELECT COUNT(*) FROM t", [], |row| row.get(0))
+            .unwrap()
+    }
+
+    /// A durable `sync_wait` returns only after its upload's PUT was issued,
+    /// so the count is already settled here.
+    fn assert_puts(store: &CountingStore, want: usize) {
+        assert_eq!(store.counts().0, want, "the write's L0 upload");
+    }
+
+    async fn shutdown(repl: LtxRepl) {
+        let owner = repl.take_task_owner();
+        drop(repl);
+        owner.join().await;
+    }
+
+    /// One write, then eviction once the time-based checkpoint is due: the
+    /// handoff capture skips that checkpoint, so its sealing write commits
+    /// no txid for an L0 PUT of its own, and both visibility LISTs go
+    /// because this residency's own PUTs prove the prefix. The eviction
+    /// costs exactly the snapshot PUT and still restores.
+    #[test]
+    fn evict_after_write_costs_one_snapshot_put() {
+        let runtime = asyncrt::shared_test_runtime();
+        runtime.block_on(async {
+            let _temp = test_watch();
+            let watch = _temp.path().to_path_buf();
+            let store = Arc::new(CountingStore::new("cells/c/ltx/"));
+            let repl = LtxRepl::start_with_store_for_test(&watch, store.clone());
+            repl.activate(ActivationOptions {
+                cell: "c",
+                epoch: 1,
+                fresh: true,
+                took_over: false,
+                resume_local: false,
+                prior: None,
+            })
+            .await
+            .unwrap();
+            sql_write(&db_path(&watch, "c", 1));
+            // Land the write's L0 first, so the handoff capture below has
+            // nothing of the application's left to upload.
+            assert!(matches!(
+                repl.sync_wait("c", 1, Duration::from_secs(10)).await,
+                SyncWait::Durable
+            ));
+            assert_puts(&store, 1);
+            // Make the time-based checkpoint due, as it is for a cell that idles
+            // past the 60 s interval before its eviction: the write above left
+            // `synced_since_checkpoint` set.
+            {
+                let handle = repl
+                    .cells
+                    .lock()
+                    .unwrap()
+                    .get(&("c".to_string(), 1))
+                    .cloned()
+                    .unwrap();
+                let mut replica = handle.replica.lock().unwrap();
+                replica
+                    .as_mut()
+                    .unwrap()
+                    .db_mut()
+                    .unwrap()
+                    .checkpoint_interval = Duration::from_nanos(1);
+            }
+            let (puts_before, lists_before) = store.counts();
+            repl.handoff_gate("c", 1, true).await.unwrap();
+            let artifact = repl.evict("c", 1, false, None).await.unwrap();
+            assert_eq!(artifact, EvictionRestoreArtifact::Snapshot);
+            let (puts, lists) = store.counts();
+            assert_eq!(
+                (puts - puts_before, lists - lists_before),
+                (1, 0),
+                "eviction must cost exactly the snapshot PUT"
+            );
+            // The trimmed eviction still restores: the next epoch reads the row back.
+            repl.activate(ActivationOptions {
+                cell: "c",
+                epoch: 2,
+                fresh: false,
+                took_over: false,
+                resume_local: false,
+                prior: None,
+            })
+            .await
+            .unwrap();
+            assert_eq!(row_count(&db_path(&watch, "c", 2)), 1);
+            shutdown(repl).await;
+        });
+    }
+
+    /// A failed snapshot keeps the L0 fallback and its visibility LIST: the
+    /// trim never skips the proof the bucket did not already give.
+    #[test]
+    fn evict_snapshot_fallback_still_lists() {
+        let runtime = asyncrt::shared_test_runtime();
+        runtime.block_on(async {
+            let _temp = test_watch();
+            let watch = _temp.path().to_path_buf();
+            let store = Arc::new(CountingStore::new("cells/c/ltx/"));
+            let repl = LtxRepl::start_with_store_for_test(&watch, store.clone());
+            repl.activate(ActivationOptions {
+                cell: "c",
+                epoch: 1,
+                fresh: true,
+                took_over: false,
+                resume_local: false,
+                prior: None,
+            })
+            .await
+            .unwrap();
+            sql_write(&db_path(&watch, "c", 1));
+            assert!(matches!(
+                repl.sync_wait("c", 1, Duration::from_secs(10)).await,
+                SyncWait::Durable
+            ));
+            assert_puts(&store, 1);
+            repl.set_handoff_snapshot_budget_for_world(1);
+            let (puts_before, lists_before) = store.counts();
+            repl.handoff_gate("c", 1, true).await.unwrap();
+            let artifact = repl.evict("c", 1, false, None).await.unwrap();
+            assert_eq!(artifact, EvictionRestoreArtifact::L0Chain);
+            let (puts, lists) = store.counts();
+            assert_eq!(
+                puts - puts_before,
+                0,
+                "no snapshot PUT on the fallback path"
+            );
+            assert_eq!(
+                lists - lists_before,
+                1,
+                "the L0 fallback keeps its visibility LIST"
+            );
+            repl.activate(ActivationOptions {
+                cell: "c",
+                epoch: 2,
+                fresh: false,
+                took_over: false,
+                resume_local: false,
+                prior: None,
+            })
+            .await
+            .unwrap();
+            assert_eq!(row_count(&db_path(&watch, "c", 2)), 1);
+            shutdown(repl).await;
+        });
     }
 }
 
