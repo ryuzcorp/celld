@@ -686,7 +686,7 @@ push to `ghcr.io/denoland`, but still. Pushing a branch named
   Measured on the same 200 short-lived Durable Objects: stored `cells/`
   bytes 2.47 MB → 0.57 MB, objects 1800 → 400 (L0 1400 → 0; the 200
   snapshots stay).
-- `0058` (sha TBD at merge) a reproducible S3 request-cost harness in
+- `0058` (`f7877ed`) a reproducible S3 request-cost harness in
   `tools/s3bench/`, so cost claims in PRs can be re-measured instead of
   quoted. `proxy.py` is a threaded HTTP reverse proxy in front of the S3
   endpoint logging one JSON line per request (method, path, query, status,
@@ -712,7 +712,7 @@ push to `ghcr.io/denoland`, but still. Pushing a branch named
   16 writers, 15 s) 1489 writes, PUT `cells/*/ltx` 259, GET
   `cells/*/own.json` ~520. New files only, so no `Modified by` notice;
   nothing under `tools/` runs in CI.
-- `0059` (sha TBD at merge) the sans-I/O core for bucket-posture group commit
+- `0059` (`2719952`) the sans-I/O core for bucket-posture group commit
   (layer 1; no executor or fold wiring yet). `BUCKET_FORMAT` becomes 3, and a
   bucket node writes shared bundle proofs only while `bucket_bundles_allowed`
   (every live lease reads format 3; a single-node fleet's own lease opens it,
@@ -732,7 +732,7 @@ push to `ghcr.io/denoland`, but still. Pushing a branch named
   decodes the new record (unknown key ignored) and either folds the whole bundle
   prefix with no loss declaration or refuses the fold; never complete, never a
   dropped row. Downgrade safety rests on that recovery-correctness, not on refusal.
-- `0060` (sha TBD at merge) the bucket-posture executor (layer 2): a bucket node with
+- `0060` (`5172069`) the bucket-posture executor (layer 2): a bucket node with
   an open gate installs a registration without an ensemble, publishes its bucket-session
   record through the live-session lease chain before the first bundle-credited ack (never
   deleted, never `active == true`), and `bundle_active` fires with no shipper. Reuses
@@ -750,7 +750,7 @@ push to `ghcr.io/denoland`, but still. Pushing a branch named
   (`CELLD_DURABILITY=bucket`). `maintain` never converts a bucket session to an ensemble; no
   posture watch or recruit on bucket posture. Layers 3-5 still pending (successor fold of
   bucket bundles, drain/GC/graceful seal for bucket sessions) — do not enable in production.
-- `0061` (sha TBD at merge) the eviction guard proves a journaled epoch with a
+- `0061` (`d77d1c2`) the eviction guard proves a journaled epoch with a
   HEAD on the newest journaled key instead of a prefix LIST (parity item (iii),
   layer 1). `ObjectStoreClient::ltx_file_exists` HEADs the `ltx_key` the
   uploader wrote and the 0057 trim deletes — one constructor shared by all
@@ -764,7 +764,7 @@ push to `ghcr.io/denoland`, but still. Pushing a branch named
   one Class-B HEAD, proven by unit tests (warm guard: 1 HEAD + 0 LISTs; empty
   journal: LIST kept; HEAD miss: LIST fallback, then refuse). No name,
   format, or protocol change.
-- `0062` (sha TBD at merge) parity item (iv) layer 1, core-only: the per-round
+- `0062` (`8bbdd74`) parity item (iv) layer 1, core-only: the per-round
   fence credit predicate plus the output-gate settlement it feeds. `log_tier`
   gains a two-arm credit check per flush-round cell — the session-record arm
   (`bundle_credit_allowed`, still `Open` at the shipper's epoch after the PUT)
@@ -781,7 +781,7 @@ push to `ghcr.io/denoland`, but still. Pushing a branch named
   runtime behaviour changes. Fail-before per arm: a sealed record crediting
   (record arm), a live-donor bump crediting (fence arm), a pre-proof read
   crediting (ordering) each turn their test red.
-- `0063` (sha TBD at merge) the successor fold for bucket-posture group commit
+- `0063` (`ec27f09`) the successor fold for bucket-posture group commit
   (layer 3): a bucket session's acked rows are restorable after death, restart,
   or a quiet handoff. `recover_serial` branches on the session kind — bucket
   passes skip the member loop outright (no `post_tail`/`post_seal` RPCs for a
@@ -806,7 +806,7 @@ push to `ghcr.io/denoland`, but still. Pushing a branch named
   (takeover and restart now fold bundle-credited rows per-cell instead of
   orphaning them); the eviction/handoff/drain side is layer 4. Still behind
   `CELLD_BUCKET_BUNDLES=1` — do not enable in production until layers 4-5.
-- `0064` (sha TBD at merge) drain, GC, and graceful close for bucket sessions
+- `0064` (`644041e`) drain, GC, and graceful close for bucket sessions
   (layer 4; still behind `CELLD_BUCKET_BUNDLES=1`, still do-not-enable until the
   stack completes). Eviction of a bundled cell writes ONE per-cell snapshot from
   the complete local DB — never a per-cell L0 re-upload — and the guard proves
@@ -825,7 +825,7 @@ push to `ghcr.io/denoland`, but still. Pushing a branch named
   linger (`CELLD_BUCKET_BUNDLE_LINGER_MS`) holds the window open only while
   more than one cell is dirty — a lone cell flushes at once, since waiting
   would add the whole linger to one ack without batching anything.
-- `0065` (sha TBD at merge) trim the C heap sooner after eviction: the
+- `0065` (`d7fd9f2`) trim the C heap sooner after eviction: the
   sampler tick returns glibc free pages past `CELLD_C_TRIM_MB` (default 8,
   was a 32 MiB const), with a pure `trim_due` predicate and unit tests.
   Measured post-drain RSS 72.0 → 61.9 MiB on the agent-50 s3bench shape. A
@@ -833,15 +833,15 @@ push to `ghcr.io/denoland`, but still. Pushing a branch named
   only ~1 MiB of ~20 MiB slack (the rest is active-run fragmentation
   `mallctl` cannot return), and the post-drain "counting" bump is the
   graceful-shutdown drain's working set, not retention — no fix needed.
-- `0066` (sha TBD at merge) a per-connection SQLite page-cache budget:
+- `0066` (`7e870d4`) a per-connection SQLite page-cache budget:
   `finish_open` sets `PRAGMA cache_size=-<kb>` from `CELLD_SQLITE_CACHE_KB`
   (default 2000, the stock ceiling: no behavior change at merge). Knob
   validated at startup and documented in `docs/`.
-- `0067` (sha TBD at merge) share the `/bundle` tree per deployment
+- `0067` (`fc0646b`) share the `/bundle` tree per deployment
   generation instead of per isolate: the projection lives on the shared
   `Arc<WorkerConfig>`, so N isolates project once; read-only semantics
   unchanged. Counter-based unit test proves one projection per config.
-- `0069` (sha TBD at merge) the s3bench agent workload drives its agents
+- `0069` (`016541d`) the s3bench agent workload drives its agents
   concurrently: one thread (and connection) per agent, each writing every
   `write_every_s` seconds on its own phase (`start + agent*every/agents`),
   so arrivals are uniform like independent Noite/Outer clients and
@@ -853,7 +853,7 @@ push to `ghcr.io/denoland`, but still. Pushing a branch named
   measured counts match the serial driver. The README notes that agents
   are concurrent and suggests `DELAY_MS=100` for realistic batching numbers
   (R2 answers a PUT in ~100–200 ms from a VPS).
-- `0070` (sha TBD at merge) rollout for bucket-posture group commit
+- `0070` (`3c442a1`) rollout for bucket-posture group commit
   (layer 5): group commit is ON by default in bucket posture.
   `CELLD_BUCKET_BUNDLES` defaults to on and `=0` disables it; any other
   value stops startup (`env_vars::validate`). The format-3 fleet gate still
@@ -878,8 +878,7 @@ push to `ghcr.io/denoland`, but still. Pushing a branch named
   watch dir, different node, same bucket) took every cell over, folded the
   whole bundle prefix with no loss declared, and served 200/200 probes with
   every acked row restorable.
-
-- `0071` (sha TBD at merge) fix the bucket hot-cell double-write, and quiet
+- `0071` (`01a68fb`) fix the bucket hot-cell double-write, and quiet
   idle bundle GC. A `sync_loop` worker spawned before the bundle arm kept
   uploading per-cell L0s beside every bundle flush: a continuously-dirty
   cell never looks clean, so the worker never left its loop and every row
@@ -939,12 +938,12 @@ push to `ghcr.io/denoland`, but still. Pushing a branch named
   so batching more would need a linger, which default config refuses (a
   lone cell never waits). 555 is zero bundle ops plus one LIST, i.e. a run
   with no multi-dirty capture at all; the floor with jitter is ~566-572.
-- `0072` (sha TBD at merge) the s3bench agent and hot drivers report
+- `0072` (`f1f15c9`) the s3bench agent and hot drivers report
   per-turn latency (`mean`, `p50`, `p95`, `p99`, nearest-rank, whole ms),
   timed per request in the worker's own thread after its pacing sleep and
   recorded only for 2xx answers. Pass/fail semantics are unchanged; the
   numbers make ack-latency regressions visible next to the request counts.
-- `0075` (sha TBD at merge) group commit defaults OFF in bucket posture.
+- `0075` (`630cedc`) group commit defaults OFF in bucket posture.
   Release measurements show bundling roughly doubles durable-write p50 even
   with the pipelined credit re-read, so `.11` ships per-cell uploads: an
   unset `CELLD_BUCKET_BUNDLES` now disables grouping and only an explicit
@@ -1080,7 +1079,7 @@ source commit; the commits keep the original author with a
     reaches them. `celld dev`'s container engine CLI (projects with
     `containers`) still inherits the environment; a production node never
     builds.
-- `v0.6.3-ryuzcorp.10` (the commit that adds this entry): adds
+- `v0.6.3-ryuzcorp.10` (`895a05d`): adds
   `0054`–`0057`, all bucket-request and storage savings; no format or API
   change, so nodes on `.9` and `.10` can share a bucket.
   Upgrade notes:
@@ -1099,6 +1098,32 @@ source commit; the commits keep the original author with a
     `nodes/` scan off to the 30 s maintenance tick (`0055`), so a node that
     starts next to it is recruited within ~30 s instead of ~1 s (the new
     node recruits the old one itself at once).
+- `v0.6.3-ryuzcorp.11` (the commit that adds this entry): adds
+  `0058`–`0067`, `0069`–`0072` and `0075`. `0068`, `0073` and `0074` were
+  parked unmerged. There is no API or CLI change. A `.11` node publishes
+  bucket format 3, which `.10` nodes read, so `.10` and `.11` nodes can
+  share a bucket.
+  Upgrade notes:
+  - Bucket-posture group commit (`0059`–`0064`, `0070`, `0071`) is in the
+    binary but off by default (`0075`); `CELLD_BUCKET_BUNDLES=1` turns it
+    on. It needs every live lease to read format 3 (every node on `.11`)
+    and falls back to per-cell uploads at once otherwise.
+    - Measured on 200 agents × 6 writes with `DELAY_MS=100`: Class A
+      requests fell from 1934 to 1140, but write-ack p50 rose from 210 to
+      445 ms. On a hot cell, p50 rose from 235 to 432 ms. Enable it only
+      where request cost matters more than write latency.
+    - `.10` recovers a bucket that `.11` wrote bundles into (whole-prefix
+      fold, no loss declared), so a downgrade is safe.
+  - An eviction proves a journaled epoch with one HEAD instead of a prefix
+    LIST (`0061`).
+  - The C heap is trimmed sooner after evictions (`0065`, `CELLD_C_TRIM_MB`,
+    default 8). Post-drain RSS fell by about 10 MiB on the agent-50 shape.
+  - `CELLD_SQLITE_CACHE_KB` caps the per-connection SQLite page cache
+    (`0066`; the default of 2000 KiB is unchanged).
+  - A deployment generation projects its `/bundle` tree once instead of
+    once per isolate (`0067`).
+  - `tools/s3bench` (`0058`, `0069`, `0072`) measures bucket request counts
+    and per-write latency against a local S3 for cost claims.
 
 ## License
 
