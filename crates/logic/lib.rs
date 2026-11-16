@@ -1,5 +1,6 @@
 // Modified by ryuzcorp (ryuzcorp/celld): round-level fence settlement (0062).
 // Modified by ryuzcorp (ryuzcorp/celld): ported from meln1k/celld: coordination-core fixes (ea471ee, e46a685, 6d61462, 18d3bf9, 9d4c163, 468b456, 01522b3, b026226, 65fdb13); shared bucket-posture ownership reads across concurrent gates (0056).
+// Modified by ryuzcorp (ryuzcorp/celld): MergeTree-style lazy handoff policy (0078).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! Clean-sheet celld decision core.
@@ -20,6 +21,7 @@ pub mod durability;
 pub mod epoch_gc;
 pub mod format;
 pub mod gate;
+pub mod handoff;
 pub mod http;
 pub mod isolate;
 pub mod kv;

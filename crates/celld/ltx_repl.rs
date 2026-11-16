@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): an eviction skips the visibility LISTs its own uploads already prove and the time-based checkpoint before the handoff; an eviction deletes the per-cell L0/L1 objects its handoff snapshot supersedes; bucket-posture group commit: paged gate judges PAGED_FORMAT (0059); bucket-posture group commit: bucket bundle gate, sync pacing and event-driven bundle flush (0060); the eviction guard proves a journaled epoch with a HEAD on the newest journaled key, falling back to the listing on a miss, an error, or an empty journal (0061); bucket-posture group commit: bundled-cell eviction guard, graceful-close per-cell drain, bundle GC without ensemble, linger holds only while the dirty set is shared (0064).; bucket-posture group commit: bucket switch on by default (0070); bucket-posture group commit: a sync worker yields once the bundle loop owns tiering, and a lone-cell round uploads per-cell instead of bundling (0071); bucket-posture group commit: bundle switch defaults off (0075).
+// Modified by ryuzcorp (ryuzcorp/celld): an eviction skips the visibility LISTs its own uploads already prove and the time-based checkpoint before the handoff; an eviction deletes the per-cell L0/L1 objects its handoff snapshot supersedes; bucket-posture group commit: paged gate judges PAGED_FORMAT (0059); bucket-posture group commit: bucket bundle gate, sync pacing and event-driven bundle flush (0060); the eviction guard proves a journaled epoch with a HEAD on the newest journaled key, falling back to the listing on a miss, an error, or an empty journal (0061); bucket-posture group commit: bundled-cell eviction guard, graceful-close per-cell drain, bundle GC without ensemble, linger holds only while the dirty set is shared (0064).; bucket-posture group commit: bucket switch on by default (0070); bucket-posture group commit: a sync worker yields once the bundle loop owns tiering, and a lone-cell round uploads per-cell instead of bundling (0071); bucket-posture group commit: bundle switch defaults off (0075); MergeTree-style lazy handoff: an eviction skips the snapshot for a short chain born in this epoch (0078).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! In-process replication backend built on `celld-ltx`.
@@ -931,6 +931,17 @@ struct Cell {
     /// seed, bundle credits, or recovered tails — so every other case keeps
     /// the LIST.
     uploaded_epoch_objects: AtomicBool,
+    /// Whether this epoch's restorable chain starts at TXID 1 in this
+    /// epoch's per-cell prefix with every object in this handle's upload
+    /// journal, so an eviction may skip its handoff snapshot (0078 lazy
+    /// handoff). Set once at activation: true for a fresh activation and
+    /// for a reused `.evicted`/`.hibernated` image (eviction stripped the
+    /// LTX metadata, so the reopened image starts a new writer generation
+    /// at TXID 1 whose first L0 carries the full image, exactly like a
+    /// fresh cell), false for a remote restore or paged continuation
+    /// (txids continue an older epoch), a same-epoch resume (pre-resume
+    /// uploads are unjournaled), and uncertified local rows.
+    chain_from_txid1_journaled: bool,
     /// Every per-cell object key this residency itself uploaded under this
     /// cell epoch's prefix (level, min txid, max txid), in upload order,
     /// capped at `EPOCH_UPLOAD_JOURNAL_MAX`. The eviction trim deletes the
@@ -949,6 +960,11 @@ struct Cell {
     /// keeps the exemption until a capture covers the handoff, even when a
     /// capture that started before `handoff_wait` runs in between.
     handoff_ticket: AtomicU64,
+    /// Whether the upload journal above ever filled and dropped an entry.
+    /// The lazy handoff counts journaled objects to bound the successor
+    /// restore; a filled journal makes that count a lie, so an overflowed
+    /// journal keeps the snapshot (0078).
+    epoch_uploads_overflowed: AtomicBool,
     /// Set while a sync for this cell is in flight, so the loop never runs two
     /// at once for one cell (they would serialize on the mutex and waste work).
     syncing: AtomicBool,
@@ -1141,6 +1157,14 @@ fn note_epoch_upload(handle: &Cell, level: i32, min_txid: u64, max_txid: u64) {
         .expect("epoch upload journal poisoned");
     if journal.len() < EPOCH_UPLOAD_JOURNAL_MAX {
         journal.push((level, min_txid, max_txid));
+    } else {
+        // The journal stopped recording, so the chain is longer than the
+        // count says. The lazy handoff (0078) counts journaled objects to
+        // bound the successor restore; an overflowed journal keeps the
+        // snapshot instead of trusting that count.
+        handle
+            .epoch_uploads_overflowed
+            .store(true, Ordering::SeqCst);
     }
 }
 
@@ -2634,6 +2658,9 @@ impl LtxRepl {
                 dst.display()
             );
             info!(cell, epoch, "resumed clean local replica");
+            // 0078: a resume continues the SAME epoch prefix, but the uploads
+            // the previous residency made are not in this handle's journal,
+            // so the object count is unknown: not chain_from_txid1_journaled.
         } else if let Some(snapshot) = local_snapshot {
             self.ltx_host.rename(&snapshot, &dst)?;
             self.preserved
@@ -2641,6 +2668,10 @@ impl LtxRepl {
                 .expect("preserved cache poisoned")
                 .forget(&snapshot);
             info!(cell, epoch, "reused local eviction snapshot");
+            // 0078: this reuse still starts a new writer generation at TXID 1
+            // (eviction stripped the LTX metadata, so `db.pos()` below reads
+            // ZERO and the replica seeded at 0 uploads every page in its
+            // first L0, exactly like a fresh cell): chain_from_txid1_journaled.
             restored = true;
         } else if !fresh {
             // Restore the newest durable epoch's full contiguous chain. The
@@ -2779,6 +2810,8 @@ impl LtxRepl {
                         "paged remote replica"
                     );
                     paged_vfs_name = Some(name);
+                    // 0078: the epoch continues the cut's txids from an older
+                    // epoch's chain: not chain_from_txid1_journaled.
                     restored = true;
                 } else {
                     let stats = replica::restore_timed_with_host_and_download_slots(
@@ -2811,11 +2844,17 @@ impl LtxRepl {
                         levels,
                     });
                     info!(cell, from, to = epoch, "restored remote replica");
+                    // 0078: the seed carries an older epoch's chain, so this
+                    // epoch's prefix continues past it: not
+                    // chain_from_txid1_journaled.
                     restored = true;
                 }
             }
         }
 
+        // 0078: a leftover database with no restore behind it holds local rows
+        // a same-epoch predecessor staged but never journaled here: not
+        // chain_from_txid1_journaled even though the epoch prefix is this one.
         let remote_seed = if !restored && dst_existed {
             Some(self.contiguous_covered_txid(cell, epoch).await?)
         } else {
@@ -2885,7 +2924,7 @@ impl LtxRepl {
         let db_open_us = asyncrt::mono_ms()
             .saturating_sub(db_open_started_mono_ms)
             .saturating_mul(1_000);
-        if let Some(timing) = remote_restore {
+        if let Some(timing) = &remote_restore {
             info!(
                 event = "restore_plan",
                 cell,
@@ -2943,7 +2982,20 @@ impl LtxRepl {
             // per-cell coverage at open.
             percell_txid: AtomicU64::new(seed.map_or(0, |pos| pos.txid.0)),
             uploaded_epoch_objects: AtomicBool::new(marker_uploaded),
+            // 0078: this epoch's chain is restorable from this handle's journal
+            // alone (so an eviction may skip its snapshot) iff no older history
+            // feeds it: no remote restore or paged continuation (the seed
+            // would carry an older epoch's chain), no same-epoch resume (the
+            // previous residency's uploads are unjournaled), and no
+            // uncertified leftover rows. A reused `.evicted`/`.hibernated`
+            // image qualifies: its generation starts at TXID 1. Otherwise the
+            // chain is born here: a fresh cell, or an empty bucket with no
+            // local state.
+            chain_from_txid1_journaled: remote_restore.is_none()
+                && !resume_local
+                && remote_seed.is_none(),
             epoch_uploads: Mutex::new(Vec::new()),
+            epoch_uploads_overflowed: AtomicBool::new(false),
             handoff_ticket: AtomicU64::new(0),
             syncing: AtomicBool::new(false),
             ready: Notify::new(),
@@ -3728,7 +3780,41 @@ impl LtxRepl {
         if abandon.is_some_and(EvictionAbandon::requested) {
             return Err(abandoned());
         }
-        let (snapshot, compaction_pause) = self.prepare_handoff_snapshot(&handle).await?;
+        // 0078 lazy handoff (MergeTree-style): a cell whose restorable chain
+        // was born in this epoch, is fully per-cell covered, and fits in a
+        // short journal needs no handoff snapshot: the L0 chain below is
+        // already the complete restore source, and the snapshot PUT would
+        // rewrite the whole database on every eviction. The skip declines
+        // exactly like the over-budget path (compaction pause held, no trim,
+        // L0-chain fallback with its own proof), so refusal behaviour is
+        // unchanged. Watermarks can only move together here (per-cell uploads
+        // credit both; the runtime is closed), and the fallback re-proves
+        // whatever moved, so the decision needs no re-check inside.
+        let journal_len = handle.epoch_uploads.lock().unwrap().len();
+        let skip_snapshot = !celld_logic::handoff::handoff_snapshot_needed(
+            &celld_logic::handoff::HandoffChain {
+                chain_from_txid1_journaled: handle.chain_from_txid1_journaled,
+                percell_txid: percell_coverage(&handle),
+                durable_txid: handle.durable_txid.load(Ordering::SeqCst),
+                journal_len,
+                journal_overflowed: handle
+                    .epoch_uploads_overflowed
+                    .load(Ordering::SeqCst),
+            },
+        );
+        if skip_snapshot {
+            info!(
+                event = "eviction_snapshot_skipped",
+                cell,
+                epoch,
+                objects = journal_len,
+                reason = "chain_from_txid1_journaled,percell_covered,short_chain",
+                "this epoch's L0 chain is the complete handoff; skipping the snapshot PUT"
+            );
+        }
+        let (snapshot, compaction_pause) = self
+            .prepare_handoff_snapshot(&handle, skip_snapshot)
+            .await?;
         if abandon.is_some_and(EvictionAbandon::requested) {
             return Err(abandoned());
         }
@@ -3787,15 +3873,47 @@ impl LtxRepl {
         let artifact = match artifact {
             Some(artifact) => artifact,
             None => {
-                let remaining_ms = deadline.saturating_sub(asyncrt::mono_ms());
-                if remaining_ms == 0
-                    || !matches!(
-                        self.sync_wait(cell, epoch, Duration::from_millis(remaining_ms))
-                            .await,
-                        SyncWait::Durable
-                    )
-                {
-                    return Err(anyhow!("final durability failed for {cell} epoch {epoch}"));
+                // 0078: the skip declined the snapshot, so this final pass proves
+                // the L0 chain with no new image. Read the local position without
+                // syncing: the fallback's ordinary sync would mint a
+                // content-free txid (the due time-based checkpoint's sealing
+                // write, or `ensure_wal_exists` after the close) and upload it
+                // as its own L0 just to prove commits the per-cell prefix
+                // already covers. `Db::pos` cannot see a WAL-only tail, so ask
+                // `has_uncaptured_changes` instead: if the WAL holds nothing
+                // past the capture AND the per-cell prefix covers every local
+                // commit, skip the sync and go straight to `epoch_replicated`;
+                // only a real pending commit runs `sync_wait` as today (it
+                // uploads the commit, so a content-free txid is not at issue).
+                // Neither `ensure_wal_exists` nor `sync_before_close` runs on
+                // the skip path.
+                let local_covered = if skip_snapshot {
+                    let handle_ = handle.clone();
+                    let percell = percell_coverage(&handle);
+                    asyncrt::blocking(move || {
+                        let mut replica = handle_.replica.lock().unwrap();
+                        let db = replica.as_mut()?.db_mut()?;
+                        let clean = !db.has_uncaptured_changes().unwrap_or(true);
+                        let covered = db.pos().ok().is_some_and(|pos| pos.txid.0 <= percell);
+                        Some(clean && covered)
+                    })
+                    .await
+                    .unwrap_or(None)
+                    .is_some_and(|covered| covered)
+                } else {
+                    false
+                };
+                if !local_covered {
+                    let remaining_ms = deadline.saturating_sub(asyncrt::mono_ms());
+                    if remaining_ms == 0
+                        || !matches!(
+                            self.sync_wait(cell, epoch, Duration::from_millis(remaining_ms))
+                                .await,
+                            SyncWait::Durable
+                        )
+                    {
+                        return Err(anyhow!("final durability failed for {cell} epoch {epoch}"));
+                    }
                 }
                 if !self.epoch_replicated(cell, epoch).await {
                     return Err(anyhow!(
@@ -3887,7 +4005,10 @@ impl LtxRepl {
         if handle.durable_txid.load(Ordering::SeqCst) <= percell_coverage(&handle) {
             return true;
         }
-        match self.prepare_handoff_snapshot(&handle).await {
+        // 0078 leaves the graceful seal untouched: it only runs with a
+        // durable-ahead-of-percell gap, where the lazy-handoff policy would
+        // demand the snapshot anyway, so it always attempts it.
+        match self.prepare_handoff_snapshot(&handle, false).await {
             Ok((Some(snapshot), pause)) => {
                 let published = self
                     .publish_handoff_snapshot(cell, epoch, &snapshot)
@@ -4364,6 +4485,7 @@ impl LtxRepl {
     async fn prepare_handoff_snapshot(
         &self,
         handle: &CellHandle,
+        skip_snapshot: bool,
     ) -> anyhow::Result<(Option<HandoffSnapshot>, Option<HandoffCompactionPause>)> {
         // A paged activation's local file is sparse. The snapshot page
         // collector reads non-WAL pages from the file directly, so a handoff
@@ -4385,6 +4507,13 @@ impl LtxRepl {
         // attempts. Returning before the run lock would let a round that was
         // already folding keep running into the L0-chain proof.
         if handle.snapshot_declined.load(Ordering::Relaxed) {
+            return Ok((None, pause));
+        }
+        // 0078: the eviction caller evaluated the lazy-handoff policy above.
+        // Declining here keeps the declined path's semantics (compaction
+        // pause held, run lock taken) and flows into the existing L0-chain
+        // fallback, which re-proves durability with no new proof.
+        if skip_snapshot {
             return Ok((None, pause));
         }
 
@@ -6667,6 +6796,22 @@ mod evict_trim_tests {
                     .unwrap()
                     .checkpoint_interval = Duration::from_nanos(1);
             }
+            // 0078: pad the journal past HANDOFF_CHAIN_MAX_OBJECTS so this
+            // fresh chain keeps its snapshot; the padded keys name txids past
+            // it, so the trim filter drops them and the assertions below are
+            // unchanged.
+            {
+                let handle = repl
+                    .cells
+                    .lock()
+                    .unwrap()
+                    .get(&("c".to_string(), 1))
+                    .cloned()
+                    .unwrap();
+                for _ in 0..celld_logic::handoff::HANDOFF_CHAIN_MAX_OBJECTS {
+                    note_epoch_upload(&handle, 0, 2, 2);
+                }
+            }
             let (puts_before, lists_before) = store.counts();
             repl.handoff_gate("c", 1, true).await.unwrap();
             let artifact = repl.evict("c", 1, false, None).await.unwrap();
@@ -6963,6 +7108,14 @@ mod evict_trim_tests {
                     .unwrap(),
                 "the probe names the key the uploader wrote"
             );
+            // 0078: pad the journal past HANDOFF_CHAIN_MAX_OBJECTS so this
+            // fresh chain keeps its snapshot; the padded keys name txids past
+            // it, so the trim filter drops them and the assertions below are
+            // unchanged. After the probe above, so `.last()` still names the
+            // real upload.
+            for _ in 0..celld_logic::handoff::HANDOFF_CHAIN_MAX_OBJECTS {
+                note_epoch_upload(&handle, 0, 2, 2);
+            }
             repl.handoff_gate("c", 1, true).await.unwrap();
             assert_eq!(
                 repl.evict("c", 1, false, None).await.unwrap(),
@@ -7357,6 +7510,22 @@ mod evict_trim_tests {
                 ));
             }
             assert_puts(&store, 3);
+            // 0078: pad the journal past HANDOFF_CHAIN_MAX_OBJECTS so this
+            // fresh chain keeps its snapshot; the padded keys name txids past
+            // it, so the trim filter drops them and the assertions below are
+            // unchanged.
+            {
+                let handle = repl
+                    .cells
+                    .lock()
+                    .unwrap()
+                    .get(&("c".to_string(), 1))
+                    .cloned()
+                    .unwrap();
+                for _ in 0..14 {
+                    note_epoch_upload(&handle, 0, 9, 9);
+                }
+            }
             let deletes_before = store.deletes();
             repl.handoff_gate("c", 1, true).await.unwrap();
             let artifact = repl.evict("c", 1, false, None).await.unwrap();
@@ -7403,6 +7572,22 @@ mod evict_trim_tests {
                     repl.sync_wait("c", 1, Duration::from_secs(10)).await,
                     SyncWait::Durable
                 ));
+            }
+            // 0078: pad the journal past HANDOFF_CHAIN_MAX_OBJECTS so this
+            // fresh chain keeps its snapshot; the padded keys name txids past
+            // it, so the trim filter drops them and the assertions below are
+            // unchanged.
+            {
+                let handle = repl
+                    .cells
+                    .lock()
+                    .unwrap()
+                    .get(&("c".to_string(), 1))
+                    .cloned()
+                    .unwrap();
+                for _ in 0..14 {
+                    note_epoch_upload(&handle, 0, 9, 9);
+                }
             }
             store.hold_deletes();
             repl.handoff_gate("c", 1, true).await.unwrap();
@@ -7463,6 +7648,370 @@ mod evict_trim_tests {
         });
     }
 
+    /// 0078: a fresh cell with a short journaled chain skips the handoff
+    /// snapshot by policy (no budget forcing): the eviction PUTs no L9,
+    /// returns the L0-chain artifact, deletes nothing, and the next epoch
+    /// restores the rows. Fail-before: forcing the old behaviour (always
+    /// snapshot) publishes one snapshot PUT and returns `Snapshot`.
+    #[test]
+    fn lazy_handoff_skips_snapshot_for_fresh_short_chain() {
+        let runtime = asyncrt::shared_test_runtime();
+        runtime.block_on(async {
+            let _temp = test_watch();
+            let watch = _temp.path().to_path_buf();
+            let store = Arc::new(CountingStore::new("cells/c/ltx/"));
+            let repl = LtxRepl::start_with_store_for_test(&watch, store.clone());
+            activate_epoch(&repl, "c", 1, true).await;
+            for _ in 0..2 {
+                sql_write(&db_path(&watch, "c", 1));
+                assert!(matches!(
+                    repl.sync_wait("c", 1, Duration::from_secs(10)).await,
+                    SyncWait::Durable
+                ));
+            }
+            assert_puts(&store, 2);
+            let (puts_before, lists_before) = store.counts();
+            let heads_before = store.heads();
+            let deletes_before = store.deletes();
+            repl.handoff_gate("c", 1, true).await.unwrap();
+            // Mirror a production-old cell: make the time-based checkpoint due,
+            // as it is for a cell that lives past the 60 s interval before its
+            // eviction. Without the pos-check below, the fallback's ordinary
+            // sync would fire that checkpoint and commit a content-free sealing
+            // txid, uploading it as its own L0 (fail-before: forcing the sync
+            // path adds one PUT here). The gate's capture is exempt and the
+            // earlier syncs ran at the default interval, so only the fallback
+            // can mint it.
+            {
+                let handle = repl
+                    .cells
+                    .lock()
+                    .unwrap()
+                    .get(&("c".to_string(), 1))
+                    .cloned()
+                    .unwrap();
+                let mut replica = handle.replica.lock().unwrap();
+                replica
+                    .as_mut()
+                    .unwrap()
+                    .db_mut()
+                    .unwrap()
+                    .checkpoint_interval = Duration::from_nanos(1);
+            }
+            let artifact = repl.evict("c", 1, false, None).await.unwrap();
+            trim_idle(&repl).await;
+            assert_eq!(artifact, EvictionRestoreArtifact::L0Chain);
+            let (puts, lists) = store.counts();
+            assert_eq!(
+                puts - puts_before,
+                0,
+                "the policy skip PUTs no L9 snapshot"
+            );
+            assert_eq!(
+                (lists - lists_before, store.heads() - heads_before),
+                (0, 1),
+                "the journaled fallback proves the epoch with one HEAD and no LIST"
+            );
+            assert_eq!(
+                store.deletes() - deletes_before,
+                0,
+                "no snapshot means no trim"
+            );
+            assert!(
+                ltx_level_files(&repl, "c", 1, 9).await.is_empty(),
+                "no snapshot object is published"
+            );
+            assert_eq!(
+                ltx_level_files(&repl, "c", 1, 0).await.len(),
+                2,
+                "the L0 chain stays for the restore"
+            );
+            activate_epoch(&repl, "c", 2, false).await;
+            assert_eq!(row_count(&db_path(&watch, "c", 2)), 2);
+            shutdown(repl).await;
+        });
+    }
+
+    /// 0078: a WAL-only tail — a write after the last sync, with no waiter,
+    /// as background or waitUntil work after the handoff gate lands — is
+    /// invisible to `Db::pos` but not to the handoff. The skip path must sync
+    /// it before handing off, or the successor restores without the row.
+    /// Fail-before: with the blind pos-check the eviction skips the sync and
+    /// the next epoch is missing the row.
+    #[test]
+    fn lazy_handoff_syncs_wal_only_tail_before_handoff() {
+        let runtime = asyncrt::shared_test_runtime();
+        runtime.block_on(async {
+            let _temp = test_watch();
+            let watch = _temp.path().to_path_buf();
+            let store = Arc::new(CountingStore::new("cells/c/ltx/"));
+            let repl = LtxRepl::start_with_store_for_test(&watch, store.clone());
+            activate_epoch(&repl, "c", 1, true).await;
+            sql_write(&db_path(&watch, "c", 1));
+            assert!(matches!(
+                repl.sync_wait("c", 1, Duration::from_secs(10)).await,
+                SyncWait::Durable
+            ));
+            assert_puts(&store, 1);
+            repl.handoff_gate("c", 1, true).await.unwrap();
+            // A write with no waiter after the gate: nothing re-syncs it
+            // before the eviction, so it sits in the WAL past the capture.
+            sql_write(&db_path(&watch, "c", 1));
+            let (puts_before, lists_before) = store.counts();
+            let artifact = repl.evict("c", 1, false, None).await.unwrap();
+            trim_idle(&repl).await;
+            assert_eq!(artifact, EvictionRestoreArtifact::L0Chain);
+            let (puts, lists) = store.counts();
+            assert_eq!(
+                (puts - puts_before, lists - lists_before),
+                (1, 0),
+                "the skip path uploads the WAL-only tail as one L0"
+            );
+            activate_epoch(&repl, "c", 2, false).await;
+            assert_eq!(
+                row_count(&db_path(&watch, "c", 2)),
+                2,
+                "the successor restores the WAL-only row"
+            );
+            shutdown(repl).await;
+        });
+    }
+
+    /// 0078: a `.evicted` reuse starts a new writer generation at TXID 1
+    /// whose first L0 carries the full image, so the chain is still born in
+    /// this epoch and journaled here: the second eviction skips the snapshot
+    /// too, and the third epoch restores every row. Fail-before for the
+    /// steering question: treating reuse as older history would publish a
+    /// snapshot at the second eviction.
+    #[test]
+    fn lazy_handoff_evict_reuse_keeps_short_chain() {
+        let runtime = asyncrt::shared_test_runtime();
+        runtime.block_on(async {
+            let _temp = test_watch();
+            let watch = _temp.path().to_path_buf();
+            let store = Arc::new(CountingStore::new("cells/c/ltx/"));
+            let repl = LtxRepl::start_with_store_for_test(&watch, store.clone());
+            activate_epoch(&repl, "c", 1, true).await;
+            sql_write(&db_path(&watch, "c", 1));
+            assert!(matches!(
+                repl.sync_wait("c", 1, Duration::from_secs(10)).await,
+                SyncWait::Durable
+            ));
+            repl.handoff_gate("c", 1, true).await.unwrap();
+            assert_eq!(
+                repl.evict("c", 1, true, None).await.unwrap(),
+                EvictionRestoreArtifact::L0Chain,
+                "the fresh first epoch skips by policy"
+            );
+            trim_idle(&repl).await;
+            assert!(
+                repl.ltx_host
+                    .metadata(&db_path(&watch, "c", 1).with_extension("evicted"))
+                    .is_ok_and(|metadata| metadata.is_file),
+                "the preserved image is the next epoch's reuse base"
+            );
+            repl.activate(ActivationOptions {
+                cell: "c",
+                epoch: 2,
+                fresh: false,
+                took_over: false,
+                resume_local: false,
+                prior: None,
+            })
+            .await
+            .unwrap();
+            assert_eq!(
+                row_count(&db_path(&watch, "c", 2)),
+                1,
+                "the reused image carries the first epoch's row"
+            );
+            sql_write(&db_path(&watch, "c", 2));
+            assert!(matches!(
+                repl.sync_wait("c", 2, Duration::from_secs(10)).await,
+                SyncWait::Durable
+            ));
+            let (puts_before, _) = store.counts();
+            repl.handoff_gate("c", 2, true).await.unwrap();
+            assert_eq!(
+                repl.evict("c", 2, false, None).await.unwrap(),
+                EvictionRestoreArtifact::L0Chain,
+                "the reused epoch's chain is still born here"
+            );
+            trim_idle(&repl).await;
+            assert_eq!(
+                store.counts().0 - puts_before,
+                0,
+                "the reuse skip PUTs no L9 snapshot either"
+            );
+            activate_epoch(&repl, "c", 3, false).await;
+            assert_eq!(row_count(&db_path(&watch, "c", 3)), 2);
+            shutdown(repl).await;
+        });
+    }
+
+    /// 0078: a cell activated by restoring from an earlier epoch carries
+    /// older history, so its eviction still publishes the snapshot: exactly
+    /// one PUT past the gate, the `Snapshot` artifact, and the next epoch
+    /// restores every row.
+    #[test]
+    fn lazy_handoff_restored_cell_still_snapshots() {
+        let runtime = asyncrt::shared_test_runtime();
+        runtime.block_on(async {
+            let _temp = test_watch();
+            let watch = _temp.path().to_path_buf();
+            let store = Arc::new(CountingStore::new("cells/c/ltx/"));
+            let repl = LtxRepl::start_with_store_for_test(&watch, store.clone());
+            activate_epoch(&repl, "c", 1, true).await;
+            sql_write(&db_path(&watch, "c", 1));
+            assert!(matches!(
+                repl.sync_wait("c", 1, Duration::from_secs(10)).await,
+                SyncWait::Durable
+            ));
+            repl.handoff_gate("c", 1, true).await.unwrap();
+            assert_eq!(
+                repl.evict("c", 1, false, None).await.unwrap(),
+                EvictionRestoreArtifact::L0Chain,
+                "the fresh first epoch skips by policy"
+            );
+            trim_idle(&repl).await;
+            activate_epoch(&repl, "c", 2, false).await;
+            assert_eq!(
+                row_count(&db_path(&watch, "c", 2)),
+                1,
+                "the second epoch clones the first epoch's L0 chain"
+            );
+            sql_write(&db_path(&watch, "c", 2));
+            assert!(matches!(
+                repl.sync_wait("c", 2, Duration::from_secs(10)).await,
+                SyncWait::Durable
+            ));
+            let (puts_before, lists_before) = store.counts();
+            repl.handoff_gate("c", 2, true).await.unwrap();
+            let artifact = repl.evict("c", 2, false, None).await.unwrap();
+            trim_idle(&repl).await;
+            assert_eq!(artifact, EvictionRestoreArtifact::Snapshot);
+            let (puts, lists) = store.counts();
+            assert_eq!(
+                (puts - puts_before, lists - lists_before),
+                (1, 0),
+                "the restored epoch still costs exactly the snapshot PUT"
+            );
+            assert_eq!(
+                ltx_level_files(&repl, "c", 2, 9).await.len(),
+                1,
+                "the handoff snapshot remains"
+            );
+            activate_epoch(&repl, "c", 3, false).await;
+            assert_eq!(row_count(&db_path(&watch, "c", 3)), 2);
+            shutdown(repl).await;
+        });
+    }
+
+    /// 0078: a journal over 16 entries keeps the snapshot even for a chain
+    /// born in this epoch with full per-cell coverage.
+    #[test]
+    fn lazy_handoff_long_journal_still_snapshots() {
+        let runtime = asyncrt::shared_test_runtime();
+        runtime.block_on(async {
+            let _temp = test_watch();
+            let watch = _temp.path().to_path_buf();
+            let store = Arc::new(CountingStore::new("cells/c/ltx/"));
+            let repl = LtxRepl::start_with_store_for_test(&watch, store.clone());
+            activate_epoch(&repl, "c", 1, true).await;
+            sql_write(&db_path(&watch, "c", 1));
+            assert!(matches!(
+                repl.sync_wait("c", 1, Duration::from_secs(10)).await,
+                SyncWait::Durable
+            ));
+            let handle = repl
+                .cells
+                .lock()
+                .unwrap()
+                .get(&("c".to_string(), 1))
+                .cloned()
+                .unwrap();
+            for _ in 0..celld_logic::handoff::HANDOFF_CHAIN_MAX_OBJECTS {
+                note_epoch_upload(&handle, 0, 1, 1);
+            }
+            assert_eq!(
+                handle.epoch_uploads.lock().unwrap().len(),
+                celld_logic::handoff::HANDOFF_CHAIN_MAX_OBJECTS + 1,
+                "one real upload plus sixteen padded entries"
+            );
+            let (puts_before, lists_before) = store.counts();
+            repl.handoff_gate("c", 1, true).await.unwrap();
+            let artifact = repl.evict("c", 1, false, None).await.unwrap();
+            trim_idle(&repl).await;
+            assert_eq!(artifact, EvictionRestoreArtifact::Snapshot);
+            let (puts, lists) = store.counts();
+            assert_eq!(
+                (puts - puts_before, lists - lists_before),
+                (1, 0),
+                "the long journal still costs exactly the snapshot PUT"
+            );
+            activate_epoch(&repl, "c", 2, false).await;
+            assert_eq!(row_count(&db_path(&watch, "c", 2)), 1);
+            shutdown(repl).await;
+        });
+    }
+
+    /// 0078: a cell whose durable watermark runs ahead of its per-cell
+    /// coverage (bundle-credited rows) still attempts the snapshot: the L9
+    /// object lands even though the stale-image guard then falls back to the
+    /// L0 chain, which proves the epoch. Fail-before for the coverage
+    /// condition: a covered cell would PUT nothing.
+    #[test]
+    fn lazy_handoff_bundle_gap_still_snapshots() {
+        let runtime = asyncrt::shared_test_runtime();
+        runtime.block_on(async {
+            let _temp = test_watch();
+            let watch = _temp.path().to_path_buf();
+            let store = Arc::new(CountingStore::new("cells/c/ltx/"));
+            let repl = LtxRepl::start_with_store_for_test(&watch, store.clone());
+            activate_epoch(&repl, "c", 1, true).await;
+            sql_write(&db_path(&watch, "c", 1));
+            assert!(matches!(
+                repl.sync_wait("c", 1, Duration::from_secs(10)).await,
+                SyncWait::Durable
+            ));
+            repl.stage_bundle_credit_for_test("c", 1, 2);
+            let (puts_before, lists_before) = store.counts();
+            let heads_before = store.heads();
+            repl.handoff_gate("c", 1, true).await.unwrap();
+            let artifact = repl.evict("c", 1, false, None).await.unwrap();
+            trim_idle(&repl).await;
+            assert_eq!(
+                artifact,
+                EvictionRestoreArtifact::L0Chain,
+                "the snapshot cannot cover the credited row, so the fallback proves the epoch"
+            );
+            let (puts, lists) = store.counts();
+            assert_eq!(
+                (puts - puts_before, lists - lists_before),
+                (1, 0),
+                "the gap still attempts the snapshot PUT"
+            );
+            assert_eq!(
+                store.heads() - heads_before,
+                1,
+                "the fallback proves the epoch with one HEAD"
+            );
+            assert_eq!(
+                ltx_level_files(&repl, "c", 1, 9).await.len(),
+                1,
+                "the attempted snapshot object remains"
+            );
+            // The staged credit is synthetic: no bundle segments exist to fold,
+            // so drop the tail the eviction retained for them. A production
+            // bundle credit always names real segments the next activation
+            // folds through its sink.
+            repl.dirty_tails.lock().unwrap().remove("c");
+            activate_epoch(&repl, "c", 2, false).await;
+            assert_eq!(row_count(&db_path(&watch, "c", 2)), 1);
+            shutdown(repl).await;
+        });
+    }
+
     /// A failed DELETE leaves garbage but never fails the eviction: the
     /// snapshot already proved durability, and the next epoch restores.
     #[test]
@@ -7479,6 +8028,22 @@ mod evict_trim_tests {
                 repl.sync_wait("c", 1, Duration::from_secs(10)).await,
                 SyncWait::Durable
             ));
+            // 0078: pad the journal past HANDOFF_CHAIN_MAX_OBJECTS so this
+            // fresh chain keeps its snapshot; the padded keys name txids past
+            // it, so the trim filter drops them and the assertions below are
+            // unchanged.
+            {
+                let handle = repl
+                    .cells
+                    .lock()
+                    .unwrap()
+                    .get(&("c".to_string(), 1))
+                    .cloned()
+                    .unwrap();
+                for _ in 0..celld_logic::handoff::HANDOFF_CHAIN_MAX_OBJECTS {
+                    note_epoch_upload(&handle, 0, 2, 2);
+                }
+            }
             store.set_fail_deletes(true);
             repl.handoff_gate("c", 1, true).await.unwrap();
             let artifact = repl.evict("c", 1, false, None).await.unwrap();
@@ -7559,6 +8124,22 @@ mod evict_trim_tests {
                     SyncWait::Durable
                 ));
             }
+            // 0078: pad the journal past HANDOFF_CHAIN_MAX_OBJECTS so this
+            // fresh chain keeps its snapshot; the padded keys name txids past
+            // it, so the trim filter drops them and the assertions below are
+            // unchanged.
+            {
+                let handle = repl
+                    .cells
+                    .lock()
+                    .unwrap()
+                    .get(&("c".to_string(), 1))
+                    .cloned()
+                    .unwrap();
+                for _ in 0..14 {
+                    note_epoch_upload(&handle, 0, 9, 9);
+                }
+            }
             store.set_fail_after(1);
             repl.handoff_gate("c", 1, true).await.unwrap();
             let artifact = repl.evict("c", 1, false, None).await.unwrap();
@@ -7603,6 +8184,13 @@ mod evict_trim_tests {
                 .cloned()
                 .unwrap();
             note_epoch_upload(&handle, 1, 1, 1);
+            // 0078: pad the journal past HANDOFF_CHAIN_MAX_OBJECTS so this
+            // fresh chain keeps its snapshot; the padded keys name txids past
+            // it, so the trim filter drops them and the assertions below are
+            // unchanged.
+            for _ in 0..15 {
+                note_epoch_upload(&handle, 0, 2, 2);
+            }
             repl.handoff_gate("c", 1, true).await.unwrap();
             let artifact = repl.evict("c", 1, false, None).await.unwrap();
             trim_idle(&repl).await;

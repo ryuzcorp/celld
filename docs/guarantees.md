@@ -150,6 +150,9 @@ seconds.
 
 An eviction proves the cell's writes durable, publishes one snapshot of the
 closed database or falls back to its L0 chain, and keeps the local copy until
+the bucket can restore the cell. A cell whose restorable chain was born in
+this epoch, is fully per-cell covered, and fits in a short upload journal
+skips the snapshot by policy and hands off through that L0 chain directly.
 the bucket can restore the cell. When this residency itself uploaded into the
 epoch prefix and got a success response, that response is the proof: a
 successor finds the objects through a listing, as every restore does, which
