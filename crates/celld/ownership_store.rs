@@ -1,4 +1,5 @@
 // Modified by ryuzcorp (ryuzcorp/celld): bucket-posture group commit: bucket-session node-log wire marker (0059). bucket-posture group commit: published-format boot self-check (0070).
+// Modified by ryuzcorp (ryuzcorp/celld): bucket-posture group commit: prefetched bundle-round ownership reads (0074).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! Bucket ownership effect adapter, over either conditional-write dialect.
@@ -439,6 +440,12 @@ pub struct BucketOwnership {
     /// Each cell whose record this node found lost, with the monotonic time
     /// at which its hold ends. See [`LOST_RECORD_RECHECK_MS`].
     lost_records: std::sync::Mutex<std::collections::BTreeMap<String, u64>>,
+    /// Prefetched per-gate ownership reads, keyed by cell and epoch. The
+    /// bundle flush creates one slot per cell per round at capture and arms
+    /// it after the round's PUT lands; a gate whose position the cover
+    /// reaches reuses the landed read (or joins it in flight) instead of
+    /// issuing its own GET. Shared across isolates through this instance.
+    prefetch: std::sync::Arc<PrefetchReads>,
 }
 
 /// What this node currently looks like, for peers deciding where to place a
@@ -515,6 +522,118 @@ impl LiveLoad {
     }
 }
 
+/// A bundle round's prefetched ownership read for one cell. The slot is
+/// created unarmed at capture with the round's cover (the max txid it
+/// carries for the cell) and armed only after that round's PUT lands, so a
+/// read can never issue before the proof it must follow. Gates whose
+/// position the cover reaches reuse the landed read; anything else —
+/// uncovered gates, unarmed slots, dropped rounds — falls back to a direct
+/// read, exactly as without prefetching.
+#[derive(Debug)]
+pub(crate) struct PrefetchSlot {
+    cover_max: u64,
+    armed: std::sync::atomic::AtomicBool,
+    result: std::sync::Mutex<Option<PrefetchOutcome>>,
+    ready: tokio::sync::Notify,
+}
+
+pub(crate) type PrefetchOutcome = Result<Option<OwnerRecord>, celld_logic::Failure>;
+
+impl PrefetchSlot {
+    fn usable_for(&self, cover_needed: u64) -> bool {
+        self.armed.load(std::sync::atomic::Ordering::SeqCst) && self.cover_max >= cover_needed
+    }
+}
+
+/// Prefetched per-gate ownership reads, keyed by cell and epoch. At most
+/// one slot per (cell, round); a newer landed slot supersedes older ones
+/// because its cover reaches at least as far and it issued later. Slots
+/// never outlive their manager: waiters hold Arcs, and the map only drops
+/// slots no new joiner may use.
+#[derive(Debug, Default)]
+pub(crate) struct PrefetchReads {
+    slots: std::sync::Mutex<SlotMap>,
+}
+
+/// Prefetch slots by cell and epoch. Factored out for clippy's
+/// `type_complexity` lint.
+type SlotMap = std::collections::HashMap<(String, u64), Vec<std::sync::Arc<PrefetchSlot>>>;
+
+impl PrefetchReads {
+    /// Create an unarmed slot for a bundle round's cell. The slot serves
+    /// nothing until [`BucketOwnership::arm_prefetch`] runs after the
+    /// round's PUT lands.
+    fn create(&self, cell: &str, epoch: u64, cover_max: u64) -> std::sync::Arc<PrefetchSlot> {
+        let slot = std::sync::Arc::new(PrefetchSlot {
+            cover_max,
+            armed: std::sync::atomic::AtomicBool::new(false),
+            result: std::sync::Mutex::new(None),
+            ready: tokio::sync::Notify::new(),
+        });
+        self.slots
+            .lock()
+            .unwrap()
+            .entry((cell.to_string(), epoch))
+            .or_default()
+            .push(slot.clone());
+        // Bound the map: keep the newest few. Waiters hold their own Arcs,
+        // and a dropped slot only costs its joiners a direct read.
+        let mut slots = self.slots.lock().unwrap();
+        if let Some(vec) = slots.get_mut(&(cell.to_string(), epoch)) {
+            while vec.len() > 4 {
+                vec.remove(0);
+            }
+        }
+        slot
+    }
+
+    /// The oldest slot covering `min_cover`, if any. First-fit keeps one
+    /// read serving every gate it covers instead of spawning a newer one
+    /// beside it.
+    fn covering(
+        &self,
+        cell: &str,
+        epoch: u64,
+        min_cover: u64,
+    ) -> Option<std::sync::Arc<PrefetchSlot>> {
+        self.slots
+            .lock()
+            .unwrap()
+            .get(&(cell.to_string(), epoch))
+            .and_then(|vec| vec.iter().find(|slot| slot.usable_for(min_cover)).cloned())
+    }
+
+    /// Land a fetched read and wake its joiners, dropping superseded landed
+    /// slots for the same cell and epoch.
+    fn land(&self, cell: &str, epoch: u64, slot: &PrefetchSlot, result: PrefetchOutcome) {
+        *slot.result.lock().unwrap() = Some(result);
+        slot.ready.notify_waiters();
+        let mut slots = self.slots.lock().unwrap();
+        if let Some(vec) = slots.get_mut(&(cell.to_string(), epoch)) {
+            let mut newest_landed = None;
+            for (index, other) in vec.iter().enumerate() {
+                if other.result.lock().unwrap().is_some() {
+                    newest_landed = Some(index);
+                }
+            }
+            if newest_landed.is_some() {
+                let drop = vec
+                    .iter()
+                    .enumerate()
+                    .map(|(index, other)| {
+                        Some(index) != newest_landed && other.result.lock().unwrap().is_some()
+                    })
+                    .collect::<Vec<_>>();
+                let mut index = 0;
+                vec.retain(|_| {
+                    let drop_this = drop[index];
+                    index += 1;
+                    !drop_this
+                });
+            }
+        }
+    }
+}
 impl BucketOwnership {
     /// Creates an adapter with an isolated lease pool and the process key
     /// advertised for challenge-bound direct probes.
@@ -537,6 +656,7 @@ impl BucketOwnership {
             own_log: std::sync::Mutex::new((0, None)),
             applied: tokio::sync::watch::channel((String::new(), 0)).0,
             lost_records: std::sync::Mutex::default(),
+            prefetch: std::sync::Arc::new(PrefetchReads::default()),
         }
     }
 
@@ -593,8 +713,68 @@ impl BucketOwnership {
     }
 
     pub async fn read_owner(&self, cell: &str) -> anyhow::Result<Option<OwnerRecord>> {
+        Self::fetch_owner_record(&self.bucket, cell).await
+    }
+
+    /// Create an unarmed prefetch slot for a bundle round's cell. The slot
+    /// serves nothing until armed after the round's PUT lands.
+    pub(crate) fn prefetch_bundle_read(
+        &self,
+        cell: &str,
+        epoch: u64,
+        cover_max: u64,
+    ) -> std::sync::Arc<PrefetchSlot> {
+        self.prefetch.create(cell, epoch, cover_max)
+    }
+
+    /// Arm a slot after its proving PUT landed and fetch the record
+    /// concurrently with the round's record re-read (detached: the slot
+    /// outlives this call and waiters join it there).
+    pub(crate) fn arm_prefetch(&self, cell: &str, epoch: u64, slot: &std::sync::Arc<PrefetchSlot>) {
+        slot.armed.store(true, std::sync::atomic::Ordering::SeqCst);
+        let bucket = self.bucket.clone();
+        let cell_owned = cell.to_string();
+        let prefetch = self.prefetch.clone();
+        let slot = slot.clone();
+        crate::asyncrt::spawn(async move {
+            let result = Self::fetch_owner_record(&bucket, &cell_owned)
+                .await
+                .map_err(|_| celld_logic::Failure::Definite);
+            prefetch.land(&cell_owned, epoch, &slot, result);
+        })
+        .detach();
+    }
+
+    /// Serve a gate from a covering prefetch: the oldest slot for this cell
+    /// and epoch whose cover reaches `min_cover`, landed or joined in
+    /// flight. Returns `None` when no usable slot exists — the caller then
+    /// does today's direct GET.
+    pub(crate) async fn read_owner_covered(
+        &self,
+        cell: &str,
+        epoch: u64,
+        min_cover: u64,
+    ) -> Option<PrefetchOutcome> {
+        let slot = self.prefetch.covering(cell, epoch, min_cover)?;
+        loop {
+            let notified = slot.ready.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if let Some(result) = slot.result.lock().unwrap().clone() {
+                return Some(result);
+            }
+            notified.await;
+        }
+    }
+
+    /// The body of [`BucketOwnership::read_owner`], shared with the prefetch
+    /// fetch so the two can never disagree on what the bucket holds.
+    pub(crate) async fn fetch_owner_record(
+        bucket: &Bucket,
+        cell: &str,
+    ) -> anyhow::Result<Option<OwnerRecord>> {
         let key = format!("cells/{cell}/own.json");
-        let Some((owner, etag)) = load_json::<OwnerWireOwned>(&self.bucket, &key).await? else {
+        let Some((owner, etag)) = load_json::<OwnerWireOwned>(bucket, &key).await? else {
             return Ok(None);
         };
         let record = OwnerRecord {
@@ -603,6 +783,20 @@ impl BucketOwnership {
             etag,
         };
         Ok(Some(record))
+    }
+
+    /// The verdict a per-gate ownership read applies: the record must still
+    /// name this node at this epoch. Shared by the direct read path and the
+    /// prefetched path so the two can never disagree on what a record proves.
+    pub(crate) fn check_owner(
+        record: &Option<OwnerRecord>,
+        node: &str,
+        epoch: u64,
+    ) -> Result<(), celld_logic::Failure> {
+        match record {
+            Some(record) if record.node.as_deref() == Some(node) && record.epoch == epoch => Ok(()),
+            _ => Err(celld_logic::Failure::Definite),
+        }
     }
 
     /// Whether the bucket holds any LTX for `cell`. LTX exists only under an

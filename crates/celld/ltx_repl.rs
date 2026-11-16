@@ -1,5 +1,6 @@
 // Modified by ryuzcorp (ryuzcorp/celld): an eviction skips the visibility LISTs its own uploads already prove and the time-based checkpoint before the handoff; an eviction deletes the per-cell L0/L1 objects its handoff snapshot supersedes; bucket-posture group commit: paged gate judges PAGED_FORMAT (0059); bucket-posture group commit: bucket bundle gate, sync pacing and event-driven bundle flush (0060); the eviction guard proves a journaled epoch with a HEAD on the newest journaled key, falling back to the listing on a miss, an error, or an empty journal (0061); bucket-posture group commit: bundled-cell eviction guard, graceful-close per-cell drain, bundle GC without ensemble, linger holds only while the dirty set is shared (0064).; bucket-posture group commit: bucket switch on by default (0070); bucket-posture group commit: a sync worker yields once the bundle loop owns tiering, and a lone-cell round uploads per-cell instead of bundling (0071).
 // Modified by ryuzcorp (ryuzcorp/celld): bucket-posture group commit: pipelined bundle PUTs with the previous round's credit re-read (0073).
+// Modified by ryuzcorp (ryuzcorp/celld): bucket-posture group commit: ticket-position ledger and round covers for prefetch (0074).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! In-process replication backend built on `celld-ltx`.
@@ -896,6 +897,14 @@ pub(crate) struct Cell {
     client: SharedObjectStoreClient,
     req_seq: AtomicU64,
     synced_seq: AtomicU64,
+    /// Gate position per durability ticket: the output gate speaks SQLite
+    /// fingerprints while the flush loop speaks txids, and the two meet only
+    /// here, where one write's ticket and position are both known. A round's
+    /// prefetch cover is the max position over its carried tickets, so a
+    /// slot serves exactly the gates whose rows its PUTs carried. Bounded:
+    /// the oldest entries age out, and a missing position only costs its
+    /// gate a direct read, never a wrong one.
+    ticket_positions: Mutex<BTreeMap<u64, u64>>,
     /// Highest ticket whose write is fsync'd on every ensemble member —
     /// the log tier's proof. The gate accepts either proof, so this stays 0
     /// forever when no shipper is installed.
@@ -1173,6 +1182,32 @@ fn note_proof(handle: &Cell) {
     handle
         .node_proof_ms
         .fetch_max(asyncrt::mono_ms(), Ordering::SeqCst);
+}
+
+/// Remember one ticket's gate position, bounding the ledger. Positions
+/// grow per cell, so evicting the oldest never affects a cover max, and a
+/// missing position only costs its gate a direct read, never a wrong one.
+fn note_ticket_position(handle: &Cell, ticket: u64, position: u64) {
+    const MAX_TICKET_POSITIONS: usize = 128;
+    let mut ledger = handle.ticket_positions.lock().unwrap();
+    ledger.insert(ticket, position);
+    while ledger.len() > MAX_TICKET_POSITIONS {
+        ledger.pop_first();
+    }
+}
+
+/// The prefetch cover for one cell of a capture: the highest gate position
+/// over the carried tickets. Positions strictly increase per cell, so a
+/// gate is covered exactly when its ticket was carried: a later write's
+/// higher position is never reached by an earlier round.
+fn round_cover(handle: &Cell, tickets: u64) -> Option<u64> {
+    handle
+        .ticket_positions
+        .lock()
+        .unwrap()
+        .range(..=tickets)
+        .map(|(_, position)| *position)
+        .max()
 }
 
 /// A writer that refuses to grow past its budget, so an oversized snapshot
@@ -2929,6 +2964,7 @@ impl LtxRepl {
             client: client.clone(),
             req_seq: AtomicU64::new(0),
             synced_seq: AtomicU64::new(0),
+            ticket_positions: Mutex::new(BTreeMap::new()),
             shipped_seq: AtomicU64::new(0),
             submitted_seq: AtomicU64::new(0),
             // Frames at or below the seed came from the bucket (or a proven
@@ -3299,6 +3335,11 @@ impl LtxRepl {
             anyhow::bail!("ltx cell not resident: {cell} epoch {epoch}");
         };
         let ticket = handle.req_seq.fetch_add(1, Ordering::SeqCst) + 1;
+        // Record where this ticket's rows sit in the gate's units: the only
+        // place the ticket and its SQLite fingerprint meet. A capture that
+        // sees this ticket but not yet this insert only understates a cover
+        // (a direct read), never overstates one.
+        note_ticket_position(&handle, ticket, position);
         #[cfg(all(test, celld_internal_tests))]
         handle.record_durability_ticket_for_world(position, ticket);
         self.dirty.notify_one();
@@ -5643,15 +5684,18 @@ async fn bundle_loop(
             }
         }
         type Credits = Vec<(CellHandle, u64, u64)>;
-        let (entries, credits, restored): (
+        type CellEpochs = BTreeMap<(String, u64), u64>;
+        let (entries, credits, restored, covers): (
             Vec<celld_ltx::bundle::BundleEntry>,
             Credits,
-            BTreeMap<(String, u64), u64>,
+            CellEpochs,
+            CellEpochs,
         ) = asyncrt::blocking(move || {
             let mut entries = Vec::new();
             let mut credits = Vec::new();
             let mut shipped: BTreeSet<(String, u64)> = BTreeSet::new();
             let mut captured = captured;
+            let mut covers: CellEpochs = BTreeMap::new();
             for ((cell, epoch), handle) in work {
                 let tickets = handle.req_seq.load(Ordering::SeqCst);
                 note_capture(&handle, tickets);
@@ -5697,6 +5741,13 @@ async fn bundle_loop(
                 drop(replica);
                 if complete {
                     captured.insert((cell.clone(), epoch), pos.txid.0);
+                    // The prefetch cover in the gate's own units: the
+                    // highest position over the carried tickets. Positions
+                    // strictly increase per cell, so this reaches exactly
+                    // the gates whose rows this capture saw.
+                    if let Some(cover) = round_cover(&handle, tickets) {
+                        covers.insert((cell.clone(), epoch), cover);
+                    }
                     // A credit is covered only by a PUT that carries the
                     // cell's rows. A round that ships nothing new for this
                     // cell — a parked round's rows, or rows a racing
@@ -5710,7 +5761,7 @@ async fn bundle_loop(
                     }
                 }
             }
-            (entries, credits, captured)
+            (entries, credits, captured, covers)
         })
         .await
         .unwrap_or_default();
@@ -5795,6 +5846,14 @@ async fn bundle_loop(
             }
             continue;
         }
+        // Prefetch slots for the round's cells, in the gates' own units.
+        // Slots arm only after the PUTs land (below); a round that PUTs
+        // nothing offers no proof, so its gates keep their direct reads.
+        let slots = if chunks.is_empty() {
+            Vec::new()
+        } else {
+            active.create_bundle_prefetches(&covers)
+        };
         active.set_flush_in_flight(true);
         let ((landed, put_ok), ()) = futures_util::join!(
             async {
@@ -5814,6 +5873,10 @@ async fn bundle_loop(
             }
         );
         active.set_flush_in_flight(false);
+        // The ownership GETs issue only now, after every chunk PUT landed:
+        // no prefetched read can precede the proof it must follow, and the
+        // reads run while the next round captures.
+        active.arm_bundle_prefetches(slots);
         if put_ok {
             prev = Some(PrevRound {
                 puts: landed,

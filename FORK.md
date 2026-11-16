@@ -970,6 +970,30 @@ push to `ghcr.io/denoland`, but still. Pushing a branch named
  key behind; applying credits despite the refuse advances durable to 1 and
  keeps the skips; without the empty-round settle the parked awaits hang
  until the test timeout.
+ - `0074` (sha TBD at merge) bucket-posture prefetch: one ownership read per
+ bundle round serves every gate it covers. The flush loop records each
+ ticket's gate position (SQLite fingerprint) in a bounded per-cell ledger —
+ the only place a write's ticket and its position meet — and each round's
+ cover is the highest position over its carried tickets. Covers are gate
+ positions, never txids or tickets (a txid-scale cover could never serve a
+ real gate, and the mismatch killed `0068`): positions strictly increase per
+ cell, so a prefetch serves a gate exactly when the PUT that preceded it
+ carried that gate's rows, and a write committed after the capture is never
+ served by that round's slot. Slots arm only after every chunk PUT lands, so
+ no prefetched read precedes its proof; uncovered gates, unarmed slots and
+ dropped rounds fall back to the direct read. `Effect::VerifyOwnership`
+ carries the issuing gate's cover for the match. The verify is only the
+ second key — a slot-served verify on a refused round never acks, because
+ the durability half still waits and the per-cell fallback re-proves it.
+ Harness (concurrent, `DELAY_MS=100`, default config): agent-200 and agent-50
+ report turns, Class A/B and per-turn latency; see the handoff tables.
+ Tests: `bundle_prefetch_serves_covered_gates_in_position_units`,
+ `bundle_prefetch_does_not_serve_later_writes`,
+ `bundle_pipeline_fenced_round_refuses_both_stages` (this patch; pipeline
+ stages). Fail-before: txid-scale covers leave position 500 unserved;
+ ignoring the cover check serves the later write from the stale slot;
+ admitting a prepare with no owner, or crediting under a seal, breaks the
+ fenced test at its assert.
 
 Patches `0025`–`0034` are ported fixes from
 [meln1k/celld](https://github.com/meln1k/celld) by Nikita

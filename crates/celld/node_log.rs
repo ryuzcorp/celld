@@ -1,5 +1,6 @@
 // Modified by ryuzcorp (ryuzcorp/celld): operator token for the internal listener; list_page resume is a cursor; ported from meln1k/celld: seal a dead lease that never opened a log (01522b3); seal_absent_log regression tests; lone-node repair backoff; bucket-posture group commit: bucket-session record encoding + old-reader interop tests (0059); bucket-posture group commit: bucket executor without ensemble (0060); bucket-posture group commit: successor fold of bucket bundles (0063); bucket-posture group commit: bucket-session drain, per-cell seal, bundle GC without ensemble, linger holds only while the dirty set is shared (0064); bucket-posture group commit: lone-cell-per-cell vs shared-bundle executor tests, and idle bucket sessions skip empty bundle-GC scans (0071).
 // Modified by ryuzcorp (ryuzcorp/celld): bucket-posture group commit: bundle PUT split into prepare/execute/confirm stages (0073).
+// Modified by ryuzcorp (ryuzcorp/celld): bucket-posture group commit: per-round ownership prefetch slots (0074).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! v0 of the in-fleet replicated log tier (`CELLD_DURABILITY=fleet`).
@@ -7223,6 +7224,46 @@ impl NodeLogManager {
         true
     }
 
+    /// Create one unarmed ownership-read slot per covered cell of a bundle
+    /// round. The covers arrive in the gates' own units (SQLite fingerprints
+    /// from the ticket ledger, never txids), so a slot serves exactly the
+    /// gates whose rows this round's capture saw. Slots arm after the
+    /// round's PUTs land; unarmed slots serve nothing — an unfired round, a
+    /// PUT failure, or a fence leaves only bounded map entries for the cap
+    /// to prune.
+    pub(crate) fn create_bundle_prefetches(
+        &self,
+        covers: &BTreeMap<(String, u64), u64>,
+    ) -> Vec<(
+        (String, u64),
+        std::sync::Arc<crate::ownership_store::PrefetchSlot>,
+    )> {
+        covers
+            .iter()
+            .map(|((cell, epoch), cover)| {
+                let slot = self.ownership.prefetch_bundle_read(cell, *epoch, *cover);
+                ((cell.clone(), *epoch), slot)
+            })
+            .collect()
+    }
+
+    /// Arm a round's slots: each GET issues only now, after every chunk PUT
+    /// landed, so no prefetched read can precede the proof it must follow.
+    /// The fetch itself runs detached inside `arm_prefetch`; a slow bucket
+    /// delays only the joiners, never the flush loop, and a failed GET lands
+    /// an outcome the gates treat exactly like a refused direct read.
+    pub(crate) fn arm_bundle_prefetches(
+        &self,
+        slots: Vec<(
+            (String, u64),
+            std::sync::Arc<crate::ownership_store::PrefetchSlot>,
+        )>,
+    ) {
+        for ((cell, epoch), slot) in slots {
+            self.ownership.arm_prefetch(&cell, epoch, &slot);
+        }
+    }
+
     /// The flush loop holds no PUT across the pipeline join itself, so it
     /// marks the window the shutdown drains wait on.
     pub(crate) fn set_flush_in_flight(&self, value: bool) {
@@ -9291,6 +9332,39 @@ mod bucket_executor_tests {
             );
         });
     }
+    /// A fenced round refuses both stages: stopping the session refuses new
+    /// prepares at the owner check, and a sealed record refuses the credit
+    /// even though the unconditional PUT lands. Fail-before: admitting a
+    /// prepare with no owner lets a stopped session keep flushing; crediting
+    /// under a seal advances the watermark without coverage.
+    #[test]
+    fn bundle_pipeline_fenced_round_refuses_both_stages() {
+        let runtime = crate::asyncrt::shared_test_runtime();
+        runtime.block_on(async {
+            let dir = tempfile::tempdir().expect("test dir");
+            let (manager, bucket) = test_manager(dir.path());
+            open_gate(&manager);
+            publish_bucket_open(&manager, &bucket).await;
+            publish_bucket_sealed(&manager, &bucket).await;
+            let owner = manager.flush_owner().expect("epoch still set");
+            let prepared = manager
+                .prepare_bundle_chunk(&owner, vec![bundle_entry("c0", 1)])
+                .expect("synthetic entries encode");
+            let landed = manager
+                .execute_bundle_chunk(prepared)
+                .await
+                .expect("unconditional PUT lands under a seal");
+            assert!(
+                !manager.confirm_bundle_chunk(landed).await,
+                "a sealed record refuses the credit"
+            );
+            manager.stop_bucket_bundling(true);
+            assert!(
+                manager.flush_owner().is_none(),
+                "a stopped session admits no prepare"
+            );
+        });
+    }
 
     /// A parked round settles on the next wake with no PUT to overlap: the
     /// leftover dirty permit drives an empty round that settles the previous
@@ -9335,6 +9409,150 @@ mod bucket_executor_tests {
             assert!(
                 bundle_keys(&bucket, "cells/").await.is_empty(),
                 "no per-cell L0 PUTs in a shared round"
+            );
+        });
+    }
+    /// Prefetch covers are gate positions, not txids. The round carries
+    /// fingerprint-scale positions (500/600, never 1/2), and the slots serve
+    /// a gate at the recorded cover while refusing anything above it — a
+    /// txid-scale cover could never serve 500. Fail-before: computing covers
+    /// from txids leaves 500 unserved and the first assert goes red;
+    /// ignoring the cover check serves 502 from the stale slot.
+    #[test]
+    fn bundle_prefetch_serves_covered_gates_in_position_units() {
+        let runtime = crate::asyncrt::shared_test_runtime();
+        runtime.block_on(async {
+            let dir = tempfile::tempdir().expect("test dir");
+            let (manager, bucket) = test_manager(dir.path());
+            let manager = Arc::new(manager);
+            let _registration = manager
+                .ltx
+                .register_durability(manager.clone())
+                .expect("registration installs");
+            open_gate(&manager);
+            publish_bucket_open(&manager, &bucket).await;
+            activate_cell(&manager, "c0", 1, true).await;
+            activate_cell(&manager, "c1", 1, true).await;
+            sql_write(&cell_db(&dir.path().join("watch"), "c0", 1));
+            sql_write(&cell_db(&dir.path().join("watch"), "c1", 1));
+            let (a, b) = crate::asyncrt::timeout(
+                std::time::Duration::from_secs(10),
+                futures_util::future::join(
+                    manager.ltx.await_durable("c0", 1, 500),
+                    manager.ltx.await_durable("c1", 1, 600),
+                ),
+            )
+            .await
+            .expect("the settle window credits the round");
+            for (_, source) in [a.expect("c0 credits"), b.expect("c1 credits")] {
+                assert_eq!(source, celld_logic::ProofSource::Bucket);
+            }
+            let covered = |cell: &'static str, min_cover: u64| {
+                let ownership = manager.ownership.clone();
+                async move {
+                    crate::asyncrt::timeout(
+                        std::time::Duration::from_secs(10),
+                        ownership.read_owner_covered(cell, 1, min_cover),
+                    )
+                    .await
+                }
+            };
+            assert!(
+                covered("c0", 500).await.expect("prefetch lands").is_some(),
+                "a gate at the recorded cover is served"
+            );
+            assert!(
+                covered("c0", 502).await.expect("no hang").is_none(),
+                "a gate above the cover falls back to a direct read"
+            );
+            assert!(
+                covered("c0", 600).await.expect("no hang").is_none(),
+                "another cell's cover never serves this cell"
+            );
+            assert!(
+                covered("c1", 601).await.expect("no hang").is_none(),
+                "a gate above the cover falls back to a direct read"
+            );
+        });
+    }
+
+    /// A write committed after a round's capture is not served by that
+    /// round's prefetch: its position exceeds every cover the round
+    /// recorded. The next round covers it in turn. Fail-before: ignoring the
+    /// cover check serves the new write from the stale slot.
+    #[test]
+    fn bundle_prefetch_does_not_serve_later_writes() {
+        let runtime = crate::asyncrt::shared_test_runtime();
+        runtime.block_on(async {
+            let dir = tempfile::tempdir().expect("test dir");
+            let (manager, bucket) = test_manager(dir.path());
+            let manager = Arc::new(manager);
+            let _registration = manager
+                .ltx
+                .register_durability(manager.clone())
+                .expect("registration installs");
+            open_gate(&manager);
+            publish_bucket_open(&manager, &bucket).await;
+            activate_cell(&manager, "c0", 1, true).await;
+            activate_cell(&manager, "c1", 1, true).await;
+            let covered = |cell: &'static str, min_cover: u64| {
+                let ownership = manager.ownership.clone();
+                async move {
+                    crate::asyncrt::timeout(
+                        std::time::Duration::from_secs(10),
+                        ownership.read_owner_covered(cell, 1, min_cover),
+                    )
+                    .await
+                }
+            };
+            // Round one carries positions 500 and 600; both awaits return
+            // through the settle window, which separates the rounds: the next
+            // writes cannot merge into this round's capture.
+            sql_write(&cell_db(&dir.path().join("watch"), "c0", 1));
+            sql_write(&cell_db(&dir.path().join("watch"), "c1", 1));
+            let (a, b) = crate::asyncrt::timeout(
+                std::time::Duration::from_secs(10),
+                futures_util::future::join(
+                    manager.ltx.await_durable("c0", 1, 500),
+                    manager.ltx.await_durable("c1", 1, 600),
+                ),
+            )
+            .await
+            .expect("round one credits");
+            for (_, source) in [a.expect("c0 credits"), b.expect("c1 credits")] {
+                assert_eq!(source, celld_logic::ProofSource::Bucket);
+            }
+            // The next writes commit after round one's capture.
+            sql_write(&cell_db(&dir.path().join("watch"), "c0", 1));
+            sql_write(&cell_db(&dir.path().join("watch"), "c1", 1));
+            assert!(
+                covered("c0", 501).await.expect("no hang").is_none(),
+                "round one's slot does not serve the later write"
+            );
+            assert!(
+                covered("c1", 601).await.expect("no hang").is_none(),
+                "round one's slot does not serve the later write"
+            );
+            // Round two carries the later writes and covers them in turn.
+            let (c, d) = crate::asyncrt::timeout(
+                std::time::Duration::from_secs(10),
+                futures_util::future::join(
+                    manager.ltx.await_durable("c0", 1, 501),
+                    manager.ltx.await_durable("c1", 1, 601),
+                ),
+            )
+            .await
+            .expect("round two credits");
+            for (_, source) in [c.expect("c0 credits"), d.expect("c1 credits")] {
+                assert_eq!(source, celld_logic::ProofSource::Bucket);
+            }
+            assert!(
+                covered("c0", 501).await.expect("prefetch lands").is_some(),
+                "round two's slot serves the later write"
+            );
+            assert!(
+                covered("c1", 601).await.expect("prefetch lands").is_some(),
+                "round two's slot serves the later write"
             );
         });
     }
