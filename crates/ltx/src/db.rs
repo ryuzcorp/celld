@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): a capture before a handoff skips the time-based checkpoint.
+// Modified by ryuzcorp (ryuzcorp/celld): a capture before a handoff skips the time-based checkpoint; exact uncaptured-changes probe for the lazy handoff (0078).
 //! db.rs — SQLite database lifecycle: WAL-mode setup, the long-running read-lock
 //! checkpoint takeover, the WAL→LTX capture loop, and manual checkpointing.
 //! Ported from litestream@v0.5.11 `db.go`.
@@ -1112,51 +1112,7 @@ impl Db {
         // sync ago, so the cache answers without re-reading the file; a
         // key miss (restore, compaction, reopen) reads and parses as the
         // port always did.
-        let cache_hit = matches!(&self.last_l0_header, Some((txid, _)) if *txid == pos.txid);
-        let (hdr, ltx_bytes) = if cache_hit {
-            let (_, cached) = self.last_l0_header.as_ref().expect("matched above");
-            (cached.clone(), None)
-        } else {
-            let ltx_path = self.ltx_path(0, pos.txid, pos.txid);
-            let ltx_bytes = match self.host.read(Path::new(&ltx_path)) {
-                Ok(b) => b,
-                Err(e) => {
-                    return Err(Error::Ltx(Box::new(new_ltx_error(
-                        "open",
-                        &ltx_path,
-                        0,
-                        pos.txid.0,
-                        pos.txid.0,
-                        e.into(),
-                    ))));
-                }
-            };
-            let parsed = match ltx::Header::parse(&ltx_bytes) {
-                Ok(h) => h,
-                Err(_) => {
-                    return Err(Error::Ltx(Box::new(new_ltx_error(
-                        "decode",
-                        &ltx_path,
-                        0,
-                        pos.txid.0,
-                        pos.txid.0,
-                        Error::LTXCorrupted,
-                    ))));
-                }
-            };
-            (
-                LastL0Header {
-                    wal_offset: parsed.wal_offset,
-                    wal_size: parsed.wal_size,
-                    wal_salt1: parsed.wal_salt1,
-                    wal_salt2: parsed.wal_salt2,
-                    commit: parsed.commit,
-                    final_pgno: 0,
-                    final_page: Vec::new(),
-                },
-                Some(ltx_bytes),
-            )
-        };
+        let (hdr, ltx_bytes) = self.last_l0_header(pos.txid)?;
         info.offset = hdr.wal_offset + hdr.wal_size;
         info.salt1 = hdr.wal_salt1;
         info.salt2 = hdr.wal_salt2;
@@ -1249,6 +1205,176 @@ impl Db {
 
         info.snapshotting = false;
         Ok(info)
+    }
+
+    /// Read the header of the L0 at `txid` that the last capture wrote: from
+    /// the in-memory cache when this instance performed that capture, or from
+    /// the file otherwise (restore, compaction, reopen). Shared by `verify`
+    /// and `has_uncaptured_changes`; the latter needs only the header, never
+    /// the file bytes.
+    fn last_l0_header(&mut self, txid: TXID) -> Result<(LastL0Header, Option<Vec<u8>>)> {
+        if let Some((cached_txid, cached)) = self.last_l0_header.as_ref() {
+            if *cached_txid == txid {
+                return Ok((cached.clone(), None));
+            }
+        }
+        let ltx_path = self.ltx_path(0, txid, txid);
+        let ltx_bytes = match self.host.read(Path::new(&ltx_path)) {
+            Ok(b) => b,
+            Err(e) => {
+                return Err(Error::Ltx(Box::new(new_ltx_error(
+                    "open",
+                    &ltx_path,
+                    0,
+                    txid.0,
+                    txid.0,
+                    e.into(),
+                ))));
+            }
+        };
+        let parsed = match ltx::Header::parse(&ltx_bytes) {
+            Ok(h) => h,
+            Err(_) => {
+                return Err(Error::Ltx(Box::new(new_ltx_error(
+                    "decode",
+                    &ltx_path,
+                    0,
+                    txid.0,
+                    txid.0,
+                    Error::LTXCorrupted,
+                ))));
+            }
+        };
+        Ok((
+            LastL0Header {
+                wal_offset: parsed.wal_offset,
+                wal_size: parsed.wal_size,
+                wal_salt1: parsed.wal_salt1,
+                wal_salt2: parsed.wal_salt2,
+                commit: parsed.commit,
+                final_pgno: 0,
+                final_page: Vec::new(),
+            },
+            Some(ltx_bytes),
+        ))
+    }
+
+    /// Whether the database holds commits the per-cell prefix does not: frames
+    /// in the WAL past the newest captured L0, or nothing captured at all.
+    ///
+    /// Mirrors `verify`'s continuity accounting (the last L0's WAL offset and
+    /// salts against the live WAL) without mutating anything: no watermark
+    /// moves, no cache fills, no db or WAL writes. Any uncertainty answers
+    /// true, so the caller syncs rather than dropping a row. The lazy-handoff
+    /// eviction uses it to tell a fully covered chain (skip the final sync)
+    /// from a WAL-only tail (sync it first); `Db::pos` cannot see that tail.
+    pub fn has_uncaptured_changes(&mut self) -> Result<bool> {
+        Ok(self.uncaptured_changes().unwrap_or(true))
+    }
+
+    fn uncaptured_changes(&mut self) -> Result<bool> {
+        let (_, max_txid) = self.max_ltx()?;
+        if max_txid == TXID(0) {
+            // No capture at all: prove the position by sync.
+            return Ok(true);
+        }
+        let (hdr, _) = self.last_l0_header(max_txid)?;
+        let offset = hdr.wal_offset + hdr.wal_size;
+        let wal_size = self.wal_file_size()?;
+        if wal_size < WAL_HEADER_SIZE as i64 {
+            // No WAL: either our own checkpoint removed it after a full
+            // capture, or something else removed it. Only the first is proved.
+            return Ok(!self.synced_to_wal_end);
+        }
+        if offset > wal_size {
+            // Truncated past the capture without our checkpoint: unknown.
+            return Ok(true);
+        }
+        let wal_hdr = self.wal_header_bytes()?;
+        let salt_match = be_u32(&wal_hdr[16..]) == hdr.wal_salt1
+            && be_u32(&wal_hdr[20..]) == hdr.wal_salt2;
+        if !salt_match {
+            // New generation (or a foreign overwrite) with unknown content.
+            return Ok(true);
+        }
+        if wal_size == offset {
+            return Ok(false);
+        }
+        // Same generation, file longer than the capture: a checkpoint restart
+        // leaves stale bytes behind without truncating, so size alone cannot
+        // tell them from genuinely new frames. Validate the next frame's
+        // checksum chain instead: stale bytes fail, new frames pass.
+        self.frame_valid_at(offset, hdr.wal_salt1, hdr.wal_salt2, wal_size)
+    }
+
+    /// Whether the WAL holds a checksum-valid frame at `offset` in the salt
+    /// chain (`salt1`, `salt2`): the exact "is there another commit" test.
+    /// Reads only the header and the two frames around `offset` through the
+    /// held WAL handle. Any uncertainty answers true (prove by sync); only a
+    /// definitively absent or stale frame answers false.
+    fn frame_valid_at(
+        &mut self,
+        offset: i64,
+        salt1: u32,
+        salt2: u32,
+        wal_size: i64,
+    ) -> Result<bool> {
+        let page_size = self.page_size;
+        if page_size == 0 {
+            return Ok(true);
+        }
+        let frame_size = page_size as i64 + WAL_FRAME_HEADER_SIZE as i64;
+        if offset - frame_size < WAL_HEADER_SIZE as i64
+            || (offset - WAL_HEADER_SIZE as i64) % frame_size != 0
+        {
+            // Not a frame boundary the capture could have left: unknown.
+            return Ok(true);
+        }
+        if wal_size < offset + frame_size {
+            // The WAL ends inside the next frame: a torn, uncommitted write is
+            // not a change.
+            return Ok(false);
+        }
+        let tail_base = offset - frame_size;
+        let mut window = vec![0u8; WAL_HEADER_SIZE + 2 * frame_size as usize];
+        let read = self.with_wal_file(|file| {
+            let hdr = file.read_exact_at(0, WAL_HEADER_SIZE)?;
+            let tail = file.read_exact_at(tail_base as u64, 2 * frame_size as usize)?;
+            Ok((hdr, tail))
+        });
+        let (hdr, tail) = match read {
+            Ok((hdr, tail))
+                if hdr.len() == WAL_HEADER_SIZE && tail.len() == 2 * frame_size as usize =>
+            {
+                (hdr, tail)
+            }
+            // The file changed under us after the size check: unknown.
+            _ => return Ok(true),
+        };
+        window[..WAL_HEADER_SIZE].copy_from_slice(&hdr);
+        window[WAL_HEADER_SIZE..].copy_from_slice(&tail);
+        let mut reader = match WalReader::new_with_offset_over_tail(
+            &window,
+            tail_base,
+            offset,
+            salt1,
+            salt2,
+        ) {
+            // The previous frame no longer matches, or the header is garbage:
+            // the WAL changed under us. Unknown.
+            Err(_) => return Ok(true),
+            Ok(reader) => reader,
+        };
+        let mut page = vec![0u8; page_size as usize];
+        match reader.read_frame(&mut page) {
+            // A checksum-valid frame past the capture: a real pending commit.
+            Ok(_) => Ok(true),
+            // Salt or checksum mismatch (`WalError::Eof` is exactly the
+            // no-further-valid-frame signal, and a short read is impossible
+            // after the size check): stale bytes from an older generation.
+            Err(WalError::Eof) => Ok(false),
+            Err(_) => Ok(true),
+        }
     }
 
     /// Checks whether the last page read in the WAL exists in the last LTX file.
@@ -2580,5 +2706,66 @@ pub mod internal {
 
     pub fn be_u32(bytes: &[u8]) -> u32 {
         super::be_u32(bytes)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn open_test_db() -> (tempfile::TempDir, Db) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db.sqlite");
+        let db = Db::open(&path).unwrap();
+        (dir, db)
+    }
+
+    fn write_row(db: &Db) {
+        let conn = Connection::open(db.path()).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS t(x TEXT); INSERT INTO t(x) VALUES('hello');",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn no_uncaptured_changes_after_sync() {
+        let (_dir, mut db) = open_test_db();
+        write_row(&db);
+        db.sync().unwrap();
+        assert!(
+            !db.has_uncaptured_changes().unwrap(),
+            "a full capture covers every commit"
+        );
+    }
+
+    #[test]
+    fn uncaptured_changes_after_commit_without_sync() {
+        let (_dir, mut db) = open_test_db();
+        write_row(&db);
+        db.sync().unwrap();
+        write_row(&db);
+        assert!(
+            db.has_uncaptured_changes().unwrap(),
+            "a WAL-only commit is invisible to the L0 position"
+        );
+    }
+
+    #[test]
+    fn no_uncaptured_changes_after_checkpoint_restart_leaves_stale_tail() {
+        let (_dir, mut db) = open_test_db();
+        write_row(&db);
+        db.sync().unwrap();
+        // Make the time-based checkpoint due, as for a cell that lives past
+        // the interval. The restart keeps the same salts and leaves the old
+        // frames' bytes behind without truncating, so the file is longer than
+        // the capture: only the checksum chain tells the stale tail from a
+        // genuinely new frame.
+        db.checkpoint_interval = Duration::from_nanos(1);
+        db.sync().unwrap();
+        assert!(
+            !db.has_uncaptured_changes().unwrap(),
+            "stale bytes past the capture fail the checksum and are not changes"
+        );
     }
 }

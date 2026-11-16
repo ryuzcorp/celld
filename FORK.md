@@ -991,6 +991,59 @@ push to `ghcr.io/denoland`, but still. Pushing a branch named
   fail-before test fits: the race is scheduling-dependent. The
   deterministic evidence is that the old `free_port` port could be taken
   between probe and bind, while the new code never names a port.
+- `0078` (sha TBD at merge) evictions skip the handoff snapshot for a short
+  chain born in this epoch (MergeTree-style lazy handoff). Motivation: every
+  eviction captured and PUT a full-DB L9 snapshot, then trimmed the journaled
+  L0s it superseded — an eager full merge on every eviction. In bucket
+  posture without group commit (Noite's and Outer's config) every write is
+  already a per-cell L0, so a cell born in this epoch has a complete
+  restorable chain from TXID 1 and the snapshot is pure overhead: 200 of the
+  1934 Class A requests on the s3bench agent-200 shape are eviction snapshot
+  PUTs, and every one rewrites the whole DB. ClickHouse MergeTree, the model
+  here, writes small parts on insert and merges them lazily by count and size
+  policy; it never merges just because an event happened. Policy: decline the
+  snapshot exactly like `snapshot_declined`/paged (compaction pause held, run
+  lock taken) iff the chain starts at TXID 1 in this epoch's prefix with
+  every object journaled here (fresh cells and `.evicted`/`.hibernated`
+  reuse, whose generation starts at TXID 1; remote restores, paged
+  continuations, same-epoch resumes and uncertified local rows keep the
+  snapshot), the per-cell prefix covers every acked row, and this epoch's
+  upload journal holds at most 16 objects (`HANDOFF_CHAIN_MAX_OBJECTS`: a
+  successor restore is then at most 16 parallel GETs) without ever filling.
+  Safety: the skip ends in the existing L0-chain fallback (`sync_wait`
+  Durable, then `epoch_replicated`) with no new proof and unchanged refusal;
+  no trim runs without a published snapshot (`trim_max` stays `None`); the
+  snapshot bytes are unchanged whenever the policy keeps it; older binaries
+  restore the result as any L0-chain handoff today. A skip logs
+  `eviction_snapshot_skipped` with cell, epoch, object count and reason. The
+  skip's final pass reads the local position without syncing: it goes straight
+  to `epoch_replicated` only if the WAL holds nothing past the capture (the
+  exact `Db::has_uncaptured_changes` probe — `Db::pos` cannot see a WAL-only
+  tail, and a blind check dropped such a row) and the per-cell prefix covers
+  every local commit; only a real pending commit runs `sync_wait` as today,
+  so neither the due time-based checkpoint nor `ensure_wal_exists` can mint a
+  content-free txid as its own L0 just before the handoff (measured: one extra
+  PUT per eviction on cells older than the 60 s interval). The
+  decision is pure (`crates/logic/handoff.rs`, `handoff_snapshot_needed`),
+  unit-tested there including the 16/17 boundary; `ltx_repl` gathers the
+  inputs. Tests in `ltx_repl`: a fresh short chain with its checkpoint due
+  skips (no snapshot PUT and no sealing L0, `L0Chain`, nothing deleted, the
+  next epoch restores the rows); a write after the gate with no waiter is
+  synced as one L0 and restored by the next epoch; an `.evicted` reuse skips
+  again; a restored cell, a 17-entry journal, and a durable-ahead-of-coverage
+  cell still snapshot. The probe is unit-tested in `celld-ltx` (clean after a
+  sync, dirty after an unsynced commit, clean after a timed checkpoint with no
+  new writes). Fail-before: forcing always-snapshot makes the fresh test
+  publish one snapshot PUT and return `Snapshot`; forcing the sync path makes
+  it upload one sealing L0; blinding the probe drops the WAL-only row.
+  `drain_bundled_cell` is untouched. Measured at `DELAY_MS=100`, release
+  builds, 1 node, `CELLD_IDLE_EVICT_S=30 CELLD_TTL_MS=60000`, all turns ok:
+  agent-200 lazy PUT ltx 1200 / Class A 1734 / p50 209 against `.11` 1400 /
+  1934 / p50 210 (the 200 snapshot PUTs gone, latency unchanged); agent-50
+  lazy 300 / 532 / p50 224 against `.11` 350 / 582 / p50 223. The skip leaves
+  the L0s in place (agent-200: 1200 objects until epoch GC, against 200
+  snapshot objects) instead of trimming them behind a snapshot; single-key
+  DELETEs are free, so the request saving is the whole win.
 
 Patches `0025`–`0034` are ported fixes from
 [meln1k/celld](https://github.com/meln1k/celld) by Nikita
