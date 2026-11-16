@@ -958,7 +958,7 @@ push to `ghcr.io/denoland`, but still. Pushing a branch named
   that tolerate about one extra round trip per durable write. Tests:
   `bucket_env_is_off_unless_explicit_one`. Fail-before: the old
   `!matches!(Some("0"))` value enables with no env set.
-- `0076` (sha TBD at merge) s3bench measures release builds and one run per
+- `0076` (`a88d2bc`) s3bench measures release builds and one run per
   box: `run.sh` defaults `CELLD_BIN` to `target/release/celld`, and refuses
   to start while another `celld-s3bench-*` container is up, unless
   `S3BENCH_ALLOW_PARALLEL=1` (counts-only runs). Two `.11` measurement
@@ -967,7 +967,7 @@ push to `ghcr.io/denoland`, but still. Pushing a branch named
   latency by up to 40%. Checked by hand: with a `celld-s3bench-*` container
   up the script exits 2 before creating a work dir. Tools only; CI does not
   run `tools/`.
-- `0077` (sha TBD at merge) every black-box test boots `celld dev` on an
+- `0077` (`b3f864a`) every black-box test boots `celld dev` on an
   ephemeral port and reads the bound address from the node's own announce
   lines. Cause: all 12 test files probed `free_port()` (bind `127.0.0.1:0`,
   read the port, drop the listener) and only later bound `--port <port>`;
@@ -991,7 +991,7 @@ push to `ghcr.io/denoland`, but still. Pushing a branch named
   fail-before test fits: the race is scheduling-dependent. The
   deterministic evidence is that the old `free_port` port could be taken
   between probe and bind, while the new code never names a port.
-- `0078` (sha TBD at merge) evictions skip the handoff snapshot for a short
+- `0078` (`fb97ac5`) evictions skip the handoff snapshot for a short
   chain born in this epoch (MergeTree-style lazy handoff). Motivation: every
   eviction captured and PUT a full-DB L9 snapshot, then trimmed the journaled
   L0s it superseded — an eager full merge on every eviction. In bucket
@@ -1184,7 +1184,7 @@ source commit; the commits keep the original author with a
     `nodes/` scan off to the 30 s maintenance tick (`0055`), so a node that
     starts next to it is recruited within ~30 s instead of ~1 s (the new
     node recruits the old one itself at once).
-- `v0.6.3-ryuzcorp.11` (the commit that adds this entry): adds
+- `v0.6.3-ryuzcorp.11` (`eac4160`): adds
   `0058`–`0067`, `0069`–`0072` and `0075`. `0068`, `0073` and `0074` were
   parked unmerged. There is no API or CLI change. A `.11` node publishes
   bucket format 3, which `.10` nodes read, so `.10` and `.11` nodes can
@@ -1210,6 +1210,25 @@ source commit; the commits keep the original author with a
     once per isolate (`0067`).
   - `tools/s3bench` (`0058`, `0069`, `0072`) measures bucket request counts
     and per-write latency against a local S3 for cost claims.
+- `v0.6.3-ryuzcorp.12` (the commit that adds this entry): adds `0076`–`0078`.
+  There is no API, CLI or bucket format change, so `.11` and `.12` nodes can
+  share a bucket, and a downgrade restores everything `.12` wrote.
+  Upgrade notes:
+  - An eviction skips the full-database handoff snapshot when the cell's
+    restorable chain was born in this epoch, every acked row is already
+    per-cell, and the chain holds at most 16 objects (`0078`, modelled on
+    ClickHouse MergeTree's lazy merges). The successor restores the short
+    L0 chain instead. A bounded number of extra Class B GETs replaces one
+    Class A PUT and a full-database upload per eviction.
+    - Measured on 200 agents × 6 writes, bucket posture, `DELAY_MS=100`,
+      release builds: Class A 1934 → 1734 (−10%), PUT 1400 → 1200, and write
+      p50 unchanged at 210 ms. On 50 agents: Class A 582 → 532.
+    - Cells restored from an older epoch, cells with group-commit rows not
+      yet per-cell, and longer chains still publish the snapshot as before.
+  - `tools/s3bench` defaults to the release binary and refuses to start
+    while another run is up (`0076`).
+  - The integration tests boot nodes on ephemeral ports, which removes a
+    port-reuse flake (`0077`).
 
 ## License
 
