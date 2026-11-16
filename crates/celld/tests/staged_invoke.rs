@@ -1,7 +1,7 @@
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 //
 // Modified by ryuzcorp (ryuzcorp/celld): staged invoke; deploy --read-root
-// option; announce-line discovery. Apache-2.0.
+// option; announce-line discovery; ephemeral-port boot (0077). Apache-2.0.
 
 // A black-box runner, not node code: it boots the binary, stages versions
 // into the node's own store, and polls TCP with wall-clock deadlines, so
@@ -22,7 +22,10 @@
 //! an observable condition with a deadline, and the server guard kills
 //! the child on every exit path.
 
-use std::io::{BufRead, BufReader, Read, Write};
+mod common;
+
+use common::{announced, forward_announce};
+use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -85,41 +88,6 @@ fn copy_project(src: &str, dst: &Path) {
     }
 }
 
-fn free_port() -> u16 {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("probe bind");
-    listener.local_addr().expect("probe addr").port()
-}
-
-/// One address of a `celld dev` node, from the announce line the supervisor
-/// forwards to its stderr. The node is non-dumpable (patch 0053), so
-/// `/proc/<pid>/fd` no longer names its listeners, and this is the node's
-/// own report of where it bound.
-fn announced(lines: &Mutex<Vec<String>>, prefix: &str) -> Option<String> {
-    lines
-        .lock()
-        .expect("announce lock")
-        .iter()
-        .find_map(|line| {
-            let address = line.strip_prefix(prefix)?.split_once(' ')?.0;
-            Some(address.to_string())
-        })
-}
-
-/// Collect the supervisor's stderr lines, which carry the node's announce
-/// lines (`--logs` forwards them).
-fn forward_announce(stderr: std::process::ChildStderr, lines: Arc<Mutex<Vec<String>>>) {
-    std::thread::spawn(move || {
-        let mut reader = BufReader::new(stderr);
-        let mut line = String::new();
-        while reader.read_line(&mut line).is_ok_and(|read| read > 0) {
-            lines
-                .lock()
-                .expect("announce lock")
-                .push(std::mem::take(&mut line));
-        }
-    });
-}
-
 /// A booted `celld dev` and its addresses. Kills the child on drop, so a
 /// failing assertion cannot leak a server onto its ports.
 struct TestNode {
@@ -139,7 +107,6 @@ impl TestNode {
         token: Option<&str>,
         env: &[(&str, &str)],
     ) -> Self {
-        let port = free_port();
         // No `--clean`: the store below already holds helper-v1, deployed
         // before boot so the live graph resolves, and cleaning would wipe
         // it. The temp project is fresh per test, so nothing stale lurks.
@@ -149,7 +116,7 @@ impl TestNode {
             .env("NO_COLOR", "1")
             .arg(project)
             .arg("--port")
-            .arg(port.to_string())
+            .arg("0")
             .arg("--no-watch")
             .arg("--logs");
         if let Some(token) = token {
@@ -170,30 +137,36 @@ impl TestNode {
             let _ = stdout.read_to_end(&mut sink);
         });
         // The supervisor's stderr carries the node's announce lines, the
-        // only channel to the internal listener now that the node is
+        // only channel to the listeners now that the node is
         // non-dumpable (patch 0053).
         let announced_lines: Arc<Mutex<Vec<String>>> = Arc::default();
         forward_announce(stderr, Arc::clone(&announced_lines));
-        let public = format!("127.0.0.1:{port}");
         // The kill-on-drop guard exists before the readiness poll, so a
         // boot timeout or an early child exit cannot leak the server.
         let mut node = Self {
             child,
-            public: public.clone(),
+            public: String::new(),
             internal: String::new(),
         };
         // Readiness is the live app answering its version: the deploy is
-        // adopted exactly then. The internal port comes from the node's own
-        // announce line.
-        node.internal = poll_until(&format!("{name} boot"), Duration::from_secs(180), || {
-            if get_body(&public, "/version") != Some("app-v1".to_string()) {
-                return None;
-            }
-            if let Some(status) = node.child.try_wait().expect("poll child") {
-                panic!("{name}: celld dev exited during boot: {status}");
-            }
-            announced(&announced_lines, "celld internal listening on ")
-        });
+        // adopted exactly then. Both addresses come from the node's own
+        // announce lines: the port is ephemeral (`--port 0`), so no
+        // probe-then-bind race can hand us another test's node.
+        (node.public, node.internal) =
+            poll_until(&format!("{name} boot"), Duration::from_secs(180), || {
+                if let Some(status) = node.child.try_wait().expect("poll child") {
+                    panic!(
+                        "{name}: celld dev exited during boot: {status}: {}",
+                        announced_lines.lock().expect("announce lock").join("\n")
+                    );
+                }
+                let public = announced(&announced_lines, "celld listening on ")?;
+                if get_body(&public, "/version") != Some("app-v1".to_string()) {
+                    return None;
+                }
+                let internal = announced(&announced_lines, "celld internal listening on ")?;
+                Some((public, internal))
+            });
         node
     }
 }

@@ -1,6 +1,6 @@
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 //
-// Modified by ryuzcorp (ryuzcorp/celld): tenant egress policy. Apache-2.0.
+// Modified by ryuzcorp (ryuzcorp/celld): tenant egress policy; refused-dial test holds its port (0077). Apache-2.0.
 
 // Tenant egress policy for Worker-initiated outbound connections.
 // It dials sockets and reads the wall clock for its DNS cache, like
@@ -1858,19 +1858,22 @@ mod tests {
 
     #[tokio::test]
     async fn policed_connect_reports_tcp_failure_for_allowed_hosts() {
-        // A closed loopback port refuses fast; open mode passes it and
-        // TCP fails. The failure must read as a connection failure, not
-        // a refusal — the same mapping the public path uses for allowed
-        // addresses.
-        let port = std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
+        // A bound-but-never-listening loopback socket refuses fast, and
+        // holding it for the whole test keeps the port reserved: no
+        // parallel test can bind it between probe and dial, the way a
+        // dropped `TcpListener` probe allowed. The failure must read as a
+        // connection failure, not a refusal — the same mapping the public
+        // path uses for allowed addresses.
+        let reserved = tokio::net::TcpSocket::new_v4().expect("reserve socket");
+        reserved
+            .bind("127.0.0.1:0".parse().expect("loopback addr"))
+            .expect("reserve port");
+        let port = reserved.local_addr().expect("reserved addr").port();
         let policy = open();
         let Err(DialError::Tcp(_)) = policed_tcp_connect(&policy, "127.0.0.1", port).await else {
             panic!("a refused dial must fail TCP, not policy");
         };
+        drop(reserved);
     }
 
     #[test]

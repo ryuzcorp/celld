@@ -958,6 +958,30 @@ push to `ghcr.io/denoland`, but still. Pushing a branch named
   that tolerate about one extra round trip per durable write. Tests:
   `bucket_env_is_off_unless_explicit_one`. Fail-before: the old
   `!matches!(Some("0"))` value enables with no env set.
+- `0077` (sha TBD at merge) every black-box test boots `celld dev` on an
+  ephemeral port and reads the bound address from the node's own announce
+  lines. Cause: all 12 test files probed `free_port()` (bind `127.0.0.1:0`,
+  read the port, drop the listener) and only later bound `--port <port>`;
+  in between, a parallel test could take the port — a sibling node's
+  ephemeral internal listener or another test's probe — so the child
+  exited 1 while `GET /version` still answered from the squatter (PR #66
+  run 43799719504 on arm64: `staged_invoke`
+  `invoke_refuses_unknown_and_malformed`, "celld dev exited during boot:
+  exit status: 1"). Fix: boot with `--port 0` and take the public address
+  from the `celld listening on <addr> (` stderr announce line inside the
+  existing boot-poll deadline; the shared `forward_announce`/`announced`
+  helpers live in the new `crates/celld/tests/common/mod.rs` (the
+  standard Cargo pattern: `tests/common/mod.rs` is not its own test
+  binary), used by all 12 files including `staged_invoke` and
+  `operator_token`; an early child exit panics with the collected stderr.
+  The same class in unit-test form —
+  `policed_connect_reports_tcp_failure_for_allowed_hosts` dropped its
+  `TcpListener` probe before dialing — now binds a `tokio::net::TcpSocket`
+  without listening and holds it for the whole test, so the refused dial
+  stays refused and the port stays reserved (no new dependency). No
+  fail-before test fits: the race is scheduling-dependent. The
+  deterministic evidence is that the old `free_port` port could be taken
+  between probe and bind, while the new code never names a port.
 
 Patches `0025`–`0034` are ported fixes from
 [meln1k/celld](https://github.com/meln1k/celld) by Nikita

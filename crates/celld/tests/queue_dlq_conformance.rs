@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): Queue DLQ forward/redrive conformance; deploy --read-root option. Apache-2.0.
+// Modified by ryuzcorp (ryuzcorp/celld): Queue DLQ forward/redrive conformance; deploy --read-root option; ephemeral-port boot (0077). Apache-2.0.
 
 // A black-box runner, not node code: it boots the binary, copies fixtures,
 // reads the cells' SQLite files, and polls TCP with wall-clock deadlines,
@@ -37,12 +37,16 @@
 //! direct send with a bad content type — because the shared queue cell
 //! runs in the runtime pool, whose isolates evaluate no tenant bundle.
 
+mod common;
+
+use common::{announced, forward_announce};
 use rusqlite::Connection;
 use serde_json::Value;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 fn celld_binary() -> PathBuf {
@@ -61,11 +65,6 @@ fn runtime_fixture_dir() -> PathBuf {
         .join("tests/fixtures/runtime-isolate")
         .canonicalize()
         .expect("fixture exists")
-}
-
-fn free_port() -> u16 {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("probe bind");
-    listener.local_addr().expect("probe addr").port()
 }
 
 fn copy_dir(src: &Path, dst: &Path) {
@@ -126,12 +125,11 @@ struct TestNode {
 
 impl TestNode {
     fn boot(app_project: &Path, data_dir: &Path) -> Self {
-        let port = free_port();
         let mut child = Command::new(celld_binary())
             .arg("dev")
             .arg(app_project)
             .arg("--port")
-            .arg(port.to_string())
+            .arg("0")
             .arg("--no-watch")
             .arg("--logs")
             .env("CELLD_TEST_DATA_DIR", data_dir)
@@ -140,32 +138,39 @@ impl TestNode {
             .spawn()
             .expect("spawn celld dev");
         let mut stdout = child.stdout.take().expect("piped stdout");
-        let mut stderr = child.stderr.take().expect("piped stderr");
-        // Drain both pipes so a chatty child can never block on a full one.
+        let stderr = child.stderr.take().expect("piped stderr");
+        // Drain stdout so a chatty child can never block on a full pipe.
+        // Stderr is collected line by line: it carries the node's announce
+        // lines, the only channel to its bound addresses now that the node
+        // is non-dumpable (patch 0053).
         std::thread::spawn(move || {
             let mut sink = Vec::new();
             let _ = stdout.read_to_end(&mut sink);
         });
-        std::thread::spawn(move || {
-            let mut sink = Vec::new();
-            let _ = stderr.read_to_end(&mut sink);
-        });
-        let public = format!("127.0.0.1:{port}");
+        let announced_lines: Arc<Mutex<Vec<String>>> = Arc::default();
+        forward_announce(stderr, Arc::clone(&announced_lines));
         // The kill-on-drop guard exists before the readiness poll, so a
         // boot timeout or an early child exit cannot leak the server.
         let mut node = Self {
             child,
-            public: public.clone(),
+            public: String::new(),
         };
-        // Readiness is the public port answering with the app loaded.
-        poll_until("boot", Duration::from_secs(120), || {
+        // Readiness is the announced public address answering with the app
+        // loaded. The port is ephemeral (`--port 0`): the announce line is
+        // the node's own report of where it bound, so no probe-then-bind
+        // race can hand us another test's node.
+        node.public = poll_until("boot", Duration::from_secs(120), || {
+            if let Some(status) = node.child.try_wait().expect("poll child") {
+                panic!(
+                    "celld dev exited during boot: {status}: {}",
+                    announced_lines.lock().expect("announce lock").join("\n")
+                );
+            }
+            let public = announced(&announced_lines, "celld listening on ")?;
             if !probe(&public, "/health") {
                 return None;
             }
-            if let Some(status) = node.child.try_wait().expect("poll child") {
-                panic!("celld dev exited during boot: {status}");
-            }
-            Some(public.clone())
+            Some(public)
         });
         node
     }

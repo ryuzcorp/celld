@@ -1,5 +1,5 @@
 // Modified by ryuzcorp (ryuzcorp/celld): operator token for the internal listener;
-// announce-line discovery. Apache-2.0.
+// announce-line discovery; ephemeral-port boot (0077). Apache-2.0.
 
 // A black-box runner, not node code: it boots the binary, copies fixtures,
 // and polls TCP with wall-clock deadlines, so the execution boundary's
@@ -21,6 +21,9 @@
 //! stops the node: the 401 without the token proves the gate, and draining
 //! the test node would only prove the shutdown path other suites own.
 
+mod common;
+
+use common::{announced, forward_announce};
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
@@ -43,11 +46,6 @@ fn fixture_source() -> PathBuf {
         .expect("fixture exists")
 }
 
-fn free_port() -> u16 {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("probe bind");
-    listener.local_addr().expect("probe addr").port()
-}
-
 fn copy_fixture(name: &str) -> tempfile::TempDir {
     let dir = tempfile::Builder::new()
         .prefix(&format!("celld-operator-token-{name}-"))
@@ -61,34 +59,25 @@ fn copy_fixture(name: &str) -> tempfile::TempDir {
 
 /// A booted `celld dev` and its addresses. Kills the child on drop, so a
 /// failing assertion cannot leak a server onto its ports.
+/// Both listeners are ephemeral (`--port 0`): the node's own announce lines
+/// name them, so no probe-then-bind race can hand us another test's node.
 struct TestNode {
     child: Child,
     public: String,
     internal: String,
-    stderr: Arc<Mutex<Vec<u8>>>,
-}
-
-/// One address of the node, from the announce line the supervisor forwards
-/// to its stderr. The node is non-dumpable (patch 0053), so
-/// `/proc/<pid>/fd` no longer names its listeners, and this is the node's
-/// own report of where it bound.
-fn announced(stderr: &Mutex<Vec<u8>>, prefix: &str) -> Option<String> {
-    let text = String::from_utf8_lossy(&stderr.lock().expect("stderr lock")).into_owned();
-    text.lines().find_map(|line| {
-        let address = line.strip_prefix(prefix)?.split_once(' ')?.0;
-        Some(address.to_string())
-    })
+    stderr: Arc<Mutex<Vec<String>>>,
 }
 
 impl TestNode {
     fn boot_with_env(fixture: &Path, name: &str, env: &[(&str, &str)]) -> Self {
-        let port = free_port();
+        // The port is ephemeral (`--port 0`); the readiness poll takes the
+        // public address from the node's own announce line below.
         let mut child = Command::new(celld_binary())
             .arg("dev")
             .env("NO_COLOR", "1")
             .arg(fixture)
             .arg("--port")
-            .arg(port.to_string())
+            .arg("0")
             .arg("--no-watch")
             .arg("--clean")
             .arg("--logs")
@@ -98,46 +87,50 @@ impl TestNode {
             .spawn()
             .expect("spawn celld dev");
         let mut stdout = child.stdout.take().expect("piped stdout");
-        let mut stderr = child.stderr.take().expect("piped stderr");
+        let stderr = child.stderr.take().expect("piped stderr");
         // Drain stdout so a chatty child can never block on a full pipe.
         // Stderr is kept: the token must never appear in it.
         std::thread::spawn(move || {
             let mut sink = Vec::new();
             let _ = stdout.read_to_end(&mut sink);
         });
-        let captured: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
-        let captured_sink = Arc::clone(&captured);
-        std::thread::spawn(move || {
-            // Streamed, not read-to-end: the node is still running when the
-            // test reads this, so bytes must arrive while the pipe is open.
-            let mut chunk = [0u8; 4096];
-            loop {
-                match stderr.read(&mut chunk) {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => captured_sink
-                        .lock()
-                        .expect("stderr lock")
-                        .extend_from_slice(&chunk[..n]),
-                }
-            }
-        });
-        let public = format!("127.0.0.1:{port}");
+        let announced_lines: Arc<Mutex<Vec<String>>> = Arc::default();
+        forward_announce(stderr, Arc::clone(&announced_lines));
+        // Readiness is the public health endpoint answering 200 on the
+        // announced address; the internal address comes from the node's
+        // own announce line below.
         // The kill-on-drop guard exists before the readiness poll, so a
         // boot timeout or an early child exit cannot leak the server.
         let mut node = Self {
             child,
-            public: public.clone(),
+            public: String::new(),
             internal: String::new(),
-            stderr: captured,
+            stderr: announced_lines,
         };
-        // Readiness is the public health endpoint answering 200; the
-        // internal port is the node child's other loopback listener.
-        node.internal = poll_until(&format!("{name} boot"), Duration::from_secs(120), || {
+        // Readiness is the public health endpoint answering 200 on the
+        // announced address, and the internal port from the node's own
+        // announce line. The port is ephemeral (`--port 0`): the announce
+        // lines are the node's own report of where it bound, so no
+        // probe-then-bind race can hand us another test's node.
+        node.public = poll_until(&format!("{name} boot"), Duration::from_secs(120), || {
+            if let Some(status) = node.child.try_wait().expect("poll child") {
+                panic!(
+                    "{name}: celld dev exited during boot: {status}: {}",
+                    node.stderr.lock().expect("stderr lock").join("\n")
+                );
+            }
+            let public = announced(&node.stderr, "celld listening on ")?;
             if !probe(&public, "/.well-known/celld/health") {
                 return None;
             }
+            Some(public)
+        });
+        node.internal = poll_until(&format!("{name} boot"), Duration::from_secs(120), || {
             if let Some(status) = node.child.try_wait().expect("poll child") {
-                panic!("{name}: celld dev exited during boot: {status}");
+                panic!(
+                    "{name}: celld dev exited during boot: {status}: {}",
+                    node.stderr.lock().expect("stderr lock").join("\n")
+                );
             }
             announced(&node.stderr, "celld internal listening on ")
         });
@@ -147,7 +140,7 @@ impl TestNode {
     /// The supervisor's stderr so far. The node child inherits the
     /// supervisor's stderr, so this also carries the node's startup logs.
     fn stderr_text(&self) -> String {
-        String::from_utf8_lossy(&self.stderr.lock().expect("stderr lock")).into_owned()
+        self.stderr.lock().expect("stderr lock").join("\n")
     }
 }
 
@@ -327,13 +320,14 @@ fn operator_token_gates_every_internal_route_class() {
 #[test]
 fn empty_operator_token_refuses_to_start() {
     let fixture = copy_fixture("empty");
-    let port = free_port();
+    // No probe port: the child refuses before its listeners bind, and
+    // `--port 0` names no port for a sibling test to steal.
     let mut child = Command::new(celld_binary())
         .arg("dev")
         .env("NO_COLOR", "1")
         .arg(fixture.path())
         .arg("--port")
-        .arg(port.to_string())
+        .arg("0")
         .arg("--no-watch")
         .arg("--clean")
         .env("CELLD_OPERATOR_TOKEN", "")
@@ -342,27 +336,15 @@ fn empty_operator_token_refuses_to_start() {
         .spawn()
         .expect("spawn celld dev");
     let mut stdout = child.stdout.take().expect("piped stdout");
-    let mut stderr = child.stderr.take().expect("piped stderr");
+    let stderr = child.stderr.take().expect("piped stderr");
     // Drain both pipes on threads so a failing child can never block on a
     // full one; stderr is kept to prove the refusal names the variable.
     std::thread::spawn(move || {
         let mut sink = Vec::new();
         let _ = stdout.read_to_end(&mut sink);
     });
-    let captured: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
-    let captured_sink = Arc::clone(&captured);
-    std::thread::spawn(move || {
-        let mut chunk = [0u8; 4096];
-        loop {
-            match stderr.read(&mut chunk) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => captured_sink
-                    .lock()
-                    .expect("stderr lock")
-                    .extend_from_slice(&chunk[..n]),
-            }
-        }
-    });
+    let captured: Arc<Mutex<Vec<String>>> = Arc::default();
+    forward_announce(stderr, Arc::clone(&captured));
     // The child node refuses before its listeners bind, and the supervisor
     // exits when the child does. Poll the exit; a node that served anyway
     // would hold this deadline and fail.
@@ -387,7 +369,7 @@ fn empty_operator_token_refuses_to_start() {
     // the pipe; poll for the refusal line itself.
     let start = Instant::now();
     let output = loop {
-        let text = String::from_utf8_lossy(&captured.lock().expect("stderr lock")).into_owned();
+        let text = captured.lock().expect("stderr lock").join("\n");
         if text.contains("CELLD_OPERATOR_TOKEN") {
             break text;
         }
