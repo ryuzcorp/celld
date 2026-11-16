@@ -1,4 +1,5 @@
 // Modified by ryuzcorp (ryuzcorp/celld): round-level fence settlement (0062).
+// Modified by ryuzcorp (ryuzcorp/celld): bucket-posture group commit: VerifyOwnership carries the issuing gate's cover (0074).
 // Modified by ryuzcorp (ryuzcorp/celld): ported from meln1k/celld: seal a dead lease that never opened a log (01522b3); shared bucket-posture ownership reads across concurrent gates (0056).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
@@ -1204,10 +1205,16 @@ pub enum Effect {
     /// emit this — the ensemble seal is their fence. Reads are shared: a
     /// proven gate whose position a read in flight already covers joins it
     /// instead of emitting another, so one effect may settle several gates.
+    /// `cover` is the issuing gate's own position: a prefetched read serves
+    /// the effect only when its cover reaches this far, so members (whose
+    /// positions never exceed the issuer's) are covered too. The shell
+    /// echoes the position back rather than a watermark, and a future
+    /// watermark in another unit must not widen the join.
     VerifyOwnership {
         op: OpId,
         cell: CellId,
         epoch: Epoch,
+        cover: u64,
     },
     StopRuntime {
         op: OpId,

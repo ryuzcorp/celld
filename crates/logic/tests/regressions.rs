@@ -1,4 +1,5 @@
 // Modified by ryuzcorp (ryuzcorp/celld): ported from meln1k/celld: scripted core-bug reproductions (ea471ee, e46a685, 6d61462, 18d3bf9, 9d4c163, 468b456, 01522b3, 65fdb13); shared bucket-posture ownership reads (0056); round-level fence settlement (0062); bucket-posture group commit: live-lease routing pin (0063).
+// Modified by ryuzcorp (ryuzcorp/celld): bucket-posture group commit: cover-carrying verify rounds (0074).
 //! Scripted reproductions of core bugs the deterministic simulator
 //! (`crates/sim`) found. Each drives the core through a minimal shell that
 //! answers every effect at once, except the ones a test holds back to
@@ -191,7 +192,9 @@ impl Shell {
             Effect::EnsureDurable { op, .. } => Event::DurabilityChecked { op, result: Ok(()) },
             // The bucket-posture ownership read: confirmed exactly when the
             // record still names this node at this epoch, as the shell does.
-            Effect::VerifyOwnership { op, cell, epoch } => {
+            Effect::VerifyOwnership {
+                op, cell, epoch, ..
+            } => {
                 let owned = self.owners.get(&cell).is_some_and(|record| {
                     record.node.as_deref() == Some("n0") && record.epoch == epoch
                 });

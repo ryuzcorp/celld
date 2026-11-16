@@ -1,4 +1,5 @@
 // Modified by ryuzcorp (ryuzcorp/celld): cross-isolate RPC stubs and streams; operator token for the internal listener; Workers Cache pressure shedding; ported from meln1k/celld: report wake coverage after maintenance (e6cb9a3); staged invoke reads the deploy bucket.
+// Modified by ryuzcorp (ryuzcorp/celld): bucket-posture group commit: VerifyOwnership serves from prefetched bundle-round reads (0074).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! The serial lifecycle executor and its shell-side request drivers.
@@ -213,6 +214,20 @@ impl Ownership {
         match self {
             Self::Memory(memory) => Ok(memory.lock().await.owners.get(cell).cloned()),
             Self::Bucket(bucket) => bucket.read_owner(cell).await.map_err(ownership_read_failed),
+        }
+    }
+    /// Serve a gate from a prefetched bundle-round read when one covers
+    /// `min_cover`, else `None` for the direct read. Memory ownership has
+    /// no bundle rounds, so it never prefetches.
+    pub(crate) async fn read_owner_covered(
+        &self,
+        cell: &str,
+        epoch: u64,
+        min_cover: u64,
+    ) -> Option<crate::ownership_store::PrefetchOutcome> {
+        match self {
+            Self::Memory(_) => None,
+            Self::Bucket(bucket) => bucket.read_owner_covered(cell, epoch, min_cover).await,
         }
     }
 
@@ -3945,7 +3960,12 @@ impl Actor {
                     });
                 }
             }
-            Effect::VerifyOwnership { op, cell, epoch } => {
+            Effect::VerifyOwnership {
+                op,
+                cell,
+                epoch,
+                cover,
+            } => {
                 // Verify ownership for bucket-proof acks. Durable in
                 // `e<epoch>/` is not the same as durable: if the cell has been taken over, that
                 // prefix is orphaned — the next owner restores a higher
@@ -3954,25 +3974,36 @@ impl Actor {
                 // record still names us, no takeover linearised before this
                 // read; the LTX went up before it; so any later takeover
                 // restores from a lineage that already contains the write.
+                // The flush loop prefetches one read per bundle round after
+                // the round's PUTs land; a gate whose position the round's
+                // cover reaches reuses it instead of issuing its own GET.
+                // Anything else — uncovered gates, unarmed slots, dropped
+                // rounds — falls back to today's direct read.
                 let ownership = self.ownership.clone();
                 let node = self.state.node().to_string();
                 out.spawn_scoped(async move {
-                    let result = match ownership.read_owner(&cell).await {
-                        Ok(Some(record))
-                            if record.node.as_deref() == Some(node.as_str())
-                                && record.epoch == epoch =>
-                        {
-                            Ok(())
-                        }
-                        Ok(record) => {
-                            eprintln!(
-                                "celld output gate: {cell} epoch {epoch} is no longer ours \
-                                 (record: {record:?}); refusing to acknowledge a write in an \
-                                 orphaned epoch"
-                            );
-                            Err(Failure::Definite)
-                        }
-                        Err(failure) => Err(failure),
+                    let result = match ownership.read_owner_covered(&cell, epoch, cover).await {
+                        Some(Ok(record)) => crate::ownership_store::BucketOwnership::check_owner(
+                            &record, &node, epoch,
+                        ),
+                        Some(Err(failure)) => Err(failure),
+                        None => match ownership.read_owner(&cell).await {
+                            Ok(Some(record))
+                                if record.node.as_deref() == Some(node.as_str())
+                                    && record.epoch == epoch =>
+                            {
+                                Ok(())
+                            }
+                            Ok(record) => {
+                                eprintln!(
+                                    "celld output gate: {cell} epoch {epoch} is no longer ours \
+                                     (record: {record:?}); refusing to acknowledge a write in an \
+                                     orphaned epoch"
+                                );
+                                Err(Failure::Definite)
+                            }
+                            Err(failure) => Err(failure),
+                        },
                     };
                     CompletedEffect::plain(Event::OwnershipVerified { op, result })
                 });

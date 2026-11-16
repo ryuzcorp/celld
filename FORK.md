@@ -984,6 +984,34 @@ push to `ghcr.io/denoland`, but still. Pushing a branch named
  the settle drain the stranded ticket's synced watermark stays at 1; without
  the failed-round skip removal the retry ships only txid 2 while the bucket
  still lacks txid 1.
+ - `0074` (sha TBD at merge) bucket-posture prefetch: one ownership read per
+ shared bundle round serves every gate it covers. The flush loop records each
+ ticket's gate position (SQLite fingerprint) in a bounded per-cell ledger —
+ the only place a write's ticket and its position meet — and each round's
+ cover is the highest position over its carried tickets. Covers are never
+ txids or tickets (a txid-scale cover could never serve a real gate, and the
+ mismatch killed `0068`): positions strictly increase per cell, so a slot
+ serves a gate exactly when the PUT that preceded the prefetch carried that
+ gate's rows, and a write committed after the capture is never served by that
+ round's slot. Slots are created only for cells with more than one pending
+ ticket — a lone ticket's gate is the slot's only querier, so creating it
+ only spends a GET it never saves — and arm only after every chunk PUT lands,
+ so no prefetched read precedes its proof. The map spares the newest landed
+ slot from its bound (fast rounds would otherwise evict the only servable
+ read) and prefers landed reads over in-flight ones. Uncovered gates, unarmed
+ slots and dropped rounds fall back to the direct read.
+ `Effect::VerifyOwnership` carries the issuing gate's cover for the match.
+ The verify is only the second key — a slot-served verify on a refused round
+ never acks, because the durability half still waits and the per-cell
+ fallback re-proves it. Harness (concurrent, `DELAY_MS=100`, release):
+ agent-200, hot and agent-50; see the handoff tables. Tests:
+ `bundle_prefetch_serves_covered_gates_in_position_units`,
+ `bundle_prefetch_does_not_serve_later_writes`,
+ `bundle_pipeline_fenced_round_refuses_both_stages`. Fail-before: txid-scale
+ covers leave position 501 unserved; ignoring the cover check serves the
+ later write from the stale slot; admitting a prepare with no owner lets a
+ stopped session keep flushing, and crediting under a seal advances the
+ watermark without coverage.
 
 Patches `0025`–`0034` are ported fixes from
 [meln1k/celld](https://github.com/meln1k/celld) by Nikita

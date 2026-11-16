@@ -1,5 +1,6 @@
 // Modified by ryuzcorp (ryuzcorp/celld): ported from meln1k/celld: 51 code probes on the core's rare branches (b026226); shared bucket-posture ownership reads across concurrent gates (0056).
 // Modified by ryuzcorp (ryuzcorp/celld): round-level fence settlement (0062).
+// Modified by ryuzcorp (ryuzcorp/celld): bucket-posture group commit: verify rounds carry the issuing gate's cover (0074).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! The output gate: one choke point every egress passes through.
@@ -392,7 +393,12 @@ impl State {
             .entry((cell.clone(), epoch))
             .or_default()
             .insert(op);
-        effects.push(Effect::VerifyOwnership { op, cell, epoch });
+        effects.push(Effect::VerifyOwnership {
+            op,
+            cell,
+            epoch,
+            cover: position,
+        });
     }
 
     /// Forget an in-flight read in both indexes. Its result, if it still
