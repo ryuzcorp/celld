@@ -944,6 +944,21 @@ push to `ghcr.io/denoland`, but still. Pushing a branch named
   timed per request in the worker's own thread after its pacing sleep and
   recorded only for 2xx answers. Pass/fail semantics are unchanged; the
   numbers make ack-latency regressions visible next to the request counts.
+- `0075` (sha TBD at merge) group commit defaults OFF in bucket posture.
+  Release measurements show bundling roughly doubles durable-write p50 even
+  with the pipelined credit re-read, so `.11` ships per-cell uploads: an
+  unset `CELLD_BUCKET_BUNDLES` now disables grouping and only an explicit
+  `1` enables it (`0` still disables; any other value, including an empty
+  one, still stops startup via `env_vars::validate`). `docs/README.md`
+  (grouping paragraph, env table), `celld -h`, and `docs/guarantees.md` now
+  describe grouping as opt-in and state the measured trade-off; the
+  guarantees themselves are unchanged. Measured at `DELAY_MS=100`, release
+  builds, 1 node: agent 200x6 Class A 1934 -> 1140 with grouping on, but
+  write p50 210 -> 445 ms; a hot cell with 16 writers 235 -> 432 ms p50
+  with ~45% fewer turns. Enable it for request-cost-sensitive workloads
+  that tolerate about one extra round trip per durable write. Tests:
+  `bucket_env_is_off_unless_explicit_one`. Fail-before: the old
+  `!matches!(Some("0"))` value enables with no env set.
 
 Patches `0025`–`0034` are ported fixes from
 [meln1k/celld](https://github.com/meln1k/celld) by Nikita
