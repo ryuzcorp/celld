@@ -1,4 +1,5 @@
 // Modified by ryuzcorp (ryuzcorp/celld): operator token for the internal listener; list_page resume is a cursor; ported from meln1k/celld: seal a dead lease that never opened a log (01522b3); seal_absent_log regression tests; lone-node repair backoff; bucket-posture group commit: bucket-session record encoding + old-reader interop tests (0059); bucket-posture group commit: bucket executor without ensemble (0060); bucket-posture group commit: successor fold of bucket bundles (0063); bucket-posture group commit: bucket-session drain, per-cell seal, bundle GC without ensemble, linger holds only while the dirty set is shared (0064); bucket-posture group commit: lone-cell-per-cell vs shared-bundle executor tests, and idle bucket sessions skip empty bundle-GC scans (0071).
+// Modified by ryuzcorp (ryuzcorp/celld): bucket-posture group commit: bundle PUT split into prepare/execute/confirm stages (0073).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! v0 of the in-fleet replicated log tier (`CELLD_DURABILITY=fleet`).
@@ -3956,6 +3957,13 @@ pub struct NodeLogManager {
     /// Resume after examined bundles, including those not yet covered.
     /// Serialize passes so overlapping callers cannot move the cursor back.
     bundle_gc_cursor: tokio::sync::Mutex<Option<String>>,
+    /// Bucket bundle rounds admitted but not yet credited or refused: PUT
+    /// landed, re-read pending. The depth-2 pipeline overlaps the next
+    /// round's PUT with the previous round's re-read, so more than one
+    /// round can be in flight; graceful close waits for the count to drain
+    /// before the seal scan (a zero count with no PUT in flight means every
+    /// row is either per-cell or refuses to seal).
+    bundle_uncredited: std::sync::atomic::AtomicU64,
     /// Bundles this session attempted to PUT (including failed or ambiguous
     /// attempts, which may have landed) minus confirmed GC deletes. With
     /// `bundle_gc_clean` lets an idle bucket session skip its GC LIST: only
@@ -4566,6 +4574,7 @@ impl NodeLogManager {
             bundle_seq: std::sync::atomic::AtomicU64::new(0),
             bundle_index: Mutex::new(BundleIndex::default()),
             bundle_gc_cursor: tokio::sync::Mutex::new(None),
+            bundle_uncredited: std::sync::atomic::AtomicU64::new(0),
             bundle_gc_outstanding: std::sync::atomic::AtomicU64::new(0),
             bundle_gc_clean: std::sync::atomic::AtomicBool::new(false),
             bundle_cache: tokio::sync::Mutex::new(None),
@@ -5678,7 +5687,11 @@ impl NodeLogManager {
             crate::asyncrt::sleep(std::time::Duration::from_millis(200)).await;
         }
         for _ in 0..30 {
-            if !self.flush_in_flight.load(Ordering::SeqCst) {
+            // Admitted-but-uncredited bundle rounds count as in flight: with
+            // pipelining their PUT has landed while the re-read is pending.
+            if !self.flush_in_flight.load(Ordering::SeqCst)
+                && self.bundle_uncredited.load(Ordering::SeqCst) == 0
+            {
                 break;
             }
             crate::asyncrt::sleep(std::time::Duration::from_millis(100)).await;
@@ -5758,7 +5771,11 @@ impl NodeLogManager {
         // drain below sees every row it could cover. No new flush can start
         // past the closing latch (`bundle_active` refuses), so this settles.
         for _ in 0..30 {
-            if !self.flush_in_flight.load(Ordering::SeqCst) {
+            // Admitted-but-uncredited bundle rounds count as in flight: with
+            // pipelining their PUT has landed while the re-read is pending.
+            if !self.flush_in_flight.load(Ordering::SeqCst)
+                && self.bundle_uncredited.load(Ordering::SeqCst) == 0
+            {
                 break;
             }
             crate::asyncrt::sleep(std::time::Duration::from_millis(100)).await;
@@ -7007,48 +7024,79 @@ fn spawn_fragment_gc(
     });
 }
 
-impl NodeLogManager {
-    /// One object per node-flush: `log/<node>/bundle/e<epoch>-<seq>.ltxb`,
-    /// verbatim L0 segments plus the footer (`crate::bundle`). Keys are
-    /// unique per (epoch, seq), so the PUT needs no condition; the epoch in
-    /// the key scopes recovery's gather and the eventual GC sweep.
-    pub(crate) async fn put_bundle(&self, entries: Vec<celld_ltx::bundle::BundleEntry>) -> bool {
-        struct FlushGuard<'a>(&'a std::sync::atomic::AtomicBool);
-        impl Drop for FlushGuard<'_> {
-            fn drop(&mut self) {
-                self.0.store(false, Ordering::SeqCst);
-            }
-        }
-        self.flush_in_flight.store(true, Ordering::SeqCst);
-        let _flush = FlushGuard(&self.flush_in_flight);
-        // Fleet path keeps its shipper epoch; bucket path uses the published
-        // bucket-session epoch with no shipper. Both reuse the same PUT then
-        // bucket re-read then `bundle_credit_allowed` credit check verbatim, so
-        // credit advances the same counters and `wait_for_durability_ticket`
-        // returns `ProofSource::Bucket` for either path.
-        enum FlushOwner {
-            Fleet(Arc<FleetShipper>, u64),
-            Bucket(u64),
-        }
-        let owner = {
-            let inner = self.inner.lock().unwrap();
-            match inner.as_ref() {
-                Some(shipper) => FlushOwner::Fleet(shipper.clone(), shipper.epoch),
-                None => {
-                    let epoch = self.bucket_epoch.load(Ordering::SeqCst);
-                    if epoch == 0 || !self.ltx.bucket_bundles_enabled() {
-                        return false;
-                    }
-                    FlushOwner::Bucket(epoch)
-                }
-            }
-        };
-        let epoch = match &owner {
+/// Whose epoch a bundle flush ships under. Fleet path keeps its shipper
+/// epoch; bucket path uses the published bucket-session epoch with no
+/// shipper. Cloned per chunk: one round's chunks share the owner, and the
+/// fence path must degrade the flusher that owned the flush, not whatever
+/// is installed when the re-read lands.
+#[derive(Clone)]
+pub(crate) enum FlushOwner {
+    Fleet(Arc<FleetShipper>, u64),
+    Bucket(u64),
+}
+/// One bundle chunk between the pipeline stages: numbered, encoded, and
+/// keyed, PUT pending. The owner rides along so the confirm stage fences
+/// the flusher that owned the flush, not whatever is installed when the
+/// re-read lands.
+pub(crate) struct PreparedBundleChunk {
+    owner: FlushOwner,
+    epoch: u64,
+    key: String,
+    body: Vec<u8>,
+    rows: Vec<celld_ltx::bundle::BundleRow>,
+}
+
+/// A landed chunk awaiting its credit re-read, plus the watermarks the
+/// re-read covers. Usually one per round; hot rounds carry several.
+/// Crosses into the flush loop, which confirms or drops it.
+pub(crate) struct LandedBundleChunk {
+    owner: FlushOwner,
+    epoch: u64,
+    key: String,
+    rows: Vec<celld_ltx::bundle::BundleRow>,
+}
+
+impl FlushOwner {
+    fn epoch(&self) -> u64 {
+        match self {
             FlushOwner::Fleet(_, epoch) => *epoch,
             FlushOwner::Bucket(epoch) => *epoch,
-        };
-        let seq = self.bundle_seq.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+}
+
+impl NodeLogManager {
+    /// Whose epoch the next bundle chunk ships under, or `None` when no
+    /// flush may start: gate closed, session unpublished, or (bucket) the
+    /// switch off. Fleet path keeps its shipper epoch; bucket path uses the
+    /// published bucket-session epoch with no shipper.
+    pub(crate) fn flush_owner(&self) -> Option<FlushOwner> {
+        let inner = self.inner.lock().unwrap();
+        match inner.as_ref() {
+            Some(shipper) => Some(FlushOwner::Fleet(shipper.clone(), shipper.epoch)),
+            None => {
+                let epoch = self.bucket_epoch.load(Ordering::SeqCst);
+                if epoch == 0 || !self.ltx.bucket_bundles_enabled() {
+                    return None;
+                }
+                Some(FlushOwner::Bucket(epoch))
+            }
+        }
+    }
+
+    /// Number and encode one bundle chunk: sequence, body, rows, key, and
+    /// the GC re-arm, exactly as the monolithic flush did. Returns `None`
+    /// without attempting anything when the bytes are unusable, fencing as
+    /// the monolith did. Admission to the in-flight count happens in
+    /// `execute`, which is synchronous with this: no await runs between.
+    pub(crate) fn prepare_bundle_chunk(
+        &self,
+        owner: &FlushOwner,
+        entries: Vec<celld_ltx::bundle::BundleEntry>,
+    ) -> Option<PreparedBundleChunk> {
+        let epoch = owner.epoch();
         let bucket_owner = matches!(owner, FlushOwner::Bucket(_));
+        let seq = self.bundle_seq.fetch_add(1, Ordering::SeqCst);
         let body = match celld_ltx::bundle::encode(&entries) {
             Ok(body) => body,
             Err(error) => {
@@ -7056,7 +7104,7 @@ impl NodeLogManager {
                 if bucket_owner {
                     self.stop_bucket_bundling(false);
                 }
-                return false;
+                return None;
             }
         };
         let rows = match celld_ltx::bundle::decode_rows(&body) {
@@ -7066,7 +7114,7 @@ impl NodeLogManager {
                 if bucket_owner {
                     self.stop_bucket_bundling(false);
                 }
-                return false;
+                return None;
             }
         };
         let key = format!("log/{}/bundle/e{epoch}-{seq:08}.ltxb", self.session);
@@ -7074,71 +7122,137 @@ impl NodeLogManager {
         // have landed, and only a scan can tell. Definite refusals above
         // return before this point, having attempted nothing.
         self.bundle_gc_outstanding.fetch_add(1, Ordering::SeqCst);
+        Some(PreparedBundleChunk {
+            owner: owner.clone(),
+            epoch,
+            key,
+            body,
+            rows,
+        })
+    }
 
+    /// PUT one prepared chunk. Admits it to the in-flight count the
+    /// shutdown drains wait on, then settles on transport failure (stopping
+    /// bundling so the rows fall back to per-cell uploads, as the monolith
+    /// did) or hands the landed chunk to the confirm stage.
+    pub(crate) async fn execute_bundle_chunk(
+        &self,
+        chunk: PreparedBundleChunk,
+    ) -> Option<LandedBundleChunk> {
+        let PreparedBundleChunk {
+            owner,
+            epoch,
+            key,
+            body,
+            rows,
+        } = chunk;
+        self.bundle_uncredited.fetch_add(1, Ordering::SeqCst);
         match self.bucket.put(&key, body).await {
-            Ok(()) => {
-                // The credit check: the PUT is unconditional, so by
-                // itself it proves nothing to the ack path — a healed
-                // zombie whose record a recoverer already sealed can
-                // still land bundle objects, and crediting them would
-                // ack rows no future takeover reads (the sealed record
-                // says the bucket is complete, and takeovers read
-                // per-cell prefixes). Durability credits only if the
-                // record is still Open at this shipper's epoch AFTER
-                // the PUT: any recovery that fences later must list
-                // after this PUT completed and therefore gathers it.
-                // A BUCKET read on purpose: the hazard is a peer's
-                // recovery CAS fencing this record, which the
-                // in-process copy cannot see.
-                let read = read_record(&self.bucket, &self.session).await;
-                let credit = log_tier::bundle_credit_allowed(
-                    read.as_ref()
-                        .ok()
-                        .and_then(Option::as_ref)
-                        .map(|folded| &folded.record),
-                    epoch,
-                );
-                if !credit {
-                    match &owner {
-                        FlushOwner::Fleet(flusher, _) => {
-                            // Degrade the shipper that OWNED this flush's
-                            // epoch, not whichever is installed now: a flush
-                            // racing a legitimate reconfiguration must not
-                            // poison the successor ensemble it knows nothing
-                            // about. For a true zombie the flusher IS the
-                            // installed shipper and stops exactly as before;
-                            // for a swap race this degrades a retired object,
-                            // which is the correct no-op — the lab measured
-                            // the alternative as an epoch-churn loop.
-                            flusher.degrade("record moved under a bundle flush");
-                        }
-                        FlushOwner::Bucket(_) => {
-                            // Fenced mid-flight (record no longer Open at epoch):
-                            // stop bundling so uncredited rows fall back to per-cell
-                            // uploads, never acked on the bundle. A read the bucket
-                            // answered is definitive and latches the session; a read
-                            // error is transient and leaves it re-armable.
-                            self.stop_bucket_bundling(read.is_ok());
-                        }
-                    }
-                    warn!(key, "bundle flush not credited: record moved");
-                    return false;
-                }
-                self.bundle_index.lock().unwrap().insert(key, rows);
-                true
-            }
+            Ok(()) => Some(LandedBundleChunk {
+                owner,
+                epoch,
+                key,
+                rows,
+            }),
             Err(error) => {
                 warn!(%error, key, "bundle put failed");
                 // The loop consumed this flush's wake, so no new write may come to
                 // retry it. Stop bundling: `sync_loop` (fallback tick) uploads the
                 // pending rows per cell, and the next flush re-arms from a fresh
                 // bucket read of the record.
-                if bucket_owner {
+                if matches!(owner, FlushOwner::Bucket(_)) {
                     self.stop_bucket_bundling(false);
                 }
-                false
+                self.bundle_uncredited.fetch_sub(1, Ordering::SeqCst);
+                None
             }
         }
+    }
+
+    /// The credit check, verbatim from the monolithic flush: the PUT is
+    /// unconditional, so by itself it proves nothing to the ack path — a
+    /// healed zombie whose record a recoverer already sealed can still land
+    /// bundle objects, and crediting them would ack rows no future takeover
+    /// reads (the sealed record says the bucket is complete, and takeovers
+    /// read per-cell prefixes). Durability credits only if the record is
+    /// still Open at this shipper's epoch AFTER the PUT: any recovery that
+    /// fences later must list after this PUT completed and therefore
+    /// gathers it. A BUCKET read on purpose: the hazard is a peer's
+    /// recovery CAS fencing this record, which the in-process copy cannot
+    /// see. Settles the chunk's admission on every path.
+    pub(crate) async fn confirm_bundle_chunk(&self, landed: LandedBundleChunk) -> bool {
+        let read = read_record(&self.bucket, &self.session).await;
+        let credit = log_tier::bundle_credit_allowed(
+            read.as_ref()
+                .ok()
+                .and_then(Option::as_ref)
+                .map(|folded| &folded.record),
+            landed.epoch,
+        );
+        if !credit {
+            match &landed.owner {
+                FlushOwner::Fleet(flusher, _) => {
+                    // Degrade the shipper that OWNED this flush's epoch, not
+                    // whichever is installed now: a flush racing a legitimate
+                    // reconfiguration must not poison the successor ensemble it
+                    // knows nothing about. For a true zombie the flusher IS the
+                    // installed shipper and stops exactly as before; for a swap
+                    // race this degrades a retired object, which is the correct
+                    // no-op — the lab measured the alternative as an
+                    // epoch-churn loop.
+                    flusher.degrade("record moved under a bundle flush");
+                }
+                FlushOwner::Bucket(_) => {
+                    // Fenced mid-flight (record no longer Open at epoch): stop
+                    // bundling so uncredited rows fall back to per-cell uploads,
+                    // never acked on the bundle. A read the bucket answered is
+                    // definitive and latches the session; a read error is
+                    // transient and leaves it re-armable.
+                    self.stop_bucket_bundling(read.is_ok());
+                }
+            }
+            warn!(key = landed.key, "bundle flush not credited: record moved");
+            self.bundle_uncredited.fetch_sub(1, Ordering::SeqCst);
+            return false;
+        }
+        self.bundle_index
+            .lock()
+            .unwrap()
+            .insert(landed.key, landed.rows);
+        self.bundle_uncredited.fetch_sub(1, Ordering::SeqCst);
+        true
+    }
+
+    /// The flush loop holds no PUT across the pipeline join itself, so it
+    /// marks the window the shutdown drains wait on.
+    pub(crate) fn set_flush_in_flight(&self, value: bool) {
+        self.flush_in_flight.store(value, Ordering::SeqCst);
+    }
+    /// One object per node-flush: `log/<node>/bundle/e<epoch>-<seq>.ltxb`,
+    /// verbatim L0 segments plus the footer (`crate::bundle`). Keys are
+    /// unique per (epoch, seq), so the PUT needs no condition; the epoch in
+    /// the key scopes recovery's gather and the eventual GC sweep.
+    /// The serial composition of the pipeline stages for the fleet loop;
+    /// the bucket loop overlaps them across rounds.
+    pub(crate) async fn put_bundle(&self, entries: Vec<celld_ltx::bundle::BundleEntry>) -> bool {
+        struct FlushGuard<'a>(&'a std::sync::atomic::AtomicBool);
+        impl Drop for FlushGuard<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::SeqCst);
+            }
+        }
+        self.flush_in_flight.store(true, Ordering::SeqCst);
+        let _flush = FlushGuard(&self.flush_in_flight);
+        let Some(owner) = self.flush_owner() else {
+            return false;
+        };
+        let Some(prepared) = self.prepare_bundle_chunk(&owner, entries) else {
+            return false;
+        };
+        let Some(landed) = self.execute_bundle_chunk(prepared).await else {
+            return false;
+        };
+        self.confirm_bundle_chunk(landed).await
     }
 
     pub(crate) fn bundle_active(&self) -> bool {
@@ -8976,6 +9090,251 @@ mod bucket_executor_tests {
             assert!(
                 bundle_keys(&bucket, "cells/").await.is_empty(),
                 "no per-cell L0 PUT when there is batching to do"
+            );
+        });
+    }
+    /// Pipeline admission accounting: prepare admits nothing, execute admits
+    /// the chunk (the shutdown drains watch this count), confirm settles it,
+    /// and the landed bundle is indexed. Fail-before: without the execute
+    /// admission the in-flight assert stays 0 (a drain would miss the
+    /// round); without the confirm settlement it stays 1.
+    #[test]
+    fn bundle_pipeline_counts_execute_through_confirm() {
+        let runtime = crate::asyncrt::shared_test_runtime();
+        runtime.block_on(async {
+            let dir = tempfile::tempdir().expect("test dir");
+            let (manager, bucket) = test_manager(dir.path());
+            open_gate(&manager);
+            publish_bucket_open(&manager, &bucket).await;
+            let owner = manager.flush_owner().expect("open gate admits a flush");
+            let prepared = manager
+                .prepare_bundle_chunk(&owner, vec![bundle_entry("c0", 1)])
+                .expect("synthetic entries encode");
+            assert_eq!(
+                manager.bundle_uncredited.load(Ordering::SeqCst),
+                0,
+                "prepare admits nothing"
+            );
+            let landed = manager
+                .execute_bundle_chunk(prepared)
+                .await
+                .expect("open bucket PUTs");
+            assert_eq!(
+                manager.bundle_uncredited.load(Ordering::SeqCst),
+                1,
+                "execute admits the chunk for the drains to see"
+            );
+            let key = landed.key.clone();
+            assert!(
+                manager.confirm_bundle_chunk(landed).await,
+                "open record credits"
+            );
+            assert_eq!(
+                manager.bundle_uncredited.load(Ordering::SeqCst),
+                0,
+                "confirm settles the admission"
+            );
+            assert!(
+                manager
+                    .bundle_index
+                    .lock()
+                    .unwrap()
+                    .bundles
+                    .contains_key(&key),
+                "the credited bundle is indexed"
+            );
+        });
+    }
+
+    /// A fenced round settles without indexing: the PUT still lands (PUTs
+    /// are unconditional) but the refused confirm drops the rows and leaves
+    /// the bundle index empty. Fail-before: indexing before the credit check
+    /// leaves the key behind.
+    #[test]
+    fn bundle_pipeline_refused_confirm_settles_without_index() {
+        let runtime = crate::asyncrt::shared_test_runtime();
+        runtime.block_on(async {
+            let dir = tempfile::tempdir().expect("test dir");
+            let (manager, bucket) = test_manager(dir.path());
+            open_gate(&manager);
+            publish_bucket_open(&manager, &bucket).await;
+            let owner = manager.flush_owner().expect("open gate admits a flush");
+            let prepared = manager
+                .prepare_bundle_chunk(&owner, vec![bundle_entry("c0", 1)])
+                .expect("synthetic entries encode");
+            let landed = manager
+                .execute_bundle_chunk(prepared)
+                .await
+                .expect("unconditional PUT lands under a seal");
+            publish_bucket_sealed(&manager, &bucket).await;
+            assert!(
+                !manager.confirm_bundle_chunk(landed).await,
+                "a sealed record refuses the credit"
+            );
+            assert_eq!(
+                manager.bundle_uncredited.load(Ordering::SeqCst),
+                0,
+                "the refused confirm still settles"
+            );
+            assert!(
+                manager.bundle_index.lock().unwrap().bundles.is_empty(),
+                "a refused bundle is never indexed"
+            );
+        });
+    }
+
+    /// Two landed rounds credit in order with monotonic watermarks: the
+    /// first confirm advances durable to 1, the second to 2, and nothing is
+    /// left outstanding. Fail-before: without applying the credits the
+    /// watermarks never move.
+    #[test]
+    fn bundle_pipeline_credits_two_rounds_in_order() {
+        use crate::ltx_repl::{confirm_prev_round, PrevRound};
+        let runtime = crate::asyncrt::shared_test_runtime();
+        runtime.block_on(async {
+            let dir = tempfile::tempdir().expect("test dir");
+            let (manager, bucket) = test_manager(dir.path());
+            let manager = Arc::new(manager);
+            open_gate(&manager);
+            publish_bucket_open(&manager, &bucket).await;
+            activate_cell(&manager, "c0", 1, true).await;
+            let handle = manager
+                .ltx
+                .cell_handle_for_test("c0", 1)
+                .expect("activated cell has a handle");
+            let mut captured = BTreeMap::new();
+            for (txid, tickets) in [(1u64, 1u64), (2u64, 2u64)] {
+                let owner = manager.flush_owner().expect("open gate admits a flush");
+                let prepared = manager
+                    .prepare_bundle_chunk(&owner, vec![bundle_entry("c0", txid)])
+                    .expect("synthetic entries encode");
+                let landed = manager
+                    .execute_bundle_chunk(prepared)
+                    .await
+                    .expect("open bucket PUTs");
+                confirm_prev_round(
+                    &manager,
+                    PrevRound {
+                        puts: vec![landed],
+                        credits: vec![(handle.clone(), tickets, txid)],
+                        count: 1,
+                    },
+                    &mut captured,
+                )
+                .await;
+                assert_eq!(
+                    manager.ltx.durable_for_test("c0", 1),
+                    Some(txid),
+                    "round {txid} advances the watermark"
+                );
+            }
+            assert_eq!(
+                manager.bundle_uncredited.load(Ordering::SeqCst),
+                0,
+                "both rounds settled"
+            );
+        });
+    }
+
+    /// A refused round drops its credits and clears the bundled-txid skips:
+    /// the watermark stays 0 and the next capture re-reads from it, so the
+    /// staged rows fall back to per-cell uploads. Fail-before: applying
+    /// credits despite the refuse advances durable without coverage.
+    #[test]
+    fn bundle_pipeline_refused_round_drops_credits_and_skips() {
+        use crate::ltx_repl::{confirm_prev_round, PrevRound};
+        let runtime = crate::asyncrt::shared_test_runtime();
+        runtime.block_on(async {
+            let dir = tempfile::tempdir().expect("test dir");
+            let (manager, bucket) = test_manager(dir.path());
+            let manager = Arc::new(manager);
+            open_gate(&manager);
+            publish_bucket_open(&manager, &bucket).await;
+            activate_cell(&manager, "c0", 1, true).await;
+            let handle = manager
+                .ltx
+                .cell_handle_for_test("c0", 1)
+                .expect("activated cell has a handle");
+            let owner = manager.flush_owner().expect("open gate admits a flush");
+            let prepared = manager
+                .prepare_bundle_chunk(&owner, vec![bundle_entry("c0", 1)])
+                .expect("synthetic entries encode");
+            let landed = manager
+                .execute_bundle_chunk(prepared)
+                .await
+                .expect("unconditional PUT lands under a seal");
+            publish_bucket_sealed(&manager, &bucket).await;
+            let mut captured = BTreeMap::from([(("c0".to_string(), 1), 1)]);
+            confirm_prev_round(
+                &manager,
+                PrevRound {
+                    puts: vec![landed],
+                    credits: vec![(handle.clone(), 1, 1)],
+                    count: 1,
+                },
+                &mut captured,
+            )
+            .await;
+            assert_eq!(
+                manager.ltx.durable_for_test("c0", 1),
+                Some(0),
+                "refused credits never advance the watermark"
+            );
+            assert!(
+                captured.is_empty(),
+                "the refuse clears the bundled-txid skips"
+            );
+            assert_eq!(
+                manager.bundle_uncredited.load(Ordering::SeqCst),
+                0,
+                "the refused round settles"
+            );
+        });
+    }
+
+    /// A parked round settles on the next wake with no PUT to overlap: the
+    /// leftover dirty permit drives an empty round that settles the previous
+    /// round inline, so both awaits return on the bundle proof with no
+    /// per-cell uploads. (The 20 ms settle window covers true quiet, when no
+    /// permit remains; the harness always leaves one.) Fail-before: without
+    /// the empty-round settle the awaits hang until the test timeout.
+    #[test]
+    fn bundle_pipeline_parked_round_settles_on_next_wake() {
+        let runtime = crate::asyncrt::shared_test_runtime();
+        runtime.block_on(async {
+            let dir = tempfile::tempdir().expect("test dir");
+            let (manager, bucket) = test_manager(dir.path());
+            let manager = Arc::new(manager);
+            let _registration = manager
+                .ltx
+                .register_durability(manager.clone())
+                .expect("registration installs");
+            open_gate(&manager);
+            publish_bucket_open(&manager, &bucket).await;
+            activate_cell(&manager, "c0", 1, true).await;
+            activate_cell(&manager, "c1", 1, true).await;
+            sql_write(&cell_db(&dir.path().join("watch"), "c0", 1));
+            sql_write(&cell_db(&dir.path().join("watch"), "c1", 1));
+            let (a, b) = crate::asyncrt::timeout(
+                std::time::Duration::from_secs(10),
+                futures_util::future::join(
+                    manager.ltx.await_durable("c0", 1, 1),
+                    manager.ltx.await_durable("c1", 1, 1),
+                ),
+            )
+            .await
+            .expect("the settle window credits the lone round");
+            for (_, source) in [a.expect("c0 credits"), b.expect("c1 credits")] {
+                assert_eq!(source, celld_logic::ProofSource::Bucket);
+            }
+            assert_eq!(
+                bundle_keys(&bucket, "log/n0/gen1/bundle/").await.len(),
+                1,
+                "one shared bundle PUT carries both cells"
+            );
+            assert!(
+                bundle_keys(&bucket, "cells/").await.is_empty(),
+                "no per-cell L0 PUTs in a shared round"
             );
         });
     }
