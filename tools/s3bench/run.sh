@@ -40,14 +40,28 @@ if [[ ! "$BUCKET" =~ ^[a-z0-9.-]{3,63}$ ]]; then
   exit 1
 fi
 
+# Release builds only by default: a debug binary distorts batching and every
+# latency figure, and once made a release look 2x slower than `.10`.
 if [[ -z "${CELLD_BIN:-}" ]]; then
-  CELLD_BIN="$ROOT/target/debug/celld"
-  [[ -x "$CELLD_BIN" ]] || CELLD_BIN="$HOME/.cargo-target/celld-wt-$(basename "$ROOT")/debug/celld"
+  CELLD_BIN="$ROOT/target/release/celld"
+  [[ -x "$CELLD_BIN" ]] || CELLD_BIN="$HOME/.cargo-target/celld-wt-$(basename "$ROOT")/release/celld"
 fi
-[[ -x "$CELLD_BIN" ]] || { echo "run.sh: no executable CELLD_BIN=$CELLD_BIN (cargo build -p celld first)" >&2; exit 1; }
+[[ -x "$CELLD_BIN" ]] || { echo "run.sh: no executable CELLD_BIN=$CELLD_BIN (cargo build --release -p celld first)" >&2; exit 1; }
 command -v esbuild >/dev/null || { echo "run.sh: esbuild not on PATH (needed by celld deploy)" >&2; exit 1; }
 command -v docker >/dev/null || { echo "run.sh: docker not on PATH" >&2; exit 1; }
 python3 -c "import boto3" 2>/dev/null || { echo "run.sh: python3 boto3 missing (pip install boto3)" >&2; exit 1; }
+
+# One harness per box: a concurrent run shares CPU and the Docker daemon,
+# and skewed hot-cell latency by up to 40% in the `.11` dogfood, which looked
+# like a regression. Refuse rather than measure noise; a leftover container
+# from a killed run must be removed first.
+if [[ "${S3BENCH_ALLOW_PARALLEL:-0}" != 1 ]]; then
+  others=$(docker ps --filter name=celld-s3bench- --format '{{.Names}}' | tr '\n' ' ')
+  if [[ -n "$others" ]]; then
+    echo "== refusing: another s3bench run is up ($others); wait for it, remove a leftover with 'docker rm -f <name>', or set S3BENCH_ALLOW_PARALLEL=1 for counts-only runs" >&2
+    exit 2
+  fi
+fi
 
 OFF="${OFF:-0}"
 HOT="${HOT:-0}"

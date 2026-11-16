@@ -958,6 +958,15 @@ push to `ghcr.io/denoland`, but still. Pushing a branch named
   that tolerate about one extra round trip per durable write. Tests:
   `bucket_env_is_off_unless_explicit_one`. Fail-before: the old
   `!matches!(Some("0"))` value enables with no env set.
+- `0076` (sha TBD at merge) s3bench measures release builds and one run per
+  box: `run.sh` defaults `CELLD_BIN` to `target/release/celld`, and refuses
+  to start while another `celld-s3bench-*` container is up, unless
+  `S3BENCH_ALLOW_PARALLEL=1` (counts-only runs). Two `.11` measurement
+  errors motivated it: debug binaries compared against the `.10` release
+  image, and peer harnesses running concurrently, which skewed hot-cell
+  latency by up to 40%. Checked by hand: with a `celld-s3bench-*` container
+  up the script exits 2 before creating a work dir. Tools only; CI does not
+  run `tools/`.
 - `0077` (sha TBD at merge) every black-box test boots `celld dev` on an
   ephemeral port and reads the bound address from the node's own announce
   lines. Cause: all 12 test files probed `free_port()` (bind `127.0.0.1:0`,
