@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): cross-isolate RPC stubs and streams; operator token for the internal listener; D1 export operator-ingress marker; ported from meln1k/celld: report wake coverage after maintenance (e6cb9a3); staged activation; trusted cell RPC; WebSocket join tokens; --version reports the full build version; staged invoke operator route; non-dumpable serving process; bucket-posture group commit: paged gate judges PAGED_FORMAT (0059); bucket-posture group commit: bucket bundle gate plumbing (0060).
+// Modified by ryuzcorp (ryuzcorp/celld): cross-isolate RPC stubs and streams; operator token for the internal listener; D1 export operator-ingress marker; ported from meln1k/celld: report wake coverage after maintenance (e6cb9a3); staged activation; trusted cell RPC; WebSocket join tokens; --version reports the full build version; staged invoke operator route; non-dumpable serving process; bucket-posture group commit: paged gate judges PAGED_FORMAT (0059); bucket-posture group commit: bucket bundle gate plumbing (0060); bucket-posture group commit: bundle switch defaults off (0075).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 // The binary contains connection, startup, shutdown, and V8 shell code. The
@@ -5052,8 +5052,8 @@ async fn async_main(
                     // bundles only while every live lease reads format 3. Off until the
                     // first sample (a failed tick publishes an empty view, which closes
                     // it), re-checked per flush via `bucket_bundles_enabled`, which
-                    // additionally requires the operator switch (on by default;
-                    // `CELLD_BUCKET_BUNDLES=0` disables it). When the gate closes,
+                    // additionally requires the operator switch (opt-in;
+                    // `CELLD_BUCKET_BUNDLES=1` enables it). When the gate closes,
                     // the node falls back at once to per-cell L0 uploads for new writes.
                     let bundle_open = bucket_posture
                         && celld_logic::format::bucket_bundles_allowed(&peers, view_ms);

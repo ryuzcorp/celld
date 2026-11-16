@@ -1,3 +1,4 @@
+// Modified by ryuzcorp (ryuzcorp/celld): bucket-posture group commit: bundle switch defaults off (0075).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! The node's replication engine behind one engine-neutral handle.
@@ -32,7 +33,7 @@ impl Replication {
     /// See `LtxRepl::set_bucket_bundles_fleet`: the fleet sampler's answer to
     /// whether every live lease reads bucket-posture bundle proofs (format 3).
     /// Off until the first sample; the per-flush path additionally requires
-    /// the operator switch (on by default; `CELLD_BUCKET_BUNDLES=0` disables).
+    /// the operator switch (opt-in; `CELLD_BUCKET_BUNDLES=1` enables it).
     pub fn set_bucket_bundles_fleet(&self, ready: bool) -> bool {
         self.ltx.set_bucket_bundles_fleet(ready)
     }

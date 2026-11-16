@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): validate CELLD_MEMORY_SCOPE; CELLD_CACHE_MAX_BYTES validation; tenant egress policy; CELLD_CACHE_SCOPE validation; CELLD_DEPLOY_AWS_* validation; CELLD_SQLITE_CACHE_KB validation; CELLD_C_TRIM_MB validation; CELLD_BUCKET_BUNDLES startup validation (0070).
+// Modified by ryuzcorp (ryuzcorp/celld): validate CELLD_MEMORY_SCOPE; CELLD_CACHE_MAX_BYTES validation; tenant egress policy; CELLD_CACHE_SCOPE validation; CELLD_DEPLOY_AWS_* validation; CELLD_SQLITE_CACHE_KB validation; CELLD_C_TRIM_MB validation; CELLD_BUCKET_BUNDLES startup validation (0070); CELLD_BUCKET_BUNDLES defaults off (0075).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! Strict runtime environment parsing.
@@ -241,9 +241,9 @@ pub fn validate() -> anyhow::Result<()> {
         flag(name, false)?;
     }
 
-    // On by default: only an explicit `0` disables. `flag` rejects anything
+    // Off by default: only an explicit `1` enables. `flag` rejects anything
     // else at startup, so the per-flush read never sees garbage.
-    flag("CELLD_BUCKET_BUNDLES", true)?;
+    flag("CELLD_BUCKET_BUNDLES", false)?;
 
     for name in [
         "CELLD_ACTIVATIONS",

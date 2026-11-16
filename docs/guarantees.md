@@ -1,3 +1,4 @@
+<!-- Modified by ryuzcorp (ryuzcorp/celld): bucket-posture group commit docs: bundle switch opt-in (0075). -->
 # What celld guarantees
 
 celld makes two promises. Exactly one node serves a cell at a time, so two
@@ -199,11 +200,12 @@ locally and replicate into its superseded prefix, but it does not acknowledge.
 The check reads the record instead of a clock, so a paused process or a skewed
 clock cannot pass it.
 
-In bucket posture the node groups writes: once per flush round it writes one
+In bucket posture the node groups writes when the operator opts in: with
+`CELLD_BUCKET_BUNDLES=1`, once per flush round it writes one
 shared bundle object (`log/<node>/<generation>/bundle/`) carrying every dirty
 cell's new rows, and that single PUT is the bucket proof for every row it
-carries — instead of one upload per write. Grouping is on by default (set
-`CELLD_BUCKET_BUNDLES=0` to upload per-cell as before); the ownership read
+carries — instead of one upload per write. The default uploads per-cell as
+before; the ownership read
 above still answers every acknowledgement, and `CELLD_BUCKET_BUNDLE_LINGER_MS`
 holds a round open only while more than one cell is dirty, so a lone dirty
 cell never waits.
