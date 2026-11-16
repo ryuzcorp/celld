@@ -1,4 +1,5 @@
 // Modified by ryuzcorp (ryuzcorp/celld): an eviction skips the visibility LISTs its own uploads already prove and the time-based checkpoint before the handoff; an eviction deletes the per-cell L0/L1 objects its handoff snapshot supersedes; bucket-posture group commit: paged gate judges PAGED_FORMAT (0059); bucket-posture group commit: bucket bundle gate, sync pacing and event-driven bundle flush (0060); the eviction guard proves a journaled epoch with a HEAD on the newest journaled key, falling back to the listing on a miss, an error, or an empty journal (0061); bucket-posture group commit: bundled-cell eviction guard, graceful-close per-cell drain, bundle GC without ensemble, linger holds only while the dirty set is shared (0064).; bucket-posture group commit: bucket switch on by default (0070); bucket-posture group commit: a sync worker yields once the bundle loop owns tiering, and a lone-cell round uploads per-cell instead of bundling (0071).
+// Modified by ryuzcorp (ryuzcorp/celld): bucket-posture group commit: pipelined bundle PUTs with the previous round's credit re-read (0073).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! In-process replication backend built on `celld-ltx`.
@@ -877,7 +878,7 @@ struct HandoffSnapshot {
 /// ticket`, so concurrent writes to one cell ride a single batched upload —
 /// and, because a sync credits only tickets whose writes committed before it
 /// started (which the sync's `db.sync` captures), never one it did not upload.
-struct Cell {
+pub(crate) struct Cell {
     /// A handoff snapshot of this cell did not publish inside the durability
     /// deadline, or its size showed that it cannot. Every later eviction of
     /// this epoch proves durability through the L0 chain instead of building
@@ -987,7 +988,7 @@ struct Cell {
     #[cfg(all(test, celld_internal_tests))]
     fleet_capture_receipts: Mutex<Vec<LtxFleetCaptureReceiptForWorld>>,
 }
-type CellHandle = Arc<Cell>;
+pub(crate) type CellHandle = Arc<Cell>;
 
 /// The successor still needs a per-cell fold, but epoch replacement needs
 /// only bucket coverage. Keep the ending bound and both live proofs together:
@@ -3940,6 +3941,30 @@ impl LtxRepl {
             handle.ready.notify_waiters();
         }
     }
+    /// Test-only: fetch one resident cell's handle, so pipeline tests can
+    /// build credits and read watermarks without driving the loop.
+    #[cfg(test)]
+    pub(crate) fn cell_handle_for_test(&self, cell: &str, epoch: u64) -> Option<CellHandle> {
+        self.cells
+            .lock()
+            .unwrap()
+            .get(&(cell.to_string(), epoch))
+            .cloned()
+    }
+    /// Test-only: read one resident cell's durable watermark without
+    /// exposing the handle's fields outside this module.
+    #[cfg(test)]
+    pub(crate) fn durable_for_test(&self, cell: &str, epoch: u64) -> Option<u64> {
+        self.cells
+            .lock()
+            .unwrap()
+            .get(&(cell.to_string(), epoch))
+            .map(|handle| {
+                handle
+                    .durable_txid
+                    .load(std::sync::atomic::Ordering::SeqCst)
+            })
+    }
 
     /// Test-only: hold (or release) one cell's sync claim, as a sync worker
     /// does between its CAS and its exit, so loop tests can pin what the
@@ -3956,6 +3981,35 @@ impl LtxRepl {
                     .syncing
                     .compare_exchange(!held, held, Ordering::SeqCst, Ordering::SeqCst)
                     .is_ok()
+            })
+    }
+
+    /// Test-only: the highest durability ticket a background credit has
+    /// released for this cell, mirroring `durable_for_test` without
+    /// exposing the handle's fields outside this module.
+    #[cfg(test)]
+    pub(crate) fn synced_for_test(&self, cell: &str, epoch: u64) -> Option<u64> {
+        self.cells
+            .lock()
+            .unwrap()
+            .get(&(cell.to_string(), epoch))
+            .map(|handle| handle.synced_seq.load(std::sync::atomic::Ordering::SeqCst))
+    }
+
+    /// Test-only: take one durability ticket for this cell — the
+    /// `req_seq` bump a waiter performs — without waiting on it, so loop
+    /// tests can model a ticket that arrives after the capture.
+    #[cfg(test)]
+    pub(crate) fn take_ticket_for_test(&self, cell: &str, epoch: u64) -> Option<u64> {
+        self.cells
+            .lock()
+            .unwrap()
+            .get(&(cell.to_string(), epoch))
+            .map(|handle| {
+                handle
+                    .req_seq
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                    + 1
             })
     }
 
@@ -5354,6 +5408,122 @@ async fn sync_loop(
     }
 }
 
+/// How long a landed round waits for the next round before settling
+/// inline. Under load the next round is already pending and its PUT
+/// overlaps this round's credit re-read for free; a lone write with
+/// nothing after it settles after one local round-trip instead of
+/// parking its ack until the next write.
+const PIPELINE_SETTLE_WAIT: Duration = Duration::from_millis(20);
+
+/// A bundle round whose PUTs landed but whose credit re-read has not run
+/// yet: the next round's PUT overlaps it. The watermarks apply only when
+/// the re-read confirms the record still Open at the flush's epoch; a
+/// refused round drops its credits and its staged rows fall back to
+/// per-cell uploads. `count` is the landed entry count for the flush log.
+pub(crate) struct PrevRound {
+    pub(crate) puts: Vec<crate::node_log::LandedBundleChunk>,
+    pub(crate) credits: Vec<(CellHandle, u64, u64)>,
+    pub(crate) count: usize,
+}
+
+/// Apply one round's bundle credits: the watermark advance, the waiter
+/// notify, and the compactor kick — the same crediting `sync_cell` does
+/// for per-cell uploads.
+fn apply_bundle_credits(credits: Vec<(CellHandle, u64, u64)>, count: usize) {
+    if count > 0 {
+        info!(
+            event = "log_bundle_flush",
+            entries = count,
+            cells = credits.len(),
+            "flushed a bundle"
+        );
+    }
+    for (handle, tickets, position) in credits {
+        handle.durable_txid.fetch_max(position, Ordering::SeqCst);
+        handle.synced_seq.fetch_max(tickets, Ordering::SeqCst);
+        handle
+            .last_sync_ms
+            .store(asyncrt::wall_ms().max(0) as u64, Ordering::SeqCst);
+        // Bundle credits also queue the overlay compactor.
+        maybe_queue_compaction(&handle, position);
+        note_proof(&handle);
+        handle.ready.notify_waiters();
+    }
+}
+
+/// Settle a landed round: run every chunk's credit re-read, then apply
+/// the watermarks only if every chunk was credited. A refused round
+/// clears the loop's bundled-txid skips (the next capture must re-read
+/// from the watermark, since the fencing may have re-based the record)
+/// and drops the credits; the staged rows stay dirty for the per-cell
+/// fallback. Every chunk settles its in-flight admission inside confirm,
+/// so this returns with nothing outstanding on any path.
+pub(crate) async fn confirm_prev_round(
+    active: &std::sync::Arc<crate::node_log::NodeLogManager>,
+    previous: PrevRound,
+    captured: &mut BTreeMap<(String, u64), u64>,
+) {
+    let mut credited = true;
+    for chunk in previous.puts {
+        if !active.confirm_bundle_chunk(chunk).await {
+            credited = false;
+        }
+    }
+    if !credited {
+        captured.clear();
+        return;
+    }
+    apply_bundle_credits(previous.credits, previous.count);
+}
+
+/// Tickets the loop captured for rows no round has covered yet: a write the
+/// pending round already carries (`pos == captured` while the watermark
+/// lags), skipped by the capture and credited by neither round. Keyed like
+/// `captured` so a newer capture supersedes and an evicted cell prunes.
+pub(crate) type PendingTickets = BTreeMap<(String, u64), (CellHandle, u64, u64)>;
+
+/// One capture pass: the staged rows, the credits they cover, the tickets
+/// stranded behind the watermark, and the updated skip map.
+pub(crate) type CaptureOutput = (
+    Vec<celld_ltx::bundle::BundleEntry>,
+    Vec<(CellHandle, u64, u64)>,
+    PendingTickets,
+    BTreeMap<(String, u64), u64>,
+);
+
+/// Credit stranded tickets whose rows the watermark now covers, and drop ones
+/// a later round already credited. Pure atomics — no blocking read — so every
+/// settle path drains inline without another capture.
+pub(crate) fn drain_covered_tickets(pending: &mut PendingTickets) -> Vec<(CellHandle, u64, u64)> {
+    let mut covered = Vec::new();
+    pending.retain(|_, (handle, tickets, pos)| {
+        if *tickets <= handle.synced_seq.load(Ordering::SeqCst) {
+            return false;
+        }
+        if *pos <= handle.durable_txid.load(Ordering::SeqCst) {
+            covered.push((handle.clone(), *tickets, *pos));
+            return false;
+        }
+        true
+    });
+    covered
+}
+
+/// Settle a landed round, then credit whatever the fresh watermark covers:
+/// stranded tickets from `PendingTickets` credit here, so no new dirty
+/// notification is needed. Refusals keep their pending entries (still dirty,
+/// still uncovered); the next capture re-ships them from the watermark.
+pub(crate) async fn settle_prev_round(
+    active: &std::sync::Arc<crate::node_log::NodeLogManager>,
+    previous: PrevRound,
+    captured: &mut BTreeMap<(String, u64), u64>,
+    pending: &mut PendingTickets,
+) {
+    confirm_prev_round(active, previous, captured).await;
+    let covered = drain_covered_tickets(pending);
+    apply_bundle_credits(covered, 0);
+}
+
 /// The bundle loop: paced like the per-cell tiering it replaces, but the
 /// unit is the node, not the cell. Every dirty cell's captured L0 segments
 /// go up as ONE object per flush interval — the Class A collapse — and the
@@ -5388,6 +5558,20 @@ async fn bundle_loop(
         tick.set_missed_tick_behavior(asyncrt::MissedTickBehavior::Delay);
         tick
     });
+    // Pipeline state across rounds: `captured` skips rows already bundled,
+    // `prev` is the landed round awaiting its credit re-read, `pending`
+    // holds tickets for rows no round has covered yet, `last_active`
+    // lets the post-loop drain settle a round that landed just before stop.
+    //
+    // Capture-skip invariant: a skip may only exist for txids carried by a
+    // round whose PUT is in flight or landed and not yet refused. Every
+    // failure or refusal path clears its round's skips before the next
+    // capture, so a retry re-reads from the watermark instead of skipping
+    // rows the bucket never received.
+    let mut captured: BTreeMap<(String, u64), u64> = BTreeMap::new();
+    let mut pending: PendingTickets = BTreeMap::new();
+    let mut prev: Option<PrevRound> = None;
+    let mut last_active: Option<Arc<crate::node_log::NodeLogManager>> = None;
     loop {
         // Choose the wait by posture: bucket waits on dirty (event-driven), fleet on
         // its interval tick. Re-evaluate every iteration so a gate close/open flips
@@ -5395,10 +5579,28 @@ async fn bundle_loop(
         let bucket_wake = registered_durability(&registration)
             .is_some_and(|targets| targets.manager.bucket_candidate());
         if bucket_wake {
-            asyncrt::select_biased! {
-                "a stop signal that ties the bucket bundle wait prevents another flush";
-                _ = stop.stopped() => break,
-                _ = dirty.notified() => {},
+            if prev.is_some() {
+                // A landed round's credits wait on the next round, whose PUT
+                // overlaps this round's credit re-read — but a lone write
+                // would park its ack until the next write, so settle inline
+                // after one local round-trip instead of overlapping it.
+                asyncrt::select_biased! {
+                    "a stop signal that ties the bucket bundle wait prevents another flush";
+                    _ = stop.stopped() => break,
+                    _ = dirty.notified() => {},
+                    _ = asyncrt::sleep(PIPELINE_SETTLE_WAIT) => {
+                        if let (Some(previous), Some(active)) = (prev.take(), last_active.clone()) {
+                            settle_prev_round(&active, previous, &mut captured, &mut pending).await;
+                        }
+                        continue;
+                    }
+                }
+            } else {
+                asyncrt::select_biased! {
+                    "a stop signal that ties the bucket bundle wait prevents another flush";
+                    _ = stop.stopped() => break,
+                    _ = dirty.notified() => {},
+                }
             }
             if stop.is_stopped() {
                 break;
@@ -5442,6 +5644,7 @@ async fn bundle_loop(
         let Some(active) = installed else {
             continue;
         };
+        last_active = Some(active.clone());
         // Bucket record-before-first-ack: the lease chain publishes the
         // bucket-session record before any bundle-credited ack, and the record
         // is never deleted. A fenced session, a failed lease write or a closed
@@ -5451,6 +5654,14 @@ async fn bundle_loop(
             continue;
         }
         if !active.bundle_active() {
+            // The gate closed with a round landed but unconfirmed: settle it
+            // here rather than parking it behind a gate that may never
+            // reopen. The confirm is only the credit re-read — no bundle
+            // write — so it needs no open gate, matching the old inline
+            // semantics.
+            if let (Some(previous), Some(last)) = (prev.take(), last_active.clone()) {
+                settle_prev_round(&last, previous, &mut captured, &mut pending).await;
+            }
             continue;
         }
         let work: Vec<((String, u64), CellHandle)> = {
@@ -5481,12 +5692,12 @@ async fn bundle_loop(
         // followers need the bundle rows, so the paced path keeps batching
         // single cells into node bundles.
         if active.bucket_bundling() && work.len() == 1 {
-            let pending = work[0]
+            let outstanding = work[0]
                 .1
                 .req_seq
                 .load(Ordering::SeqCst)
                 .saturating_sub(work[0].1.synced_seq.load(Ordering::SeqCst));
-            if pending <= 1 {
+            if outstanding <= 1 {
                 let handle = work[0].1.clone();
                 // Claim the cell the way the sync scan does. A sync worker
                 // that already holds the claim may be about to yield to this
@@ -5501,10 +5712,19 @@ async fn bundle_loop(
                     .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
                     .is_ok()
                 {
+                    // Overlap the previous round's credit re-read with this
+                    // lone cell's upload: the two touch different objects.
                     // The verdict needs no branch: credited rows ride per-cell
                     // acks through `sync_cell`'s own notify, and anything still
                     // dirty stays dirty for the next round.
-                    if sync_cell(handle.clone()).await != Some(true) {
+                    let previous = prev.take();
+                    let settle = async {
+                        if let Some(previous) = previous {
+                            settle_prev_round(&active, previous, &mut captured, &mut pending).await;
+                        }
+                    };
+                    let (sync_result, ()) = futures_util::join!(sync_cell(handle.clone()), settle);
+                    if sync_result != Some(true) {
                         // A failed lone-cell upload must fall back like a failed bundle PUT:
                         // drop bundling so the scan re-spawns a sync worker that retries with
                         // backoff, instead of parking this round with the scan suppressed.
@@ -5515,49 +5735,91 @@ async fn bundle_loop(
                 }
             }
         }
-        type Credits = Vec<(CellHandle, u64, u64)>;
-        let (entries, credits): (Vec<celld_ltx::bundle::BundleEntry>, Credits) =
-            asyncrt::blocking(move || {
-                let mut entries = Vec::new();
-                let mut credits = Vec::new();
-                for ((cell, epoch), handle) in work {
-                    let tickets = handle.req_seq.load(Ordering::SeqCst);
-                    note_capture(&handle, tickets);
-                    let mut replica = handle.replica.lock().unwrap();
-                    let Some(db) = managed_db_mut(&mut replica) else {
-                        continue;
-                    };
-                    if db.sync().is_err() {
-                        continue;
-                    }
-                    let Ok(pos) = db.pos() else { continue };
-                    let from = handle.durable_txid.load(Ordering::SeqCst) + 1;
-                    let mut complete = true;
-                    for txid in from..=pos.txid.0 {
-                        match db.read_ltx_file(0, TXID(txid), TXID(txid)) {
-                            Ok(bytes) => entries.push(celld_ltx::bundle::BundleEntry {
+        let (entries, credits, stranded, restored): CaptureOutput = asyncrt::blocking(move || {
+            let mut entries = Vec::new();
+            let mut credits = Vec::new();
+            let mut shipped: BTreeSet<(String, u64)> = BTreeSet::new();
+            let mut captured = captured;
+            let mut stranded: PendingTickets = BTreeMap::new();
+            for ((cell, epoch), handle) in work {
+                let tickets = handle.req_seq.load(Ordering::SeqCst);
+                note_capture(&handle, tickets);
+                let mut replica = handle.replica.lock().unwrap();
+                let Some(db) = managed_db_mut(&mut replica) else {
+                    continue;
+                };
+                if db.sync().is_err() {
+                    continue;
+                }
+                let Ok(pos) = db.pos() else { continue };
+                let durable = handle.durable_txid.load(Ordering::SeqCst);
+                // Skip rows already bundled: a yielded per-cell upload or a
+                // concurrent sync worker may have advanced `durable_txid`
+                // past what this cell last staged, and a parked round may
+                // have carried rows the watermarks have not caught up to.
+                // The position is the max of the two, so rows are never
+                // skipped; re-shipped rows only duplicate what the
+                // `fetch_max` watermarks absorb.
+                let from =
+                    durable.max(captured.get(&(cell.clone(), epoch)).copied().unwrap_or(0)) + 1;
+                let mut complete = true;
+                for txid in from..=pos.txid.0 {
+                    match db.read_ltx_file(0, TXID(txid), TXID(txid)) {
+                        Ok(bytes) => {
+                            shipped.insert((cell.clone(), epoch));
+                            entries.push(celld_ltx::bundle::BundleEntry {
                                 cell: cell.clone(),
                                 cell_epoch: epoch,
                                 txid,
                                 bytes,
-                            }),
-                            Err(error) => {
-                                warn!(%error, txid, "read staged l0 for bundle failed");
-                                complete = false;
-                                break;
-                            }
+                            })
+                        }
+                        Err(error) => {
+                            warn!(%error, txid, "read staged l0 for bundle failed");
+                            complete = false;
+                            break;
                         }
                     }
-                    drop(replica);
-                    if complete {
+                }
+                drop(replica);
+                if complete {
+                    captured.insert((cell.clone(), epoch), pos.txid.0);
+                    // A credit is covered only by a PUT that carries the
+                    // cell's rows. A round that ships nothing new for this
+                    // cell — a parked round's rows, or rows a racing
+                    // per-cell upload already made durable — applies its
+                    // credit only when the watermark already reaches it;
+                    // anything further waits for a round that ships it.
+                    if shipped.contains(&(cell.clone(), epoch)) || pos.txid.0 <= durable {
                         credits.push((handle, tickets, pos.txid.0));
+                    } else {
+                        // Skipped behind the watermark for rows the pending
+                        // round already carries. Neither round credits this
+                        // ticket; the settle drains it once the watermark
+                        // covers it, without needing a new notification.
+                        stranded.insert((cell.clone(), epoch), (handle, tickets, pos.txid.0));
                     }
                 }
-                (entries, credits)
-            })
-            .await
-            .unwrap_or_default();
+            }
+            (entries, credits, stranded, captured)
+        })
+        .await
+        .unwrap_or_default();
+        captured = restored;
+        pending.extend(stranded);
+        // Prune cells that left the map (evicted): their entries would
+        // otherwise pin the watermark map forever.
+        {
+            let map = cells.lock().unwrap();
+            captured.retain(|key, _| map.contains_key(key));
+            pending.retain(|key, _| map.contains_key(key));
+        }
         if credits.is_empty() {
+            // Nothing covered anything: settle the previous round inline —
+            // there is no PUT to overlap it with — and park.
+            if let Some(previous) = prev.take() {
+                settle_prev_round(&active, previous, &mut captured, &mut pending).await;
+            }
             continue;
         }
         let count = entries.len();
@@ -5565,40 +5827,133 @@ async fn bundle_loop(
         // each with its own sequence, so a hot node never builds an unbounded object.
         // Credit requires every chunk credited; any refusal falls back to per-cell.
         let is_bucket = active.bucket_bundling();
-        let mut flushed_ok = false;
         if entries.is_empty() {
-            flushed_ok = true;
-        } else if is_bucket {
-            flushed_ok = true;
-            for chunk in split_bundle_entries(entries) {
-                if !active.put_bundle(chunk).await {
-                    flushed_ok = false;
+            // A no-PUT round: every credit is watermark-covered by
+            // construction (the capture rule above), so settle the previous
+            // round first — preserving round order — then apply them.
+            if let Some(previous) = prev.take() {
+                settle_prev_round(&active, previous, &mut captured, &mut pending).await;
+            }
+            apply_bundle_credits(credits, count);
+            continue;
+        }
+        if !is_bucket {
+            // Fleet posture keeps the serial flush; a previous round only
+            // exists across a posture flip, so settle it first. A failed
+            // `put_bundle` leaves this round's rows uncovered, so drop its
+            // skips: the retry must re-read from the watermark, never skip
+            // past a row the bucket never received.
+            let round_cells: BTreeSet<(String, u64)> = entries
+                .iter()
+                .map(|entry| (entry.cell.clone(), entry.cell_epoch))
+                .collect();
+            if let Some(previous) = prev.take() {
+                settle_prev_round(&active, previous, &mut captured, &mut pending).await;
+            }
+            if active.put_bundle(entries).await {
+                apply_bundle_credits(credits, count);
+            } else {
+                for key in &round_cells {
+                    captured.remove(key);
+                }
+            }
+            continue;
+        }
+        // Bucket path: pipeline. Prepare every chunk, then overlap this
+        // round's PUTs with the previous round's credit re-read — the two
+        // touch different objects.
+        let round_cells: BTreeSet<(String, u64)> = entries
+            .iter()
+            .map(|entry| (entry.cell.clone(), entry.cell_epoch))
+            .collect();
+        let Some(owner) = active.flush_owner() else {
+            // Gate closed mid-round: the staged rows stay dirty for the
+            // per-cell fallback. Settle the previous round rather than
+            // parking it behind a gate that may never reopen, and drop
+            // this round's watermark skips (nothing was PUT).
+            if let Some(previous) = prev.take() {
+                settle_prev_round(&active, previous, &mut captured, &mut pending).await;
+            }
+            for key in &round_cells {
+                captured.remove(key);
+            }
+            continue;
+        };
+        let mut chunks = Vec::new();
+        let mut prepared_ok = true;
+        for chunk in split_bundle_entries(entries) {
+            match active.prepare_bundle_chunk(&owner, chunk) {
+                Some(prepared) => chunks.push(prepared),
+                None => {
+                    prepared_ok = false;
                     break;
                 }
             }
-        } else if active.put_bundle(entries).await {
-            flushed_ok = true;
         }
-        if flushed_ok {
-            if count > 0 {
-                info!(
-                    event = "log_bundle_flush",
-                    entries = count,
-                    cells = credits.len(),
-                    "flushed a bundle"
-                );
+        if !prepared_ok {
+            // The encode/refusal path already fenced inside prepare, and
+            // nothing was PUT, so nothing needs confirming. Drop the skips
+            // so the fallback re-ships from the watermark.
+            for key in &round_cells {
+                captured.remove(key);
             }
-            for (handle, tickets, position) in credits {
-                handle.durable_txid.fetch_max(position, Ordering::SeqCst);
-                handle.synced_seq.fetch_max(tickets, Ordering::SeqCst);
-                handle
-                    .last_sync_ms
-                    .store(asyncrt::wall_ms().max(0) as u64, Ordering::SeqCst);
-                // Bundle credits also queue the overlay compactor.
-                maybe_queue_compaction(&handle, position);
-                note_proof(&handle);
-                handle.ready.notify_waiters();
+            continue;
+        }
+        active.set_flush_in_flight(true);
+        let ((landed, put_ok), ()) = futures_util::join!(
+            async {
+                let mut landed = Vec::new();
+                for prepared in chunks {
+                    match active.execute_bundle_chunk(prepared).await {
+                        Some(chunk) => landed.push(chunk),
+                        None => return (landed, false),
+                    }
+                }
+                (landed, true)
+            },
+            async {
+                if let Some(previous) = prev.take() {
+                    settle_prev_round(&active, previous, &mut captured, &mut pending).await;
+                }
             }
+        );
+        active.set_flush_in_flight(false);
+        if put_ok {
+            prev = Some(PrevRound {
+                puts: landed,
+                credits,
+                count,
+            });
+        } else {
+            // A chunk PUT failed; the fence already stopped bundling inside
+            // execute. This round's skips die with it — including when
+            // nothing landed — so the retry re-reads from the watermark
+            // instead of skipping the failed txids. Confirm what landed
+            // (usually credited, settling every admission), drop this
+            // round's credits — the failed chunk's rows are uncovered — and
+            // let the fallback re-ship the rest.
+            for key in &round_cells {
+                captured.remove(key);
+            }
+            settle_prev_round(
+                &active,
+                PrevRound {
+                    puts: landed,
+                    credits: Vec::new(),
+                    count: 0,
+                },
+                &mut captured,
+                &mut pending,
+            )
+            .await;
+        }
+    }
+    // Stop landed between rounds with a round still unconfirmed: settle it
+    // so the shutdown drains see nothing outstanding. A landed round implies
+    // a manager was bound, so `last_active` is always `Some` here.
+    if let Some(previous) = prev.take() {
+        if let Some(active) = last_active {
+            settle_prev_round(&active, previous, &mut captured, &mut pending).await;
         }
     }
 }
