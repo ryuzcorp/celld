@@ -944,6 +944,46 @@ push to `ghcr.io/denoland`, but still. Pushing a branch named
   timed per request in the worker's own thread after its pacing sleep and
   recorded only for 2xx answers. Pass/fail semantics are unchanged; the
   numbers make ack-latency regressions visible next to the request counts.
+ - `0073` (sha TBD at merge) bucket-posture pipeline: overlap one bundle
+ round's PUTs with the previous round's credit re-read. `put_bundle` splits
+ into prepare (number/encode/key/GC arm), execute (PUT, admitting the
+ shutdown-visible in-flight count) and confirm (the verbatim credit re-read,
+ index insert, settle-on-every-path) stages; the bucket loop joins the
+ current round's PUTs with the previous round's confirm, so the record
+ re-read no longer sits on the ack critical path under load. Watermark safety
+ is structural: the capture reads from `max(durable, captured)+1` and credits
+ only rows the round shipped (or the watermark already reaches), so a parked
+ round's rows are never acked uncovered; a refused round clears the skips and
+ drops its credits for the per-cell fallback. A lone write settles through a
+ 20 ms window when no next round comes (a leftover dirty permit settles it
+ sooner through an empty round), and the shutdown drains wait on the
+ in-flight count. Fleet posture keeps the serial composition. Request counts
+ are unchanged by construction (same PUTs and GETs as `0071`, only
+ reordered); latency is measured under `0074`. Tests:
+ `bundle_pipeline_counts_execute_through_confirm`,
+ `bundle_pipeline_refused_confirm_settles_without_index`,
+ `bundle_pipeline_credits_two_rounds_in_order`,
+ `bundle_pipeline_refused_round_drops_credits_and_skips`,
+ `bundle_pipeline_parked_round_settles_on_next_wake`,
+ `bundle_pipeline_settle_credits_stranded_ticket`,
+ `bundle_pipeline_failed_put_reships_skipped_txid`,
+ `bundle_pipeline_failed_fleet_put_reships_skipped_txid`. Fail-before: without
+ the execute admission the in-flight assert stays 0; without the confirm
+ settlement it stays 1; indexing before the credit check leaves the refused
+ key behind; applying credits despite the refuse advances durable to 1 and
+ keeps the skips; without the empty-round settle the parked awaits hang
+ until the test timeout. Capture-skip invariant: a skip may only exist for
+ txids carried by a round whose PUT is in flight or landed and not yet
+ refused. Every failure or refusal of a round clears that round's skips
+ before the next capture — a failed fleet `put_bundle`, a failed bucket
+ chunk PUT (even with nothing landed), and a refused confirm (which clears
+ them all) — so a retry re-reads from the watermark and never skips a row
+ the bucket never received. Tickets stranded by a skip (taken after the
+ capture for rows the pending round already carries) drain off the fresh
+ watermark at every settle, needing no new notification. Fail-before: without
+ the settle drain the stranded ticket's synced watermark stays at 1; without
+ the failed-round skip removal the retry ships only txid 2 while the bucket
+ still lacks txid 1.
 
 Patches `0025`–`0034` are ported fixes from
 [meln1k/celld](https://github.com/meln1k/celld) by Nikita
