@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): node:crypto scrypt; container exec resize op; cross-isolate RPC stubs and streams; test-only fake exec ops; fake kill completion op; exec reads survive their subscribing event; per-node Workers Cache API ops; tenant egress policy; D1 export operator-ingress marker; stateless attribution tokens; reaction-aware request resources; fake close/signal completion ops; binding-forgery enforcement; trusted cell RPC; Queue DLQ forward host op; DLQ forward caller identity; WebSocket and TCP socket ownership; receiver-held stream lifetime; deployment cache scope key; share the /bundle tree per deployment generation.; cancelled requests reject pending ops so co-awaiters settle (upstream #317); answered drivers poll while waitUntil background is outstanding (upstream #300); refused handoffs reject instead of dropping resolvers (upstream #309); facet adoption drops the restored flag (upstream #292); background expiry for orphaned drives (upstream #275); unrefed AbortSignal.timeout timer (upstream #306); loader-fetch 101 webSocket join (upstream #305); nodejs process.env population (upstream #296); writable request /tmp files (upstream #280).
+// Modified by ryuzcorp (ryuzcorp/celld): node:crypto scrypt; container exec resize op; cross-isolate RPC stubs and streams; test-only fake exec ops; fake kill completion op; exec reads survive their subscribing event; per-node Workers Cache API ops; tenant egress policy; D1 export operator-ingress marker; stateless attribution tokens; reaction-aware request resources; fake close/signal completion ops; binding-forgery enforcement; trusted cell RPC; Queue DLQ forward host op; DLQ forward caller identity; WebSocket and TCP socket ownership; receiver-held stream lifetime; deployment cache scope key; share the /bundle tree per deployment generation.; cancelled requests reject pending ops so co-awaiters settle (upstream #317); answered drivers poll while waitUntil background is outstanding (upstream #300); refused handoffs reject instead of dropping resolvers (upstream #309); facet adoption drops the restored flag (upstream #292); background expiry for orphaned drives (upstream #275); unrefed AbortSignal.timeout timer (upstream #306); loader-fetch 101 webSocket join (upstream #305); nodejs process.env population (upstream #296); writable request /tmp files (upstream #280); synchronous loader abort publish (upstream #281).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 // The raw V8 adapter and its child modules remain outside the Actor execution
@@ -486,11 +486,33 @@ pub struct FetchRequest<'a> {
     pub request_id: Option<RequestId>,
 }
 
+/// A cancellable call's abort sender, plus the request-cancellation lifetime
+/// a caller-side abort must publish to. The sender alone cannot reach a
+/// callee isolate: once the caller's entry retires, its driver stops polling
+/// the call's future, so a select waiting on the receiver never fires and
+/// the abort dies with the entry (upstream #281). Publishing synchronously
+/// from `__do_call_cancel` closes that race; the select stays for settling
+/// the caller-side promise.
 static DO_CALL_CANCELS: OnceLock<
-    std::sync::Mutex<HashMap<RequestId, tokio::sync::oneshot::Sender<()>>>,
+    std::sync::Mutex<
+        HashMap<
+            RequestId,
+            (
+                tokio::sync::oneshot::Sender<()>,
+                Option<Arc<crate::runtime::RequestCancellationLifetime>>,
+            ),
+        >,
+    >,
 > = OnceLock::new();
-fn do_call_cancels(
-) -> &'static std::sync::Mutex<HashMap<RequestId, tokio::sync::oneshot::Sender<()>>> {
+fn do_call_cancels() -> &'static std::sync::Mutex<
+    HashMap<
+        RequestId,
+        (
+            tokio::sync::oneshot::Sender<()>,
+            Option<Arc<crate::runtime::RequestCancellationLifetime>>,
+        ),
+    >,
+> {
     DO_CALL_CANCELS.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
 }
 
@@ -592,7 +614,7 @@ impl Drop for DoCallCancelGuard {
         let Some(request) = self.0.take() else {
             return;
         };
-        if let Some(cancel) = do_call_cancels().lock().unwrap().remove(&request) {
+        if let Some((cancel, _)) = do_call_cancels().lock().unwrap().remove(&request) {
             let _ = cancel.send(());
         }
     }
@@ -7687,7 +7709,7 @@ fn op_svc_call_impl(
         do_call_cancels()
             .lock()
             .unwrap()
-            .insert(request_id, cancel_sender);
+            .insert(request_id, (cancel_sender, None));
         (
             Some(request_id),
             Some(cancel_receiver),
@@ -8289,20 +8311,26 @@ fn op_loader_fetch(
     // `__do_call_cancel` already reads, as a service-binding call does. Only a
     // call with a signal registers, because nothing else can name the id.
     let cancellable = args.get(10).boolean_value(scope);
-    let (cancel_id, cancel, cancel_guard) = if cancellable {
+    let (cancel_id, cancel, cancel_guard, cancellation) = if cancellable {
         let request_id = next_do_request_id();
         let (cancel_sender, cancel_receiver) = tokio::sync::oneshot::channel();
+        // Minted here so the registry entry carries the lifetime the abort
+        // must publish to: `op_do_call_cancel` publishes synchronously
+        // instead of relying on the call's select being polled after the
+        // caller's entry retires (upstream #281).
+        let cancellation = crate::runtime::RequestCancellationLifetime::stateless();
         do_call_cancels()
             .lock()
             .unwrap()
-            .insert(request_id, cancel_sender);
+            .insert(request_id, (cancel_sender, Some(cancellation.clone())));
         (
             Some(request_id),
             Some(cancel_receiver),
             Some(DoCallCancelGuard::new(request_id)),
+            Some(cancellation),
         )
     } else {
-        (None, None, None)
+        (None, None, None, None)
     };
     let (tail_report, tail_receive) = if want_tail_report {
         let (send, receive) = tokio::sync::oneshot::channel();
@@ -8352,7 +8380,8 @@ fn op_loader_fetch(
         // Without this shared lifetime, a caller's abort rejected only the
         // caller's promise and the child ran to completion with a live
         // `request.signal` (denoland/celld#257).
-        let cancellation = crate::runtime::RequestCancellationLifetime::stateless();
+        let cancellation =
+            cancellation.unwrap_or_else(crate::runtime::RequestCancellationLifetime::stateless);
         let driving = tokio::spawn(cancellation.clone().drive_fetch_job(slot, job));
         let response = async {
             match receive.await {
@@ -9303,7 +9332,7 @@ fn op_do_call_impl(
     do_call_cancels()
         .lock()
         .unwrap()
-        .insert(request_id, cancel_sender);
+        .insert(request_id, (cancel_sender, None));
     let mut cancel_guard = DoCallCancelGuard::new(request_id);
     let Some(event) = event_context(scope) else {
         return retired_event_throw(scope);
@@ -9354,8 +9383,18 @@ fn op_do_call_cancel(
     let Some(request_id) = parse_request_id(&request_id) else {
         return;
     };
-    if let Some(cancel) = do_call_cancels().lock().unwrap().remove(&request_id) {
+    let hit = do_call_cancels().lock().unwrap().remove(&request_id);
+    if let Some((cancel, lifetime)) = hit {
         let _ = cancel.send(());
+        // Publish here, not only in the call's select: once the caller's
+        // entry retires, its driver stops polling the call's future, so a
+        // select waiting on the receiver never fires and the abort dies
+        // with the entry. Publishing synchronously hands the abort to the
+        // callee's driver, which samples it on its next turn (upstream
+        // #281). A finished lifetime suppresses its own publish.
+        if let Some(lifetime) = lifetime {
+            lifetime.publish_abort();
+        }
     }
 }
 
@@ -10282,7 +10321,7 @@ fn op_fetch(
             do_call_cancels()
                 .lock()
                 .unwrap()
-                .insert(request_id, cancel_sender);
+                .insert(request_id, (cancel_sender, None));
             (
                 Some(request_id),
                 Some(cancel_receiver),
@@ -10394,7 +10433,7 @@ fn op_fetch(
         do_call_cancels()
             .lock()
             .unwrap()
-            .insert(request_id, cancel_sender);
+            .insert(request_id, (cancel_sender, None));
         (
             Some(request_id),
             Some(cancel_receiver),
