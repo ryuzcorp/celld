@@ -1,6 +1,6 @@
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 //
-// Modified by ryuzcorp (ryuzcorp/celld): retired-event attribution test; cancelled-request shared-work regression tests (upstream #317); shared-promise attribution regression test (upstream #316); trailing-handoff rejection test (upstream #309); refused-handoff settlement test (upstream #207). Apache-2.0.
+// Modified by ryuzcorp (ryuzcorp/celld): retired-event attribution test; cancelled-request shared-work regression tests (upstream #317); shared-promise attribution regression test (upstream #316); trailing-handoff rejection test (upstream #309); refused-handoff settlement test (upstream #207); answered waitUntil retirement test (upstream #289). Apache-2.0.
 
 // A white-box driver test, not node code: it builds a Worker in-process and
 // runs its turns directly, so the execution boundary's injected
@@ -16,7 +16,7 @@
 
 use celld::js::{Compat, RequestBody, Worker, WorkerConfig, WorkerConfigOptions};
 use std::sync::OnceLock;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// Init V8 and the asyncrt host handle once per test binary, on a leaked
 /// current-thread runtime. The handle asserts exactly-once, so the tests
@@ -667,6 +667,132 @@ fn finished_non_keeping_event_rejects_trailing_handoff() {
     let body: serde_json::Value = serde_json::from_slice(&response.body).expect("JSON body");
     assert_eq!(body["outcome"], "fired", "{body}");
     entry_c.abandon();
+}
+
+const WAITUNTIL_RETIRE: &str = r#"
+let shared = null;
+export default {
+  async fetch(request, env, ctx) {
+    const url = new URL(request.url);
+    if (url.pathname === "/start") {
+      shared = new Promise((resolve) => setTimeout(() => resolve("v"), 20));
+      ctx.waitUntil(shared);
+      const value = await shared;
+      return Response.json({ value });
+    }
+    if (url.pathname === "/join") {
+      // Answer at once, leaving only the shared waitUntil behind: no op
+      // of its own, background outstanding.
+      ctx.waitUntil(shared);
+      return Response.json({ ok: true });
+    }
+    return new Response("not found", { status: 404 });
+  },
+};
+"#;
+
+/// An answered stateless entry driving `waitUntil` work with no native op
+/// of its own must retire once the background settles (denoland/celld#289),
+/// instead of spinning past it until the budget gives out. Two requests
+/// share one timer through `waitUntil`; the second holds no op, so only a
+/// look-in observes the aggregate settle and retires the entry. This drives
+/// both entries to completion through the real driver on one test slot —
+/// the starter owns the timer and retires, while the answered entry's wake
+/// polls for the settling background and retires with it. Pre-fix the wake
+/// spun to the handler budget (300 s), so the deadline below fires; with
+/// the fix both drives finish in milliseconds.
+#[test]
+fn answered_waituntil_without_ops_retires_once_background_settles() {
+    ensure_engine();
+    // One pool-built isolate serves both entries, so the module-level
+    // `shared` promise is truly shared between their turns.
+    let config = std::sync::Arc::new(WorkerConfig::new(WorkerConfigOptions {
+        src: WAITUNTIL_RETIRE.to_string(),
+        script_name: "waituntil-retire".to_string(),
+        do_classes: Vec::new(),
+        bindings: Vec::new(),
+        r2_bindings: Vec::new(),
+        d1_bindings: Vec::new(),
+        kv_bindings: Vec::new(),
+        queue_bindings: Vec::new(),
+        queue_consumers: Vec::new(),
+        workflow_bindings: Vec::new(),
+        vars: Vec::new(),
+        node: String::new(),
+        modules: Vec::new(),
+        compat: Compat::default(),
+    }));
+    let pool = celld::pool::Pool::new(
+        celld::runtime::pool_limits(),
+        Duration::from_secs(5),
+        Box::new({
+            let config = config.clone();
+            move || Worker::load_config(config.clone())
+        }),
+    );
+
+    fn job(
+        url: &str,
+        request_id: u128,
+    ) -> (
+        celld::WorkerJob,
+        tokio::sync::oneshot::Receiver<Result<celld::js::HttpResponse, anyhow::Error>>,
+    ) {
+        let (reply, receive) = tokio::sync::oneshot::channel();
+        (
+            celld::WorkerJob::Fetch {
+                queued_at: Instant::now(),
+                entrypoint: None,
+                invocation_limits: None,
+                url: url.to_string(),
+                method: "GET".to_string(),
+                body: RequestBody::Bytes(bytes::Bytes::new()),
+                headers: Vec::new(),
+                request_id: Some(request_id),
+                tail_report: None,
+                reply,
+            },
+            receive,
+        )
+    }
+
+    let (job_a, mut reply_a) = job("http://test/start", 28901);
+    let (job_b, mut reply_b) = job("http://test/join", 28902);
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("drive runtime")
+        .block_on(async {
+            let affiliation = pool
+                .admit_or_wait(false)
+                .await
+                .expect("admit the test slot");
+            let slot = affiliation.slot().clone();
+            tokio::time::timeout(Duration::from_secs(30), async {
+                tokio::join!(
+                    celld::runtime::drive(slot.clone(), job_a, None),
+                    celld::runtime::drive(slot.clone(), job_b, None),
+                )
+            })
+            .await
+            .expect(
+                "both entries retire: the answered one polls for its background instead of spinning to budget",
+            );
+            drop(affiliation);
+        });
+
+    let response = reply_a
+        .try_recv()
+        .expect("A answered")
+        .unwrap_or_else(|error| panic!("A must answer: {error:#}"));
+    assert_eq!(response.status, 200);
+    let body: serde_json::Value = serde_json::from_slice(&response.body).expect("JSON body");
+    assert_eq!(body["value"], "v", "{body}");
+    let response = reply_b
+        .try_recv()
+        .expect("B answered")
+        .unwrap_or_else(|error| panic!("B must answer: {error:#}"));
+    assert_eq!(response.status, 200);
 }
 
 /// A handoff racing the trailing take must be refused at the source, not
