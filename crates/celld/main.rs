@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): cross-isolate RPC stubs and streams; operator token for the internal listener; D1 export operator-ingress marker; ported from meln1k/celld: report wake coverage after maintenance (e6cb9a3); staged activation; trusted cell RPC; WebSocket join tokens; --version reports the full build version; staged invoke operator route; non-dumpable serving process; bucket-posture group commit: paged gate judges PAGED_FORMAT (0059); bucket-posture group commit: bucket bundle gate plumbing (0060); bucket-posture group commit: bundle switch defaults off (0075); stale-route marker import from peer_auth (upstream #273); resolve the node-session id from the data-dir pin (upstream #249); boot scan takes the due scan's upcoming minute (upstream #308); unclean-restart prune of live-named epochs (upstream #290).
+// Modified by ryuzcorp (ryuzcorp/celld): cross-isolate RPC stubs and streams; operator token for the internal listener; D1 export operator-ingress marker; ported from meln1k/celld: report wake coverage after maintenance (e6cb9a3); staged activation; trusted cell RPC; WebSocket join tokens; --version reports the full build version; staged invoke operator route; non-dumpable serving process; bucket-posture group commit: paged gate judges PAGED_FORMAT (0059); bucket-posture group commit: bucket bundle gate plumbing (0060); bucket-posture group commit: bundle switch defaults off (0075); stale-route marker import from peer_auth (upstream #273); resolve the node-session id from the data-dir pin (upstream #249); boot scan takes the due scan's upcoming minute (upstream #308); unclean-restart prune of live-named epochs (upstream #290); celld versions dispatch (upstream #181).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 // The binary contains connection, startup, shutdown, and V8 shell code. The
@@ -3991,6 +3991,7 @@ async fn async_main(
         Action::Deploy(arguments) => return fleet::run_deploy(arguments).await,
         Action::Activate(arguments) => return fleet::run_activate(arguments).await,
         Action::Discard(arguments) => return fleet::run_discard(arguments).await,
+        Action::Versions(arguments) => return fleet::run_versions(arguments).await,
         Action::Invoke(arguments) => return celld::invoke_cli::run(arguments).await,
         Action::Dev(arguments) => return celld::dev::run(arguments).await,
         Action::Cell(arguments) => return celld::cell_cli::run(arguments).await,
