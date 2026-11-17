@@ -1,3 +1,4 @@
+// Modified by ryuzcorp (ryuzcorp/celld): parse OTEL_RESOURCE_ATTRIBUTES into the OTLP resource (upstream #314)
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 // Telemetry is observational and does not affect Actor decisions.
@@ -94,6 +95,11 @@ pub struct Config {
     pub otlp_headers: Vec<(String, String)>,
     pub otlp_timeout: Duration,
     pub service: String,
+    /// Parsed `OTEL_RESOURCE_ATTRIBUTES`: operator-owned resource entries
+    /// exported alongside the spans and logs. `service.name` never appears
+    /// here (`OTEL_SERVICE_NAME` wins) and duplicates resolve last-wins, per
+    /// the OpenTelemetry environment-variable spec (denoland/celld#314).
+    pub resource_attrs: Vec<(String, String)>,
     pub sample_ratio: f64,
     /// `parentbased_*`: a caller's sampled flag decides for its children;
     /// the ratio applies to roots only.
@@ -149,7 +155,12 @@ impl Config {
         )?
         .map(Duration::from_millis)
         .unwrap_or(Duration::from_secs(10));
-        let service = get("OTEL_SERVICE_NAME")?.unwrap_or_else(|| "celld".to_string());
+        let resource_input = get("OTEL_RESOURCE_ATTRIBUTES")?;
+        let service = match get("OTEL_SERVICE_NAME")? {
+            Some(name) => name,
+            None => resource_service_name(&resource_input).unwrap_or_else(|| "celld".to_string()),
+        };
+        let resource_attrs = parse_resource_attributes(&resource_input);
         // Per the otel spec: a `parentbased_*` sampler defers to the
         // caller's sampled flag and decides itself only for roots. That
         // is an explicit statement of upstream trust — appropriate here,
@@ -205,6 +216,7 @@ impl Config {
             otlp_headers,
             otlp_timeout,
             service,
+            resource_attrs,
             sample_ratio,
             parent_based,
             retention,
@@ -212,6 +224,74 @@ impl Config {
             flush_bytes,
         }))
     }
+}
+
+/// Parse `OTEL_RESOURCE_ATTRIBUTES` into ordered resource entries.
+///
+/// The SDK environment-variable spec shapes this: a comma-separated list of
+/// `key=value` pairs, surrounding whitespace tolerated, malformed entries
+/// skipped rather than failing startup (telemetry must never refuse to
+/// boot). Percent-encoded separators are decoded before duplicate
+/// resolution, so `qa%2Cblue` exports as `qa,blue`. Duplicates resolve
+/// last-wins, and `service.name` is dropped here because `from_lookup`
+/// resolves it first (explicit `OTEL_SERVICE_NAME`, then the resource
+/// `service.name`, then `celld`). Values stay strings: the OTLP
+/// resource this feeds carries scalar attributes, and sniffing a version
+/// like `123` into an integer would corrupt the deployment tracking the
+/// operator configured it for.
+#[doc(hidden)]
+pub fn parse_resource_attributes(input: &Option<String>) -> Vec<(String, String)> {
+    let Some(input) = input.as_deref() else {
+        return Vec::new();
+    };
+    let mut out: Vec<(String, String)> = Vec::new();
+    for entry in input.split(',') {
+        let Some((key, value)) = entry.split_once('=') else {
+            continue;
+        };
+        let key = decode_component(key.trim());
+        let value = decode_component(value.trim());
+        if key.is_empty() || key == "service.name" {
+            continue;
+        }
+        if let Some(slot) = out.iter_mut().find(|(existing, _)| *existing == key) {
+            slot.1 = value;
+        } else {
+            out.push((key, value));
+        }
+    }
+    out
+}
+
+/// The `service.name` the resource attributes carry, if any: the fallback
+/// between explicit `OTEL_SERVICE_NAME` and the `celld` default. Parsed
+/// with the same leniency as [`parse_resource_attributes`] (last-wins,
+/// percent-decoded) so the two cannot disagree on what the operator wrote.
+fn resource_service_name(input: &Option<String>) -> Option<String> {
+    let input = input.as_deref()?;
+    let mut name: Option<String> = None;
+    for entry in input.split(',') {
+        let Some((key, value)) = entry.split_once('=') else {
+            continue;
+        };
+        if decode_component(key.trim()) == "service.name" {
+            let value = decode_component(value.trim());
+            if !value.is_empty() {
+                name = Some(value);
+            }
+        }
+    }
+    name
+}
+
+/// Decode one percent-encoded resource component. Malformed sequences and
+/// non-UTF-8 results keep the raw text: telemetry must never refuse to
+/// boot over an operator typo.
+fn decode_component(raw: &str) -> String {
+    percent_encoding::percent_decode_str(raw)
+        .decode_utf8()
+        .map(|decoded| decoded.into_owned())
+        .unwrap_or_else(|_| raw.to_string())
 }
 
 /// Span kinds, numbered as the OTLP proto numbers them so the later OTLP
@@ -675,13 +755,35 @@ pub fn init(
     tokio::spawn(pump(
         rx,
         sink,
-        node,
-        region,
-        config.service.clone(),
+        ExportTarget {
+            node,
+            region,
+            service: config.service.clone(),
+            resource_attrs: config.resource_attrs.clone(),
+        },
         config.flush,
         config.flush_bytes,
     ));
     Ok(())
+}
+
+/// The owned export identity one pump carries across its batches.
+struct ExportTarget {
+    node: String,
+    region: String,
+    service: String,
+    resource_attrs: Vec<(String, String)>,
+}
+
+impl ExportTarget {
+    fn scope(&self) -> ExportScope<'_> {
+        ExportScope {
+            node: &self.node,
+            region: &self.region,
+            service: &self.service,
+            resource_attrs: &self.resource_attrs,
+        }
+    }
 }
 
 enum SinkRuntime {
@@ -701,20 +803,13 @@ impl SinkRuntime {
     /// Ship one flush interval's events. Encoding runs on the blocking
     /// pool either way. For OTLP, the return value counts records discarded
     /// after a permanent refusal or retry exhaustion.
-    async fn flush(
-        &self,
-        spans: Vec<Span>,
-        logs: Vec<Log>,
-        node: &str,
-        region: &str,
-        service: &str,
-    ) -> u64 {
+    async fn flush(&self, spans: Vec<Span>, logs: Vec<Log>, scope: &ExportScope<'_>) -> u64 {
         let span_count = spans.len() as u64;
         let log_count = logs.len() as u64;
         match self {
             SinkRuntime::Bucket { bucket, retention } => {
-                let node_ = node.to_string();
-                let region_ = region.to_string();
+                let node_ = scope.node.to_string();
+                let region_ = scope.region.to_string();
                 let encoded = tokio::task::spawn_blocking(move || {
                     let spans = (!spans.is_empty())
                         .then(|| encode_spans(&spans, &node_, &region_))
@@ -738,7 +833,7 @@ impl SinkRuntime {
                 ];
                 for (prefix, bytes) in [(TRACES_PREFIX, span_bytes), (LOGS_PREFIX, log_bytes)] {
                     let Some(bytes) = bytes else { continue };
-                    let key = object_key(prefix, node, now_unix_us());
+                    let key = object_key(prefix, scope.node, now_unix_us());
                     if let Err(error) = bucket.put_with_meta(&key, bytes, &meta).await {
                         tracing::warn!(%error, key, "telemetry batch lost: put failed");
                     }
@@ -751,14 +846,17 @@ impl SinkRuntime {
                 logs_url,
                 headers,
             } => {
-                let node_ = node.to_string();
-                let region_ = region.to_string();
-                let service_ = service.to_string();
+                let node_ = scope.node.to_string();
+                let region_ = scope.region.to_string();
+                let service_ = scope.service.to_string();
+                let attrs_ = scope.resource_attrs.to_vec();
                 let encoded = tokio::task::spawn_blocking(move || {
-                    let spans = (!spans.is_empty())
-                        .then(|| crate::otlp::traces_request(&spans, &node_, &region_, &service_));
-                    let logs = (!logs.is_empty())
-                        .then(|| crate::otlp::logs_request(&logs, &node_, &region_, &service_));
+                    let spans = (!spans.is_empty()).then(|| {
+                        crate::otlp::traces_request(&spans, &node_, &region_, &service_, &attrs_)
+                    });
+                    let logs = (!logs.is_empty()).then(|| {
+                        crate::otlp::logs_request(&logs, &node_, &region_, &service_, &attrs_)
+                    });
                     anyhow::Ok((spans, logs))
                 })
                 .await;
@@ -783,6 +881,15 @@ impl SinkRuntime {
             }
         }
     }
+}
+
+/// Where one flush batch is exported: the identity the resource carries.
+/// Bundled so the split-flush plumbing stays under the argument-count lint.
+struct ExportScope<'a> {
+    node: &'a str,
+    region: &'a str,
+    service: &'a str,
+    resource_attrs: &'a [(String, String)],
 }
 
 /// Send the same encoded request until the collector accepts it, refuses it
@@ -908,9 +1015,7 @@ fn flatten<T>(joined: Result<anyhow::Result<T>, tokio::task::JoinError>) -> anyh
 async fn pump(
     mut rx: tokio::sync::mpsc::Receiver<Event>,
     sink: SinkRuntime,
-    node: String,
-    region: String,
-    service: String,
+    target: ExportTarget,
     flush: Duration,
     flush_bytes: usize,
 ) {
@@ -944,7 +1049,7 @@ async fn pump(
                 Event::Log(log) => logs.push(log),
             }
         }
-        let sink_dropped = sink.flush(spans, logs, &node, &region, &service).await;
+        let sink_dropped = sink.flush(spans, logs, &target.scope()).await;
         let dropped = sink_dropped.saturating_add(
             TELEMETRY
                 .get()
@@ -1261,4 +1366,133 @@ pub fn encode_logs(logs: &[Log], node: &str, region: &str) -> anyhow::Result<Vec
 
     group.close()?;
     Ok(writer.into_inner()?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resource_attributes_parse_leniently() {
+        assert!(parse_resource_attributes(&None).is_empty());
+        assert!(parse_resource_attributes(&Some(String::new())).is_empty());
+        let parsed = parse_resource_attributes(&Some(
+            "service.version=abc123, deployment.environment.name = play ,broken,=nokey,service.name=loser".to_string(),
+        ));
+        // Malformed entries are skipped, service.name is dropped so
+        // OTEL_SERVICE_NAME keeps winning it, and duplicates resolve
+        // last-wins.
+        assert_eq!(
+            parsed,
+            vec![
+                ("service.version".to_string(), "abc123".to_string()),
+                (
+                    "deployment.environment.name".to_string(),
+                    "play".to_string()
+                ),
+            ]
+        );
+        let dupes = parse_resource_attributes(&Some("a=1,a=2".to_string()));
+        assert_eq!(dupes, vec![("a".to_string(), "2".to_string())]);
+        // A value may itself contain `=`.
+        let padded = parse_resource_attributes(&Some("token=ab== ".to_string()));
+        assert_eq!(padded, vec![("token".to_string(), "ab==".to_string())]);
+    }
+
+    #[test]
+    fn resource_attributes_decode_percent_encoding() {
+        // Encoded separators decode before duplicate resolution, while
+        // ordinary strings pass through untouched.
+        let parsed = parse_resource_attributes(&Some(
+            "deployment.environment.name=qa%2Cblue,my%20key=a%3Db,plain=play".to_string(),
+        ));
+        assert_eq!(
+            parsed,
+            vec![
+                (
+                    "deployment.environment.name".to_string(),
+                    "qa,blue".to_string()
+                ),
+                ("my key".to_string(), "a=b".to_string()),
+                ("plain".to_string(), "play".to_string()),
+            ]
+        );
+        // A malformed escape keeps the raw text instead of refusing to boot.
+        let raw = parse_resource_attributes(&Some("token=100%".to_string()));
+        assert_eq!(raw, vec![("token".to_string(), "100%".to_string())]);
+    }
+
+    #[test]
+    fn lookup_prefers_resource_service_name_over_the_default() {
+        let config = config_with(&[
+            ("CELLD_OTEL", "http://127.0.0.1:4318"),
+            ("OTEL_RESOURCE_ATTRIBUTES", "service.name=payments"),
+        ])
+        .expect("valid config")
+        .expect("telemetry on");
+        assert_eq!(config.service, "payments");
+        assert!(
+            !config
+                .resource_attrs
+                .iter()
+                .any(|(key, _)| key == "service.name"),
+            "the resource name must not also reach the exporter as an attribute"
+        );
+        // Explicit OTEL_SERVICE_NAME still wins, and the default survives
+        // when neither source names a service.
+        let config = config_with(&[
+            ("CELLD_OTEL", "http://127.0.0.1:4318"),
+            ("OTEL_SERVICE_NAME", "explicit"),
+            ("OTEL_RESOURCE_ATTRIBUTES", "service.name=payments"),
+        ])
+        .expect("valid config")
+        .expect("telemetry on");
+        assert_eq!(config.service, "explicit");
+        let config = config_with(&[("CELLD_OTEL", "http://127.0.0.1:4318")])
+            .expect("valid config")
+            .expect("telemetry on");
+        assert_eq!(config.service, "celld");
+    }
+
+    fn config_with(env: &[(&str, &str)]) -> anyhow::Result<Option<Config>> {
+        use std::collections::HashMap;
+        let env: HashMap<String, String> = env
+            .iter()
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect();
+        Config::from_lookup(|name| Ok(env.get(name).cloned()))
+    }
+
+    #[test]
+    fn lookup_threads_service_name_and_resource_attributes() {
+        use std::collections::HashMap;
+        let env: HashMap<String, String> = [
+            ("CELLD_OTEL", "http://127.0.0.1:4318"),
+            ("OTEL_SERVICE_NAME", "trace-probe"),
+            (
+                "OTEL_RESOURCE_ATTRIBUTES",
+                "service.version=abc123,deployment.environment.name=play,service.name=loser",
+            ),
+        ]
+        .into_iter()
+        .map(|(key, value)| (key.to_string(), value.to_string()))
+        .collect();
+        let config = Config::from_lookup(|name| Ok(env.get(name).cloned()))
+            .expect("valid config")
+            .expect("telemetry on");
+        assert_eq!(config.service, "trace-probe");
+        // OTEL_SERVICE_NAME wins: the attribute's service.name never reaches
+        // the exporter, where it would rename the service behind the
+        // operator's back.
+        assert_eq!(
+            config.resource_attrs,
+            vec![
+                ("service.version".to_string(), "abc123".to_string()),
+                (
+                    "deployment.environment.name".to_string(),
+                    "play".to_string()
+                ),
+            ]
+        );
+    }
 }
