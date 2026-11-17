@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): validate CELLD_MEMORY_SCOPE.
+// Modified by ryuzcorp (ryuzcorp/celld): validate CELLD_MEMORY_SCOPE; pin the node-session id in the data dir (upstream #249).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! What the process can learn about where it is running.
@@ -19,6 +19,64 @@ pub(crate) fn validate_node_name(node: &str) -> anyhow::Result<()> {
         anyhow::bail!(
             "must be a safe node name of 1 to 128 ASCII letters, numbers, dots, dashes, or underscores"
         )
+    }
+}
+
+/// The file beside the follower peerlog that pins this disk's node-session
+/// id across restarts (upstream #249).
+pub const NODE_ID_FILE: &str = "node-id";
+
+/// Resolve the node-session id: an explicit `CELLD_NODE` wins outright and
+/// is recorded for the next boot; otherwise reuse the id the data directory
+/// already pins, generating and pinning one on first boot. The pin lives
+/// beside the follower fragments, so the id and the disks it recovers share
+/// a fate: a restarted process answers for its predecessor's leases and
+/// fragments instead of stranding them behind `WrongTarget` (upstream
+/// #249). A missing or unwritable directory degrades to today's ephemeral
+/// id with a loud line, never a boot failure; a corrupt pin warns and
+/// regenerates, naming the discarded id for operator recovery.
+#[allow(clippy::disallowed_methods)] // The pin is read before any injected filesystem exists.
+pub fn resolve_node_session_id(
+    explicit: Option<String>,
+    data_dir: &std::path::Path,
+) -> String {
+    if let Some(node) = explicit {
+        if validate_node_name(&node).is_ok() {
+            record_node_session_id(data_dir, &node);
+        }
+        return node;
+    }
+    let path = data_dir.join(NODE_ID_FILE);
+    if let Ok(pinned) = std::fs::read_to_string(&path) {
+        let pinned = pinned.trim().to_string();
+        if validate_node_name(&pinned).is_ok() {
+            return pinned;
+        }
+        tracing::warn!(
+            path = %path.display(),
+            discarded = %pinned,
+            "pinned node id is corrupt; generating a fresh session id"
+        );
+    }
+    let node = random_node_session_id();
+    record_node_session_id(data_dir, &node);
+    node
+}
+
+/// Reflect the effective node-session id in the data directory's pin. Best
+/// effort: an unwritable directory keeps today's ephemeral behavior, loudly.
+#[allow(clippy::disallowed_methods)] // The pin is written before any injected filesystem exists.
+fn record_node_session_id(data_dir: &std::path::Path, node: &str) {
+    if let Err(error) = (|| -> std::io::Result<()> {
+        std::fs::create_dir_all(data_dir)?;
+        std::fs::write(data_dir.join(NODE_ID_FILE), format!("{node}\n"))?;
+        Ok(())
+    })() {
+        tracing::warn!(
+            path = %data_dir.join(NODE_ID_FILE).display(),
+            %error,
+            "cannot pin the node-session id; restarts will mint fresh ids"
+        );
     }
 }
 
@@ -193,4 +251,46 @@ pub fn local_cache_max_bytes_from_environment() -> anyhow::Result<Option<u64>> {
 #[cfg(all(test, celld_internal_tests))]
 mod internal_tests {
     include!(env!("CELLD_INTERNAL_MACHINE_TESTS"));
+}
+
+#[cfg(test)]
+#[allow(clippy::disallowed_methods)] // Test tempdirs live outside the injected filesystem.
+mod node_id_tests {
+    use super::*;
+
+    /// An explicit CELLD_NODE wins and is recorded for the next boot.
+    #[test]
+    fn explicit_id_wins_and_is_recorded() {
+        let dir = tempfile::tempdir().expect("test dir");
+        let node = resolve_node_session_id(Some("node_fixed".into()), dir.path());
+        assert_eq!(node, "node_fixed");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(NODE_ID_FILE)).expect("pin written"),
+            "node_fixed\n"
+        );
+    }
+
+    /// A restart with no explicit id reuses the pin: the process answers
+    /// for its predecessor's leases and fragments (upstream #249).
+    /// Fail-before: every boot minted a stranger and recovery looped on
+    /// `WrongTarget` forever.
+    #[test]
+    fn restart_reuses_the_pinned_id() {
+        let dir = tempfile::tempdir().expect("test dir");
+        let first = resolve_node_session_id(None, dir.path());
+        assert!(validate_node_name(&first).is_ok());
+        let second = resolve_node_session_id(None, dir.path());
+        assert_eq!(second, first, "the restart keeps its predecessor's id");
+    }
+
+    /// A corrupt pin warns and regenerates instead of bricking boot or
+    /// pinning an unusable identity.
+    #[test]
+    fn corrupt_pin_regenerates() {
+        let dir = tempfile::tempdir().expect("test dir");
+        std::fs::write(dir.path().join(NODE_ID_FILE), "not a node id!!!\n").expect("pin written");
+        let node = resolve_node_session_id(None, dir.path());
+        assert!(validate_node_name(&node).is_ok());
+        assert_ne!(node, "not a node id!!!");
+    }
 }

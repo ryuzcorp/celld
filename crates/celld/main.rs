@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): cross-isolate RPC stubs and streams; operator token for the internal listener; D1 export operator-ingress marker; ported from meln1k/celld: report wake coverage after maintenance (e6cb9a3); staged activation; trusted cell RPC; WebSocket join tokens; --version reports the full build version; staged invoke operator route; non-dumpable serving process; bucket-posture group commit: paged gate judges PAGED_FORMAT (0059); bucket-posture group commit: bucket bundle gate plumbing (0060); bucket-posture group commit: bundle switch defaults off (0075); stale-route marker import from peer_auth (upstream #273).
+// Modified by ryuzcorp (ryuzcorp/celld): cross-isolate RPC stubs and streams; operator token for the internal listener; D1 export operator-ingress marker; ported from meln1k/celld: report wake coverage after maintenance (e6cb9a3); staged activation; trusted cell RPC; WebSocket join tokens; --version reports the full build version; staged invoke operator route; non-dumpable serving process; bucket-posture group commit: paged gate judges PAGED_FORMAT (0059); bucket-posture group commit: bucket bundle gate plumbing (0060); bucket-posture group commit: bundle switch defaults off (0075); stale-route marker import from peer_auth (upstream #273); resolve the node-session id from the data-dir pin (upstream #249).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 // The binary contains connection, startup, shutdown, and V8 shell code. The
@@ -4217,7 +4217,15 @@ async fn async_main(
         });
     });
     let (fence_tx, mut fence_rx) = mpsc::unbounded_channel();
-    let node = std::env::var("CELLD_NODE").unwrap_or_else(|_| random_node_session_id());
+    // The data directory comes first: the node-session id is pinned beside
+    // the follower fragments it recovers, so a restart answers for its
+    // predecessor instead of minting a stranger (upstream #249).
+    let data_dir = std::env::var_os("CELLD_TEST_DATA_DIR")
+        .or_else(|| std::env::var_os("CELLD_WATCH"))
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::env::temp_dir().join(format!("celld-{}", std::process::id())));
+    let node =
+        celld::machine::resolve_node_session_id(std::env::var("CELLD_NODE").ok(), &data_dir);
     let clean_reload_node = node.clone();
     celld::control_plane::install_reexec_node_session_id(&node)?;
     let probe_public_key = celld::peer_probe::install_signer()?;
@@ -4250,10 +4258,6 @@ async fn async_main(
     };
     let max_releases = celld::env_vars::positive::<usize>("CELLD_RELEASES")?
         .unwrap_or(DEFAULT_MAX_CONCURRENT_RELEASES);
-    let data_dir = std::env::var_os("CELLD_TEST_DATA_DIR")
-        .or_else(|| std::env::var_os("CELLD_WATCH"))
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::env::temp_dir().join(format!("celld-{}", std::process::id())));
     let mut deploy_agent = None;
     // The channel `POST /reload` and a managed notification nudge the pointer
     // watcher through. Without a deployment bucket the receiver is dropped
@@ -6117,7 +6121,7 @@ async fn async_main(
 }
 
 use celld::machine::{
-    lease_ttl_ms_from_environment, local_cache_max_bytes_from_environment, random_node_session_id,
+    lease_ttl_ms_from_environment, local_cache_max_bytes_from_environment,
     random_peer_key, DEFAULT_MAX_OUTBOUND_WEBSOCKETS, PEER_CONNECT_TIMEOUT,
 };
 
