@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): round-level fence settlement (0062); renewal lease readback carries the authority bound (upstream #264); first alarm-deadline expiry only marks the firing (upstream #256); same-guard retry on lease conflicts (upstream #239); storage-poisoned runtimes restart on their own generation (upstream #291).
+// Modified by ryuzcorp (ryuzcorp/celld): round-level fence settlement (0062); renewal lease readback carries the authority bound (upstream #264); first alarm-deadline expiry only marks the firing (upstream #256); same-guard retry on lease conflicts (upstream #239); storage-poisoned runtimes restart on their own generation (upstream #291); failed start disarms the restored alarm (upstream #276).
 // Modified by ryuzcorp (ryuzcorp/celld): ported from meln1k/celld: coordination-core fixes (ea471ee, e46a685, 6d61462, 18d3bf9, 9d4c163, 468b456, 01522b3, b026226, 65fdb13); shared bucket-posture ownership reads across concurrent gates (0056).
 // Modified by ryuzcorp (ryuzcorp/celld): MergeTree-style lazy handoff policy (0078).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
@@ -5158,6 +5158,16 @@ impl State {
                 });
             }
             Err(_) => {
+                // The restore may have armed the cell's alarm timer just
+                // before this start failed. Drop that in-process arming:
+                // otherwise the overdue alarm fires immediately, reactivates
+                // the cell, and hot-loops restores against a start that will
+                // not succeed (denoland/celld#276). The alarm stays persisted
+                // in the cell's SQLite, so the wake scan rediscovers it at
+                // scan pace instead of loop pace.
+                if cell.alarm.take().is_some() {
+                    self.probe(Probe::StartFailedDisarmsAlarm);
+                }
                 set_phase(&mut self.occupied, &mut cell, Phase::Dormant { epoch });
                 self.finish_requests(&id, &mut cell, Err(RequestError::RuntimeFailed), effects);
                 resume_failed = cell.resume_demand;

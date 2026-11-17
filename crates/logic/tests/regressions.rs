@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): ported from meln1k/celld: scripted core-bug reproductions (ea471ee, e46a685, 6d61462, 18d3bf9, 9d4c163, 468b456, 01522b3, 65fdb13); shared bucket-posture ownership reads (0056); round-level fence settlement (0062); bucket-posture group commit: live-lease routing pin (0063); renewal readback authority bound (upstream #264); alarm deadline waits for the running copy (upstream #256); same-guard lease conflict retry (upstream #239); storage-poison restart pump (upstream #291).
+// Modified by ryuzcorp (ryuzcorp/celld): ported from meln1k/celld: scripted core-bug reproductions (ea471ee, e46a685, 6d61462, 18d3bf9, 9d4c163, 468b456, 01522b3, 65fdb13); shared bucket-posture ownership reads (0056); round-level fence settlement (0062); bucket-posture group commit: live-lease routing pin (0063); renewal readback authority bound (upstream #264); alarm deadline waits for the running copy (upstream #256); same-guard lease conflict retry (upstream #239); storage-poison restart pump (upstream #291); failed start disarms the restored alarm (upstream #276).
 //! Scripted reproductions of core bugs the deterministic simulator
 //! (`crates/sim`) found. Each drives the core through a minimal shell that
 //! answers every effect at once, except the ones a test holds back to
@@ -1873,3 +1873,90 @@ fn a_renewal_readback_carries_the_authority_bound() {
     shell.state.validate().expect("state invariant");
 }
 
+/// A restored overdue alarm must not hot-loop a cell whose runtime will not
+/// start. The failed start drops the in-process arming the restore seeded,
+/// so the timer's fire finds no alarm instead of reactivating the cell for
+/// another restore-then-fail cycle without application traffic
+/// (denoland/celld#276).
+#[test]
+fn a_failed_start_disarms_the_restored_alarm() {
+    let mut shell = Shell::new(2, |effect| {
+        matches!(
+            effect,
+            Effect::Restore { .. } | Effect::StartRuntime { .. }
+        )
+    });
+    shell.start();
+    shell.owners.insert(
+        "c".into(),
+        OwnerRecord {
+            node: Some("n0".into()),
+            epoch: 1,
+            etag: "owned".into(),
+        },
+    );
+    shell.send(Event::RequestAt {
+        request: 1,
+        cell: "c".into(),
+        now_mono_ms: MONO_MS,
+    });
+    let Some(Effect::Restore { op, .. }) = shell.held.pop() else {
+        panic!("expected a restore: {:?}", shell.held);
+    };
+    let effects = shell.send(Event::RestoreCompleted {
+        op,
+        result: Ok(celld_logic::RestoreOutcome {
+            restored: true,
+            alarm: Some(celld_logic::RestoredAlarm {
+                at_ms: NOW_MS as i64 - 1_000,
+                covered: true,
+            }),
+        }),
+    });
+    assert!(
+        effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::StartRuntime { .. })),
+        "a restored cell must start: {effects:?}"
+    );
+    let Some(Effect::StartRuntime { op, .. }) = shell.held.pop() else {
+        panic!("expected a runtime start: {:?}", shell.held);
+    };
+    let effects = shell.send(Event::RuntimeStarted {
+        op,
+        isolate: None,
+        generation: 0,
+        result: Err(celld_logic::Failure::Definite),
+    });
+    assert!(
+        effects.iter().any(|effect| matches!(
+            effect,
+            Effect::Complete {
+                request: 1,
+                result: Err(RequestError::RuntimeFailed),
+            }
+        )),
+        "the request must fail with the start: {effects:?}"
+    );
+    let Some(timer) = shell.timers.iter().find_map(|timer| match timer {
+        Timer::CellAlarm { cell, generation } if cell == "c" => Some(Timer::CellAlarm {
+            cell: cell.clone(),
+            generation: *generation,
+        }),
+        _ => None,
+    }) else {
+        panic!("the restored alarm must have scheduled a timer");
+    };
+    let effects = shell.send(Event::TimerFired {
+        timer,
+        now_ms: NOW_MS,
+        now_mono_ms: MONO_MS,
+    });
+    assert!(
+        !effects.iter().any(|effect| matches!(
+            effect,
+            Effect::ReadOwner { .. } | Effect::Restore { .. } | Effect::StartRuntime { .. }
+        )),
+        "a failed start must not reactivate on its restored alarm: {effects:?}"
+    );
+}
