@@ -1,0 +1,7 @@
+{
+  "name": "cancelled-request-repro",
+  "main": "worker.js",
+  "compatibility_date": "2026-01-01",
+  "durable_objects": { "bindings": [{ "name": "LAZY", "class_name": "Lazy" }] },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Lazy"] }]
+}
