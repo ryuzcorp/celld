@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): ported from meln1k/celld: scripted core-bug reproductions (ea471ee, e46a685, 6d61462, 18d3bf9, 9d4c163, 468b456, 01522b3, 65fdb13); shared bucket-posture ownership reads (0056); round-level fence settlement (0062); bucket-posture group commit: live-lease routing pin (0063).
+// Modified by ryuzcorp (ryuzcorp/celld): ported from meln1k/celld: scripted core-bug reproductions (ea471ee, e46a685, 6d61462, 18d3bf9, 9d4c163, 468b456, 01522b3, 65fdb13); shared bucket-posture ownership reads (0056); round-level fence settlement (0062); bucket-posture group commit: live-lease routing pin (0063); renewal readback authority bound (upstream #264).
 //! Scripted reproductions of core bugs the deterministic simulator
 //! (`crates/sim`) found. Each drives the core through a minimal shell that
 //! answers every effect at once, except the ones a test holds back to
@@ -104,7 +104,7 @@ impl Shell {
                 self.timers.push(timer);
                 return None;
             }
-            Effect::ReadSelfNodeLease { op } => Event::SelfNodeLeaseRead {
+            Effect::ReadSelfNodeLease { op, .. } => Event::SelfNodeLeaseRead {
                 op,
                 now_ms: NOW_MS,
                 now_mono_ms: MONO_MS,
@@ -1485,6 +1485,63 @@ fn a_live_matching_owner_lease_routes_remote_without_a_claim() {
             Effect::RecoverNodeLog { .. } | Effect::CasOwner { .. }
         )),
         "no claim and no takeover interlock while the owner is live: {effects:?}"
+    );
+    shell.state.validate().expect("state invariant");
+}
+
+/// Upstream #264: every contested renewal funnels through a readback, and a
+/// readback that hangs on a stalled store used to wedge every renewal until
+/// the fence timer — even with proven headroom left — because the read
+/// carried no bound for the shell to enforce. The renewal readback now
+/// carries the prior record's peer-visible expiry; the initial acquisition
+/// (no prior authority) stays unbounded. Fail-before: the readback carried
+/// no expiry, so the shell could not bound it.
+#[test]
+fn a_renewal_readback_carries_the_authority_bound() {
+    let mut shell = Shell::new(4, |_| false);
+    shell.start();
+    shell.hold = |effect| {
+        matches!(
+            effect,
+            Effect::CasNodeLease { .. } | Effect::ReadSelfNodeLease { .. }
+        )
+    };
+    let renew = shell
+        .timers
+        .iter()
+        .find(|timer| matches!(timer, Timer::NodeLeaseRenew { .. }))
+        .cloned()
+        .expect("the held lease arms its renew timer");
+    shell.send(Event::TimerFired {
+        timer: renew,
+        now_ms: NOW_MS,
+        now_mono_ms: MONO_MS,
+    });
+    let (cas_op, prior_expires) = match shell.held.as_slice() {
+        [Effect::CasNodeLease { op, record, .. }] => (*op, record.expires_ms),
+        held => panic!("the renew timer issues one lease CAS: {held:?}"),
+    };
+    shell.send(Event::NodeLeaseCasCompleted {
+        op: cas_op,
+        now_mono_ms: MONO_MS,
+        result: Err(Failure::Ambiguous),
+        stamped_log_state: None,
+    });
+    let bound = shell
+        .held
+        .iter()
+        .find_map(|effect| match effect {
+            Effect::ReadSelfNodeLease {
+                authority_expires_ms,
+                ..
+            } => Some(*authority_expires_ms),
+            _ => None,
+        })
+        .expect("an ambiguous renewal reads back");
+    assert_eq!(
+        bound,
+        Some(prior_expires),
+        "the readback carries the prior expiry so the shell can bound it"
     );
     shell.state.validate().expect("state invariant");
 }

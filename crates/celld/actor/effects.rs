@@ -1,3 +1,4 @@
+// Modified by ryuzcorp (ryuzcorp/celld): bound the renewal lease readback to half the remaining authority (upstream #264).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! Effect dispatch keeps ordinary work off the core's lease timer thread.
@@ -28,6 +29,10 @@ pub(crate) enum LeaseRequest {
     ReadSelf {
         op: OpId,
         node: String,
+        /// The prior record's peer-visible expiry for a renewal readback.
+        /// Bounds the read to half the remaining authority (upstream #264);
+        /// `None` (initial acquisition) reads unbounded.
+        authority_expires_ms: Option<u64>,
     },
     Cas {
         op: OpId,
@@ -81,8 +86,33 @@ impl StepOutput {
     pub(crate) fn lease(&mut self, request: LeaseRequest, ownership: &Ownership) {
         let ownership = ownership.clone();
         let future: EffectFuture = match request {
-            LeaseRequest::ReadSelf { op, node } => Box::pin(async move {
-                let result = ownership.read_self_node_lease(&node).await;
+            LeaseRequest::ReadSelf {
+                op,
+                node,
+                authority_expires_ms,
+            } => Box::pin(async move {
+                // A renewal readback that hangs on a stalled store wedges
+                // every renewal behind it until the fence timer, with proven
+                // headroom left (upstream #264). Bound it like the CAS arm
+                // and report a timeout as definite: a read commits nothing,
+                // and the core retries from preserved authority.
+                let result = match authority_expires_ms {
+                    Some(expires_ms) => {
+                        let remaining = expires_ms.saturating_sub(now_ms());
+                        let bound =
+                            std::time::Duration::from_millis((remaining / 2).clamp(250, 2_500));
+                        match crate::asyncrt::timeout(
+                            bound,
+                            ownership.read_self_node_lease(&node),
+                        )
+                        .await
+                        {
+                            Ok(result) => result,
+                            Err(_) => Err(Failure::Definite),
+                        }
+                    }
+                    None => ownership.read_self_node_lease(&node).await,
+                };
                 CompletedEffect::plain(Event::SelfNodeLeaseRead {
                     op,
                     now_ms: now_ms(),
