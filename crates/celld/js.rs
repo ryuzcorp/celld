@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): node:crypto scrypt; container exec resize op; cross-isolate RPC stubs and streams; test-only fake exec ops; fake kill completion op; exec reads survive their subscribing event; per-node Workers Cache API ops; tenant egress policy; D1 export operator-ingress marker; stateless attribution tokens; reaction-aware request resources; fake close/signal completion ops; binding-forgery enforcement; trusted cell RPC; Queue DLQ forward host op; DLQ forward caller identity; WebSocket and TCP socket ownership; receiver-held stream lifetime; deployment cache scope key; share the /bundle tree per deployment generation.; cancelled requests reject pending ops so co-awaiters settle (upstream #317); answered drivers poll while waitUntil background is outstanding (upstream #300); refused handoffs reject instead of dropping resolvers (upstream #309); facet adoption drops the restored flag (upstream #292); background expiry for orphaned drives (upstream #275); unrefed AbortSignal.timeout timer (upstream #306); loader-fetch 101 webSocket join (upstream #305).
+// Modified by ryuzcorp (ryuzcorp/celld): node:crypto scrypt; container exec resize op; cross-isolate RPC stubs and streams; test-only fake exec ops; fake kill completion op; exec reads survive their subscribing event; per-node Workers Cache API ops; tenant egress policy; D1 export operator-ingress marker; stateless attribution tokens; reaction-aware request resources; fake close/signal completion ops; binding-forgery enforcement; trusted cell RPC; Queue DLQ forward host op; DLQ forward caller identity; WebSocket and TCP socket ownership; receiver-held stream lifetime; deployment cache scope key; share the /bundle tree per deployment generation.; cancelled requests reject pending ops so co-awaiters settle (upstream #317); answered drivers poll while waitUntil background is outstanding (upstream #300); refused handoffs reject instead of dropping resolvers (upstream #309); facet adoption drops the restored flag (upstream #292); background expiry for orphaned drives (upstream #275); unrefed AbortSignal.timeout timer (upstream #306); loader-fetch 101 webSocket join (upstream #305); nodejs process.env population (upstream #296); writable request /tmp files (upstream #280).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 // The raw V8 adapter and its child modules remain outside the Actor execution
@@ -7360,6 +7360,7 @@ ops! { OP_NAMES, install_op_functions,
         "__vfs_mkdir" => op_vfs_mkdir,
         "__vfs_read_file" => op_vfs_read_file,
         "__vfs_stat" => op_vfs_stat,
+        "__vfs_write_file" => op_vfs_write_file,
         "__wait_until" => op_wait_until,
         "__wait_until_active" => op_wait_until_active,
         "__event_depth" => op_event_depth,
@@ -12075,6 +12076,7 @@ struct RequestVfs {
 /// would make a later file node indistinguishable from its parent directory.
 enum VfsNode {
     Directory { writable: bool },
+    File { bytes: Vec<u8> },
 }
 
 /// Test-only count of `/bundle` materializations, for the sharing test at
@@ -12214,18 +12216,36 @@ impl Default for InputGateClaims {
 }
 
 impl RequestVfs {
-    fn stat(&self, path: &str) -> Option<bool> {
+    /// The stat pair `op_vfs_stat` reports: kind 1 for a read-only directory,
+    /// 2 for a writable one, and 3 for a file with its byte size. `None`
+    /// means this tree claims nothing and the bundle projection is tried.
+    fn stat(&self, path: &str) -> Option<(u8, usize)> {
         self.nodes.get(path).map(|node| match node {
-            VfsNode::Directory { writable } => *writable,
+            VfsNode::Directory { writable } => (if *writable { 2 } else { 1 }, 0),
+            VfsNode::File { bytes } => (3, bytes.len()),
         })
+    }
+
+    fn read_file(&self, path: &str) -> Option<Vec<u8>> {
+        match self.nodes.get(path) {
+            Some(VfsNode::File { bytes }) => Some(bytes.clone()),
+            _ => None,
+        }
     }
 
     fn mkdir(&mut self, path: &str, recursive: bool) -> VfsMkdirResult {
         if path != "/tmp" && !path.starts_with("/tmp/") {
             return VfsMkdirResult::Error("EPERM");
         }
-        if self.stat(path).is_some() {
-            return VfsMkdirResult::Created(None);
+        match self.nodes.get(path) {
+            // An existing directory is success; a file is not a directory.
+            // Recursive creation tolerates any existing leaf, as Node does.
+            Some(VfsNode::Directory { .. }) => return VfsMkdirResult::Created(None),
+            Some(VfsNode::File { .. }) if recursive => {
+                return VfsMkdirResult::Created(None);
+            }
+            Some(VfsNode::File { .. }) => return VfsMkdirResult::Error("EEXIST"),
+            None => {}
         }
         if recursive {
             let mut current = "/tmp".to_string();
@@ -12233,13 +12253,19 @@ impl RequestVfs {
             for segment in path.trim_start_matches("/tmp/").split('/') {
                 current.push('/');
                 current.push_str(segment);
-                if self
-                    .nodes
-                    .insert(current.clone(), VfsNode::Directory { writable: true })
-                    .is_none()
-                    && first_created.is_none()
-                {
-                    first_created = Some(current.clone());
+                match self.nodes.get(&current) {
+                    // A file in the middle of the path is not a directory.
+                    Some(VfsNode::File { .. }) => {
+                        return VfsMkdirResult::Error("ENOTDIR");
+                    }
+                    Some(VfsNode::Directory { .. }) => {}
+                    None => {
+                        self.nodes
+                            .insert(current.clone(), VfsNode::Directory { writable: true });
+                        if first_created.is_none() {
+                            first_created = Some(current.clone());
+                        }
+                    }
                 }
             }
             return VfsMkdirResult::Created(first_created);
@@ -12255,12 +12281,36 @@ impl RequestVfs {
                     }
                 },
             );
-        if self.stat(parent).is_none() {
-            return VfsMkdirResult::Error("ENOENT");
+        match self.nodes.get(parent) {
+            Some(VfsNode::Directory { .. }) => {}
+            Some(VfsNode::File { .. }) => return VfsMkdirResult::Error("ENOTDIR"),
+            None => return VfsMkdirResult::Error("ENOENT"),
         }
         self.nodes
             .insert(path.to_string(), VfsNode::Directory { writable: true });
         VfsMkdirResult::Created(None)
+    }
+
+    /// Store `bytes` at `path`, creating or replacing a file. Only `/tmp`
+    /// is writable, the parent must be a directory that exists, and a
+    /// directory is never overwritten by a file.
+    fn write_file(&mut self, path: &str, bytes: Vec<u8>) -> Result<(), &'static str> {
+        if path == "/tmp" || !path.starts_with("/tmp/") {
+            return Err("EPERM");
+        }
+        let Some((parent, _)) = path.rsplit_once('/') else {
+            return Err("ENOENT");
+        };
+        let parent = if parent.is_empty() { "/" } else { parent };
+        match self.nodes.get(parent) {
+            Some(VfsNode::Directory { .. }) => {}
+            _ => return Err("ENOENT"),
+        }
+        if matches!(self.nodes.get(path), Some(VfsNode::Directory { .. })) {
+            return Err("EISDIR");
+        }
+        self.nodes.insert(path.to_string(), VfsNode::File { bytes });
+        Ok(())
     }
 }
 
@@ -13347,7 +13397,7 @@ fn op_vfs_stat(
             .stat(&path)
     });
     let (kind, size) = match vfs {
-        Some(writable) => (if writable { 2 } else { 1 }, 0),
+        Some(pair) => pair,
         // Only a path the writable tree does not claim can be a bundle path,
         // so the request tree stays authoritative for `/tmp`.
         None => match bundle_node(scope, &path) {
@@ -13357,7 +13407,7 @@ fn op_vfs_stat(
         },
     };
     let pair = v8::Array::new(scope, 2);
-    let kind = v8::Integer::new(scope, kind).into();
+    let kind = v8::Integer::new(scope, i32::from(kind)).into();
     let size = v8::Number::new(scope, size as f64).into();
     pair.set_index(scope, 0, kind);
     pair.set_index(scope, 1, size);
@@ -13379,15 +13429,32 @@ fn bundle_node(scope: &mut v8::PinScope, path: &str) -> Option<BundleStat> {
     }
 }
 
-/// Read a whole bundle file. Returns an `ArrayBuffer` of the module's bytes,
-/// or `null` when the path is not a bundle file, so the caller raises the
-/// `ENOENT` that names the syscall it was performing.
+/// Read a whole request-`/tmp` file, then a bundle file. Returns an
+/// `ArrayBuffer` of the file's bytes, or `null` when the path is neither, so
+/// the caller raises the `ENOENT` that names the syscall it was performing.
+/// A file the request wrote shadows the bundle, as the stat above does.
 fn op_vfs_read_file(
     scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
     let path = args.get(0).to_rust_string_lossy(scope);
+    // As for `mkdir`: a continuation resumed in a foreign checkpoint reads
+    // its own request's `/tmp`, never the turn owner's.
+    if let Some(context) = reaction_or_current_context(scope) {
+        let bytes = context
+            .vfs
+            .get_or_init(|| Mutex::new(RequestVfs::default()))
+            .lock()
+            .unwrap()
+            .read_file(&path);
+        if let Some(bytes) = bytes {
+            let store = v8::ArrayBuffer::new_backing_store_from_vec(bytes).make_shared();
+            let buffer = v8::ArrayBuffer::with_backing_store(scope, &store);
+            rv.set(buffer.into());
+            return;
+        }
+    }
     let Some(bundle) = scope.get_slot::<Arc<BundleFs>>().cloned() else {
         return;
     };
@@ -13400,6 +13467,42 @@ fn op_vfs_read_file(
     let store = v8::ArrayBuffer::new_backing_store_from_vec(bytes.to_vec()).make_shared();
     let buffer = v8::ArrayBuffer::with_backing_store(scope, &store);
     rv.set(buffer.into());
+}
+
+/// Store bytes at a request-`/tmp` path. Answers `""` on success and a Node
+/// error code otherwise — the same disjoint representation `op_vfs_mkdir`
+/// uses, so no JS object is allocated per written file.
+fn op_vfs_write_file(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let path = args.get(0).to_rust_string_lossy(scope);
+    let bytes = match view_bytes(args.get(1)) {
+        Some(bytes) => bytes,
+        None => {
+            let code = v8::String::new(scope, "EINVAL").unwrap();
+            rv.set(code.into());
+            return;
+        }
+    };
+    // As for `mkdir`: the tree belongs to the entry whose code is running.
+    let Some(context) = reaction_or_current_context(scope) else {
+        let code = v8::String::new(scope, "ENOENT").unwrap();
+        rv.set(code.into());
+        return;
+    };
+    let result = context
+        .vfs
+        .get_or_init(|| Mutex::new(RequestVfs::default()))
+        .lock()
+        .unwrap()
+        .write_file(&path, bytes);
+    let result = match result {
+        Ok(()) => String::new(),
+        Err(code) => code.to_string(),
+    };
+    rv.set(v8::String::new(scope, &result).unwrap().into());
 }
 
 fn op_wait_until<'s>(
