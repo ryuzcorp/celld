@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): round-level fence settlement (0062); renewal lease readback carries the authority bound (upstream #264); lease CAS conflict outcome (upstream #239).
+// Modified by ryuzcorp (ryuzcorp/celld): round-level fence settlement (0062); renewal lease readback carries the authority bound (upstream #264); lease CAS conflict outcome (upstream #239); RestartRuntime event (upstream #291).
 // Modified by ryuzcorp (ryuzcorp/celld): ported from meln1k/celld: seal a dead lease that never opened a log (01522b3); shared bucket-posture ownership reads across concurrent gates (0056).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
@@ -870,6 +870,11 @@ pub enum Event {
     /// policy drivers use this input; the Actor uses `EvictRequested` so a
     /// refusal or an interrupted operation cannot look like success.
     Evict {
+        cell: CellId,
+    },
+    /// The cell's SQLite destroyed a transaction, so its runtime fails every
+    /// later event. Restart the runtime at its next safe point, as a swap does.
+    RestartRuntime {
         cell: CellId,
     },
     /// Try an explicit eviction now and report admission before its effects

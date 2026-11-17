@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): round-level fence settlement (0062); renewal lease readback carries the authority bound (upstream #264); first alarm-deadline expiry only marks the firing (upstream #256); same-guard retry on lease conflicts (upstream #239).
+// Modified by ryuzcorp (ryuzcorp/celld): round-level fence settlement (0062); renewal lease readback carries the authority bound (upstream #264); first alarm-deadline expiry only marks the firing (upstream #256); same-guard retry on lease conflicts (upstream #239); storage-poisoned runtimes restart on their own generation (upstream #291).
 // Modified by ryuzcorp (ryuzcorp/celld): ported from meln1k/celld: coordination-core fixes (ea471ee, e46a685, 6d61462, 18d3bf9, 9d4c163, 468b456, 01522b3, b026226, 65fdb13); shared bucket-posture ownership reads across concurrent gates (0056).
 // Modified by ryuzcorp (ryuzcorp/celld): MergeTree-style lazy handoff policy (0078).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
@@ -541,6 +541,9 @@ struct Cell {
     /// swap, stopped, or starting again. Cleared when it publishes, and by
     /// any phase change that leaves the swap path.
     swapping: bool,
+    /// The swap pump moves this cell even on the current generation, because
+    /// its runtime cannot serve until the restart reopens its database.
+    restart: bool,
     /// A forced swap already cancelled this cell's activity. It asks once.
     swap_cancelled: bool,
     /// The queue deadline now watching this cell, if it is parked. A timer
@@ -690,6 +693,7 @@ impl Default for Cell {
             isolate: None,
             generation: 0,
             swapping: false,
+            restart: false,
             swap_cancelled: false,
             queued_generation: None,
             eviction_refused_mono_ms: None,
@@ -5139,6 +5143,8 @@ impl State {
             Ok(()) => {
                 cell.isolate = isolate;
                 cell.generation = generation;
+                // Every start opens the database again, so a pending restart is moot.
+                cell.restart = false;
                 let next = self.cell_op(&id);
                 set_phase(
                     &mut self.occupied,
@@ -5609,11 +5615,8 @@ impl State {
     /// a Cloudflare deployment does to every object unconditionally. The
     /// hibernatable sockets survive either way.
     fn pump_swap(&mut self, effects: &mut Vec<Effect>) {
-        if self.current_generation == 0
-            || self.draining
-            || self.fenced
-            || !self.node_authoritative()
-        {
+        // Before any announcement only a marked restart is stale.
+        if self.draining || self.fenced || !self.node_authoritative() {
             return;
         }
         let current = self.current_generation;
@@ -5631,12 +5634,13 @@ impl State {
                     && !cell.swapping
                     && !cell.quiescing
                     && cell.releasing.is_none()
-                    && cell.generation != current
+                    && (cell.restart || (current != 0 && cell.generation != current))
             })
             .map(|(id, _)| id.clone())
             .collect();
         for id in stale.into_iter().take(room) {
             let cell = self.cells.get_mut(&id).expect("stale cell listed above");
+            cell.restart = false;
             cell.swapping = true;
             cell.quiescing = true;
             self.quiescing_cells.insert(id);
@@ -5786,6 +5790,20 @@ impl State {
     /// this node to drop the cell, not to give it away.
     fn evict(&mut self, id: &str, effects: &mut Vec<Effect>) {
         let _ = self.begin_eviction(id, false, effects);
+    }
+
+    /// Mark a resident cell for the swap pump. A cell already on the swap
+    /// path, or leaving residency, reopens its database without this.
+    fn restart_runtime(&mut self, id: &str) {
+        if let Some(cell) = self.cells.get_mut(id) {
+            if matches!(cell.phase, Phase::Resident { .. })
+                && !cell.swapping
+                && !cell.quiescing
+                && cell.releasing.is_none()
+            {
+                cell.restart = true;
+            }
+        }
     }
 
     fn evict_requested(&mut self, request: RequestId, id: CellId, effects: &mut Vec<Effect>) {
@@ -7345,6 +7363,7 @@ pub fn on_event(state: &mut State, event: Event) -> Vec<Effect> {
             &mut effects,
         ),
         Event::Evict { cell } => state.evict(&cell, &mut effects),
+        Event::RestartRuntime { cell } => state.restart_runtime(&cell),
         Event::EvictRequested { request, cell, .. } => {
             state.evict_requested(request, cell, &mut effects)
         }
