@@ -1,4 +1,4 @@
-<!-- Modified by ryuzcorp (ryuzcorp/celld): node:crypto scrypt; cloned streaming bodies; cross-isolate RPC stubs and streams; per-node Workers Cache API; receiver-held RPC streams; AbortSignal.timeout is unreferenced (upstream #306); loader 101 webSocket target (upstream #305); loader sibling cloudflare:workers imports (upstream #304); AES-KW and symmetric JWK (upstream #295); EC raw point format (upstream #271); writable request /tmp, node:url file helpers, and the CELLD_TMP_MAX_BYTES /tmp cap (upstream #280).; workerd close codes (upstream #279). -->
+<!-- Modified by ryuzcorp (ryuzcorp/celld): node:crypto scrypt; cloned streaming bodies; cross-isolate RPC stubs and streams; per-node Workers Cache API; receiver-held RPC streams; AbortSignal.timeout is unreferenced (upstream #306); loader 101 webSocket target (upstream #305); loader sibling cloudflare:workers imports (upstream #304); AES-KW and symmetric JWK (upstream #295); EC raw point format (upstream #271); writable request /tmp, node:url file helpers, and the CELLD_TMP_MAX_BYTES /tmp cap (upstream #280).; workerd close codes (upstream #279).; fetch gzip/deflate decoding (upstream #238). -->
 # Cloudflare compatibility
 
 This page lists only the differences from the linked Cloudflare APIs. An entry
@@ -63,6 +63,10 @@ An unsupported feature that does not cause an error is a defect.
 ### [Fetch, Request, Response, and Headers](https://developers.cloudflare.com/workers/runtime-apis/fetch/)
 
 - The `cache` request option is unavailable.
+- A gzip or deflate response body decodes before delivery, unless the request
+  names `accept-encoding` (then the body arrives raw, as the Fetch standard
+  requires). `content-encoding` stays on the response, as in workerd; the
+  wire size no longer describes the body, so `content-length` is removed.
 - An inbound `Request` has a `cf` object without Cloudflare edge fields. celld
   cannot prove the geolocation, colo, or TLS metadata.
 - celld removes `Content-Length` from a Worker response, except for a `HEAD`

@@ -10639,6 +10639,12 @@ fn op_fetch(
                 name.eq_ignore_ascii_case("content-length")
                     || name.eq_ignore_ascii_case("transfer-encoding")
             });
+        // A worker-named `accept-encoding` takes the body raw, as the Fetch
+        // standard requires; otherwise the runtime owns the coding and a
+        // gzip/deflate body decodes (upstream #238).
+        let auto_decode = !headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("accept-encoding"));
         for (name, value) in headers {
             rb = rb.header(name, value);
         }
@@ -10679,7 +10685,8 @@ fn op_fetch(
         match sent {
             Ok(resp) => {
                 let status = resp.status().as_u16();
-                let headers = resp
+                let encoding = crate::http_streams::fetch_body_encoding(&resp, auto_decode);
+                let mut headers = resp
                     .headers()
                     .iter()
                     .map(|(name, value)| {
@@ -10691,9 +10698,20 @@ fn op_fetch(
                         )
                     })
                     .collect::<Vec<_>>();
-                let Some(stream_id) =
-                    stream_service.register_source(HttpStreamSource::Response(resp))
-                else {
+                let source = match encoding {
+                    crate::http_streams::FetchBodyEncoding::Identity => {
+                        HttpStreamSource::Response(resp)
+                    }
+                    coding => {
+                        // The wire size no longer describes the body.
+                        // `content-encoding` itself stays, as in workerd.
+                        headers.retain(|(name, _)| !name.eq_ignore_ascii_case("content-length"));
+                        HttpStreamSource::Stream(crate::http_streams::decoded_fetch_stream(
+                            resp, coding,
+                        ))
+                    }
+                };
+                let Some(stream_id) = stream_service.register_source(source) else {
                     let error = format!("fetch: {HTTP_STREAM_REGISTRATION_CLOSED}");
                     finish(false, Some(status), Some(error.clone()));
                     return Err(error);

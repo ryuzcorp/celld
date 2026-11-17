@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): WebSocket join tokens; joinable targets for loaded-worker 101s (upstream #305). Apache-2.0.
+// Modified by ryuzcorp (ryuzcorp/celld): WebSocket join tokens; joinable targets for loaded-worker 101s (upstream #305); transparent fetch gzip/deflate decode (upstream #238). Apache-2.0.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! The HTTP stream registry: request and response bodies that cross the host
@@ -1992,6 +1992,261 @@ pub(crate) async fn response_stream_close(
     Ok(())
 }
 
+/// How a fetch response body reaches the worker: as sent, or transparently
+/// decoded. workerd decodes a lone `gzip`/`x-gzip`/`deflate` content coding
+/// when the worker left `accept-encoding` to the runtime; an explicit worker
+/// coding, several codings, or anything else (notably `br`, which needs a
+/// decoder this build does not carry) passes through untouched.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FetchBodyEncoding {
+    Identity,
+    Gzip,
+    Deflate,
+}
+
+/// The response's content coding when the worker left `accept-encoding` to
+/// the runtime. `auto_decode` is false when the worker named its own coding,
+/// and then the body always passes through: decoding under an explicit
+/// coding would corrupt what the worker asked to see raw.
+pub(crate) fn fetch_body_encoding(
+    response: &reqwest::Response,
+    auto_decode: bool,
+) -> FetchBodyEncoding {
+    if !auto_decode {
+        return FetchBodyEncoding::Identity;
+    }
+    let mut codings = response
+        .headers()
+        .get_all(reqwest::header::CONTENT_ENCODING)
+        .iter();
+    let (Some(only), None) = (codings.next(), codings.next()) else {
+        return FetchBodyEncoding::Identity;
+    };
+    match only
+        .to_str()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "gzip" | "x-gzip" => FetchBodyEncoding::Gzip,
+        "deflate" => FetchBodyEncoding::Deflate,
+        _ => FetchBodyEncoding::Identity,
+    }
+}
+
+/// A fetch response body as a chunk stream with the transparent coding
+/// removed. The `content-encoding` header itself is retained — the caller
+/// keeps it — while `content-length` is the caller's to drop, since it names
+/// the wire size, not the decoded one.
+///
+/// The decoder is a live flate2 writer whose `Vec` sink is drained after
+/// every input chunk, the same shape `CompressionStream` uses: feeding is
+/// fallible chunk by chunk. A truncated body is an error, not a clean end:
+/// gzip's trailer check fails its `try_finish`, while the zlib arm tracks
+/// the deflate end marker itself — the write decoder's `try_finish` reports
+/// `Ok` for a body cut before its Adler-32 trailer, so reaching EOF without
+/// the marker is reported as a `response stream` error instead.
+pub(crate) fn decoded_fetch_stream(
+    response: reqwest::Response,
+    encoding: FetchBodyEncoding,
+) -> HttpChunkStream {
+    decode_chunk_stream(response.bytes_stream(), encoding)
+}
+
+fn decode_chunk_stream<S, E>(input: S, encoding: FetchBodyEncoding) -> HttpChunkStream
+where
+    S: futures_util::Stream<Item = Result<bytes::Bytes, E>> + Send + Unpin + 'static,
+    E: std::fmt::Display,
+{
+    use futures_util::StreamExt as _;
+    use std::io::Write as _;
+    enum Decoder {
+        // Multi-member: a valid body may concatenate gzip members back to
+        // back, and a single-member decoder rejects everything past the
+        // first trailer.
+        Gzip(flate2::write::MultiGzDecoder<Vec<u8>>),
+        Zlib(ZlibStreamDecoder),
+    }
+    /// A zlib-wrapped deflate stream driven directly so truncation is an
+    /// error. `write::ZlibDecoder::try_finish` returns `Ok` when the body
+    /// ends before its Adler-32 trailer — the decompressor only stalls,
+    /// waiting for input that never comes — so reaching EOF without
+    /// `Status::StreamEnd` is the truncation signal. The write decoder
+    /// itself exposes no end-of-stream status (flate2 1.1.9).
+    struct ZlibStreamDecoder {
+        decomp: flate2::Decompress,
+        out: Vec<u8>,
+        ended: bool,
+    }
+    impl ZlibStreamDecoder {
+        fn new() -> Self {
+            Self {
+                // `true`: the wire form carries a zlib header, not raw deflate.
+                decomp: flate2::Decompress::new(true),
+                out: Vec::new(),
+                ended: false,
+            }
+        }
+        fn truncated() -> std::io::Error {
+            std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "truncated zlib stream")
+        }
+        fn trailing() -> std::io::Error {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "trailing data after zlib stream end",
+            )
+        }
+        fn feed(&mut self, chunk: &[u8]) -> std::io::Result<Vec<u8>> {
+            use flate2::{FlushDecompress, Status};
+            if self.ended {
+                // The end marker already passed: bytes after it are an
+                // error, the way the write decoder rejects post-stream
+                // input, rather than a second stream.
+                if chunk.is_empty() {
+                    return Ok(Vec::new());
+                }
+                return Err(Self::trailing());
+            }
+            let mut input = chunk;
+            loop {
+                self.out.reserve(32 * 1024);
+                let before_in = self.decomp.total_in();
+                let before_out = self.decomp.total_out();
+                let status = self
+                    .decomp
+                    .decompress_vec(input, &mut self.out, FlushDecompress::None)
+                    .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+                input = &input[(self.decomp.total_in() - before_in) as usize..];
+                match status {
+                    Status::StreamEnd => {
+                        self.ended = true;
+                        if !input.is_empty() {
+                            return Err(Self::trailing());
+                        }
+                        break;
+                    }
+                    Status::Ok | Status::BufError => {
+                        if input.is_empty() {
+                            break;
+                        }
+                        if self.decomp.total_in() == before_in
+                            && self.decomp.total_out() == before_out
+                        {
+                            // Output room was reserved, so a stalled turn
+                            // with input left cannot progress: fail rather
+                            // than spin on it.
+                            return Err(Self::truncated());
+                        }
+                    }
+                }
+            }
+            Ok(std::mem::take(&mut self.out))
+        }
+        fn finish(&mut self) -> std::io::Result<Vec<u8>> {
+            use flate2::{FlushDecompress, Status};
+            if !self.ended {
+                // Drain what the stream holds, then require the end marker:
+                // a body cut before its trailer stalls here instead of
+                // ending, and that stall is the truncation error.
+                loop {
+                    self.out.reserve(32 * 1024);
+                    let before_out = self.decomp.total_out();
+                    let status = self
+                        .decomp
+                        .decompress_vec(&[], &mut self.out, FlushDecompress::Finish)
+                        .map_err(|error| {
+                            std::io::Error::new(std::io::ErrorKind::InvalidData, error)
+                        })?;
+                    if matches!(status, Status::StreamEnd) {
+                        self.ended = true;
+                        break;
+                    }
+                    if self.decomp.total_out() == before_out {
+                        return Err(Self::truncated());
+                    }
+                }
+            }
+            Ok(std::mem::take(&mut self.out))
+        }
+    }
+    impl Decoder {
+        fn feed(&mut self, chunk: &[u8]) -> std::io::Result<Vec<u8>> {
+            match self {
+                Decoder::Gzip(decoder) => {
+                    decoder.write_all(chunk)?;
+                    Ok(std::mem::take(decoder.get_mut()))
+                }
+                Decoder::Zlib(decoder) => decoder.feed(chunk),
+            }
+        }
+        fn finish(&mut self) -> std::io::Result<Vec<u8>> {
+            match self {
+                Decoder::Gzip(decoder) => {
+                    decoder.try_finish()?;
+                    Ok(std::mem::take(decoder.get_mut()))
+                }
+                Decoder::Zlib(decoder) => decoder.finish(),
+            }
+        }
+    }
+    struct DecodeState<S> {
+        input: S,
+        decoder: Decoder,
+        eof: bool,
+        finished: bool,
+    }
+    let decoder = match encoding {
+        FetchBodyEncoding::Gzip => Decoder::Gzip(flate2::write::MultiGzDecoder::new(Vec::new())),
+        FetchBodyEncoding::Deflate => Decoder::Zlib(ZlibStreamDecoder::new()),
+        FetchBodyEncoding::Identity => {
+            unreachable!("decoded_fetch_stream runs only for a coded body")
+        }
+    };
+    Box::pin(futures_util::stream::unfold(
+        DecodeState {
+            input,
+            decoder,
+            eof: false,
+            finished: false,
+        },
+        |mut state| async move {
+            loop {
+                if state.finished {
+                    return None;
+                }
+                if state.eof {
+                    match state.decoder.finish() {
+                        Ok(out) if out.is_empty() => return None,
+                        // Deliver the tail, then end: no more input can
+                        // follow a finished decoder.
+                        Ok(out) => {
+                            state.finished = true;
+                            return Some((Ok(out), state));
+                        }
+                        Err(error) => {
+                            return Some((Err(format!("response stream: {error}")), state));
+                        }
+                    }
+                }
+                match state.input.next().await {
+                    Some(Ok(chunk)) => match state.decoder.feed(&chunk) {
+                        Ok(out) if out.is_empty() => continue,
+                        Ok(out) => return Some((Ok(out), state)),
+                        Err(error) => {
+                            return Some((Err(format!("response stream: {error}")), state));
+                        }
+                    },
+                    Some(Err(error)) => {
+                        return Some((Err(format!("response stream: {error}")), state));
+                    }
+                    None => state.eof = true,
+                }
+            }
+        },
+    ))
+}
+
 /// Move a host response source into a directly-polled stream. No pump task is
 /// needed: the eventual HTTP or JS consumer supplies the backpressure.
 fn http_chunk_stream(source: HttpStreamSource) -> HttpChunkStream {
@@ -2139,4 +2394,124 @@ pub(crate) fn prepare_http_stream_tee(
 pub fn register_body_stream(stream: HttpChunkStream) -> Result<u64, String> {
     register_http_stream(HttpStreamSource::Stream(stream))
         .ok_or_else(|| HTTP_STREAM_REGISTRATION_CLOSED.to_string())
+}
+
+#[cfg(test)]
+mod decoded_stream_tests {
+    use super::{decode_chunk_stream, FetchBodyEncoding};
+    use futures_util::StreamExt as _;
+
+    fn chunk_stream(
+        chunks: Vec<Vec<u8>>,
+    ) -> impl futures_util::Stream<Item = Result<bytes::Bytes, std::io::Error>> + Send + 'static
+    {
+        futures_util::stream::iter(
+            chunks
+                .into_iter()
+                .map(|chunk| Ok::<bytes::Bytes, std::io::Error>(chunk.into())),
+        )
+    }
+
+    async fn collect(encoding: FetchBodyEncoding, chunks: Vec<Vec<u8>>) -> Result<Vec<u8>, String> {
+        let mut out = Vec::new();
+        let mut stream = decode_chunk_stream(chunk_stream(chunks), encoding);
+        while let Some(next) = stream.next().await {
+            out.extend_from_slice(&next?);
+        }
+        Ok(out)
+    }
+
+    fn gzip_member(data: &[u8]) -> Vec<u8> {
+        use std::io::Write as _;
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(data).expect("gzip fixture");
+        encoder.finish().expect("gzip fixture")
+    }
+
+    fn zlib_stream(data: &[u8]) -> Vec<u8> {
+        use std::io::Write as _;
+        let mut encoder =
+            flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(data).expect("zlib fixture");
+        encoder.finish().expect("zlib fixture")
+    }
+
+    #[tokio::test]
+    async fn gzip_single_member_decodes() {
+        let member = gzip_member(b"ab");
+        assert_eq!(
+            collect(FetchBodyEncoding::Gzip, vec![member]).await,
+            Ok(b"ab".to_vec()),
+        );
+    }
+
+    #[tokio::test]
+    async fn gzip_concatenated_members_decode_across_chunk_boundary() {
+        // A valid body may concatenate gzip members: the chunk split lands
+        // exactly on the member boundary, which a single-member decoder
+        // rejects as trailing data.
+        let first = gzip_member(b"a");
+        let second = gzip_member(b"b");
+        assert_eq!(
+            collect(FetchBodyEncoding::Gzip, vec![first, second]).await,
+            Ok(b"ab".to_vec()),
+        );
+    }
+
+    #[tokio::test]
+    async fn zlib_complete_stream_decodes_across_chunks() {
+        let body = zlib_stream(b"hello world");
+        let split = body.len() / 2;
+        assert_eq!(
+            collect(
+                FetchBodyEncoding::Deflate,
+                vec![body[..split].to_vec(), body[split..].to_vec()],
+            )
+            .await,
+            Ok(b"hello world".to_vec()),
+        );
+    }
+
+    #[tokio::test]
+    async fn zlib_truncated_trailer_is_an_error() {
+        // The Adler-32 trailer is missing: every byte decodes, but the
+        // stream never reached its end marker, so EOF is an error.
+        let mut body = zlib_stream(b"hello world");
+        body.truncate(body.len() - 4);
+        let error = collect(FetchBodyEncoding::Deflate, vec![body])
+            .await
+            .expect_err("truncated zlib must error");
+        assert!(
+            error.contains("response stream"),
+            "unexpected error: {error}",
+        );
+    }
+
+    #[tokio::test]
+    async fn zlib_truncated_midstream_is_an_error() {
+        let body = zlib_stream(b"hello world, hello world, hello world");
+        let error = collect(
+            FetchBodyEncoding::Deflate,
+            vec![body[..body.len() / 2].to_vec()],
+        )
+        .await
+        .expect_err("truncated zlib must error");
+        assert!(
+            error.contains("response stream"),
+            "unexpected error: {error}",
+        );
+    }
+
+    #[tokio::test]
+    async fn zlib_trailing_data_is_an_error() {
+        let mut body = zlib_stream(b"hello world");
+        body.extend_from_slice(b"XX");
+        let error = collect(FetchBodyEncoding::Deflate, vec![body])
+            .await
+            .expect_err("trailing data must error");
+        assert!(
+            error.contains("response stream"),
+            "unexpected error: {error}",
+        );
+    }
 }
