@@ -38,7 +38,9 @@ collector base URL in `CELLD_OTEL`, or keep `CELLD_OTEL=1` for the bucket.
 celld records a span for each stateless Worker request, each cell event (a
 fetch, an alarm, an RPC, a WebSocket message), each outbound `fetch()`, and
 each cell start. A span carries the request id, the cell, the isolate, the
-queue wait, the outbound URL and status, and the known durability facts.
+queue wait, the outbound URL and status, the incoming request method and
+response status, and the known durability facts. A handler that answers 5xx
+without throwing still marks its span an error.
 
 Each `console.log` line becomes a log record with the trace id and span id of
 its handler, across `await`. The record carries the console method's severity

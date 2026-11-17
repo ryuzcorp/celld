@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): node:crypto scrypt; container exec resize op; cross-isolate RPC stubs and streams; test-only fake exec ops; fake kill completion op; exec reads survive their subscribing event; per-node Workers Cache API ops; tenant egress policy; D1 export operator-ingress marker; stateless attribution tokens; reaction-aware request resources; fake close/signal completion ops; binding-forgery enforcement; trusted cell RPC; Queue DLQ forward host op; DLQ forward caller identity; WebSocket and TCP socket ownership; receiver-held stream lifetime; deployment cache scope key; share the /bundle tree per deployment generation.; cancelled requests reject pending ops so co-awaiters settle (upstream #317); answered drivers poll while waitUntil background is outstanding (upstream #300); refused handoffs reject instead of dropping resolvers (upstream #309); facet adoption drops the restored flag (upstream #292); background expiry for orphaned drives (upstream #275); unrefed AbortSignal.timeout timer (upstream #306); loader-fetch 101 webSocket join (upstream #305); nodejs process.env population (upstream #296); writable request /tmp files (upstream #280); synchronous loader abort publish (upstream #281); tenant fetch trusts the shared TLS roots (upstream #230); __traceparent op for handler-visible trace context (upstream #313).
+// Modified by ryuzcorp (ryuzcorp/celld): node:crypto scrypt; container exec resize op; cross-isolate RPC stubs and streams; test-only fake exec ops; fake kill completion op; exec reads survive their subscribing event; per-node Workers Cache API ops; tenant egress policy; D1 export operator-ingress marker; stateless attribution tokens; reaction-aware request resources; fake close/signal completion ops; binding-forgery enforcement; trusted cell RPC; Queue DLQ forward host op; DLQ forward caller identity; WebSocket and TCP socket ownership; receiver-held stream lifetime; deployment cache scope key; share the /bundle tree per deployment generation.; cancelled requests reject pending ops so co-awaiters settle (upstream #317); answered drivers poll while waitUntil background is outstanding (upstream #300); refused handoffs reject instead of dropping resolvers (upstream #309); facet adoption drops the restored flag (upstream #292); background expiry for orphaned drives (upstream #275); unrefed AbortSignal.timeout timer (upstream #306); loader-fetch 101 webSocket join (upstream #305); nodejs process.env population (upstream #296); writable request /tmp files (upstream #280); synchronous loader abort publish (upstream #281); tenant fetch trusts the shared TLS roots (upstream #230); __traceparent op for handler-visible trace context (upstream #313); incoming fetch answers record their HTTP status for spans (upstream #285).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 // The raw V8 adapter and its child modules remain outside the Actor execution
@@ -3590,6 +3590,11 @@ pub struct InFlight {
     /// the reason, not only that it failed. This also records an output-gate
     /// failure after a successful handler.
     failure: Option<String>,
+    /// The HTTP status the handler's response carried, when it answered a
+    /// fetch. A 5xx response without an exception still marks the span an
+    /// error (denoland/celld#285); without this the span only knew failures
+    /// that threw.
+    response_status: Option<u16>,
     /// The report owed to the loader isolate after this invocation retires.
     tail_report: Option<TailReportState>,
     /// The isolate this entry's ops belong to, so `abandon` can drop their
@@ -3658,6 +3663,12 @@ impl InFlight {
                         Ok(response) => report.response_status = Some(response.status),
                         Err(error) => report.record_failure(format!("{error:#}")),
                     }
+                }
+                // The span learns the response status even when nothing threw:
+                // a handler that returns a 5xx without an exception still
+                // marks its span an error (denoland/celld#285).
+                if let Ok(response) = &read {
+                    self.response_status = Some(response.status);
                 }
                 send_and_end(tc, &self.context, reply, read)
             }
@@ -3972,6 +3983,11 @@ impl InFlight {
     /// Why the event failed, when a sampled trace captured it.
     pub fn failure(&self) -> Option<&str> {
         self.failure.as_deref()
+    }
+
+    /// The HTTP status the handler's response carried, if it answered a fetch.
+    pub fn response_status(&self) -> Option<u16> {
+        self.response_status
     }
 
     pub(crate) fn finish_tail_report(&mut self) {
@@ -5017,6 +5033,7 @@ fn begin<'s>(
                 background_since: None,
                 trace: None,
                 failure: None,
+                response_status: None,
                 tail_report,
             };
             drop(guard);
@@ -5117,6 +5134,7 @@ fn begin_entrypoint_rpc(
                 background_since: None,
                 trace: None,
                 failure: None,
+                response_status: None,
                 tail_report: None,
             };
             drop(guard);
@@ -5362,6 +5380,7 @@ fn begin_queue(
                 background_since: None,
                 trace: None,
                 failure: None,
+                response_status: None,
                 tail_report: None,
             };
             drop(guard);
@@ -5548,6 +5567,7 @@ fn start_cell_event<'s>(
                 background_since: None,
                 trace: None,
                 failure: None,
+                response_status: None,
                 tail_report: None,
             };
             restore_io_context(tc, previous_io_context);
@@ -5604,6 +5624,7 @@ fn start_cell_event<'s>(
                     background_since: None,
                     trace: None,
                     failure: Some(failure),
+                    response_status: None,
                     tail_report: None,
                 }))
             };
