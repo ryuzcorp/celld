@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): parse OTEL_RESOURCE_ATTRIBUTES into the OTLP resource (upstream #314)
+// Modified by ryuzcorp (ryuzcorp/celld): parse OTEL_RESOURCE_ATTRIBUTES into the OTLP resource (upstream #314); incoming spans carry HTTP method (upstream #285)
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 // Telemetry is observational and does not affect Actor decisions.
@@ -414,6 +414,10 @@ pub struct Span {
     pub isolate: Option<u64>,
     pub queue_wait_us: Option<i64>,
     pub url: Option<String>,
+    /// The incoming request's HTTP method, on server spans. OTel names this
+    /// `http.request.method`; without it a trace backend cannot break an
+    /// incoming span down by method (denoland/celld#285).
+    pub http_method: Option<String>,
     pub http_status: Option<u16>,
     /// `Some(true)` for a parent extracted from a caller's traceparent,
     /// `Some(false)` for an in-process parent, `None` for a root.
@@ -475,6 +479,19 @@ impl Severity {
 }
 
 impl Span {
+    /// Fold a finished incoming fetch into a server span: the response
+    /// status when the handler answered, and an error when that status is
+    /// 5xx even though nothing threw. A handler that returns a 503 without
+    /// an exception used to leave the span successful with no status at all
+    /// (denoland/celld#285).
+    pub fn finish_http(&mut self, status: Option<u16>) {
+        self.http_status = status;
+        if self.ok && status.is_some_and(|status| status >= 500) {
+            self.ok = false;
+            self.error = status.map(|status| format!("handler returned HTTP {status}"));
+        }
+    }
+
     pub fn new(ids: TraceIds, name: &'static str, kind: u8) -> Span {
         Span {
             ids,
@@ -491,6 +508,7 @@ impl Span {
             isolate: None,
             queue_wait_us: None,
             url: None,
+            http_method: None,
             http_status: None,
             parent_remote: None,
         }
@@ -515,6 +533,7 @@ impl Event {
                     + LEN(&span.request_id)
                     + LEN(&span.cell)
                     + LEN(&span.url)
+                    + LEN(&span.http_method)
             }
             Event::Log(log) => 40 + log.body.len(),
         }
@@ -1213,6 +1232,7 @@ message celld_span {
   optional int64 isolate;
   optional int64 queue_wait_us;
   optional binary url (STRING);
+  optional binary http_method (STRING);
   optional int32 http_status (INTEGER(16,false));
   optional boolean parent_remote;
 }";
@@ -1303,6 +1323,7 @@ pub fn encode_spans(spans: &[Span], node: &str, region: &str) -> anyhow::Result<
     column!(Int64Type, opt each.clone().map(|s| s.isolate.map(|v| v as i64)).collect::<Vec<_>>());
     column!(Int64Type, opt each.clone().map(|s| s.queue_wait_us).collect::<Vec<_>>());
     column!(ByteArrayType, opt each.clone().map(|s| s.url.as_deref().map(text)).collect::<Vec<_>>());
+    column!(ByteArrayType, opt each.clone().map(|s| s.http_method.as_deref().map(text)).collect::<Vec<_>>());
     column!(Int32Type, opt each.clone().map(|s| s.http_status.map(|v| v as i32)).collect::<Vec<_>>());
     column!(BoolType, opt each.clone().map(|s| s.parent_remote).collect::<Vec<_>>());
 

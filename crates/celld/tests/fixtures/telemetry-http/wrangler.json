@@ -1,0 +1,7 @@
+{
+  "name": "telemetry-http",
+  "main": "worker.js",
+  "compatibility_date": "2026-01-01",
+  "durable_objects": { "bindings": [{ "name": "PROBE", "class_name": "Probe" }] },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Probe"] }]
+}

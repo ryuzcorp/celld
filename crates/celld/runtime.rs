@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): cross-isolate RPC stubs and streams; D1 export operator-ingress marker; ported from meln1k/celld: report wake coverage after maintenance (e6cb9a3); wake coverage follow-ups: startup observation ordering, installation comparison; trusted cell RPC; deployment cache scope purge on generation free; staged invoke joins the driver past the reply.; answered drivers poll while waitUntil background is outstanding (upstream #300); drivers take the mailbox once more before retiring (upstream #309); post-response background budget ends orphaned drives (upstream #275); storage-poisoned cells restart on a fresh isolate (upstream #291); restore fails a vanished class before touching disk (upstream #276).
+// Modified by ryuzcorp (ryuzcorp/celld): cross-isolate RPC stubs and streams; D1 export operator-ingress marker; ported from meln1k/celld: report wake coverage after maintenance (e6cb9a3); wake coverage follow-ups: startup observation ordering, installation comparison; trusted cell RPC; deployment cache scope purge on generation free; staged invoke joins the driver past the reply.; answered drivers poll while waitUntil background is outstanding (upstream #300); drivers take the mailbox once more before retiring (upstream #309); post-response background budget ends orphaned drives (upstream #275); storage-poisoned cells restart on a fresh isolate (upstream #291); restore fails a vanished class before touching disk (upstream #276); incoming spans carry HTTP method/status and 5xx without exception marks error (upstream #285).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 // RuntimeManager is the V8 cell-host arm, so its executor and observability
@@ -2815,6 +2815,9 @@ async fn wake(ops: &mut Ops, entry: &mut js::InFlight, budget: Duration) -> Wake
 /// spans every turn the request took rather than one uninterrupted run.
 struct StatelessTiming {
     queued_at: Instant,
+    /// The incoming HTTP method, for the span. `None` for queue batches and
+    /// RPC dispatches, which are not HTTP fetches.
+    method: Option<String>,
     request_id: Option<js::RequestId>,
     node: Arc<str>,
     region: Arc<str>,
@@ -2828,6 +2831,9 @@ struct StatelessTiming {
     remote_parent: Option<crate::telemetry::ParentContext>,
     /// Why the handler failed, read from the entry when it was answered.
     failure: Option<String>,
+    /// The HTTP status the handler's response carried, read alongside the
+    /// failure for the same reason.
+    status: Option<u16>,
     span_name: &'static str,
     span_kind: u8,
 }
@@ -2841,13 +2847,15 @@ impl StatelessTiming {
         trace: Option<crate::telemetry::TraceIds>,
         remote_parent: Option<crate::telemetry::ParentContext>,
     ) -> Self {
-        let (queued_at, request_id, span_name, span_kind) = match job {
+        let (queued_at, method, request_id, span_name, span_kind) = match job {
             crate::WorkerJob::Fetch {
                 queued_at,
+                method,
                 request_id,
                 ..
             } => (
                 *queued_at,
+                Some(method.clone()),
                 *request_id,
                 "celld.fetch",
                 crate::telemetry::KIND_SERVER,
@@ -2855,11 +2863,13 @@ impl StatelessTiming {
             crate::WorkerJob::Queue { queued_at, .. } => (
                 *queued_at,
                 None,
+                None,
                 "celld.queue",
                 crate::telemetry::KIND_CONSUMER,
             ),
             crate::WorkerJob::Rpc { .. } => (
                 Instant::now(),
+                None,
                 None,
                 "celld.fetch",
                 crate::telemetry::KIND_SERVER,
@@ -2867,6 +2877,7 @@ impl StatelessTiming {
         };
         StatelessTiming {
             queued_at,
+            method,
             request_id,
             node,
             region,
@@ -2876,6 +2887,7 @@ impl StatelessTiming {
             trace,
             remote_parent,
             failure: None,
+            status: None,
             span_name,
             span_kind,
         }
@@ -2889,6 +2901,7 @@ impl StatelessTiming {
         }
         self.emitted = true;
         self.failure = entry.failure().map(str::to_string);
+        self.status = entry.response_status();
         self.emit();
     }
 
@@ -2900,6 +2913,8 @@ impl StatelessTiming {
             span.duration_us = total_us;
             span.ok = self.failure.is_none();
             span.error = self.failure.clone();
+            span.http_method = self.method.clone();
+            span.finish_http(self.status);
             span.request_id = self.request_id.map(js::request_id_string);
             span.isolate = Some(self.isolate as u64);
             span.parent_span_id = self.remote_parent.map(|parent| parent.span_id);
@@ -3344,6 +3359,10 @@ async fn drive_worker_on_cell(affiliation: crate::pool::Affiliation, job: crate:
     let trace = crate::telemetry::start_trace_with_parent(remote.as_ref());
     let recording = trace.and_then(crate::telemetry::TraceContext::recording_ids);
     let span_started = recording.map(|_| (Instant::now(), crate::telemetry::now_unix_us()));
+    let method = match &job {
+        crate::WorkerJob::Fetch { method, .. } => Some(method.clone()),
+        _ => None,
+    };
     drive_worker(
         &slot,
         job,
@@ -3358,6 +3377,8 @@ async fn drive_worker_on_cell(affiliation: crate::pool::Affiliation, job: crate:
                 span.duration_us = started.elapsed().as_micros() as i64;
                 span.ok = entry.finished() && entry.failure().is_none();
                 span.error = entry.failure().map(str::to_string);
+                span.http_method = method.clone();
+                span.finish_http(entry.response_status());
                 span.parent_span_id = remote.map(|parent| parent.span_id);
                 span.parent_remote = remote.map(|_| true);
                 crate::telemetry::record(span);
@@ -3699,11 +3720,18 @@ async fn drive_cell_inner(
             #[cfg(celld_internal_tests)]
             CellJob::SyncErrorForTest { .. } => "celld.sync_error_test",
         };
+        // The RPC method names a stub method, not an HTTP request, so only a
+        // fetch contributes its method to the span.
+        let method = match &job {
+            CellJob::Fetch { method, .. } => Some(method.clone()),
+            _ => None,
+        };
         (
             name,
             job.scope().to_string(),
             Instant::now(),
             crate::telemetry::now_unix_us(),
+            method,
         )
     });
     let mut ops = Ops::new();
@@ -3957,7 +3985,7 @@ async fn drive_cell_inner(
         report_alarm_moves(&report, moves);
         alarm_write = write;
     }
-    if let (Some(ids), Some((name, cell, started, start_unix))) = (recording, span_seed) {
+    if let (Some(ids), Some((name, cell, started, start_unix, method))) = (recording, span_seed) {
         let kind = if name == "celld.cell_fetch" {
             crate::telemetry::KIND_SERVER
         } else {
@@ -3968,6 +3996,8 @@ async fn drive_cell_inner(
         span.duration_us = started.elapsed().as_micros() as i64;
         span.ok = entry.finished() && entry.failure().is_none();
         span.error = entry.failure().map(str::to_string);
+        span.http_method = method;
+        span.finish_http(entry.response_status());
         span.cell = Some(cell);
         span.parent_span_id = parent.map(|parent| parent.span_id);
         span.parent_remote = parent.map(|_| false);
