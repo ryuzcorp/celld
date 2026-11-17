@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): ported from meln1k/celld: scripted core-bug reproductions (ea471ee, e46a685, 6d61462, 18d3bf9, 9d4c163, 468b456, 01522b3, 65fdb13); shared bucket-posture ownership reads (0056); round-level fence settlement (0062); bucket-posture group commit: live-lease routing pin (0063); renewal readback authority bound (upstream #264).
+// Modified by ryuzcorp (ryuzcorp/celld): ported from meln1k/celld: scripted core-bug reproductions (ea471ee, e46a685, 6d61462, 18d3bf9, 9d4c163, 468b456, 01522b3, 65fdb13); shared bucket-posture ownership reads (0056); round-level fence settlement (0062); bucket-posture group commit: live-lease routing pin (0063); renewal readback authority bound (upstream #264); alarm deadline waits for the running copy (upstream #256).
 //! Scripted reproductions of core bugs the deterministic simulator
 //! (`crates/sim`) found. Each drives the core through a minimal shell that
 //! answers every effect at once, except the ones a test holds back to
@@ -409,6 +409,207 @@ fn a_failed_proof_settles_an_alarm_still_running() {
         now_mono_ms: MONO_MS,
         result: Ok((AlarmSnapshot::without_wake(None), true, Some(2))),
     });
+    shell.state.validate().expect("state invariant");
+}
+
+/// Renewals keep flowing while the alarm runs, as in production: without
+/// them the test node would lose authority and the timer under test would
+/// never fire for unrelated reasons.
+fn renew_lease(shell: &mut Shell, now_mono_ms: u64) {
+    let renew = shell
+        .timers
+        .iter()
+        .rev()
+        .find(|timer| matches!(timer, Timer::NodeLeaseRenew { .. }))
+        .cloned()
+        .expect("the held lease arms its renew timer");
+    shell.send(Event::TimerFired {
+        timer: renew,
+        now_ms: NOW_MS,
+        now_mono_ms,
+    });
+}
+
+/// Upstream #256: an alarm handler that outlives the operation deadline is
+/// still running, not failed, so the first deadline must not re-fire it.
+/// The repro armed a 20 s alarm under a 5 s deadline and got copies at 0,
+/// 5.5, 11 and 16.5 s. The first expiry now only marks the firing; the
+/// running copy settles the alarm when it answers, with no second `FireAlarm`.
+/// A second expiry with the op still outstanding treats the op as lost and
+/// re-fires, preserving at-least-once. Fail-before: the first expiry retired
+/// the op and re-armed, so the held effects held two concurrent `FireAlarm`s.
+#[test]
+fn an_alarm_deadline_waits_for_the_running_copy() {
+    let mut shell = Shell::new(4, |effect| {
+        matches!(effect, Effect::AwaitDurable { .. } | Effect::FireAlarm { .. })
+    });
+    shell.start();
+    shell.serve(1, "a");
+    shell.observe_alarm("a", NOW_MS as i64 - 1);
+    let alarm = shell
+        .timers
+        .iter()
+        .rev()
+        .find(|timer| matches!(timer, Timer::CellAlarm { .. }))
+        .cloned()
+        .expect("the observed alarm arms its timer");
+    let mut seen = shell.send(Event::TimerFired {
+        timer: alarm,
+        now_ms: NOW_MS,
+        now_mono_ms: MONO_MS,
+    });
+    let (op, cell, epoch) = shell
+        .held
+        .iter()
+        .find_map(|effect| match effect {
+            Effect::FireAlarm { op, cell, epoch, .. } => Some((*op, cell.clone(), *epoch)),
+            _ => None,
+        })
+        .expect("the due alarm fires");
+    for at in [MONO_MS + 4_000, MONO_MS + 7_000, MONO_MS + 10_000, MONO_MS + 13_000] {
+        renew_lease(&mut shell, at);
+    }
+    let deadline = shell
+        .timers
+        .iter()
+        .rev()
+        .find(|timer| matches!(timer, Timer::OperationDeadline { op: current } if current == &op))
+        .cloned()
+        .expect("the firing arms its deadline");
+    seen.extend(shell.send(Event::TimerFired {
+        timer: deadline,
+        now_ms: NOW_MS,
+        now_mono_ms: MONO_MS + 15_000,
+    }));
+    // The deadline marked the firing and re-armed its own timer, but fired
+    // nothing: still exactly one copy running. Firing the latest cell timer
+    // proves it: the old code re-armed a `CellAlarm` here whose tick starts
+    // the second copy, while the new code arms only the fallback deadline.
+    assert!(
+        seen.iter().any(|effect| matches!(
+            effect,
+            Effect::ScheduleTimer {
+                timer: Timer::OperationDeadline { op: current },
+                ..
+            } if current == &op
+        )),
+        "the first deadline re-arms its fallback"
+    );
+    if let Some(tick) = shell
+        .timers
+        .iter()
+        .rev()
+        .find(|timer| matches!(timer, Timer::CellAlarm { .. }))
+        .cloned()
+    {
+        shell.send(Event::TimerFired {
+            timer: tick,
+            now_ms: NOW_MS,
+            now_mono_ms: MONO_MS + 16_000,
+        });
+    }
+    assert_eq!(
+        shell
+            .held
+            .iter()
+            .filter(|effect| matches!(effect, Effect::FireAlarm { .. }))
+            .count(),
+        1,
+        "the first deadline must not re-fire a running alarm"
+    );
+    // The running copy answers late and settles the alarm: no refire, no
+    // dangling firing state.
+    shell.hold = |_| false;
+    let settled = shell.send(Event::AlarmFinished {
+        op,
+        cell,
+        epoch,
+        now_ms: NOW_MS,
+        now_mono_ms: MONO_MS + 20_000,
+        result: Ok((AlarmSnapshot::without_wake(None), true, None)),
+    });
+    assert!(
+        !settled.iter().any(|effect| matches!(effect, Effect::FireAlarm { .. })),
+        "the late answer settles without a second copy"
+    );
+    shell.state.validate().expect("state invariant");
+}
+
+/// The other half of upstream #256: an op that never answers is still a lost
+/// alarm, not a silent one. A second deadline expiry with the firing op
+/// still outstanding retires it exactly as a failed handler would, so the
+/// alarm re-fires. Fail-before: already re-fired at the first expiry.
+#[test]
+fn a_twice_expired_alarm_still_refires() {
+    let mut shell = Shell::new(4, |effect| {
+        matches!(effect, Effect::AwaitDurable { .. } | Effect::FireAlarm { .. })
+    });
+    shell.start();
+    shell.serve(1, "a");
+    shell.observe_alarm("a", NOW_MS as i64 - 1);
+    let alarm = shell
+        .timers
+        .iter()
+        .rev()
+        .find(|timer| matches!(timer, Timer::CellAlarm { .. }))
+        .cloned()
+        .expect("the observed alarm arms its timer");
+    shell.send(Event::TimerFired {
+        timer: alarm,
+        now_ms: NOW_MS,
+        now_mono_ms: MONO_MS,
+    });
+    let op = shell
+        .held
+        .iter()
+        .find_map(|effect| match effect {
+            Effect::FireAlarm { op, .. } => Some(*op),
+            _ => None,
+        })
+        .expect("the due alarm fires");
+    for at in [MONO_MS + 4_000, MONO_MS + 7_000, MONO_MS + 10_000, MONO_MS + 13_000] {
+        renew_lease(&mut shell, at);
+    }
+    for now_mono_ms in [MONO_MS + 15_000, MONO_MS + 30_000] {
+        if now_mono_ms == MONO_MS + 30_000 {
+            for at in [MONO_MS + 19_000, MONO_MS + 22_000, MONO_MS + 25_000, MONO_MS + 28_000] {
+                renew_lease(&mut shell, at);
+            }
+        }
+        let deadline = shell
+            .timers
+            .iter()
+            .rev()
+            .find(|timer| matches!(timer, Timer::OperationDeadline { op: current } if current == &op))
+            .cloned()
+            .expect("the firing arms its deadline");
+        shell.send(Event::TimerFired {
+            timer: deadline,
+            now_ms: NOW_MS,
+            now_mono_ms,
+        });
+    }
+    // The op never answered, so the second expiry retired it and re-armed:
+    // firing the re-armed cell timer starts the second copy.
+    let realarm = shell
+        .timers
+        .iter()
+        .rev()
+        .find(|timer| matches!(timer, Timer::CellAlarm { .. }))
+        .cloned()
+        .expect("the lost op re-arms the alarm");
+    shell.send(Event::TimerFired {
+        timer: realarm,
+        now_ms: NOW_MS,
+        now_mono_ms: MONO_MS + 31_000,
+    });
+    assert!(
+        shell.held.iter().any(|effect| matches!(
+            effect,
+            Effect::FireAlarm { op: current, .. } if current != &op
+        )),
+        "a lost alarm copy still re-fires"
+    );
     shell.state.validate().expect("state invariant");
 }
 
@@ -1545,3 +1746,4 @@ fn a_renewal_readback_carries_the_authority_bound() {
     );
     shell.state.validate().expect("state invariant");
 }
+
