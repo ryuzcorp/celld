@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): ported from meln1k/celld: scripted core-bug reproductions (ea471ee, e46a685, 6d61462, 18d3bf9, 9d4c163, 468b456, 01522b3, 65fdb13); shared bucket-posture ownership reads (0056); round-level fence settlement (0062); bucket-posture group commit: live-lease routing pin (0063); renewal readback authority bound (upstream #264); alarm deadline waits for the running copy (upstream #256); same-guard lease conflict retry (upstream #239); storage-poison restart pump (upstream #291).
+// Modified by ryuzcorp (ryuzcorp/celld): ported from meln1k/celld: scripted core-bug reproductions (ea471ee, e46a685, 6d61462, 18d3bf9, 9d4c163, 468b456, 01522b3, 65fdb13); shared bucket-posture ownership reads (0056); round-level fence settlement (0062); bucket-posture group commit: live-lease routing pin (0063); renewal readback authority bound (upstream #264); alarm deadline waits for the running copy (upstream #256); same-guard lease conflict retry (upstream #239); storage-poison restart pump (upstream #291); failed start disarms the restored alarm (upstream #276).
 //! Scripted reproductions of core bugs the deterministic simulator
 //! (`crates/sim`) found. Each drives the core through a minimal shell that
 //! answers every effect at once, except the ones a test holds back to
@@ -50,6 +50,7 @@ struct Shell {
     hold: fn(&Effect) -> bool,
     held: Vec<Effect>,
     timers: Vec<Timer>,
+    timer_at_mono: Vec<u64>,
 }
 
 impl Shell {
@@ -62,6 +63,7 @@ impl Shell {
             hold,
             held: Vec::new(),
             timers: Vec::new(),
+            timer_at_mono: Vec::new(),
         }
     }
 
@@ -100,8 +102,9 @@ impl Shell {
 
     fn answer(&mut self, effect: &Effect) -> Option<Event> {
         Some(match effect.clone() {
-            Effect::ScheduleTimer { timer, .. } => {
+            Effect::ScheduleTimer { timer, at_mono_ms } => {
                 self.timers.push(timer);
+                self.timer_at_mono.push(at_mono_ms);
                 return None;
             }
             Effect::ReadSelfNodeLease { op, .. } => Event::SelfNodeLeaseRead {
@@ -1898,4 +1901,275 @@ fn a_renewal_readback_carries_the_authority_bound() {
         "the readback carries the prior expiry so the shell can bound it"
     );
     shell.state.validate().expect("state invariant");
+}
+
+/// A restored overdue alarm must not hot-loop a cell whose runtime will not
+/// start. The failed start drops the in-process arming the restore seeded,
+/// so the timer's fire finds no alarm instead of reactivating the cell for
+/// another restore-then-fail cycle without application traffic
+/// (denoland/celld#276).
+#[test]
+fn a_failed_start_disarms_the_restored_alarm() {
+    let mut shell = Shell::new(2, |effect| {
+        matches!(effect, Effect::Restore { .. } | Effect::StartRuntime { .. })
+    });
+    shell.start();
+    shell.owners.insert(
+        "c".into(),
+        OwnerRecord {
+            node: Some("n0".into()),
+            epoch: 1,
+            etag: "owned".into(),
+        },
+    );
+    shell.send(Event::RequestAt {
+        request: 1,
+        cell: "c".into(),
+        now_mono_ms: MONO_MS,
+    });
+    let Some(Effect::Restore { op, .. }) = shell.held.pop() else {
+        panic!("expected a restore: {:?}", shell.held);
+    };
+    let effects = shell.send(Event::RestoreCompleted {
+        op,
+        result: Ok(celld_logic::RestoreOutcome {
+            restored: true,
+            alarm: Some(celld_logic::RestoredAlarm {
+                at_ms: NOW_MS as i64 - 1_000,
+                covered: true,
+            }),
+        }),
+    });
+    assert!(
+        effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::StartRuntime { .. })),
+        "a restored cell must start: {effects:?}"
+    );
+    let Some(Effect::StartRuntime { op, .. }) = shell.held.pop() else {
+        panic!("expected a runtime start: {:?}", shell.held);
+    };
+    let effects = shell.send(Event::RuntimeStarted {
+        op,
+        isolate: None,
+        generation: 0,
+        result: Err(celld_logic::Failure::Definite),
+    });
+    assert!(
+        effects.iter().any(|effect| matches!(
+            effect,
+            Effect::Complete {
+                request: 1,
+                result: Err(RequestError::RuntimeFailed),
+            }
+        )),
+        "the request must fail with the start: {effects:?}"
+    );
+    let Some(timer) = shell.timers.iter().find_map(|timer| match timer {
+        Timer::CellAlarm { cell, generation } if cell == "c" => Some(Timer::CellAlarm {
+            cell: cell.clone(),
+            generation: *generation,
+        }),
+        _ => None,
+    }) else {
+        panic!("the restored alarm must have scheduled a timer");
+    };
+    let effects = shell.send(Event::TimerFired {
+        timer,
+        now_ms: NOW_MS,
+        now_mono_ms: MONO_MS,
+    });
+    assert!(
+        !effects.iter().any(|effect| matches!(
+            effect,
+            Effect::ReadOwner { .. } | Effect::Restore { .. } | Effect::StartRuntime { .. }
+        )),
+        "a failed start must not reactivate on its restored alarm: {effects:?}"
+    );
+}
+
+/// A failed start must not lose an uncovered restored alarm. No wake entry
+/// exists for the scan to find, so the core re-arms the timer at scan pace:
+/// the bumped generation retires the restore's immediate timer, and the new
+/// timer reactivates the cell once per backoff. A second failure reschedules
+/// again instead of storming.
+#[test]
+fn a_failed_start_rearms_the_uncovered_restored_alarm_at_scan_pace() {
+    let mut shell = Shell::new(2, |effect| {
+        matches!(effect, Effect::Restore { .. } | Effect::StartRuntime { .. })
+    });
+    shell.start();
+    shell.owners.insert(
+        "c".into(),
+        OwnerRecord {
+            node: Some("n0".into()),
+            epoch: 1,
+            etag: "owned".into(),
+        },
+    );
+    shell.send(Event::RequestAt {
+        request: 1,
+        cell: "c".into(),
+        now_mono_ms: MONO_MS,
+    });
+    let Some(Effect::Restore { op, .. }) = shell.held.pop() else {
+        panic!("expected a restore: {:?}", shell.held);
+    };
+    let effects = shell.send(Event::RestoreCompleted {
+        op,
+        result: Ok(celld_logic::RestoreOutcome {
+            restored: true,
+            alarm: Some(celld_logic::RestoredAlarm {
+                at_ms: NOW_MS as i64 - 1_000,
+                covered: false,
+            }),
+        }),
+    });
+    assert!(
+        effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::StartRuntime { .. })),
+        "a restored cell must start: {effects:?}"
+    );
+    let Some(Effect::StartRuntime { op, .. }) = shell.held.pop() else {
+        panic!("expected a runtime start: {:?}", shell.held);
+    };
+    let effects = shell.send(Event::RuntimeStarted {
+        op,
+        isolate: None,
+        generation: 0,
+        result: Err(celld_logic::Failure::Definite),
+    });
+    assert!(
+        effects.iter().any(|effect| matches!(
+            effect,
+            Effect::Complete {
+                request: 1,
+                result: Err(RequestError::RuntimeFailed),
+            }
+        )),
+        "the request must fail with the start: {effects:?}"
+    );
+    // The restore's immediate timer plus the rearmed backoff one, waiting
+    // out the scan-pace backoff instead of firing at once.
+    let cell_timers: Vec<Timer> = shell
+        .timers
+        .iter()
+        .filter(|timer| matches!(timer, Timer::CellAlarm { cell, .. } if cell == "c"))
+        .cloned()
+        .collect();
+    assert_eq!(
+        cell_timers.len(),
+        2,
+        "a failed start re-arms the uncovered alarm: {:?}",
+        shell.timers
+    );
+    assert_eq!(
+        shell.timer_at_mono[shell.timers.len() - 1],
+        MONO_MS + 60_000,
+        "the re-armed timer waits out the scan-pace backoff"
+    );
+    // The restore's immediate timer is retired: firing it reactivates
+    // nothing.
+    let effects = shell.send(Event::TimerFired {
+        timer: cell_timers[0].clone(),
+        now_ms: NOW_MS,
+        now_mono_ms: MONO_MS,
+    });
+    assert!(
+        !effects.iter().any(|effect| matches!(
+            effect,
+            Effect::ReadOwner { .. } | Effect::Restore { .. } | Effect::StartRuntime { .. }
+        )),
+        "the retired immediate timer must not reactivate: {effects:?}"
+    );
+    // The rearmed timer reactivates the cell without new traffic.
+    let effects = shell.send(Event::TimerFired {
+        timer: cell_timers[1].clone(),
+        now_ms: NOW_MS,
+        now_mono_ms: MONO_MS,
+    });
+    assert!(
+        effects.iter().any(|effect| matches!(
+            effect,
+            Effect::ReadOwner { .. } | Effect::Restore { .. } | Effect::StartRuntime { .. }
+        )),
+        "the rearmed timer must reactivate the cell: {effects:?}"
+    );
+    // Complete the retry's restore and fail its start the same way: a second
+    // failure reschedules at the same pace instead of storming.
+    let Some(Effect::Restore { op, .. }) = shell.held.pop() else {
+        panic!("expected a restore on the retry: {:?}", shell.held);
+    };
+    let effects = shell.send(Event::RestoreCompleted {
+        op,
+        result: Ok(celld_logic::RestoreOutcome {
+            restored: true,
+            alarm: Some(celld_logic::RestoredAlarm {
+                at_ms: NOW_MS as i64 - 1_000,
+                covered: false,
+            }),
+        }),
+    });
+    assert!(
+        effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::StartRuntime { .. })),
+        "a restored cell must start: {effects:?}"
+    );
+    let Some(Effect::StartRuntime { op, .. }) = shell.held.pop() else {
+        panic!("expected a runtime restart: {:?}", shell.held);
+    };
+    shell.send(Event::RuntimeStarted {
+        op,
+        isolate: None,
+        generation: 0,
+        result: Err(celld_logic::Failure::Definite),
+    });
+    // The restore's immediate timer, the first re-arm, its scan-pace retry,
+    // the retry's own restore timer, and the second re-arm: every older
+    // timer stays retired and exactly one new generation waits.
+    let cell_timers: Vec<Timer> = shell
+        .timers
+        .iter()
+        .filter(|timer| matches!(timer, Timer::CellAlarm { cell, .. } if cell == "c"))
+        .cloned()
+        .collect();
+    assert_eq!(
+        cell_timers.len(),
+        5,
+        "each failure retires its timer and waits once: {:?}",
+        shell.timers
+    );
+    assert_eq!(
+        shell.timer_at_mono[shell.timers.len() - 1],
+        MONO_MS + 60_000,
+        "the second re-arm waits out the same backoff"
+    );
+    for stale in &cell_timers[..4] {
+        let effects = shell.send(Event::TimerFired {
+            timer: stale.clone(),
+            now_ms: NOW_MS,
+            now_mono_ms: MONO_MS,
+        });
+        assert!(
+            !effects.iter().any(|effect| matches!(
+                effect,
+                Effect::ReadOwner { .. } | Effect::Restore { .. } | Effect::StartRuntime { .. }
+            )),
+            "a retired timer must never reactivate: {effects:?}"
+        );
+    }
+    let effects = shell.send(Event::TimerFired {
+        timer: cell_timers[4].clone(),
+        now_ms: NOW_MS,
+        now_mono_ms: MONO_MS,
+    });
+    assert!(
+        effects.iter().any(|effect| matches!(
+            effect,
+            Effect::ReadOwner { .. } | Effect::Restore { .. } | Effect::StartRuntime { .. }
+        )),
+        "the latest re-armed timer must reactivate the cell: {effects:?}"
+    );
 }

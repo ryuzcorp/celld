@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): round-level fence settlement (0062); renewal lease readback carries the authority bound (upstream #264); first alarm-deadline expiry only marks the firing (upstream #256); same-guard retry on lease conflicts (upstream #239); storage-poisoned runtimes restart on their own generation (upstream #291).
+// Modified by ryuzcorp (ryuzcorp/celld): round-level fence settlement (0062); renewal lease readback carries the authority bound (upstream #264); first alarm-deadline expiry only marks the firing (upstream #256); same-guard retry on lease conflicts (upstream #239); storage-poisoned runtimes restart on their own generation (upstream #291); failed start disarms the restored alarm (upstream #276).
 // Modified by ryuzcorp (ryuzcorp/celld): ported from meln1k/celld: coordination-core fixes (ea471ee, e46a685, 6d61462, 18d3bf9, 9d4c163, 468b456, 01522b3, b026226, 65fdb13); shared bucket-posture ownership reads across concurrent gates (0056).
 // Modified by ryuzcorp (ryuzcorp/celld): MergeTree-style lazy handoff policy (0078).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
@@ -133,6 +133,14 @@ pub struct Claim {
 /// read plus a write, and a store answering ambiguously three times running is
 /// not about to start answering.
 pub const MAX_ACQUIRE_RECONCILES: u32 = 3;
+
+/// How long a failed start waits before retrying an uncovered restored alarm.
+/// The wake scan rediscovers covered alarms at about this pace; an uncovered
+/// one has no entry to find, so the core re-arms its timer this far out
+/// instead. One reactivation per backoff still heals a transient failure
+/// without traffic, while a start that never succeeds costs one restore per
+/// backoff instead of a hot loop (denoland/celld#276).
+const FAILED_START_ALARM_REARM_MS: u64 = 60_000;
 
 /// The two local upper bounds on reusing an observed remote lease.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -5158,6 +5166,54 @@ impl State {
                 });
             }
             Err(_) => {
+                // The restore may have armed the cell's alarm timer just
+                // before this start failed. A covered alarm stays
+                // discoverable through its wake entry, so drop that
+                // in-process arming: otherwise the overdue alarm fires
+                // immediately, reactivates the cell, and hot-loops restores
+                // against a start that will not succeed
+                // (denoland/celld#276). An uncovered alarm has no entry for
+                // the scan to find, so dropping it would leave the alarm
+                // undelivered until new traffic. Re-arm that one at scan
+                // pace instead: the bumped generation retires the restore's
+                // immediate timer, and the new timer reactivates the cell
+                // once per backoff rather than in a loop.
+                match cell.alarm.take() {
+                    Some(AlarmState::Armed {
+                        at_ms,
+                        covered: false,
+                        ..
+                    }) => {
+                        let generation = self.next_timer_generation;
+                        self.next_timer_generation = self
+                            .next_timer_generation
+                            .checked_add(1)
+                            .expect("timer generation exhausted");
+                        let (now_ms, now_mono_ms) = (self.now_ms, self.now_mono_ms);
+                        let due_mono_ms = now_mono_ms.saturating_add(
+                            u64::try_from(at_ms).unwrap_or(0).saturating_sub(now_ms),
+                        );
+                        cell.alarm = Some(AlarmState::Armed {
+                            at_ms,
+                            generation,
+                            covered: false,
+                        });
+                        effects.push(Effect::ScheduleTimer {
+                            timer: Timer::CellAlarm {
+                                cell: id.clone(),
+                                generation,
+                            },
+                            at_mono_ms: due_mono_ms
+                                .max(now_mono_ms.saturating_add(FAILED_START_ALARM_REARM_MS)),
+                        });
+                        self.probe(Probe::StartFailedRearmsAlarm);
+                    }
+                    taken => {
+                        if taken.is_some() {
+                            self.probe(Probe::StartFailedDisarmsAlarm);
+                        }
+                    }
+                }
                 set_phase(&mut self.occupied, &mut cell, Phase::Dormant { epoch });
                 self.finish_requests(&id, &mut cell, Err(RequestError::RuntimeFailed), effects);
                 resume_failed = cell.resume_demand;
