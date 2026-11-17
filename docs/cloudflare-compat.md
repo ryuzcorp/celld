@@ -1,4 +1,4 @@
-<!-- Modified by ryuzcorp (ryuzcorp/celld): node:crypto scrypt; cloned streaming bodies; cross-isolate RPC stubs and streams; per-node Workers Cache API; receiver-held RPC streams; AbortSignal.timeout is unreferenced (upstream #306). -->
+<!-- Modified by ryuzcorp (ryuzcorp/celld): node:crypto scrypt; cloned streaming bodies; cross-isolate RPC stubs and streams; per-node Workers Cache API; receiver-held RPC streams; AbortSignal.timeout is unreferenced (upstream #306); loader 101 webSocket target (upstream #305). -->
 # Cloudflare compatibility
 
 This page lists only the differences from the linked Cloudflare APIs. An entry
@@ -177,6 +177,10 @@ The `tail` and `email` handlers are unavailable.
   event with code 1006.
 - A Durable Object's `stub.fetch()` call rejects when the handler fails, on the
   owner node and on any other node.
+- A Worker Loader worker (`env.LOADER`) answers a WebSocket upgrade the same
+  way: a `101` response carrying `webSocket` routes to its target whether the
+  loaded worker made the socket itself or forwards the upgrade to a Durable
+  Object.
 
 ### [Web Crypto](https://developers.cloudflare.com/workers/runtime-apis/web-crypto/)
 

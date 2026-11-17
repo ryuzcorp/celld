@@ -3664,6 +3664,15 @@ impl Actor {
                 if let (Some(runtime), Some(op)) = (&self.host, alarm) {
                     runtime.abort_alarm(&cell, op);
                 }
+                // Pull endpoints the cell owns outlive output unregister:
+                // terminal consumption and request retirement do not cover
+                // cell-owned binds, so sweep them by scope first. The sweep
+                // discovers the cell's facet scopes through metadata the way
+                // `ws_close_scope` does, so it must run before the output
+                // loop below removes that metadata. Facet scopes die with
+                // their root; a released facet's own endpoints are swept by
+                // `ws_close_facet`.
+                crate::js::ws_pull_unregister_cell(&cell);
                 if !websockets.is_empty() {
                     if keep_hibernatable {
                         for websocket in &websockets {
