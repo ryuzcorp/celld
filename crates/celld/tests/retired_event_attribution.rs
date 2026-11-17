@@ -1,6 +1,6 @@
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 //
-// Modified by ryuzcorp (ryuzcorp/celld): retired-event attribution test. Apache-2.0.
+// Modified by ryuzcorp (ryuzcorp/celld): retired-event attribution test; cancelled-request shared-work regression tests (upstream #317). Apache-2.0.
 
 // A white-box driver test, not node code: it builds a Worker in-process and
 // runs its turns directly, so the execution boundary's injected
@@ -115,6 +115,34 @@ fn turn_once(worker: &mut Worker, url: &str) -> (u16, Vec<u8>) {
     (response.status, response.body)
 }
 
+/// Start one request that suspends, keeping its entry and reply channel open
+/// so the test can cancel or poll it like the driver would.
+fn begin_suspended(
+    worker: &mut Worker,
+    url: &str,
+    request_id: u128,
+) -> (
+    celld::js::InFlight,
+    tokio::sync::oneshot::Receiver<Result<celld::js::HttpResponse, anyhow::Error>>,
+    Vec<celld::js::Op>,
+) {
+    let (reply, receive) = tokio::sync::oneshot::channel();
+    let job = celld::WorkerJob::Fetch {
+        queued_at: Instant::now(),
+        entrypoint: None,
+        invocation_limits: None,
+        url: url.to_string(),
+        method: "GET".to_string(),
+        body: RequestBody::Bytes(bytes::Bytes::new()),
+        headers: Vec::new(),
+        request_id: Some(request_id),
+        tail_report: None,
+        reply,
+    };
+    let (entry, started) = worker.turn_begin(job, None);
+    (entry.expect("request starts"), receive, started)
+}
+
 #[test]
 fn retired_event_subrequest_work_fails_instead_of_charging_ambient() {
     ensure_engine();
@@ -187,6 +215,202 @@ export default {
   },
 };
 "#;
+
+const SHARED_FLIGHT: &str = r#"
+const flights = new Map();
+let outcomeA = "unset";
+let outcomeB = "unset";
+
+export default {
+  async fetch(request) {
+    const url = new URL(request.url);
+    if (url.pathname === "/start") {
+      // Shared work: a timer this white-box driver never polls, so it stays
+      // pending like an outbound fetch whose response never arrives.
+      const flight = new Promise((resolve) => setTimeout(resolve, 60000));
+      flights.set("k", flight);
+      try {
+        await flight;
+        outcomeA = "resolved";
+      } catch (error) {
+        outcomeA = "rejected:" + String((error && error.message) || error);
+      }
+      return Response.json({ outcomeA });
+    }
+    if (url.pathname === "/join") {
+      const flight = flights.get("k");
+      if (!flight) return Response.json({ error: "no-flight" });
+      try {
+        await flight;
+        outcomeB = "resolved";
+      } catch (error) {
+        outcomeB = "rejected:" + String((error && error.message) || error);
+      }
+      return Response.json({ outcomeB });
+    }
+    if (url.pathname === "/outcome") {
+      return Response.json({ outcomeA, outcomeB });
+    }
+    return new Response("not found", { status: 404 });
+  },
+};
+"#;
+
+/// A request whose client disconnects must settle the work it started, so a
+/// request awaiting the same promise answers instead of hanging to its
+/// budget (denoland/celld#317). Dropping the op's resolver left every
+/// co-awaiter's promise pending forever with nothing logged: the dropped
+/// timer op now fires its callback early, so the shared promise settles
+/// with the value the callback computes.
+#[test]
+fn cancelled_request_settles_shared_work_so_co_awaiters_answer() {
+    ensure_engine();
+    let mut worker = load_worker(SHARED_FLIGHT, "cancelled-shared-flight");
+
+    // A starts shared work and suspends on it; B awaits the same promise and
+    // holds no op of its own.
+    let (mut entry_a, mut reply_a, started_a) =
+        begin_suspended(&mut worker, "http://test/start", 31701);
+    assert_eq!(started_a.len(), 1, "A waits on its timer op");
+    drop(started_a);
+    let (mut entry_b, mut reply_b, started_b) =
+        begin_suspended(&mut worker, "http://test/join", 31702);
+    assert!(
+        started_b.is_empty(),
+        "B waits on A's promise, no op of its own"
+    );
+    drop(started_b);
+    assert!(reply_b.try_recv().is_err(), "B is still suspended");
+
+    // A's client disconnects before the work finishes.
+    celld::js::abort_request(31701);
+    let started = worker.turn_cancel(&mut entry_a);
+    drop(started);
+    drop(entry_a);
+
+    // B's handler must settle now instead of hanging: the dropped timer
+    // fired its callback early, so the shared promise resolved.
+    let started = worker.turn_poll(&mut entry_b);
+    drop(started);
+    let response = reply_b
+        .try_recv()
+        .expect("B answered after A was cancelled")
+        .unwrap_or_else(|error| panic!("B must answer, not fail: {error:#}"));
+    assert_eq!(response.status, 200);
+    let body: serde_json::Value = serde_json::from_slice(&response.body).expect("JSON body");
+    assert_eq!(body["outcomeB"], "resolved", "{body}");
+    drop(entry_b);
+
+    // A itself still failed with the disconnect; only the shared work it
+    // started settled, so its own catch observed the early firing too.
+    match reply_a
+        .try_recv()
+        .expect("A answered after its client left")
+    {
+        Ok(_) => panic!("cancelled A must fail"),
+        Err(error) => assert!(
+            format!("{error:#}").contains("disconnected"),
+            "{error:#}"
+        ),
+    }
+    let (status, body) = turn_once(&mut worker, "http://test/outcome");
+    assert_eq!(status, 200);
+    let outcome: serde_json::Value = serde_json::from_slice(&body).expect("JSON body");
+    assert_eq!(outcome["outcomeA"], "resolved", "{outcome}");
+}
+
+const SHARED_FETCH: &str = r#"
+const flights = new Map();
+let outcomeA = "unset";
+let outcomeB = "unset";
+
+export default {
+  async fetch(request) {
+    const url = new URL(request.url);
+    if (url.pathname === "/start") {
+      // Unroutable: the subrequest stays in flight until the client goes
+      // away, and the future is never polled in this driver. The op is
+      // created without I/O, so this needs no network.
+      const flight = fetch("http://10.255.255.1/slow")
+        .then((r) => r.text())
+        .catch((e) => `error:${e && e.name ? e.name : e}`);
+      flights.set("k", flight);
+      outcomeA = await flight;
+      return Response.json({ outcomeA });
+    }
+    if (url.pathname === "/join") {
+      const flight = flights.get("k");
+      if (!flight) return Response.json({ error: "no-flight" });
+      outcomeB = await flight;
+      return Response.json({ outcomeB });
+    }
+    if (url.pathname === "/outcome") {
+      return Response.json({ outcomeA, outcomeB });
+    }
+    return new Response("not found", { status: 404 });
+  },
+};
+"#;
+
+/// The fetch half of the same fix: a dropped subrequest rejects, and the
+/// fetch wrapper carries that rejection to every co-awaiter's `.catch`
+/// (denoland/celld#317). A subrequest has no value to produce early, so
+/// unlike a timer it cannot fire — it must fail loudly.
+#[test]
+fn cancelled_request_rejects_shared_fetch_so_co_awaiters_fail_loudly() {
+    ensure_engine();
+    let mut worker = load_worker(SHARED_FETCH, "cancelled-shared-fetch");
+
+    let (mut entry_a, mut reply_a, started_a) =
+        begin_suspended(&mut worker, "http://test/start", 31711);
+    assert!(
+        !started_a.is_empty(),
+        "A waits on its subrequest op"
+    );
+    drop(started_a);
+    let (mut entry_b, mut reply_b, started_b) =
+        begin_suspended(&mut worker, "http://test/join", 31712);
+    assert!(
+        started_b.is_empty(),
+        "B waits on A's promise, no op of its own"
+    );
+    drop(started_b);
+
+    celld::js::abort_request(31711);
+    let started = worker.turn_cancel(&mut entry_a);
+    drop(started);
+    drop(entry_a);
+
+    // The fetch wrapper turned the dropped op into a rejection, so both
+    // requests observed the disconnect instead of hanging.
+    let started = worker.turn_poll(&mut entry_b);
+    drop(started);
+    let response = reply_b
+        .try_recv()
+        .expect("B answered after A was cancelled")
+        .unwrap_or_else(|error| panic!("B must answer, not fail: {error:#}"));
+    assert_eq!(response.status, 200);
+    let body: serde_json::Value = serde_json::from_slice(&response.body).expect("JSON body");
+    assert_eq!(
+        body["outcomeB"], "error:Error",
+        "{body}"
+    );
+    drop(entry_b);
+    let (status, body) = turn_once(&mut worker, "http://test/outcome");
+    assert_eq!(status, 200);
+    let outcome: serde_json::Value = serde_json::from_slice(&body).expect("JSON body");
+    assert_eq!(outcome["outcomeA"], "error:Error", "{outcome}");
+    match reply_a
+        .try_recv()
+        .expect("A answered after its client left")
+    {
+        Ok(_) => panic!("cancelled A must fail"),
+        Err(error) => assert!(
+            format!("{error:#}").contains("disconnected"),
+            "{error:#}"
+        ),
+    }
+}
 
 #[test]
 fn retired_event_resource_accounting_throws_with_nothing_owned() {
