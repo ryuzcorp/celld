@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): D1 export operator-ingress marker; ported from meln1k/celld: report wake coverage after maintenance (e6cb9a3); shared-cell compat union; WebSocket join tokens; post-response background budget (upstream #275).
+// Modified by ryuzcorp (ryuzcorp/celld): D1 export operator-ingress marker; ported from meln1k/celld: report wake coverage after maintenance (e6cb9a3); shared-cell compat union; WebSocket join tokens; post-response background budget (upstream #275); nodejs process.env population flag (upstream #296).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! Engine-neutral types and helpers that the cell runtimes and the host
@@ -270,6 +270,11 @@ pub struct Compat {
     /// Queue bodies default to JSON on compatibility dates after 2024-03-18;
     /// older deployments retain the V8 structured-clone default.
     pub queue_json_messages: bool,
+    /// `nodejs_compat` (or the explicit `nodejs_compat_populate_process_env`):
+    /// worker vars populate `globalThis.process.env`, and `node:process` is
+    /// the global process object. Without it `process.env` stays empty, as
+    /// before.
+    pub nodejs_process_env: bool,
 }
 
 impl Compat {
@@ -320,6 +325,7 @@ impl Compat {
             websocket_standard_binary_type: self.websocket_standard_binary_type
                 || other.websocket_standard_binary_type,
             queue_json_messages: self.queue_json_messages || other.queue_json_messages,
+            nodejs_process_env: self.nodejs_process_env || other.nodejs_process_env,
         }
     }
 }

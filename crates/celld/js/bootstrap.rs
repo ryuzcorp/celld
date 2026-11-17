@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): facet adoption drops the restored flag (upstream #292).
+// Modified by ryuzcorp (ryuzcorp/celld): facet adoption drops the restored flag (upstream #292); nodejs process.env population (upstream #296).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! Isolate bootstrap: what a fresh context needs before user code runs.
@@ -596,6 +596,30 @@ pub(super) fn inject_compatibility_flags(scope: &mut v8::PinScope, compat: Compa
     Ok(())
 }
 
+/// Copy the worker's string vars into `globalThis.process.env`, in place.
+///
+/// Runs before the user module evaluates, so module-scope reads see the
+/// same values the handler's `env` argument carries. Only string entries
+/// cross: bindings are objects, and `process.env` is string-to-string.
+/// Gated on the `nodejs_compat` (or explicit populate) flag — without it
+/// `process.env` stays empty, as before. The object is mutated, never
+/// replaced, so a `node:process` named import bound at link time stays live.
+pub(super) fn populate_process_env(scope: &mut v8::PinScope, config: &WorkerConfig) -> Result<()> {
+    if !config.compat.nodejs_process_env || config.vars.is_empty() {
+        return Ok(());
+    }
+    let mut lines = String::from(
+        "const __pe = globalThis.process && globalThis.process.env;\n\
+         if (__pe) {\n",
+    );
+    for (name, value) in config.vars.as_slice() {
+        lines.push_str(&format!("__pe[{name:?}] = {value:?};\n"));
+    }
+    lines.push_str("}\n");
+    run_internal_snippet(scope, &lines).ok_or_else(|| anyhow!("process.env install failed"))?;
+    Ok(())
+}
+
 pub(super) fn build_env(scope: &mut v8::PinScope, config: &WorkerConfig) -> Result<()> {
     let script_name = config.script_name.as_str();
     let bindings = config.bindings.as_slice();
@@ -1025,12 +1049,14 @@ pub(super) fn inject_storage_compatibility(scope: &mut v8::PinScope, compat: Com
          c.compat.jsRpc = {};\n\
          c.compat.fetcherGetPutDelete = {};\n\
          c.compat.websocketStandardBinaryType = {};\n\
-         c.compat.queueJsonMessages = {};",
+         c.compat.queueJsonMessages = {};\n\
+         c.compat.nodejsProcessEnv = {};",
         compat.delete_all_deletes_alarm,
         compat.js_rpc,
         compat.fetcher_get_put_delete,
         compat.websocket_standard_binary_type,
         compat.queue_json_messages,
+        compat.nodejs_process_env,
     );
     run_internal_snippet(scope, &source).ok_or_else(|| anyhow!("compatibility install failed"))?;
     Ok(())
