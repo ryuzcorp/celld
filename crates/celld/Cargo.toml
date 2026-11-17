@@ -68,6 +68,7 @@ reqwest = { workspace = true, features = ["rustls-tls", "stream", "json"] }
 rusqlite = { workspace = true, features = ["backup", "bundled", "hooks", "serialize"] }
 sqlite-vec.workspace = true
 rustls.workspace = true
+rustls-native-certs.workspace = true
 rustls-webpki.workspace = true
 rsa.workspace = true
 scrypt.workspace = true
@@ -98,3 +99,4 @@ nix.workspace = true
 [dev-dependencies]
 futures = "0.3"
 lz4_flex.workspace = true
+rustls-pemfile = "2.2"
