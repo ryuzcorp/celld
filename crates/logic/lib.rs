@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): round-level fence settlement (0062).
+// Modified by ryuzcorp (ryuzcorp/celld): round-level fence settlement (0062); renewal lease readback carries the authority bound (upstream #264).
 // Modified by ryuzcorp (ryuzcorp/celld): ported from meln1k/celld: coordination-core fixes (ea471ee, e46a685, 6d61462, 18d3bf9, 9d4c163, 468b456, 01522b3, b026226, 65fdb13); shared bucket-posture ownership reads across concurrent gates (0056).
 // Modified by ryuzcorp (ryuzcorp/celld): MergeTree-style lazy handoff policy (0078).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
@@ -2518,7 +2518,10 @@ impl State {
         };
         let op = self.op();
         self.node_authority = NodeAuthority::Reading { op, pending };
-        effects.push(Effect::ReadSelfNodeLease { op });
+        effects.push(Effect::ReadSelfNodeLease {
+            op,
+            authority_expires_ms: None,
+        });
     }
 
     fn fail_initial_node_lease(&mut self, spec: NodeLeaseSpec, effects: &mut Vec<Effect>) {
@@ -2920,13 +2923,20 @@ impl State {
                 // compares against what the shell actually serialized, for
                 // the same reason the ambiguous arm does.
                 let read = self.op();
+                let authority_expires_ms =
+                    pending.prior.as_ref().map(|prior| prior.record.expires_ms);
                 let mut pending = pending;
                 pending.desired.log_state = stamped_log_state;
                 self.node_authority = NodeAuthority::Reading { op: read, pending };
-                effects.push(Effect::ReadSelfNodeLease { op: read });
+                effects.push(Effect::ReadSelfNodeLease {
+                    op: read,
+                    authority_expires_ms,
+                });
             }
             Err(Failure::Ambiguous) => {
                 let read = self.op();
+                let authority_expires_ms =
+                    pending.prior.as_ref().map(|prior| prior.record.expires_ms);
                 let mut pending = pending;
                 pending.readback_only = true;
                 // The readback compares against what the shell actually
@@ -2934,7 +2944,10 @@ impl State {
                 // pre-attempt belief.
                 pending.desired.log_state = stamped_log_state;
                 self.node_authority = NodeAuthority::Reading { op: read, pending };
-                effects.push(Effect::ReadSelfNodeLease { op: read });
+                effects.push(Effect::ReadSelfNodeLease {
+                    op: read,
+                    authority_expires_ms,
+                });
             }
             Err(Failure::Definite) => {
                 if let Some(prior) = pending.prior {

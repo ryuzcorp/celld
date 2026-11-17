@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): round-level fence settlement (0062).
+// Modified by ryuzcorp (ryuzcorp/celld): round-level fence settlement (0062); renewal lease readback carries the authority bound (upstream #264).
 // Modified by ryuzcorp (ryuzcorp/celld): ported from meln1k/celld: seal a dead lease that never opened a log (01522b3); shared bucket-posture ownership reads across concurrent gates (0056).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
@@ -1054,6 +1054,11 @@ pub enum Effect {
     },
     ReadSelfNodeLease {
         op: OpId,
+        /// The prior record's peer-visible expiry for a renewal readback.
+        /// The shell bounds the read to half the remaining authority so a
+        /// hung readback cannot wedge renewals until the fence (upstream
+        /// #264). An initial acquisition has no prior authority.
+        authority_expires_ms: Option<u64>,
     },
     CasNodeLease {
         op: OpId,
