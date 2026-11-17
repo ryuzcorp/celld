@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): AES-KW import/generate/wrap/unwrap + symmetric JWK import/export (upstream #295).
+// Modified by ryuzcorp (ryuzcorp/celld): AES-KW import/generate/wrap/unwrap + symmetric JWK import/export (upstream #295); raw EC key import/export (upstream #271).
 // Web Crypto implementation for the embedded runtime.
 //
 // The common WebCrypto paths use typed-array host ops.
@@ -306,6 +306,35 @@
           "secret", normalized, extractable, usages, { bytes: raw },
         );
       }
+      // An EC public key's `raw` form is its SEC1 point, uncompressed or
+      // compressed. Like the Secure Curves arm below, it is checked before
+      // the asymmetric block, which would read the point as a DER document
+      // and can only report a parse failure for it.
+      if (format === "raw" && (name === "ECDH" || name === "ECDSA")) {
+        const curve = _canonicalEcCurve(algorithm?.namedCurve);
+        if (curve === undefined) {
+          throw _notSupported("unsupported curve: " + algorithm?.namedCurve);
+        }
+        const imported = _extra("asym-key-import", {
+          key: Array.from(_toBuf(keyData)),
+          format: "raw",
+          type: "ec",
+          namedCurve: curve,
+          visibility: "public",
+          passphrase: null,
+        });
+        return _makeKey(
+          "public",
+          _keyAlgorithm(name, algorithm, imported.keyType, imported.details),
+          extractable,
+          usages,
+          {
+            bytes: Uint8Array.from(imported.der),
+            keyType: imported.keyType,
+            details: imported.details,
+          },
+        );
+      }
       // A Secure Curves public key has a `raw` form: the 32-byte point on
       // its own. It is checked before the asymmetric block below, because
       // that block reads `raw` bytes as a DER document and can only report a
@@ -378,14 +407,16 @@
     }
 
     async exportKey(format, key) {
-      // The `raw` form of a Secure Curves public key is its 32-byte point.
-      // The branch below answers every `raw` request from the stored bytes,
-      // which for an asymmetric key are its SPKI document -- so without this
-      // arm an X25519 peer key exports as 44 bytes that no counterpart can
-      // read, and nothing reports an error.
+      // The `raw` form of a Secure Curves public key is its 32-byte point,
+      // and of an EC public key its uncompressed SEC1 point. The branch
+      // below answers every `raw` request from the stored bytes, which for
+      // an asymmetric key are its SPKI document -- so without this arm an
+      // X25519 peer key exports as 44 bytes that no counterpart can read,
+      // and an EC key as 91 bytes of SPKI, and nothing reports an error.
       if (format === "raw" && key?.type === "public" &&
           (key.__celldMaterial?.keyType === "ed25519" ||
-            key.__celldMaterial?.keyType === "x25519")) {
+            key.__celldMaterial?.keyType === "x25519" ||
+            key.__celldMaterial?.keyType === "ec")) {
         if (!key.extractable) {
           throw new DOMException("key is not extractable", "InvalidAccessError");
         }
