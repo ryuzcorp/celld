@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): node:crypto scrypt; container exec resize op; cross-isolate RPC stubs and streams; test-only fake exec ops; fake kill completion op; exec reads survive their subscribing event; per-node Workers Cache API ops; tenant egress policy; D1 export operator-ingress marker; stateless attribution tokens; reaction-aware request resources; fake close/signal completion ops; binding-forgery enforcement; trusted cell RPC; Queue DLQ forward host op; DLQ forward caller identity; WebSocket and TCP socket ownership; receiver-held stream lifetime; deployment cache scope key; share the /bundle tree per deployment generation.; cancelled requests reject pending ops so co-awaiters settle (upstream #317); answered drivers poll while waitUntil background is outstanding (upstream #300)
+// Modified by ryuzcorp (ryuzcorp/celld): node:crypto scrypt; container exec resize op; cross-isolate RPC stubs and streams; test-only fake exec ops; fake kill completion op; exec reads survive their subscribing event; per-node Workers Cache API ops; tenant egress policy; D1 export operator-ingress marker; stateless attribution tokens; reaction-aware request resources; fake close/signal completion ops; binding-forgery enforcement; trusted cell RPC; Queue DLQ forward host op; DLQ forward caller identity; WebSocket and TCP socket ownership; receiver-held stream lifetime; deployment cache scope key; share the /bundle tree per deployment generation.; cancelled requests reject pending ops so co-awaiters settle (upstream #317); answered drivers poll while waitUntil background is outstanding (upstream #300); refused handoffs reject instead of dropping resolvers (upstream #309)
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 // The raw V8 adapter and its child modules remain outside the Actor execution
@@ -4119,24 +4119,33 @@ impl InFlight {
     ///
     /// The owner's driver polls it, so the owner's retirement decides when it
     /// is cancelled and this event's retirement cannot take it away. An owner
-    /// that is already gone can never run the continuation again, so its
-    /// resolver goes with the op, exactly as `abandon` drops this event's own.
+    /// that is already gone — or whose mailbox closed while this turn ran —
+    /// will never poll the future, so the promise rejects instead of hanging
+    /// whoever awaits it: silently dropping the resolver wedged the waiter
+    /// with nothing logged (denoland/celld#207), and a timer the harness
+    /// fires early on rejection still settles its dependents
+    /// (denoland/celld#309).
     fn hand_op(
         &mut self,
+        tc: &mut v8::PinScope,
         owner: u64,
         id: u64,
         future: asyncrt::OpFuture,
         lifetime: asyncrt::OpLifetime,
     ) {
         // One branch for both refusals — an owner that is already gone, and
-        // one whose mailbox closed while this turn ran. Splitting them let the
-        // second forget to drop the resolver, which is the whole defect.
+        // one whose mailbox closed while this turn ran. Either way nobody
+        // polls the future, so its promise must settle here.
         let delivered = self
             .runtime_state
             .io_context(owner)
             .is_some_and(|context| context.hand_op(id, future, lifetime));
         if !delivered {
-            self.runtime_state.promises.lock().unwrap().remove(&id);
+            resolve_res(
+                tc,
+                id,
+                Err("the event that issued this operation already ended".to_string()),
+            );
         }
     }
 
@@ -4734,7 +4743,7 @@ fn finish_turn(tc: &mut v8::PinScope, entry: &mut InFlight) -> Vec<Op> {
     //    write rather than the turn owner, because the checkpoint can run a
     //    continuation from another event.
     ws_capture_flush_touched(tc, &entry.runtime_state);
-    let ops = adopt(entry);
+    let ops = adopt(tc, entry);
     // 7. **close the request's sockets** — see above.
     if entry.retired() {
         entry.context.close_sockets();
@@ -4762,13 +4771,13 @@ pub type Op = (u64, asyncrt::OpFuture);
 /// so an op with a foreign name goes to that event's driver instead. Critical
 /// sections carry an explicit driver alongside their resource context; the
 /// op wrapper uses that driver so gate retirement and op cancellation agree.
-fn adopt(entry: &mut InFlight) -> Vec<Op> {
+fn adopt(tc: &mut v8::PinScope, entry: &mut InFlight) -> Vec<Op> {
     let spawns = asyncrt::drain_spawns();
     let mine = entry.context.continuation_id();
     let mut ops = Vec::with_capacity(spawns.len());
     for (id, future, lifetime, owner) in spawns {
         if let Some(owner) = owner.filter(|owner| Some(*owner) != mine) {
-            entry.hand_op(owner, id, future, lifetime);
+            entry.hand_op(tc, owner, id, future, lifetime);
             continue;
         }
         entry.ops.insert(id);
