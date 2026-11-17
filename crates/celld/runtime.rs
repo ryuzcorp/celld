@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): cross-isolate RPC stubs and streams; D1 export operator-ingress marker; ported from meln1k/celld: report wake coverage after maintenance (e6cb9a3); wake coverage follow-ups: startup observation ordering, installation comparison; trusted cell RPC; deployment cache scope purge on generation free; staged invoke joins the driver past the reply.; answered drivers poll while waitUntil background is outstanding (upstream #300); drivers take the mailbox once more before retiring (upstream #309); answered waitUntil with no ops polls for settlement (upstream #289); post-response background budget ends orphaned drives (upstream #275).
+// Modified by ryuzcorp (ryuzcorp/celld): cross-isolate RPC stubs and streams; D1 export operator-ingress marker; ported from meln1k/celld: report wake coverage after maintenance (e6cb9a3); wake coverage follow-ups: startup observation ordering, installation comparison; trusted cell RPC; deployment cache scope purge on generation free; staged invoke joins the driver past the reply.; answered drivers poll while waitUntil background is outstanding (upstream #300); drivers take the mailbox once more before retiring (upstream #309); answered waitUntil with no ops polls for settlement (upstream #289); post-response background budget ends orphaned drives (upstream #275); storage-poisoned cells restart on a fresh isolate (upstream #291).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 // RuntimeManager is the V8 cell-host arm, so its executor and observability
@@ -1226,6 +1226,17 @@ impl RuntimeManager {
                 .map(|handle| (handle.residency.slot().clone(), handle.generation))
                 .collect()
         };
+        // A cell whose SQLite destroyed a transaction restarts on its own
+        // generation. Its old instance's `waitUntil` work stays in this isolate,
+        // and SQL handles there are keyed by scope, so the restart must open elsewhere.
+        if crate::storage::sql_broken(cell) {
+            // Placement skips a retiring isolate, which frees only once no cell
+            // or request is left in it. The release below clears the mark, so
+            // every slot is condemned first, and a retried release keeps them.
+            for (slot, _) in &slots {
+                slot.condemn("a cell restarts after SQLite destroyed a transaction");
+            }
+        }
         for (slot, generation) in slots {
             // Taking the isolate for this turn is the barrier: an event of
             // this cell either finished its turn before it or has not

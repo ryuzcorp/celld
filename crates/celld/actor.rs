@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): cross-isolate RPC stubs and streams; operator token for the internal listener; Workers Cache pressure shedding; ported from meln1k/celld: report wake coverage after maintenance (e6cb9a3); staged invoke reads the deploy bucket; pass the renewal readback authority bound through (upstream #264).
+// Modified by ryuzcorp (ryuzcorp/celld): cross-isolate RPC stubs and streams; operator token for the internal listener; Workers Cache pressure shedding; ported from meln1k/celld: report wake coverage after maintenance (e6cb9a3); staged invoke reads the deploy bucket; pass the renewal readback authority bound through (upstream #264); storage-poisoned activity restarts the runtime (upstream #291).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! The serial lifecycle executor and its shell-side request drivers.
@@ -3002,6 +3002,7 @@ impl Actor {
             } => {
                 // Observe the alarm before releasing the activity. The core
                 // reports whether that observation cancels an eviction proof.
+                let broken = crate::storage::sql_broken(&cell).then(|| cell.clone());
                 self.drive(
                     Event::AlarmObserved {
                         cell,
@@ -3013,6 +3014,11 @@ impl Actor {
                     out,
                 );
                 self.drive(Event::ActivityFinished { request }, out);
+                // A destroyed transaction fails every later event until the
+                // database reopens.
+                if let Some(cell) = broken {
+                    self.drive(Event::RestartRuntime { cell }, out);
+                }
             }
             Message::WebSocketOpened {
                 cell,

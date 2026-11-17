@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): ported from meln1k/celld: scripted core-bug reproductions (ea471ee, e46a685, 6d61462, 18d3bf9, 9d4c163, 468b456, 01522b3, 65fdb13); shared bucket-posture ownership reads (0056); round-level fence settlement (0062); bucket-posture group commit: live-lease routing pin (0063); renewal readback authority bound (upstream #264); alarm deadline waits for the running copy (upstream #256); same-guard lease conflict retry (upstream #239).
+// Modified by ryuzcorp (ryuzcorp/celld): ported from meln1k/celld: scripted core-bug reproductions (ea471ee, e46a685, 6d61462, 18d3bf9, 9d4c163, 468b456, 01522b3, 65fdb13); shared bucket-posture ownership reads (0056); round-level fence settlement (0062); bucket-posture group commit: live-lease routing pin (0063); renewal readback authority bound (upstream #264); alarm deadline waits for the running copy (upstream #256); same-guard lease conflict retry (upstream #239); storage-poison restart pump (upstream #291).
 //! Scripted reproductions of core bugs the deterministic simulator
 //! (`crates/sim`) found. Each drives the core through a minimal shell that
 //! answers every effect at once, except the ones a test holds back to
@@ -257,6 +257,52 @@ impl Shell {
         );
         self.send(Event::ActivityFinished { request });
     }
+}
+
+/// A cell whose SQLite destroyed a transaction restarts on its own
+/// generation (upstream #291): the swap pump moves it even though its
+/// generation is current, and the fresh start opens the database again.
+/// Without a matching resident cell nothing moves.
+#[test]
+fn poisoned_cell_restarts_on_its_generation() {
+    let mut shell = Shell::new(4, |_| false);
+    shell.start();
+    shell.send(Event::GenerationChanged {
+        generation: 1,
+        now_mono_ms: MONO_MS,
+        max_age_ms: 60_000,
+        eager_classes: Vec::new(),
+    });
+    shell.serve(1, "a");
+    // Same generation, unknown cell: nothing moves.
+    let quiet = shell.send(Event::RestartRuntime {
+        cell: "no-such-cell".into(),
+    });
+    assert!(
+        !quiet.iter().any(|effect| matches!(
+            effect,
+            Effect::StartRuntime { cell, .. } if cell == "no-such-cell"
+        )),
+        "an unknown cell never starts: {quiet:?}"
+    );
+    let effects = shell.send(Event::RestartRuntime { cell: "a".into() });
+    assert!(
+        effects.iter().any(|effect| matches!(
+            effect,
+            Effect::StartRuntime { cell, .. } if cell == "a"
+        )),
+        "the marked cell restarts on its generation: {effects:?}"
+    );
+    // The restart is consumed: a second mark is needed to move it again.
+    let again = shell.send(Event::RestartRuntime { cell: "a".into() });
+    assert!(
+        again.iter().any(|effect| matches!(
+            effect,
+            Effect::StartRuntime { cell, .. } if cell == "a"
+        )),
+        "each poison report restarts once: {again:?}"
+    );
+    shell.state.validate().expect("state invariant");
 }
 
 /// A full node sheds a resident to admit another cell, and with
