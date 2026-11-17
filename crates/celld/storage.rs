@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): D1 export; D1 export hardening; D1 batch tests; D1 export sequence scoping; binding-forgery enforcement; per-connection SQLite page-cache budget (CELLD_SQLITE_CACHE_KB); 0.5.1 facet-image import repair (upstream #292).
+// Modified by ryuzcorp (ryuzcorp/celld): D1 export; D1 export hardening; D1 batch tests; D1 export sequence scoping; binding-forgery enforcement; per-connection SQLite page-cache budget (CELLD_SQLITE_CACHE_KB); 0.5.1 facet-image import repair (upstream #292); broken-SQL scopes restart the cell (upstream #291).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 // This is V8-thread SQLite plumbing outside the Actor execution domain.
@@ -893,7 +893,7 @@ fn finish_open(
     close_sync_list_cursors(scope);
     close_sql_cursors(scope);
     close_sql_statement_cache(scope);
-    sql_critical_errors(|errors| errors.borrow_mut().remove(scope));
+    clear_sql_critical_error(scope);
     dbs(|d| {
         d.borrow_mut().insert(
             scope.to_string(),
@@ -930,7 +930,7 @@ pub fn close(scope: &str) {
     close_sync_list_cursors(scope);
     close_sql_cursors(scope);
     close_sql_statement_cache(scope);
-    sql_critical_errors(|errors| errors.borrow_mut().remove(scope));
+    clear_sql_critical_error(scope);
     cells(|c| c.schema_cookies.borrow_mut().remove(scope));
     dbs(|d| d.borrow_mut().remove(scope));
     active_alarms(|alarms| alarms.borrow_mut().remove(scope));
@@ -3161,12 +3161,7 @@ impl D1TransactionOperation {
 }
 
 fn d1_poison_transaction(scope: &str, error: String) {
-    sql_critical_errors(|errors| {
-        errors
-            .borrow_mut()
-            .entry(scope.to_string())
-            .or_insert(error);
-    });
+    store_sql_critical_error(scope, &error);
 }
 
 fn d1_rollback_after_commit_failure(scope: &str, connection: &Connection) -> Result<(), String> {
@@ -3273,12 +3268,7 @@ fn d1_critical_transaction_failure(
         // A D1 call owns its transaction bracket and cannot hand an open or
         // ambiguous one back to application code. Fail closed even when
         // SQLite did not re-enable autocommit after the control failure.
-        sql_critical_errors(|errors| {
-            errors
-                .borrow_mut()
-                .entry(scope.to_string())
-                .or_insert_with(|| error.clone());
-        });
+        store_sql_critical_error(scope, &error);
     }
     error
 }
@@ -4933,6 +4923,43 @@ pub fn sql_critical_error(scope: &str) -> Option<String> {
     sql_critical_errors(|errors| errors.borrow().get(scope).cloned())
 }
 
+/// The scopes holding a critical SQL error, readable outside a turn. The actor
+/// reads it when an activity finishes and restarts the cell, because only a
+/// reopen clears the error.
+static BROKEN_SCOPES: std::sync::Mutex<std::collections::BTreeSet<String>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+/// Whether the scope's SQLite destroyed a transaction and has not been
+/// reopened since. Reads stay failed until the cell restarts on a fresh
+/// isolate, which is what clears the error.
+pub fn sql_broken(scope: &str) -> bool {
+    BROKEN_SCOPES
+        .lock()
+        .expect("broken scopes poisoned")
+        .contains(scope)
+}
+
+fn store_sql_critical_error(scope: &str, error: &str) {
+    sql_critical_errors(|errors| {
+        errors
+            .borrow_mut()
+            .entry(scope.to_string())
+            .or_insert_with(|| error.to_string());
+    });
+    BROKEN_SCOPES
+        .lock()
+        .expect("broken scopes poisoned")
+        .insert(scope.to_string());
+}
+
+fn clear_sql_critical_error(scope: &str) {
+    sql_critical_errors(|errors| errors.borrow_mut().remove(scope));
+    BROKEN_SCOPES
+        .lock()
+        .expect("broken scopes poisoned")
+        .remove(scope);
+}
+
 fn require_sql_healthy(scope: &str) -> Result<(), String> {
     match sql_critical_error(scope) {
         Some(error) => Err(error),
@@ -4958,12 +4985,7 @@ fn record_sqlite_operation_failure(
     );
     let now_autocommit = unsafe { rusqlite::ffi::sqlite3_get_autocommit(database) != 0 };
     if celld_logic::sqlite::poisons_actor(result_code, started_in_transaction, now_autocommit) {
-        sql_critical_errors(|errors| {
-            errors
-                .borrow_mut()
-                .entry(scope.to_string())
-                .or_insert_with(|| error.to_string());
-        });
+        store_sql_critical_error(scope, error);
     }
 }
 
@@ -6677,6 +6699,83 @@ mod d1_batch_tests {
             Ok(_) => panic!("count answered the wrong shape"),
             Err(failure) => panic!("count failed: {}", failure.message),
         }
+    }
+
+    /// Upstream #291: a full disk poisons the actor. A transactional write
+    /// past the page cap fails with SQLITE_FULL; the failure is recorded,
+    /// and every later operation — even a read — fails until the database
+    /// reopens. The reopen (what the swap restart does) clears the mark.
+    #[test]
+    fn full_disk_poisons_until_reopen() {
+        let db = TestDb::open("full-disk");
+        db.exec("CREATE TABLE t(v TEXT); INSERT INTO t VALUES (zeroblob(4000));");
+        let pages: u32 = with(&db.scope, |connection| {
+            without_sql_authorizer(connection, || {
+                connection
+                    .query_row("PRAGMA page_count", [], |row| row.get(0))
+                    .expect("page count")
+            })
+        })
+        .expect("db open");
+        with(&db.scope, |connection| {
+            without_sql_authorizer(connection, || {
+                connection
+                    .pragma_update(None, "max_page_count", pages)
+                    .expect("cap the database")
+            })
+        });
+        // A transactional write past the cap fails with SQLITE_FULL.
+        let big = "x".repeat(100_000);
+        let failed = d1_run(
+            &db.scope,
+            &D1Request::Batch {
+                statements: vec![prepared(
+                    "INSERT INTO t VALUES (?)",
+                    vec![serde_json::Value::String(big)],
+                )],
+            },
+        );
+        assert!(failed.is_err(), "the capped write must fail");
+        assert!(
+            super::sql_broken(&db.scope),
+            "the destroyed transaction marks the scope broken"
+        );
+        // Reads fail too while the mark stands, even though the database
+        // itself is intact.
+        assert!(
+            d1_run(
+                &db.scope,
+                &D1Request::Exec {
+                    sql: "SELECT COUNT(*) AS n FROM t".to_string(),
+                    rows: true,
+                },
+            )
+            .is_err(),
+            "reads fail while the mark stands"
+        );
+        // Reopening — what the swap restart does — clears the mark.
+        let path = db.path();
+        super::open_with_compat(&db.scope, path.to_str().expect("utf-8 path"), false)
+            .expect("reopen");
+        assert!(
+            !super::sql_broken(&db.scope),
+            "a reopened scope is healthy again"
+        );
+        assert_eq!(count(&db, "t"), 1, "the rolled-back write left one row");
+        // Raising the cap lets writes through again.
+        with(&db.scope, |connection| {
+            without_sql_authorizer(connection, || {
+                connection
+                    .pragma_update(None, "max_page_count", 1_000_000)
+                    .expect("lift the cap")
+            })
+        });
+        db.exec("INSERT INTO t VALUES ('y');");
+        assert!(
+            !super::sql_broken(&db.scope),
+            "a healthy write marks nothing"
+        );
+        assert_eq!(count(&db, "t"), 2);
     }
 
     #[test]
