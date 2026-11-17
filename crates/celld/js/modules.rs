@@ -1,3 +1,4 @@
+// Modified by ryuzcorp (ryuzcorp/celld): loader external stubs from the union of main + sibling imports (upstream #304).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! ES module resolution and compilation.
@@ -821,19 +822,36 @@ pub(super) fn register_loader_modules(
     config: &WorkerConfig,
     main: v8::Local<v8::Module>,
 ) {
+    // Each external stub serves every module that imports the specifier, so
+    // build it from the union of the names the main module and all siblings
+    // import. The main module's stub alone would cut off a name only a
+    // sibling imports (upstream #304): the sibling would link against a
+    // module that does not export it.
+    let mut union: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> =
+        config.main_imports.clone();
     for (_name, _source, imports) in config.es_modules() {
         for (spec, names) in imports {
-            if modreg(scope).modules.lock().unwrap().contains_key(spec) {
-                continue;
-            }
-            install_lazy_module(scope, spec);
-            let s = if names.contains("*") {
-                full_surface_source(scope, spec, names).unwrap_or_else(|| stub_source(spec, names))
-            } else {
-                stub_source(spec, names)
-            };
-            register_internal_stub(scope, spec, &s);
+            union
+                .entry(spec.clone())
+                .or_default()
+                .extend(names.iter().cloned());
         }
+    }
+    for (spec, names) in &union {
+        let already = config
+            .main_imports
+            .get(spec)
+            .is_some_and(|main| main == names);
+        if already && modreg(scope).modules.lock().unwrap().contains_key(spec) {
+            continue;
+        }
+        install_lazy_module(scope, spec);
+        let s = if names.contains("*") {
+            full_surface_source(scope, spec, names).unwrap_or_else(|| stub_source(spec, names))
+        } else {
+            stub_source(spec, names)
+        };
+        register_internal_stub(scope, spec, &s);
     }
     register_named_module(scope, &config.main_module_name, main, false);
     for (name, source, _imports) in config.es_modules() {
