@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): cross-isolate RPC stubs and streams; operator token for the internal listener; D1 export operator-ingress marker; ported from meln1k/celld: report wake coverage after maintenance (e6cb9a3); staged activation; trusted cell RPC; WebSocket join tokens; --version reports the full build version; staged invoke operator route; non-dumpable serving process; bucket-posture group commit: paged gate judges PAGED_FORMAT (0059); bucket-posture group commit: bucket bundle gate plumbing (0060); bucket-posture group commit: bundle switch defaults off (0075); stale-route marker import from peer_auth (upstream #273); resolve the node-session id from the data-dir pin (upstream #249); boot scan takes the due scan's upcoming minute (upstream #308); unclean-restart prune of live-named epochs (upstream #290); celld versions dispatch (upstream #181).
+// Modified by ryuzcorp (ryuzcorp/celld): cross-isolate RPC stubs and streams; operator token for the internal listener; D1 export operator-ingress marker; ported from meln1k/celld: report wake coverage after maintenance (e6cb9a3); staged activation; trusted cell RPC; WebSocket join tokens; --version reports the full build version; staged invoke operator route; non-dumpable serving process; bucket-posture group commit: paged gate judges PAGED_FORMAT (0059); bucket-posture group commit: bucket bundle gate plumbing (0060); bucket-posture group commit: bundle switch defaults off (0075); stale-route marker import from peer_auth (upstream #273); resolve the node-session id from the data-dir pin (upstream #249); boot scan takes the due scan's upcoming minute (upstream #308); unclean-restart prune of live-named epochs (upstream #290); celld versions dispatch (upstream #181); telemetry bucket for split log sink (upstream #153).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 // The binary contains connection, startup, shutdown, and V8 shell code. The
@@ -4587,11 +4587,13 @@ async fn async_main(
             (None, ownership, peer_key, None, None)
         };
     if let Some(config) = &telemetry_config {
-        let sink_bucket = match &config.sink {
-            celld::telemetry::SinkChoice::Bucket => {
+        // Either signal can demand the bucket: traces via `CELLD_OTEL=1`,
+        // logs via `CELLD_OTEL_LOGS=bucket` under any traces sink.
+        let sink_bucket = match (&config.sink, &config.logs_sink) {
+            (celld::telemetry::SinkChoice::Bucket, _) | (_, celld::telemetry::LogsSink::Bucket) => {
                 if settings.bucket.is_none() {
                     anyhow::bail!(
-                        "CELLD_OTEL=1 but this node has no bucket; the \
+                        "CELLD_OTEL=1 or CELLD_OTEL_LOGS=bucket but this node has no bucket; the \
                          bucket sink needs one (CELLD_BUCKET), or choose \
                          CELLD_OTEL=http://collector:4318"
                     );
@@ -4610,8 +4612,8 @@ async fn async_main(
                     node_bucket(&settings, managed_storage.as_ref(), false)?
                 })
             }
-            // The collector path needs no bucket at all.
-            celld::telemetry::SinkChoice::Otlp { .. } => None,
+            // The collector path with following logs needs no bucket at all.
+            _ => None,
         };
         celld::telemetry::init(config, sink_bucket, node.clone(), settings.region.clone())?;
     }
