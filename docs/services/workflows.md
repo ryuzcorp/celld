@@ -42,6 +42,15 @@ so a step callback must tolerate a second attempt.
 await. celld fails the instance when such work keeps `run()` pending for 60
 seconds while no step runs or waits.
 
+## Handler budget
+
+An instance whose steps sum past `CELLD_HANDLER_BUDGET_S` does not stall:
+each alarm-handler drive runs what fits in the budget, the expired handler
+counts as a failed attempt that does not consume the alarm retry limit, and
+the retried alarm replays the ledger and continues where the expired drive
+left off. Keep steps short enough that one drive makes progress; a single
+step that outlasts the budget never completes.
+
 ## Sleeps, events, and retries
 
 `step.waitForEvent()` times out after 24 hours by default. An event that

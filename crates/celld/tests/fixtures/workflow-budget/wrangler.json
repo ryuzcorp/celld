@@ -1,0 +1,6 @@
+{
+  "name": "budget-repro",
+  "main": "index.js",
+  "compatibility_date": "2026-09-24",
+  "workflows": [{ "name": "slow", "binding": "SLOW", "class_name": "Slow" }]
+}

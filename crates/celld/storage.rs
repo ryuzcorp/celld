@@ -61,6 +61,13 @@ pub(crate) fn alarm_snapshot(scope: &str) -> anyhow::Result<celld_logic::wake::A
 pub struct Cells {
     dbs: RefCell<HashMap<String, OpenCell>>,
     active_alarms: RefCell<HashMap<String, ActiveAlarm>>,
+    /// Scopes whose last alarm turn ended without settling its drive (a
+    /// budget kill, a disconnect): the still-set `_wfDriving` in the
+    /// harness is orphaned, even when a racing nudge has since reset the
+    /// stored retry counter. In-memory only, like `_wfDriving` itself: an
+    /// isolate restart clears both, so no orphan can outlive the flag.
+    /// Read-and-cleared on the next dispatch, whatever triggered it.
+    alarm_redrives: RefCell<HashSet<String>>,
     /// Committed alarm mutations no turn has taken yet, `-1` for a delete.
     /// The turn that committed one drains it (`take_alarm_moves`) and the
     /// drive reports it to the host: the alarm move is a turn *output*,
@@ -266,6 +273,10 @@ fn dbs<T>(f: impl FnOnce(&RefCell<HashMap<String, OpenCell>>) -> T) -> T {
 
 fn active_alarms<T>(f: impl FnOnce(&RefCell<HashMap<String, ActiveAlarm>>) -> T) -> T {
     cells(|c| f(&c.active_alarms))
+}
+
+fn alarm_redrives<T>(f: impl FnOnce(&RefCell<HashSet<String>>) -> T) -> T {
+    cells(|c| f(&c.alarm_redrives))
 }
 
 fn alarm_moves<T>(
@@ -939,6 +950,9 @@ pub fn close(scope: &str) {
     });
     alarm_dirty(|dirty| {
         dirty.borrow_mut().remove(scope);
+    });
+    alarm_redrives(|redrives| {
+        redrives.borrow_mut().remove(scope);
     });
 }
 
@@ -5601,6 +5615,27 @@ pub fn begin_alarm_handler(scope: &str, fired_at_ms: i64) {
 
 pub fn active_alarm_scheduled_time(scope: &str) -> Option<i64> {
     active_alarms(|alarms| alarms.borrow().get(scope).map(|active| active.fired_at_ms))
+}
+
+/// Record that scope's last alarm turn ended without settling its drive.
+/// The harness promise it left behind never settles, so the next dispatch
+/// must drop it even when a racing nudge has reset the stored retry
+/// counter to zero (denoland/celld#299). Set only on the path that owns
+/// this bookkeeping: the isolate turn that closes an unclaimed alarm
+/// outcome, where a budget kill or a disconnect abandoned the event
+/// between turns and cell storage is reachable again.
+pub fn mark_alarm_redrive(scope: &str) {
+    alarm_redrives(|redrives| {
+        redrives.borrow_mut().insert(scope.to_string());
+    });
+}
+
+/// Take and clear scope's redrive bit for the dispatch now starting. True
+/// when the previous turn died without settling, whatever triggered this
+/// dispatch: a retry redrive and a racing nudge both observe it, and the
+/// first dispatch to run consumes it so a healthy drive is never dropped.
+pub fn take_alarm_redrive(scope: &str) -> bool {
+    alarm_redrives(|redrives| redrives.borrow_mut().remove(scope))
 }
 
 /// Finish an alarm handler. A successful handler consumes its original alarm;

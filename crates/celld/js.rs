@@ -6202,6 +6202,12 @@ fn fire_alarm_handler(
     request_id: Option<RequestId>,
     reply: tokio::sync::oneshot::Sender<Result<(celld_logic::wake::AlarmSnapshot, Option<u64>)>>,
 ) -> Begun {
+    // Whether the previous alarm turn for this scope ended without settling
+    // its drive (a budget kill, a disconnect). Taken here so whatever
+    // triggered this dispatch — the retry redrive or a racing nudge — sees
+    // it, and the first dispatch to run consumes it. The stored retry
+    // counter cannot carry this: any nudge resets it to zero.
+    let redrive = storage::take_alarm_redrive(scope);
     let begun = start_cell_event(
         tc,
         scope,
@@ -6215,6 +6221,7 @@ fn fire_alarm_handler(
                 v8::String::new(tc, scope).unwrap().into(),
                 v8::Number::new(tc, scheduled_at as f64).into(),
                 v8::Number::new(tc, retry as f64).into(),
+                v8::Boolean::new(tc, redrive).into(),
             ];
             let recv = v8::undefined(tc).into();
             f.call(tc, recv, &arguments)
@@ -6230,6 +6237,12 @@ fn fire_alarm_handler(
         // Give the claim back as a failure that does not count against the
         // retry limit: the handler is not what failed.
         begun => {
+            // No drive started, so whatever orphan the bit named is still
+            // orphaned: put it back for the dispatch that follows. The
+            // bump below keeps the retry counter truthful in the meantime.
+            if redrive {
+                storage::mark_alarm_redrive(scope);
+            }
             if let Some(claim) = claim {
                 storage::finish_alarm_handler_with_retry_policy(scope, false, claim.now_ms, false);
             }
@@ -7110,6 +7123,17 @@ impl Worker {
             return Ok(None);
         };
         let (_locker, _cells) = inner.lock();
+        // The turn ended without running JavaScript again — a budget
+        // overrun, a handler waiting on nothing — so the harness drive it
+        // may have started is orphaned: its promise never settles. Record
+        // that for the next dispatch, which reads-and-clears it on the way
+        // in. Settling here already re-armed the retry, but a racing nudge
+        // resets that counter, so the bit (not the counter) is what lets
+        // the next dispatch tell this orphan from a live drive
+        // (denoland/celld#299).
+        if let Some(scope) = entry.scope.clone() {
+            storage::mark_alarm_redrive(&scope);
+        }
         entry.settle_alarm(false, false);
         entry.write_delta()
     }

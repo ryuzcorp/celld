@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): ctx.container.images; clone() of streaming and disturbed bodies; __celld$do on the service-binding RPC path; container exec pty/resize; cross-isolate RPC stubs and streams; container exec AbortSignal; test-only fake kill completion; exec reads survive their subscribing event; context end aborts finished uploads; tenant egress policy; D1 export; D1 export operator gate; D1 batch; test-only fake close/signal completion; binding-forgery enforcement; Queue/KV operator fetch gate; Queue/KV stub-RPC allowlists; Queue DLQ host-op forward; Queue send/DLQ cell-side validation; trusted-RPC target pin; Queue operator internal re-checks; receiver-held RPC streams.; dropped timer ops fire their callback early so sleepers settle (upstream #317); unrefed AbortSignal.timeout timer (upstream #306); loader-fetch 101 webSocket join (upstream #305); nodejs process.env population (upstream #296); writable request /tmp files (upstream #280); Worker WebSocket close codes (upstream #279); Symbol.dispose on plain RPC results (upstream #260).
+// Modified by ryuzcorp (ryuzcorp/celld): ctx.container.images; clone() of streaming and disturbed bodies; __celld$do on the service-binding RPC path; container exec pty/resize; cross-isolate RPC stubs and streams; container exec AbortSignal; test-only fake kill completion; exec reads survive their subscribing event; context end aborts finished uploads; tenant egress policy; D1 export; D1 export operator gate; D1 batch; test-only fake close/signal completion; binding-forgery enforcement; Queue/KV operator fetch gate; Queue/KV stub-RPC allowlists; Queue DLQ host-op forward; Queue send/DLQ cell-side validation; trusted-RPC target pin; Queue operator internal re-checks; receiver-held RPC streams.; dropped timer ops fire their callback early so sleepers settle (upstream #317); unrefed AbortSignal.timeout timer (upstream #306); loader-fetch 101 webSocket join (upstream #305); nodejs process.env population (upstream #296); writable request /tmp files (upstream #280); Worker WebSocket close codes (upstream #279); Symbol.dispose on plain RPC results (upstream #260); workflow alarm forgets budget-orphaned drives (upstream #299).
 // The DO object model and the Cloudflare-compatible runtime surface, run
 // once per isolate by `js.rs::install_harness` after the Web-API prelude.
 // Lived as a 4,000-line raw string inside js.rs until 2026-07-29; it is a
@@ -7600,7 +7600,7 @@ __celld.__wsClosed = async (scope, wsId, code, reason, wasClean) => {
   }
 };
 // called by celld's scheduler when an alarm is due. Returns a promise.
-__celld.__fireAlarm = async (scope, scheduledTime, retryCount) => {
+__celld.__fireAlarm = async (scope, scheduledTime, retryCount, isRedrive) => {
   const actorEvent = __beginActorEvent(scope);
   // An alarm is an invocation: a stub the handler revives dies with it.
   const ctxId = __ctxNext();
@@ -7608,7 +7608,7 @@ __celld.__fireAlarm = async (scope, scheduledTime, retryCount) => {
     const inst = await _readyInstance(scope);
     if (typeof inst.alarm !== "function") return;
     await __ctxRun(ctxId, () =>
-      inst.alarm({ scheduledTime, retryCount, isRetry: retryCount > 0 }));
+      inst.alarm({ scheduledTime, retryCount, isRetry: retryCount > 0, isRedrive: isRedrive === true }));
   } finally {
     __ctxEnd(ctxId);
     __endActorEvent(actorEvent);
@@ -10930,7 +10930,7 @@ const __WorkflowCell = (() => {
       }
     });
   }
-  async alarm() {
+  async alarm(info) {
     const storage = this._state.storage;
     // One drive at a time. A sendEvent nudge (setAlarm(now)) landing
     // mid-fire replaces the firing alarm in the core, and the replacement
@@ -10945,19 +10945,40 @@ const __WorkflowCell = (() => {
     // A failed drive is not re-raised here: the engine already retries the
     // alarm that fired it.
     if (this._wfDriving !== undefined) {
-      this._wfNudge = Date.now();
-      await this._wfDriving.catch(() => {});
-      if (this._wfNudge !== undefined) {
-        this._wfNudge = undefined;
-        const meta = await storage.get("__wf.meta");
-        if (
-          meta !== undefined && !__wfTerminal(meta.status) &&
-          meta.status !== "paused" && meta.status !== "waitingForPause"
-        ) {
-          await storage.setAlarm(Date.now());
+      // A dispatch after the previous turn died without settling (budget,
+      // disconnect) is not a concurrent nudge: the in-flight drive is
+      // orphaned. Its entry died without settling the drive, and the promise
+      // it left behind only the dropped entry's ops could resolve. Awaiting
+      // it would park this dispatch behind a promise that never settles, and
+      // every redrive would fail the same way while the instance reads
+      // "running" forever (denoland/celld#299). The host marks that death in
+      // memory and hands it in as `isRedrive` on the next dispatch, whatever
+      // triggered it; a racing nudge cannot clear it the way `setAlarm`
+      // clears the stored retry counter to zero, so the counter alone cannot
+      // tell this orphan from a live drive. Either signal drops the orphan:
+      // the bit is authoritative, and a nonzero counter without the bit still
+      // names a retry, which a live drive never owes. A nudge during a
+      // healthy drive carries neither and still waits below, so two live
+      // drives never double-execute steps. Forget the orphan and fall through
+      // to a fresh drive; the ledger replay picks up where it left off.
+      if (info !== undefined && (info.isRedrive === true || info.retryCount > 0)) {
+        this._wfNudge = Date.now();
+        this._wfDriving = undefined;
+      } else {
+        this._wfNudge = Date.now();
+        await this._wfDriving.catch(() => {});
+        if (this._wfNudge !== undefined) {
+          this._wfNudge = undefined;
+          const meta = await storage.get("__wf.meta");
+          if (
+            meta !== undefined && !__wfTerminal(meta.status) &&
+            meta.status !== "paused" && meta.status !== "waitingForPause"
+          ) {
+            await storage.setAlarm(Date.now());
+          }
         }
+        return;
       }
-      return;
     }
     const meta = await storage.get("__wf.meta");
     // A terminal instance's pending alarm can still fire. It owns retention:
