@@ -1,4 +1,4 @@
-<!-- Modified by ryuzcorp (ryuzcorp/celld): CELLD_MEMORY_SCOPE; deploy --sourcemap writes the bundle's external map; operator token for the internal listener; r2 list --delimiter, the --page shape, and --cursor continuation; Workers Cache API page; deployment cache scope; deploy --sourcemap collects the no_bundle sibling map; staged invoke docs; deploy confines esbuild reads to the project; deploy --read-root; CELLD_SQLITE_CACHE_KB; CELLD_C_TRIM_MB; bucket-posture group commit docs: bundle switch default-on, linger, guarantees (0070); bundle switch defaults off (0075). -->
+<!-- Modified by ryuzcorp (ryuzcorp/celld): CELLD_MEMORY_SCOPE; deploy --sourcemap writes the bundle's external map; operator token for the internal listener; r2 list --delimiter, the --page shape, and --cursor continuation; Workers Cache API page; deployment cache scope; deploy --sourcemap collects the no_bundle sibling map; staged invoke docs; deploy confines esbuild reads to the project; deploy --read-root; CELLD_SQLITE_CACHE_KB; CELLD_C_TRIM_MB; bucket-posture group commit docs: bundle switch default-on, linger, guarantees (0070); bundle switch defaults off (0075); CELLD_BACKGROUND_BUDGET_S (upstream #275). -->
 # celld
 
 celld is a stateful distributed system. It runs server-side JavaScript on
@@ -720,6 +720,8 @@ unset variable selects its default. A Boolean variable accepts only `0` or
 | `CELLD_CACHE_SCOPE` | Which cache entries a Worker sees: `script` (default) isolates each script's entries, `deployment` shares one `caches.default` and one set of `caches.open(name)` namespaces across every script of the serving deployment, like one Cloudflare zone. See [cache](services/cache.md#cache-scope) and [security](security.md#cache-scope-and-co-hosted-scripts) |
 | `CELLD_OPERATION_DEADLINE_MS` | The deadline for a non-restore operation (default: 15000) |
 | `CELLD_MAX_CELL_REQUESTS` | Concurrent fetch events for one Durable Object (default: 64) |
+| `CELLD_MAX_CELLS_PER_ISOLATE` | Cells packed into one isolate (default: 32). Lower it for heavyweight cells such as agents |
+| `CELLD_BACKGROUND_BUDGET_S` | Post-response background budget in seconds (default: 30, Cloudflare's waitUntil limit). Past it the driver ends leftover timers and `waitUntil` without failing the answered request, and the abort pass releases the isolate |
 | `CELLD_MAX_REQUEST_BODY_BYTES` | The body limit for a public Worker request or a direct Durable Object request (default: 1 GiB) |
 | `CELLD_MAX_RESIDENT_CELLS` | The hard limit for resident cells, enforced at admission |
 | `CELLD_IDLE_EVICT_S` | Seconds after which an idle cell leaves memory and hibernates (unset: only pressure or the residency cap removes an idle cell) |

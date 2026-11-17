@@ -1,6 +1,6 @@
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 //
-// Modified by ryuzcorp (ryuzcorp/celld): retired-event attribution test; cancelled-request shared-work regression tests (upstream #317); shared-promise attribution regression test (upstream #316); trailing-handoff rejection test (upstream #309); refused-handoff settlement test (upstream #207); answered waitUntil retirement test (upstream #289). Apache-2.0.
+// Modified by ryuzcorp (ryuzcorp/celld): retired-event attribution test; cancelled-request shared-work regression tests (upstream #317); shared-promise attribution regression test (upstream #316); trailing-handoff rejection test (upstream #309); refused-handoff settlement test (upstream #207); answered waitUntil retirement test (upstream #289); background-clock re-arm test (upstream #275). Apache-2.0.
 
 // A white-box driver test, not node code: it builds a Worker in-process and
 // runs its turns directly, so the execution boundary's injected
@@ -556,6 +556,81 @@ fn retired_event_resource_accounting_throws_with_nothing_owned() {
         outcome["hr"], "the event that issued this operation already ended",
         "{outcome}"
     );
+}
+
+const BACKGROUND_CLOCK: &str = r#"
+export default {
+  async fetch(request, env, ctx) {
+    const url = new URL(request.url);
+    if (url.pathname === "/hold") {
+      // Never settles: the entry keeps background work outstanding past
+      // any budget, like a gate-holding event that outlives it (upstream
+      // #275). The answer goes out at once; only the clock below matters.
+      ctx.waitUntil(new Promise(() => {}));
+      return Response.json({ ok: true });
+    }
+    return new Response("not found", { status: 404 });
+  },
+};
+"#;
+
+/// Expiring the background re-arms its clock, so a gate-holding event that
+/// outlives its budget warns at most once per budget window instead of on
+/// every poll while it keeps its native ops (upstream #275). Drives one
+/// entry through the public API only: stamp the clock, let it elapse,
+/// expire, and observe a fresh window — not the old one still elapsed.
+#[test]
+fn expired_background_re_arms_its_clock() {
+    ensure_engine();
+    let mut worker = load_worker(BACKGROUND_CLOCK, "background-clock");
+
+    // Answered at once with unsettlable background outstanding.
+    let (reply, mut receive) = tokio::sync::oneshot::channel();
+    let job = celld::WorkerJob::Fetch {
+        queued_at: Instant::now(),
+        entrypoint: None,
+        invocation_limits: None,
+        url: "http://test/hold".to_string(),
+        method: "GET".to_string(),
+        body: RequestBody::Bytes(bytes::Bytes::new()),
+        headers: Vec::new(),
+        request_id: Some(27501),
+        tail_report: None,
+        reply,
+    };
+    let (entry, started) = worker.turn_begin(job, None);
+    drop(started);
+    let mut entry = entry.expect("request starts");
+    let response = receive
+        .try_recv()
+        .expect("answered at once")
+        .expect("ok answer");
+    assert_eq!(response.status, 200);
+
+    // The background clock starts on first observation, then elapses: spin
+    // without sleeping until the monotonic clock passes the 1 ms window.
+    let window = Duration::from_millis(1);
+    assert!(
+        !entry.background_expired(window),
+        "a fresh background window is not expired"
+    );
+    let start = Instant::now();
+    while !entry.background_expired(window) {
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "the monotonic clock advances past a 1 ms window"
+        );
+    }
+    // Expiring re-arms the clock: the next observation starts a new window
+    // instead of reporting the old one still elapsed. Pre-fix the stamp
+    // survived, so this stayed expired and the driver warned on every poll
+    // while the event kept its native ops.
+    entry.expire_background();
+    assert!(
+        !entry.background_expired(window),
+        "expiring the background re-arms its clock"
+    );
+    entry.abandon();
 }
 
 const TRAILING_HANDOFF: &str = r#"
