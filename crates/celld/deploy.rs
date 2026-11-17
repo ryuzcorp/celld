@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): idempotent content-tagged image create; tag-race tests run the fake engine through sh; deploy --sourcemap writes the bundle's external map; service binding targets validated at deploy; staged activation; deploy --sourcemap collects the no_bundle sibling map; staged invoke shares the version-ref parsing; deploy reads stay inside the project; deploy --read-root bounds bundling and container builds.
+// Modified by ryuzcorp (ryuzcorp/celld): idempotent content-tagged image create; tag-race tests run the fake engine through sh; deploy --sourcemap writes the bundle's external map; service binding targets validated at deploy; staged activation; deploy --sourcemap collects the no_bundle sibling map; staged invoke shares the version-ref parsing; deploy reads stay inside the project; deploy --read-root bounds bundling and container builds; durable object bindings with a foreign script_name are refused (upstream #312).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 // Deployment is an operator control-plane path outside the Actor execution
@@ -2998,6 +2998,23 @@ fn read_project(path: &Path, root: &Path, overrides: &VarOverrides) -> anyhow::R
             .get("class_name")
             .and_then(Value::as_str)
             .ok_or_else(|| anyhow!("durable object binding {name} has no `class_name`"))?;
+        // A `script_name` names the script that owns the class. celld
+        // deploys one script, so a binding naming another script is
+        // refused here rather than counted as a class of this one: the
+        // node would otherwise fail to start, reporting the class as
+        // exported by more than one co-hosted script. A binding naming
+        // its own script is local and falls through.
+        if let Some(script) = binding.get("script_name") {
+            let script = script.as_str().ok_or_else(|| {
+                anyhow!("durable object binding {name} has a non-string `script_name`")
+            })?;
+            if script != script_name {
+                bail!(
+                    "durable object binding {name} sets `script_name` {script:?}; celld runs a \
+                     Durable Object class only in the script that declares it"
+                );
+            }
+        }
         do_classes.push(class_name.to_string());
         bindings.push(json!({
             "type": "durable_object_namespace",
@@ -5466,6 +5483,68 @@ fi
                 "unexpected error: {error:#}"
             );
         }
+    }
+
+    #[test]
+    fn durable_object_binding_with_foreign_script_name_is_refused() {
+        let project = tempfile::tempdir().unwrap();
+        let config = project.path().join("wrangler.json");
+        std::fs::write(project.path().join("b.js"), "export default {};\n").unwrap();
+        std::fs::write(
+            &config,
+            r#"{"name": "b", "main": "b.js", "no_bundle": true,
+                "durable_objects": {"bindings": [{"name": "COUNTER", "class_name": "Counter", "script_name": "a"}]}}"#,
+        )
+        .unwrap();
+        let error = match read_project(&config, project.path(), &VarOverrides::None) {
+            Ok(_) => panic!("a durable object binding naming another script must be refused"),
+            Err(error) => error,
+        };
+        let message = format!("{error:?}");
+        assert!(
+            message.contains("script_name"),
+            "the refusal must name `script_name`: {message}"
+        );
+    }
+
+    #[test]
+    fn durable_object_binding_with_own_script_name_is_local() {
+        let project = tempfile::tempdir().unwrap();
+        let config = project.path().join("wrangler.json");
+        std::fs::write(project.path().join("b.js"), "export default {};\n").unwrap();
+        std::fs::write(
+            &config,
+            r#"{"name": "b", "main": "b.js", "no_bundle": true,
+                "durable_objects": {"bindings": [{"name": "COUNTER", "class_name": "Counter", "script_name": "b"}]},
+                "migrations": [{"tag": "v1", "new_sqlite_classes": ["Counter"]}]}"#,
+        )
+        .unwrap();
+        let parsed = read_project(&config, project.path(), &VarOverrides::None)
+            .expect("a binding naming its own script is local and must parse");
+        assert_eq!(parsed.script_name, "b");
+        assert!(parsed.do_classes.iter().any(|class| class == "Counter"));
+    }
+
+    #[test]
+    fn durable_object_binding_with_non_string_script_name_is_refused() {
+        let project = tempfile::tempdir().unwrap();
+        let config = project.path().join("wrangler.json");
+        std::fs::write(project.path().join("b.js"), "export default {};\n").unwrap();
+        std::fs::write(
+            &config,
+            r#"{"name": "b", "main": "b.js", "no_bundle": true,
+                "durable_objects": {"bindings": [{"name": "COUNTER", "class_name": "Counter", "script_name": 5}]}}"#,
+        )
+        .unwrap();
+        let error = match read_project(&config, project.path(), &VarOverrides::None) {
+            Ok(_) => panic!("a non-string `script_name` must be refused, not treated as absent"),
+            Err(error) => error,
+        };
+        let message = format!("{error:?}");
+        assert!(
+            message.contains("script_name"),
+            "the refusal must name `script_name`: {message}"
+        );
     }
 }
 
