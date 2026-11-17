@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): loader external stubs from the union of main + sibling imports (upstream #304).
+// Modified by ryuzcorp (ryuzcorp/celld): loader external stubs from the union of main + sibling imports (upstream #304); node:process eager global (upstream #296).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! ES module resolution and compilation.
@@ -545,6 +545,10 @@ fn eager_module_global(spec: &str) -> Option<&'static str> {
         "fs" | "node:fs" => "__fs",
         "fs/promises" | "node:fs/promises" => "__fsPromises",
         "zlib" | "node:zlib" => "__zlibModule",
+        // The global process object itself, not a copy: `node:process`
+        // default-imports to `globalThis.process`, and a named `env`
+        // import reads the same live object (upstream #296).
+        "process" | "node:process" => "__processGlobal",
         _ => return None,
     })
 }

@@ -6451,6 +6451,12 @@ impl Worker {
             // read Cloudflare.compatibilityFlags at module scope.
             inject_compatibility_flags(scope, compat)?;
             inject_storage_compatibility(scope, compat)?;
+            // Worker vars reach `process.env` before the module evaluates,
+            // so module-scope reads agree with the handler's `env`. A loaded
+            // worker's strings travel in its loader env instead of `vars`,
+            // and need the same pre-evaluation copy.
+            populate_process_env(scope, &config)?;
+            populate_loader_process_env(scope, &config)?;
 
             let module = match compile_module(scope, &config.main_module_name, src) {
                 Some(m) => m,
@@ -14152,8 +14158,9 @@ use bootstrap::{
     adopt_cell, adopt_embedded_cell, begin_event_context, build_env, end_event_context,
     harness_env, inject_compatibility_flags, inject_containers, inject_crons, inject_kv_limits,
     inject_namespace_keys, inject_queue_config, inject_routing, inject_storage_compatibility,
-    inject_workflows, install_harness, install_prelude, populate_cf_exports, register_class,
-    register_entrypoints, validate_workflow_classes, EmbeddedStartup,
+    inject_workflows, install_harness, install_prelude, populate_cf_exports,
+    populate_loader_process_env, populate_process_env, register_class, register_entrypoints,
+    validate_workflow_classes, EmbeddedStartup,
 };
 use modules::{
     compile_module, host_import_module_dynamically, install_lazy_globals, op_builtin_module,
