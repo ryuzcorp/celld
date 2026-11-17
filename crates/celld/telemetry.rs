@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): parse OTEL_RESOURCE_ATTRIBUTES into the OTLP resource (upstream #314); incoming spans carry HTTP method (upstream #285)
+// Modified by ryuzcorp (ryuzcorp/celld): parse OTEL_RESOURCE_ATTRIBUTES into the OTLP resource (upstream #314); incoming spans carry HTTP method (upstream #285); split logs from traces via CELLD_OTEL_LOGS (upstream #153).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 // Telemetry is observational and does not affect Actor decisions.
@@ -86,6 +86,21 @@ pub enum SinkChoice {
     Otlp { endpoint: String },
 }
 
+/// Where log records go when the operator splits them from traces
+/// (`CELLD_OTEL_LOGS`, denoland/celld#153). Traces always follow
+/// [`SinkChoice`]; only the logs signal can take a separate path, so a fleet
+/// can point its collector at traces while its logs land in the bucket.
+#[derive(Debug, Clone, PartialEq)]
+pub enum LogsSink {
+    /// Logs follow the traces sink — the historical behavior.
+    Follow,
+    /// Logs go to the bucket as Parquet, whatever the traces sink is.
+    /// The node refuses to start without a bucket, like `CELLD_OTEL=1`.
+    Bucket,
+    /// Logs are dropped; only traces export.
+    Drop,
+}
+
 #[derive(Debug)]
 pub struct Config {
     pub sink: SinkChoice,
@@ -94,6 +109,7 @@ pub struct Config {
     pub bucket_override: Option<String>,
     pub otlp_headers: Vec<(String, String)>,
     pub otlp_timeout: Duration,
+    pub logs_sink: LogsSink,
     pub service: String,
     /// Parsed `OTEL_RESOURCE_ATTRIBUTES`: operator-owned resource entries
     /// exported alongside the spans and logs. `service.name` never appears
@@ -157,6 +173,14 @@ impl Config {
         .unwrap_or(Duration::from_secs(10));
         let service = get("OTEL_SERVICE_NAME")?.unwrap_or_else(|| "celld".to_string());
         let resource_attrs = parse_resource_attributes(&get("OTEL_RESOURCE_ATTRIBUTES")?);
+        let logs_sink = match get("CELLD_OTEL_LOGS")?.as_deref() {
+            None => LogsSink::Follow,
+            Some("bucket") => LogsSink::Bucket,
+            Some("0") => LogsSink::Drop,
+            Some(other) => {
+                bail!("CELLD_OTEL_LOGS must be bucket or 0, not {other:?}")
+            }
+        };
         // Per the otel spec: a `parentbased_*` sampler defers to the
         // caller's sampled flag and decides itself only for roots. That
         // is an explicit statement of upstream trust — appropriate here,
@@ -211,6 +235,7 @@ impl Config {
             bucket_override,
             otlp_headers,
             otlp_timeout,
+            logs_sink,
             service,
             resource_attrs,
             sample_ratio,
@@ -689,18 +714,31 @@ pub fn init(
     node: String,
     region: String,
 ) -> anyhow::Result<()> {
-    let sink = match &config.sink {
+    fn bucket_sink(
+        bucket: &Option<Bucket>,
+        what: &str,
+        retention: &str,
+    ) -> anyhow::Result<SinkRuntime> {
+        let Some(bucket) = bucket.clone() else {
+            anyhow::bail!(
+                "{what} but this node has no bucket; the bucket sink needs \
+                 one (CELLD_BUCKET)"
+            );
+        };
+        Ok(SinkRuntime::Bucket {
+            bucket,
+            retention: retention.to_string(),
+        })
+    }
+    let traces = match &config.sink {
         SinkChoice::Bucket => {
-            let bucket = bucket.expect("the bucket sink needs a bucket");
+            let bucket = bucket.clone().expect("the bucket sink needs a bucket");
             tracing::info!(
                 retention = %config.retention.label(),
                 sample_ratio = config.sample_ratio,
                 bucket = %bucket.name,
                 "telemetry on; Parquet to the bucket"
             );
-            if let Retention::Days(days) = config.retention {
-                tokio::spawn(sweep_loop(bucket.clone(), days));
-            }
             SinkRuntime::Bucket {
                 bucket,
                 retention: config.retention.label(),
@@ -723,6 +761,34 @@ pub fn init(
             }
         }
     };
+    let logs = match config.logs_sink {
+        LogsSink::Follow => Some(traces.clone()),
+        LogsSink::Bucket => {
+            tracing::info!("telemetry logs to the bucket while traces follow the traces sink");
+            Some(bucket_sink(
+                &bucket,
+                "CELLD_OTEL_LOGS=bucket",
+                &config.retention.label(),
+            )?)
+        }
+        LogsSink::Drop => {
+            tracing::info!("telemetry logs are dropped; only traces export");
+            None
+        }
+    };
+    // One sweep covers every signal in the bucket: traces and logs share the
+    // bucket, the prefix, and the retention, so a second sweep would list
+    // and delete the same keys twice.
+    if let Retention::Days(days) = config.retention {
+        let sweep = match (&traces, &logs) {
+            (SinkRuntime::Bucket { bucket, .. }, _)
+            | (_, Some(SinkRuntime::Bucket { bucket, .. })) => Some(bucket.clone()),
+            _ => None,
+        };
+        if let Some(bucket) = sweep {
+            tokio::spawn(sweep_loop(bucket, days));
+        }
+    }
     let (tx, rx) = tokio::sync::mpsc::channel(CHANNEL_CAPACITY);
     let telemetry = Telemetry {
         tx,
@@ -735,7 +801,8 @@ pub fn init(
     }
     tokio::spawn(pump(
         rx,
-        sink,
+        traces,
+        logs,
         ExportTarget {
             node,
             region,
@@ -767,6 +834,7 @@ impl ExportTarget {
     }
 }
 
+#[derive(Clone)]
 enum SinkRuntime {
     Bucket {
         bucket: Bucket,
@@ -867,6 +935,26 @@ impl SinkRuntime {
             }
         }
     }
+}
+
+/// Flush one batch to the traces sink and the logs sink separately. Split by
+/// `CELLD_OTEL_LOGS`, together otherwise (the same sink twice, each side
+/// carrying only its own signal). A dropped logs sink discards its signal
+/// here, after the same batching, so a collector-only fleet never buffers
+/// log records it will not send.
+async fn flush_split(
+    traces: &SinkRuntime,
+    logs_sink: &Option<SinkRuntime>,
+    spans: Vec<Span>,
+    logs: Vec<Log>,
+    scope: &ExportScope<'_>,
+) -> u64 {
+    let traces_dropped = traces.flush(spans, Vec::new(), scope).await;
+    let logs_dropped = match logs_sink {
+        Some(sink) => sink.flush(Vec::new(), logs, scope).await,
+        None => 0,
+    };
+    traces_dropped + logs_dropped
 }
 
 /// Where one flush batch is exported: the identity the resource carries.
@@ -1000,7 +1088,8 @@ fn flatten<T>(joined: Result<anyhow::Result<T>, tokio::task::JoinError>) -> anyh
 /// async I/O.
 async fn pump(
     mut rx: tokio::sync::mpsc::Receiver<Event>,
-    sink: SinkRuntime,
+    traces: SinkRuntime,
+    logs_sink: Option<SinkRuntime>,
     target: ExportTarget,
     flush: Duration,
     flush_bytes: usize,
@@ -1035,7 +1124,8 @@ async fn pump(
                 Event::Log(log) => logs.push(log),
             }
         }
-        let sink_dropped = sink.flush(spans, logs, &target.scope()).await;
+        let sink_dropped =
+            flush_split(&traces, &logs_sink, spans, logs, &target.scope()).await;
         let dropped = sink_dropped.saturating_add(
             TELEMETRY
                 .get()
@@ -1394,6 +1484,90 @@ mod tests {
             .map(|(key, value)| (key.to_string(), value.to_string()))
             .collect();
         Config::from_lookup(|name| Ok(env.get(name).cloned()))
+    }
+
+    #[test]
+    fn lookup_parses_the_logs_sink() {
+        let config = config_with(&[("CELLD_OTEL", "http://127.0.0.1:4318")])
+            .expect("valid config")
+            .expect("telemetry on");
+        assert_eq!(config.logs_sink, LogsSink::Follow);
+        for (value, expected) in [("bucket", LogsSink::Bucket), ("0", LogsSink::Drop)] {
+            let config = config_with(&[
+                ("CELLD_OTEL", "http://127.0.0.1:4318"),
+                ("CELLD_OTEL_LOGS", value),
+            ])
+            .expect("valid config")
+            .expect("telemetry on");
+            assert_eq!(config.logs_sink, expected, "CELLD_OTEL_LOGS={value}");
+        }
+        assert!(
+            config_with(&[
+                ("CELLD_OTEL", "http://127.0.0.1:4318"),
+                ("CELLD_OTEL_LOGS", "collector"),
+            ])
+            .is_err(),
+            "an unknown logs sink must fail startup, not silently follow"
+        );
+    }
+
+    /// Traces and logs flush to their own sinks: with a split, the traces
+    /// bucket holds only spans and the logs bucket only log records; with a
+    /// dropped logs sink, the records never land anywhere (denoland/celld#153).
+    #[tokio::test]
+    async fn split_flush_routes_each_signal_to_its_sink() {
+        use crate::bucket::Bucket;
+        fn span() -> Span {
+            Span::new(
+                TraceIds {
+                    trace_id: [1; 16],
+                    span_id: [2; 8],
+                },
+                "celld.fetch",
+                KIND_SERVER,
+            )
+        }
+        fn log() -> Log {
+            Log {
+                trace_id: None,
+                span_id: None,
+                time_unix_us: 1,
+                severity: Severity::Info,
+                body: "hello".to_string(),
+            }
+        }
+        async fn listed(bucket: &Bucket, prefix: &str) -> usize {
+            bucket
+                .list(prefix)
+                .await
+                .expect("list the sink bucket")
+                .len()
+        }
+        let traces_bucket = Bucket::for_test();
+        let logs_bucket = Bucket::for_test();
+        let traces = SinkRuntime::Bucket {
+            bucket: traces_bucket.clone(),
+            retention: "none".to_string(),
+        };
+        let logs = SinkRuntime::Bucket {
+            bucket: logs_bucket.clone(),
+            retention: "none".to_string(),
+        };
+        let scope = ExportScope {
+            node: "n",
+            region: "r",
+            service: "s",
+            resource_attrs: &[],
+        };
+        flush_split(&traces, &Some(logs), vec![span()], vec![log()], &scope).await;
+        assert_eq!(listed(&traces_bucket, TRACES_PREFIX).await, 1);
+        assert_eq!(listed(&traces_bucket, LOGS_PREFIX).await, 0);
+        assert_eq!(listed(&logs_bucket, LOGS_PREFIX).await, 1);
+        assert_eq!(listed(&logs_bucket, TRACES_PREFIX).await, 0);
+        // A dropped logs sink discards without touching the traces bucket.
+        flush_split(&traces, &None, vec![span()], vec![log()], &scope).await;
+        assert_eq!(listed(&traces_bucket, TRACES_PREFIX).await, 2);
+        assert_eq!(listed(&traces_bucket, LOGS_PREFIX).await, 0);
     }
 
     #[test]
