@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): operator token for the internal listener; list_page resume is a cursor; ported from meln1k/celld: seal a dead lease that never opened a log (01522b3); seal_absent_log regression tests; lone-node repair backoff; bucket-posture group commit: bucket-session record encoding + old-reader interop tests (0059); bucket-posture group commit: bucket executor without ensemble (0060); bucket-posture group commit: successor fold of bucket bundles (0063); bucket-posture group commit: bucket-session drain, per-cell seal, bundle GC without ensemble, linger holds only while the dirty set is shared (0064); bucket-posture group commit: lone-cell-per-cell vs shared-bundle executor tests, and idle bucket sessions skip empty bundle-GC scans (0071); stale-target 409 proves the member gone in recovery (upstream #273); tail reads stream under a progress timeout (upstream #250); deleted sessions with surviving objects declare loss (upstream #245).
+// Modified by ryuzcorp (ryuzcorp/celld): operator token for the internal listener; list_page resume is a cursor; ported from meln1k/celld: seal a dead lease that never opened a log (01522b3); seal_absent_log regression tests; lone-node repair backoff; bucket-posture group commit: bucket-session record encoding + old-reader interop tests (0059); bucket-posture group commit: bucket executor without ensemble (0060); bucket-posture group commit: successor fold of bucket bundles (0063); bucket-posture group commit: bucket-session drain, per-cell seal, bundle GC without ensemble, linger holds only while the dirty set is shared (0064); bucket-posture group commit: lone-cell-per-cell vs shared-bundle executor tests, and idle bucket sessions skip empty bundle-GC scans (0071); stale-target 409 proves the member gone in recovery (upstream #273); tail reads stream under a progress timeout (upstream #250); deleted sessions with surviving objects declare loss (upstream #245); same-ensemble degrade resumes the epoch (upstream #268).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! v0 of the in-fleet replicated log tier (`CELLD_DURABILITY=fleet`).
@@ -4126,6 +4126,12 @@ pub struct NodeLogManager {
     /// The gray-follower ledger: append timings in, eviction verdicts and
     /// the quarantine out. Outlives every shipper swap.
     health: Arc<Mutex<celld_logic::log_evict::FollowerHealth>>,
+    /// Consecutive same-ensemble resumes without an epoch install
+    /// (upstream #268). Past MAX_SAME_ENSEMBLE_RESUMES the loop steps the
+    /// epoch anyway, so a member that lost its fragment can still rejoin —
+    /// which under persistent failure means a step on every 4th consecutive
+    /// degrade, ~1/4 of the pre-#268 lease-write rate rather than zero.
+    same_ensemble_resumes: std::sync::atomic::AtomicU64,
     policy: Arc<celld_logic::log_evict::EvictionPolicy>,
     /// A correlated member stall latched self-suspicion: every ensemble
     /// member stuck at once means our own connectivity is the suspect,
@@ -4635,6 +4641,274 @@ mod maintain_outcome_tests {
     }
 }
 
+/// How many consecutive same-ensemble resumes one epoch absorbs before
+/// the maintenance loop steps it anyway (upstream #268). A transiently
+/// sick member heals within a resume or two, with zero record churn; a
+/// member that lost its fragment (or sealed) can only rejoin through
+/// adoption at sequence 1, which needs the step.
+///
+/// Residual: under a persistently failing append verdict the pattern is
+/// three cheap resumes and then one full step — a lease write and posture
+/// repair per fourth consecutive degrade — so the loop still pays ~1/4 of
+/// the pre-#268 lease-write rate instead of zero. The guard mitigates the
+/// 429→self-fence churn; it does not eliminate the step while the failure
+/// persists.
+const MAX_SAME_ENSEMBLE_RESUMES: u64 = 3;
+
+/// Whether a degraded ensemble whose eligible membership matches its
+/// record resumes its epoch instead of stepping it (upstream #268).
+/// Pure, so the flap guard's boundary is unit-tested where the loop is not.
+fn resume_same_ensemble(resumes: u64) -> bool {
+    resumes < MAX_SAME_ENSEMBLE_RESUMES
+}
+
+/// Whether the folded own-log record still names the installed shipper's
+/// epoch and ensemble. A failed `transition.write` leaves the newer record
+/// in the ownership slot (`OwnLog::write` replaces the slot before it waits
+/// for a lease write to carry it), so the slot can run ahead of the
+/// installed shipper; only a match may clear `degraded` (upstream #268).
+fn folded_names_shipper(transition: &LiveLogTransition<'_>, shipper: &FleetShipper) -> bool {
+    transition
+        .current()
+        .as_ref()
+        .and_then(|wire| log_from_wire(wire).ok())
+        .is_some_and(|folded| {
+            folded.epoch == shipper.epoch && folded.ensemble == shipper.record.ensemble
+        })
+}
+
+#[cfg(test)]
+mod same_ensemble_resume_tests {
+    use super::*;
+
+    /// The flap guard resumes while the budget lasts and steps past it:
+    /// three cheap resumes, then the epoch step that rejoins an amnesiac
+    /// member through adoption.
+    #[test]
+    fn resume_budget_steps_past_three() {
+        assert!(resume_same_ensemble(0));
+        assert!(resume_same_ensemble(2));
+        assert!(!resume_same_ensemble(3));
+        assert!(!resume_same_ensemble(100));
+        assert_eq!(MAX_SAME_ENSEMBLE_RESUMES, 3);
+    }
+}
+
+#[cfg(test)]
+mod degraded_resume_guard_tests {
+    use super::*;
+    use crate::ownership_store::{NodeLeaseWire, NodeLoadWire};
+
+    fn fleet_record(epoch: u64) -> log_tier::LogRecord {
+        log_tier::LogRecord {
+            epoch,
+            ensemble: BTreeSet::from(["p1".to_string()]),
+            tiered: 0,
+            state: LogState::Open,
+            kind: log_tier::SessionKind::Fleet,
+            claimant: None,
+            claimed_ms: None,
+        }
+    }
+
+    /// A degraded shipper whose folded own-log record moved past it must
+    /// not resume: a failed `transition.write` leaves the newer record in
+    /// the ownership slot, and resuming would enable fleet acks for the old
+    /// epoch while the published record names the newer one. Fail-before:
+    /// the matching membership cleared `degraded` without checking the
+    /// folded record.
+    #[test]
+    fn folded_record_ahead_of_shipper_keeps_degraded() {
+        let runtime = crate::asyncrt::shared_test_runtime();
+        runtime.block_on(async {
+            let dir = tempfile::tempdir().expect("test dir");
+            let database = dir.path().join("objects.sqlite3");
+            let bucket = Arc::new(crate::dev::open_local_bucket(&database).expect("dev bucket"));
+            let replication = crate::ltx_replication::Replication::start(
+                bucket.as_ref().clone(),
+                &dir.path().join("watch"),
+                None,
+                "test".into(),
+                None,
+            )
+            .expect("replication starts");
+            let ownership = Arc::new(crate::ownership_store::BucketOwnership::new(
+                bucket.as_ref().clone(),
+                bucket.as_ref().clone(),
+                "n0".into(),
+                "test-probe-key".into(),
+            ));
+            let own_log = Arc::new(OwnLog {
+                ownership,
+                nudge: Box::new(|| {}),
+                write_lock: tokio::sync::Mutex::new(()),
+            });
+            let auth = Arc::new(PeerAuth::new([0u8; 32], "n0").expect("test auth"));
+            let manager = NodeLogManager::new(
+                "n0/gen1",
+                bucket.clone(),
+                own_log,
+                replication.ltx(),
+                auth,
+                celld_logic::log_evict::EvictionPolicy::default(),
+            );
+            // One live peer, exactly the installed ensemble.
+            bucket
+                .put(
+                    &lease_key("p1"),
+                    serde_json::to_vec(&NodeLeaseWire {
+                        node: "p1".into(),
+                        expires_ms: crate::ownership_store::now_ms() + 3_600_000,
+                        addr: "127.0.0.1:9".into(),
+                        probe_public_key: String::new(),
+                        peer_protocol: 1,
+                        paced_handoff: false,
+                        generation: "g".into(),
+                        log: None,
+                        load: NodeLoadWire::default(),
+                    })
+                    .expect("lease encodes"),
+                )
+                .await
+                .expect("peer lease publishes");
+            // The slot holds the record a failed `transition.write` left
+            // behind: one epoch past the installed shipper.
+            manager
+                .ownership
+                .set_own_log(Some(log_to_wire(&fleet_record(6), false)));
+            let shipper = Arc::new(FleetShipper {
+                node: "n0/gen1".into(),
+                transport: manager.transport.clone(),
+                record: fleet_record(5),
+                live_log: manager.live_log.clone(),
+                activated: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                epoch: 5,
+                members: vec![Member {
+                    node: "p1".into(),
+                    addr: "127.0.0.1:9".into(),
+                }],
+                lanes: Vec::new(),
+                pipeline: 4,
+                seq: std::sync::atomic::AtomicU64::new(0),
+                degraded: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+                // A batch between capture and credit parks the pass at the
+                // barrier instead of attempting the reconfiguration write,
+                // which has no lease writer to carry it in this test.
+                outstanding: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+                policy: Arc::new(celld_logic::log_evict::EvictionPolicy::default()),
+                stream: None,
+            });
+            *manager.inner.lock().unwrap() = Some(shipper.clone());
+            let outcome = manager.maintain().await.expect("maintain runs");
+            assert_eq!(
+                outcome,
+                MaintainOutcome::Other,
+                "the guarded pass parks at the barrier"
+            );
+            assert!(
+                shipper.degraded.load(Ordering::SeqCst),
+                "the folded record names epoch 6 while the shipper serves epoch 5: no resume"
+            );
+            assert_eq!(
+                manager.same_ensemble_resumes.load(Ordering::SeqCst),
+                0,
+                "no resume budget is spent on a mismatched fold"
+            );
+        });
+    }
+
+    /// The control: a folded record that still names the shipper resumes
+    /// the live epoch instead of stepping it.
+    #[test]
+    fn folded_record_matching_shipper_resumes() {
+        let runtime = crate::asyncrt::shared_test_runtime();
+        runtime.block_on(async {
+            let dir = tempfile::tempdir().expect("test dir");
+            let database = dir.path().join("objects.sqlite3");
+            let bucket = Arc::new(crate::dev::open_local_bucket(&database).expect("dev bucket"));
+            let replication = crate::ltx_replication::Replication::start(
+                bucket.as_ref().clone(),
+                &dir.path().join("watch"),
+                None,
+                "test".into(),
+                None,
+            )
+            .expect("replication starts");
+            let ownership = Arc::new(crate::ownership_store::BucketOwnership::new(
+                bucket.as_ref().clone(),
+                bucket.as_ref().clone(),
+                "n0".into(),
+                "test-probe-key".into(),
+            ));
+            let own_log = Arc::new(OwnLog {
+                ownership,
+                nudge: Box::new(|| {}),
+                write_lock: tokio::sync::Mutex::new(()),
+            });
+            let auth = Arc::new(PeerAuth::new([0u8; 32], "n0").expect("test auth"));
+            let manager = NodeLogManager::new(
+                "n0/gen1",
+                bucket.clone(),
+                own_log,
+                replication.ltx(),
+                auth,
+                celld_logic::log_evict::EvictionPolicy::default(),
+            );
+            bucket
+                .put(
+                    &lease_key("p1"),
+                    serde_json::to_vec(&NodeLeaseWire {
+                        node: "p1".into(),
+                        expires_ms: crate::ownership_store::now_ms() + 3_600_000,
+                        addr: "127.0.0.1:9".into(),
+                        probe_public_key: String::new(),
+                        peer_protocol: 1,
+                        paced_handoff: false,
+                        generation: "g".into(),
+                        log: None,
+                        load: NodeLoadWire::default(),
+                    })
+                    .expect("lease encodes"),
+                )
+                .await
+                .expect("peer lease publishes");
+            manager
+                .ownership
+                .set_own_log(Some(log_to_wire(&fleet_record(5), false)));
+            let shipper = Arc::new(FleetShipper {
+                node: "n0/gen1".into(),
+                transport: manager.transport.clone(),
+                record: fleet_record(5),
+                live_log: manager.live_log.clone(),
+                activated: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                epoch: 5,
+                members: vec![Member {
+                    node: "p1".into(),
+                    addr: "127.0.0.1:9".into(),
+                }],
+                lanes: Vec::new(),
+                pipeline: 4,
+                seq: std::sync::atomic::AtomicU64::new(0),
+                degraded: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+                outstanding: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                policy: Arc::new(celld_logic::log_evict::EvictionPolicy::default()),
+                stream: None,
+            });
+            *manager.inner.lock().unwrap() = Some(shipper.clone());
+            let outcome = manager.maintain().await.expect("maintain runs");
+            assert_eq!(
+                outcome,
+                MaintainOutcome::Other,
+                "the matching fold resumes cheaply"
+            );
+            assert!(
+                !shipper.degraded.load(Ordering::SeqCst),
+                "the matching fold resumes the live epoch"
+            );
+        });
+    }
+}
+
 #[cfg(test)]
 mod seal_gone_tests {
     use super::*;
@@ -4812,9 +5086,8 @@ mod recovery_heartbeat_tests {
             _path: &'a str,
             _body: Vec<u8>,
             _deadline: Option<std::time::Duration>,
-        ) -> std::pin::Pin<
-            Box<dyn Future<Output = anyhow::Result<bytes::Bytes>> + Send + 'a>,
-        > {
+        ) -> std::pin::Pin<Box<dyn Future<Output = anyhow::Result<bytes::Bytes>> + Send + 'a>>
+        {
             Box::pin(async move { anyhow::bail!("slow tails never seal") })
         }
 
@@ -4825,9 +5098,8 @@ mod recovery_heartbeat_tests {
             _path: &'a str,
             _body: Vec<u8>,
             _progress: std::time::Duration,
-        ) -> std::pin::Pin<
-            Box<dyn Future<Output = anyhow::Result<bytes::Bytes>> + Send + 'a>,
-        > {
+        ) -> std::pin::Pin<Box<dyn Future<Output = anyhow::Result<bytes::Bytes>> + Send + 'a>>
+        {
             let delay = self.delay;
             let body = self.body.clone();
             Box::pin(async move {
@@ -4869,10 +5141,9 @@ mod recovery_heartbeat_tests {
         let runtime = crate::asyncrt::shared_test_runtime();
         runtime.block_on(async {
             let dir = tempfile::tempdir().expect("test dir");
-            let bucket =
-                Arc::new(Bucket::with_store_for_test(Arc::new(
-                    object_store::memory::InMemory::new(),
-                )));
+            let bucket = Arc::new(Bucket::with_store_for_test(Arc::new(
+                object_store::memory::InMemory::new(),
+            )));
             let database = dir.path().join("objects.sqlite3");
             let dev = Arc::new(crate::dev::open_local_bucket(&database).expect("dev bucket"));
             let replication = crate::ltx_replication::Replication::start(
@@ -5032,6 +5303,7 @@ impl NodeLogManager {
             bundle_gc_clean: std::sync::atomic::AtomicBool::new(false),
             bundle_cache: tokio::sync::Mutex::new(None),
             health: Arc::new(Mutex::new(celld_logic::log_evict::FollowerHealth::default())),
+            same_ensemble_resumes: std::sync::atomic::AtomicU64::new(0),
             policy: Arc::new(policy),
             suspect_self: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             shortfall_logged_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -6153,7 +6425,9 @@ impl NodeLogManager {
             // every later pass over the still-deleted session keeps them.
             // A conditional create wins the first write and loses every
             // later one (upstream #245).
-            return self.declare_absent_loss(node, serde_json::to_vec(&loss)?).await;
+            return self
+                .declare_absent_loss(node, serde_json::to_vec(&loss)?)
+                .await;
         };
         let wire: crate::ownership_store::NodeLeaseWire = serde_json::from_slice(&bytes)?;
         if wire.log.is_some() {
@@ -6184,7 +6458,11 @@ impl NodeLogManager {
         let key = format!("log/{node}.loss.json");
         let mut attempt = 0_u32;
         loop {
-            match self.bucket.put_cas_verdict(&key, loss.clone(), None).await? {
+            match self
+                .bucket
+                .put_cas_verdict(&key, loss.clone(), None)
+                .await?
+            {
                 crate::bucket::CasPut::Applied(_) => {
                     warn!(
                         node,
@@ -6201,8 +6479,10 @@ impl NodeLogManager {
                 }
                 crate::bucket::CasPut::Rejected { conflict: true } if attempt < 3 => {
                     attempt += 1;
-                    crate::asyncrt::sleep(std::time::Duration::from_millis(20 * u64::from(attempt)))
-                        .await;
+                    crate::asyncrt::sleep(std::time::Duration::from_millis(
+                        20 * u64::from(attempt),
+                    ))
+                    .await;
                 }
                 crate::bucket::CasPut::Rejected { .. } => {
                     // Still conflicting: confirm the record before sealing.
@@ -6582,6 +6862,58 @@ impl NodeLogManager {
                 if current.is_active() && members.len() <= current.members.len() {
                     return Ok(MaintainOutcome::Other);
                 }
+                // The flap guard (upstream #268): a degraded ensemble whose
+                // eligible membership matches its record in both names and
+                // addresses gains no witness from an epoch step — the step only churns the record, a
+                // lease write per reopen, and the member's fragment. Resume
+                // the live epoch instead: the failed batch already rode the
+                // bucket, the ledger is intact, and the next batch continues
+                // the sequence. Past MAX_SAME_ENSEMBLE_RESUMES consecutive
+                // resumes, step anyway: a member that lost its fragment (or
+                // sealed) can only rejoin through adoption at sequence 1.
+                // Residual: under persistent failure this still steps the
+                // epoch on every 4th consecutive degrade — mitigated churn,
+                // not zero churn.
+                // The folded own-log record must still name this shipper's
+                // epoch and ensemble. A failed `transition.write` leaves the
+                // newer record in the ownership slot while the installed
+                // shipper still serves the old one, and the next lease write
+                // can publish it; resuming then would enable fleet acks for
+                // the old epoch while the published record names a newer
+                // one. A mismatch keeps the shipper degraded and lets the
+                // pass below adopt the folded record instead.
+                if !current.is_active()
+                    && members
+                        .iter()
+                        .map(|member| member.node.clone())
+                        .collect::<BTreeSet<_>>()
+                        == current.record.ensemble
+                    // A member that restarted with its pinned id at a new
+                    // address keeps its name but moves: resuming would keep
+                    // the stale lanes dialing the dead address, so the pass
+                    // below drains and reinstalls instead (upstream #268).
+                    && members
+                        .iter()
+                        .map(|member| (member.node.clone(), member.addr.clone()))
+                        .collect::<BTreeSet<_>>()
+                        == current
+                            .members
+                            .iter()
+                            .map(|member| (member.node.clone(), member.addr.clone()))
+                            .collect::<BTreeSet<_>>()
+                    && resume_same_ensemble(self.same_ensemble_resumes.load(Ordering::SeqCst))
+                    && folded_names_shipper(&transition, &current)
+                {
+                    self.same_ensemble_resumes.fetch_add(1, Ordering::SeqCst);
+                    current.degraded.store(false, Ordering::SeqCst);
+                    self.health.lock().unwrap().reset();
+                    info!(
+                        epoch = current.epoch,
+                        members = ?current.record.ensemble,
+                        "log ensemble resumed; fleet acks enabled"
+                    );
+                    return Ok(MaintainOutcome::Other);
+                }
                 // Deactivate first: acks fall to the bucket and pacing
                 // stops, so the drain below converges.
                 current.degraded.store(true, Ordering::SeqCst);
@@ -6736,6 +7068,9 @@ impl NodeLogManager {
             );
             lanes.push(send);
         }
+        // An epoch install settles the resume budget: the next degrade of
+        // this ensemble resumes cheaply again (upstream #268).
+        self.same_ensemble_resumes.store(0, Ordering::SeqCst);
         *installed = Some(Arc::new(FleetShipper {
             // The wire leader identity IS the session string: followers key
             // fragments and seal marks by it, so a restarted process's
@@ -8534,10 +8869,8 @@ mod seal_absent_log_tests {
         fn list(
             &self,
             prefix: Option<&Path>,
-        ) -> futures_util::stream::BoxStream<
-            'static,
-            object_store::Result<object_store::ObjectMeta>,
-        > {
+        ) -> futures_util::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+        {
             self.inner.list(prefix)
         }
 
@@ -10196,6 +10529,169 @@ mod bucket_recovery_tests {
                 .recover_self()
                 .await
                 .expect("the clean latch makes recovery done-once");
+        });
+    }
+
+    /// Upstream #268: a degraded ensemble whose eligible membership matches
+    /// its record resumes its epoch instead of stepping it — no record
+    /// churn, no lease write, no fragment wipe. A single-member ensemble
+    /// whose member is only transiently sick flapped through a
+    /// degrade/reopen/lease-write cycle per batch; the resume keeps the
+    /// live ledger and continues the sequence. Fail-before: maintain
+    /// stepped the epoch (and stalled on the lease write the renewal loop
+    /// would have carried) on every degraded pass.
+    #[test]
+    fn degraded_same_ensemble_resumes_without_an_epoch_step() {
+        let runtime = crate::asyncrt::shared_test_runtime();
+        runtime.block_on(async {
+            let shared = tempfile::tempdir().expect("test dir");
+            let bucket = bucket_in(shared.path());
+            let local = tempfile::tempdir().expect("test dir");
+            let manager = manager_for(&bucket, local.path(), "n0/gen1", "n0");
+            // One live peer: the single-member ensemble.
+            publish_lease(
+                &bucket,
+                "n1",
+                "gen9",
+                crate::ownership_store::now_ms() + 3_600_000,
+                None,
+            )
+            .await;
+            let ensemble: BTreeSet<String> = BTreeSet::from(["n1".to_string()]);
+            let record = log_tier::create_record(ensemble, 0).expect("nonempty ensemble");
+            let shipper = FleetShipper {
+                node: "n0/gen1".to_string(),
+                transport: manager.transport.clone(),
+                live_log: manager.live_log.clone(),
+                record: record.clone(),
+                activated: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+                epoch: record.epoch,
+                members: vec![Member {
+                    node: "n1".to_string(),
+                    addr: String::new(),
+                }],
+                lanes: Vec::new(),
+                pipeline: 4,
+                seq: std::sync::atomic::AtomicU64::new(359),
+                degraded: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+                outstanding: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                policy: manager.policy.clone(),
+                stream: None,
+            };
+            *manager.inner.lock().unwrap() = Some(Arc::new(shipper));
+            // Mirror the live lease chain: the slot holds the installed
+            // record once its `transition.write` applies, so the resume
+            // guard reads the shipper it serves (upstream #268).
+            manager
+                .ownership
+                .set_own_log(Some(log_to_wire(&record, false)));
+            let outcome = manager.maintain().await.expect("maintain runs");
+            assert_eq!(outcome, MaintainOutcome::Other);
+            let inner = manager
+                .inner
+                .lock()
+                .unwrap()
+                .clone()
+                .expect("the shipper stays installed");
+            assert_eq!(inner.epoch, 1, "same ensemble: no epoch step");
+            assert!(inner.is_active(), "the epoch resumes");
+            assert_eq!(
+                inner.seq.load(Ordering::SeqCst),
+                359,
+                "the ledger is intact: the next batch continues the sequence"
+            );
+            assert_eq!(
+                manager.same_ensemble_resumes.load(Ordering::SeqCst),
+                1,
+                "the resume spends the budget"
+            );
+        });
+    }
+
+    /// Upstream #268 follow-up: the resume compares addresses too. A member
+    /// that restarted with its pinned id at a new address keeps its name
+    /// but moves: resuming would keep the stale lanes dialing the dead
+    /// address, so the pass stays degraded and the drain below reinstalls
+    /// once the in-flight batch credits. Fail-before: the name-only
+    /// comparison resumed the live epoch and kept the dead lanes.
+    #[test]
+    fn degraded_same_names_new_address_reinstalls() {
+        let runtime = crate::asyncrt::shared_test_runtime();
+        runtime.block_on(async {
+            let shared = tempfile::tempdir().expect("test dir");
+            let bucket = bucket_in(shared.path());
+            let local = tempfile::tempdir().expect("test dir");
+            let manager = manager_for(&bucket, local.path(), "n0/gen1", "n0");
+            // Same name, new address: the member restarted elsewhere.
+            let wire = NodeLeaseWire {
+                node: "n1".into(),
+                expires_ms: crate::ownership_store::now_ms() + 3_600_000,
+                addr: "10.0.0.2:9".into(),
+                probe_public_key: String::new(),
+                peer_protocol: 1,
+                paced_handoff: false,
+                generation: "gen9".into(),
+                log: None,
+                load: NodeLoadWire::default(),
+            };
+            bucket
+                .put(
+                    &lease_key("n1"),
+                    serde_json::to_vec(&wire).expect("lease encodes"),
+                )
+                .await
+                .expect("lease publishes");
+            let ensemble: BTreeSet<String> = BTreeSet::from(["n1".to_string()]);
+            let record = log_tier::create_record(ensemble, 0).expect("nonempty ensemble");
+            let shipper = FleetShipper {
+                node: "n0/gen1".to_string(),
+                transport: manager.transport.clone(),
+                live_log: manager.live_log.clone(),
+                record: record.clone(),
+                activated: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+                epoch: record.epoch,
+                members: vec![Member {
+                    node: "n1".into(),
+                    addr: "10.0.0.1:9".into(),
+                }],
+                lanes: Vec::new(),
+                pipeline: 4,
+                seq: std::sync::atomic::AtomicU64::new(359),
+                degraded: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+                // A batch between capture and credit parks the pass at the
+                // barrier, so the address mismatch is observable without a
+                // lease writer to carry a reinstall.
+                outstanding: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+                policy: manager.policy.clone(),
+                stream: None,
+            };
+            *manager.inner.lock().unwrap() = Some(Arc::new(shipper));
+            // Mirror the live lease chain: the slot holds the installed
+            // record, so only the address move blocks the resume.
+            manager
+                .ownership
+                .set_own_log(Some(log_to_wire(&record, false)));
+            let outcome = manager.maintain().await.expect("maintain runs");
+            assert_eq!(
+                outcome,
+                MaintainOutcome::Other,
+                "the mismatched pass parks at the barrier"
+            );
+            let inner = manager
+                .inner
+                .lock()
+                .unwrap()
+                .clone()
+                .expect("the shipper stays installed");
+            assert!(
+                inner.degraded.load(Ordering::SeqCst),
+                "the address move blocks the resume: the shipper stays degraded for the drain below"
+            );
+            assert_eq!(
+                manager.same_ensemble_resumes.load(Ordering::SeqCst),
+                0,
+                "no resume budget is spent on an address change"
+            );
         });
     }
 
