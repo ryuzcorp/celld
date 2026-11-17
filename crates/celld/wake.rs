@@ -1,3 +1,4 @@
+// Modified by ryuzcorp (ryuzcorp/celld): the due scan reports the next upcoming minute and the scanner wakes for it (upstream #308).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! Immutable alarm discovery publications and restart-safe reclamation.
@@ -30,6 +31,23 @@ pub fn resident_ms() -> i64 {
     })
 }
 
+/// Split armed minutes into the due set and the next not-yet-due minute.
+/// The periodic scan opens only due minutes but must wake for the next
+/// upcoming one, or a restarted node's persisted alarm fires only at the
+/// next 60 s tick (upstream #308).
+fn partition_minutes(minutes: Vec<String>, now_ms: i64) -> (Vec<String>, Option<i64>) {
+    let mut upcoming_ms: Option<i64> = None;
+    let mut due = Vec::new();
+    for minute in minutes {
+        match celld_logic::wake::parse_minute_prefix(&minute) {
+            Some(ms) if ms <= now_ms => due.push(minute),
+            Some(ms) => upcoming_ms = Some(upcoming_ms.map_or(ms, |known| known.min(ms))),
+            None => {}
+        }
+    }
+    (due, upcoming_ms)
+}
+
 /// Scan the due wake buckets: used by the boot-time orphan scan and the
 /// periodic waker tick.
 ///
@@ -40,7 +58,11 @@ pub fn resident_ms() -> i64 {
 /// The returned minute bounds an Actor wake hint; SQLite supplies the actual
 /// deadline and delivery authority. Malformed entries cannot reach ownership
 /// or cleanup, because deleting an unclassified name could destroy live work.
-pub async fn due_scan(bucket: &Bucket, now_ms: i64) -> Vec<(String, i64)> {
+///
+/// The second return is the next not-yet-due minute, if any: the caller
+/// sleeps until it instead of the next tick, so a persisted alarm fires on
+/// time after a restart (upstream #308).
+pub async fn due_scan(bucket: &Bucket, now_ms: i64) -> (Vec<(String, i64)>, Option<i64>) {
     /// Bounded like every other fan-out against the store: a long outage can
     /// leave one due bucket per minute of backlog, and opening them all at
     /// once is the thundering herd the eviction bound exists to prevent.
@@ -51,15 +73,10 @@ pub async fn due_scan(bucket: &Bucket, now_ms: i64) -> Vec<(String, i64)> {
         Ok(minutes) => minutes,
         Err(e) => {
             warn!(error = %e, "wake due scan bucket listing failed");
-            return due;
+            return (due, None);
         }
     };
-    let overdue: Vec<String> = minutes
-        .into_iter()
-        .filter(|minute| {
-            celld_logic::wake::parse_minute_prefix(minute).is_some_and(|ms| ms <= now_ms)
-        })
-        .collect();
+    let (overdue, upcoming_ms) = partition_minutes(minutes, now_ms);
 
     let mut listings = futures_util::stream::iter(
         overdue
@@ -85,7 +102,7 @@ pub async fn due_scan(bucket: &Bucket, now_ms: i64) -> Vec<(String, i64)> {
     }
     due.sort();
     due.dedup_by(|a, b| a.0 == b.0);
-    due
+    (due, upcoming_ms)
 }
 
 /// Owner records the elected waker reads at once while it sorts the fleet's
@@ -252,14 +269,10 @@ async fn run_due_scans(
     actor: tokio::sync::mpsc::UnboundedSender<crate::actor::Message>,
     tick_ms: u64,
 ) {
-    let mut tick = crate::asyncrt::interval(Duration::from_millis(tick_ms));
-    tick.set_missed_tick_behavior(crate::asyncrt::MissedTickBehavior::Delay);
-    tick.tick().await;
     let mut dead_node_gc = crate::dead_node_gc::DeadNodeGc::default();
     loop {
-        tick.tick().await;
         let elected = dead_node_gc.run_elected_pass(&bucket, &node, tick_ms).await;
-        let due = due_scan(&bucket, crate::asyncrt::wall_ms()).await;
+        let (due, upcoming_ms) = due_scan(&bucket, crate::asyncrt::wall_ms()).await;
         let (scope, due) = match elected {
             Some(live) => (
                 celld_logic::WakeHintScope::Fleet,
@@ -279,6 +292,21 @@ async fn run_due_scans(
                 return;
             }
         }
+        // Sleep until the next tick, or the next not-yet-due alarm minute
+        // if it lands sooner, so a persisted alarm fires on time after a
+        // restart instead of waiting out the 60 s tick (upstream #308).
+        // An early scan is the same idempotent pass as a tick scan, so the
+        // only cost is one extra listing per upcoming alarm. Like the old
+        // `Delay` tick, a slow scan pushes the next pass out rather than
+        // stacking them.
+        let wait_ms = match upcoming_ms {
+            Some(upcoming_ms) => {
+                let now_ms = crate::asyncrt::wall_ms();
+                tick_ms.min(upcoming_ms.saturating_sub(now_ms).max(1) as u64)
+            }
+            None => tick_ms,
+        };
+        crate::asyncrt::sleep(Duration::from_millis(wait_ms)).await;
     }
 }
 
@@ -669,5 +697,53 @@ impl Collector {
         }
         self.cursor = page.page_token;
         Ok(refresh)
+    }
+}
+
+#[cfg(test)]
+mod partition_tests {
+    use super::*;
+    use celld_logic::wake::{parse_minute_prefix, ENTRY_PREFIX};
+
+    fn minute(bucket: &str) -> String {
+        format!("{ENTRY_PREFIX}{bucket}")
+    }
+
+    /// The upstream #308 split: past and current minutes are due, the
+    /// earliest future minute is the wakeup, and anything unparsable is
+    /// ignored. Fail-before: no upcoming minute was reported, so the
+    /// scanner slept the whole tick and the restarted alarm fired ~60 s
+    /// late whenever its deadline crossed a minute boundary.
+    #[test]
+    fn due_and_next_upcoming_split() {
+        let now_ms = parse_minute_prefix(&minute("2026-11-17T12:34")).expect("valid minute");
+        let (due, upcoming) = partition_minutes(
+            vec![
+                minute("2026-11-17T12:30"),
+                minute("2026-11-17T12:34"),
+                minute("2026-11-17T12:35"),
+                minute("2026-11-17T12:40"),
+                minute("2026-11-17T12:35/"),
+                "wake/entries/bogus".to_string(),
+                "wake/other/2026-11-17T12:20".to_string(),
+            ],
+            now_ms,
+        );
+        assert_eq!(due.len(), 2, "past and boundary minutes are due: {due:?}");
+        assert_eq!(
+            upcoming,
+            parse_minute_prefix(&minute("2026-11-17T12:35")),
+            "the earliest future minute wakes the scanner"
+        );
+    }
+
+    /// No future minutes, no wakeup: the scanner sleeps the whole tick.
+    #[test]
+    fn no_upcoming_without_future_minutes() {
+        let now_ms = parse_minute_prefix(&minute("2026-11-17T12:34")).expect("valid minute");
+        let (due, upcoming) =
+            partition_minutes(vec![minute("2026-11-17T12:30"), "junk".to_string()], now_ms);
+        assert_eq!(due.len(), 1);
+        assert_eq!(upcoming, None);
     }
 }
