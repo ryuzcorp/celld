@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): ported from meln1k/celld: scripted core-bug reproductions (ea471ee, e46a685, 6d61462, 18d3bf9, 9d4c163, 468b456, 01522b3, 65fdb13); shared bucket-posture ownership reads (0056); round-level fence settlement (0062); bucket-posture group commit: live-lease routing pin (0063); renewal readback authority bound (upstream #264); alarm deadline waits for the running copy (upstream #256).
+// Modified by ryuzcorp (ryuzcorp/celld): ported from meln1k/celld: scripted core-bug reproductions (ea471ee, e46a685, 6d61462, 18d3bf9, 9d4c163, 468b456, 01522b3, 65fdb13); shared bucket-posture ownership reads (0056); round-level fence settlement (0062); bucket-posture group commit: live-lease routing pin (0063); renewal readback authority bound (upstream #264); alarm deadline waits for the running copy (upstream #256); same-guard lease conflict retry (upstream #239).
 //! Scripted reproductions of core bugs the deterministic simulator
 //! (`crates/sim`) found. Each drives the core through a minimal shell that
 //! answers every effect at once, except the ones a test holds back to
@@ -11,9 +11,9 @@
 use celld_logic::log_tier::{CellCredit, FenceCellSettlement, FenceRoundSettlement, ProofThenRead};
 use celld_logic::wake::{AlarmSnapshot, AlarmSource, PublicationId};
 use celld_logic::{
-    on_event, pressure, CasOutcome, Channel, Config, Effect, Event, Failure, LeaseCasOutcome,
-    LocalCell, NodeLeaseRecord, NodeLeaseSpec, OwnerRecord, OwnershipOnEvict, Probe, ProofSource,
-    RequestError, RestoreOutcome, State, Timer, WakeHintScope, WebSocketKind,
+    on_event, pressure, CasGuard, CasOutcome, Channel, Config, Effect, Event, Failure,
+    LeaseCasOutcome, LocalCell, NodeLeaseRecord, NodeLeaseSpec, OwnerRecord, OwnershipOnEvict,
+    Probe, ProofSource, RequestError, RestoreOutcome, State, Timer, WakeHintScope, WebSocketKind,
 };
 use std::collections::{BTreeMap, VecDeque};
 
@@ -409,6 +409,86 @@ fn a_failed_proof_settles_an_alarm_still_running() {
         now_mono_ms: MONO_MS,
         result: Ok((AlarmSnapshot::without_wake(None), true, Some(2))),
     });
+    shell.state.validate().expect("state invariant");
+}
+
+/// Upstream #239: a 409-style conflict answers against the guard just
+/// attempted, so a renewal retries with the same guard instead of spending
+/// a readback round trip on an ETag the readback would only re-learn. Two
+/// same-guard retries, then the readback like a lost race. Fail-before:
+/// every conflict paid a full readback out of the remaining authority, and
+/// the 6.6 s S3 409 storm fenced the node on its readbacks.
+#[test]
+fn a_lease_conflict_retries_with_the_same_guard() {
+    let mut shell = Shell::new(4, |_| false);
+    shell.start();
+    shell.hold = |effect| {
+        matches!(
+            effect,
+            Effect::CasNodeLease { .. } | Effect::ReadSelfNodeLease { .. }
+        )
+    };
+    let renew = shell
+        .timers
+        .iter()
+        .rev()
+        .find(|timer| matches!(timer, Timer::NodeLeaseRenew { .. }))
+        .cloned()
+        .expect("the held lease arms its renew timer");
+    shell.send(Event::TimerFired {
+        timer: renew,
+        now_ms: NOW_MS,
+        now_mono_ms: MONO_MS,
+    });
+    let (mut op, guard) = match shell.held.as_slice() {
+        [Effect::CasNodeLease { op, guard, .. }] => (*op, guard.clone()),
+        held => panic!("the renew timer issues one lease CAS: {held:?}"),
+    };
+    assert!(
+        matches!(guard, CasGuard::Match(_)),
+        "a renewal guards on the held ETag"
+    );
+    for _ in 0..2 {
+        shell.send(Event::NodeLeaseCasCompleted {
+            op,
+            now_mono_ms: MONO_MS,
+            result: Ok(LeaseCasOutcome::Conflict),
+            stamped_log_state: None,
+        });
+        let (retry, retry_guard) = shell
+            .held
+            .iter()
+            .rev()
+            .find_map(|effect| match effect {
+                Effect::CasNodeLease {
+                    op: retry, guard, ..
+                } => Some((*retry, guard.clone())),
+                _ => None,
+            })
+            .expect("a conflict retries without a readback");
+        assert_eq!(retry_guard, guard, "the retry keeps the attempted guard");
+        assert!(
+            !shell
+                .held
+                .iter()
+                .any(|effect| matches!(effect, Effect::ReadSelfNodeLease { .. })),
+            "no readback while retries remain"
+        );
+        op = retry;
+    }
+    shell.send(Event::NodeLeaseCasCompleted {
+        op,
+        now_mono_ms: MONO_MS,
+        result: Ok(LeaseCasOutcome::Conflict),
+        stamped_log_state: None,
+    });
+    assert!(
+        shell
+            .held
+            .iter()
+            .any(|effect| matches!(effect, Effect::ReadSelfNodeLease { .. })),
+        "exhausted retries fall back to the readback"
+    );
     shell.state.validate().expect("state invariant");
 }
 

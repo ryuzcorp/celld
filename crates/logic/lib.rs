@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): round-level fence settlement (0062); renewal lease readback carries the authority bound (upstream #264); first alarm-deadline expiry only marks the firing (upstream #256).
+// Modified by ryuzcorp (ryuzcorp/celld): round-level fence settlement (0062); renewal lease readback carries the authority bound (upstream #264); first alarm-deadline expiry only marks the firing (upstream #256); same-guard retry on lease conflicts (upstream #239).
 // Modified by ryuzcorp (ryuzcorp/celld): ported from meln1k/celld: coordination-core fixes (ea471ee, e46a685, 6d61462, 18d3bf9, 9d4c163, 468b456, 01522b3, b026226, 65fdb13); shared bucket-posture ownership reads across concurrent gates (0056).
 // Modified by ryuzcorp (ryuzcorp/celld): MergeTree-style lazy handoff policy (0078).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
@@ -609,6 +609,10 @@ struct HeldNodeLease {
     timer_generation: u64,
 }
 
+/// How many times one renewal may retry a transient store conflict with
+/// the same guard before falling back to the readback (upstream #239).
+const MAX_SAME_GUARD_CONFLICT_RETRIES: u8 = 2;
+
 #[derive(Clone, Debug)]
 struct PendingNodeLease {
     spec: NodeLeaseSpec,
@@ -618,6 +622,8 @@ struct PendingNodeLease {
     /// desired record landed, but must not turn a failed create into an
     /// unbounded read/write loop.
     readback_only: bool,
+    /// Same-guard conflict retries spent on this attempt.
+    conflict_retries: u8,
     /// The monotonic instant `desired.expires_ms` was computed from.
     ///
     /// Authority is bounded by what the *bucket* says, and the bucket says
@@ -2519,6 +2525,7 @@ impl State {
             desired,
             prior: None,
             readback_only: false,
+            conflict_retries: 0,
             anchor_mono_ms: self.now_mono_ms,
             resume_local: false,
         };
@@ -2919,7 +2926,33 @@ impl State {
                 record.log_state = stamped_log_state;
                 self.complete_node_lease_write(pending, record, now_mono_ms, effects);
             }
-            Ok(LeaseCasOutcome::Rejected) => {
+            Ok(outcome @ (LeaseCasOutcome::Rejected | LeaseCasOutcome::Conflict)) => {
+                // A transient store conflict (HTTP 409) answers against the
+                // guard just attempted: AWS documents a same-guard retry,
+                // and the readback below costs a full round trip out of the
+                // remaining authority for an ETag the readback would only
+                // re-learn (upstream #239). Renewals retry twice with the
+                // same guard, then fall back to the readback like a lost
+                // race; an initial acquisition (no prior authority) always
+                // reads back.
+                if matches!(outcome, LeaseCasOutcome::Conflict)
+                    && pending.prior.is_some()
+                    && pending.conflict_retries < MAX_SAME_GUARD_CONFLICT_RETRIES
+                {
+                    let mut pending = pending;
+                    pending.conflict_retries += 1;
+                    let guard = CasGuard::Match(
+                        pending
+                            .prior
+                            .as_ref()
+                            .expect("checked above")
+                            .record
+                            .etag
+                            .clone(),
+                    );
+                    self.begin_node_lease_write(pending, guard, effects);
+                    return;
+                }
                 // A rejected renewal is NOT proof of usurpation: an earlier
                 // AMBIGUOUS renewal can land after its own readback missed
                 // it, and then the ETag moved under our hand (#482 — R2
@@ -3290,6 +3323,7 @@ impl State {
                         desired,
                         prior: Some(prior),
                         readback_only: false,
+                        conflict_retries: 0,
                         anchor_mono_ms: now_mono_ms,
                         resume_local: false,
                     },

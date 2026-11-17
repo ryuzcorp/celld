@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): bucket-posture group commit: bucket-session node-log wire marker (0059). bucket-posture group commit: published-format boot self-check (0070).
+// Modified by ryuzcorp (ryuzcorp/celld): bucket-posture group commit: bucket-session node-log wire marker (0059). bucket-posture group commit: published-format boot self-check (0070); lease CAS keeps the 409 conflict kind (upstream #239).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! Bucket ownership effect adapter, over either conditional-write dialect.
@@ -1024,21 +1024,25 @@ impl BucketOwnership {
             CasGuard::Match(etag) => Some(etag.as_str()),
         };
         let started_us = lease_request_started_us();
-        let written = self.lease_bucket.put_cas(&key, body, etag).await;
+        let written = self.lease_bucket.put_cas_verdict(&key, body, etag).await;
         log_lease_request(
             "node_lease_write",
             format_args!("{key}"),
             self.lease_bucket.scheme(),
             started_us,
             match &written {
-                Ok(Some(_)) => LeaseRequestOutcome::Applied,
-                Ok(None) => LeaseRequestOutcome::Rejected,
+                Ok(crate::bucket::CasPut::Applied(_)) => LeaseRequestOutcome::Applied,
+                Ok(crate::bucket::CasPut::Rejected { conflict }) => {
+                    LeaseRequestOutcome::Rejected {
+                        conflict: *conflict,
+                    }
+                }
                 Err(error) => LeaseRequestOutcome::Error(error),
             },
         );
-        // `put_cas` folds a clean 412/409 into `Ok(None)`, so every failure
-        // left here either carries a store answer that proves no object was
-        // written, or describes a write that can have committed.
+        // A clean 412/409 arrives as `Rejected`, so every failure left here
+        // either carries a store answer that proves no object was written,
+        // or describes a write that can have committed.
         let applied = written.map_err(|error| {
             if crate::bucket::cas_write_did_not_commit(&error) {
                 LeaseCasError::NotCommitted(error)
@@ -1047,11 +1051,15 @@ impl BucketOwnership {
             }
         })?;
         match applied {
-            Some(etag) => {
+            crate::bucket::CasPut::Applied(etag) => {
                 let _ = self.applied.send((etag.clone(), log_seq));
                 Ok(LeaseCasOutcome::Applied { etag })
             }
-            None => Ok(LeaseCasOutcome::Rejected),
+            // A 409-style conflict keeps the attempted guard: the core
+            // retries it unchanged instead of spending a readback on an
+            // ETag it already holds (upstream #239).
+            crate::bucket::CasPut::Rejected { conflict: true } => Ok(LeaseCasOutcome::Conflict),
+            crate::bucket::CasPut::Rejected { conflict: false } => Ok(LeaseCasOutcome::Rejected),
         }
     }
 
@@ -1121,7 +1129,9 @@ enum LeaseRequestOutcome<'a> {
     Found { generation: &'a str },
     Missing,
     Applied,
-    Rejected,
+    /// A clean CAS rejection; `conflict` is the transient 409 kind that a
+    /// same-guard retry may clear (upstream #239).
+    Rejected { conflict: bool },
     Error(&'a anyhow::Error),
 }
 
@@ -1131,7 +1141,7 @@ impl LeaseRequestOutcome<'_> {
             Self::Found { .. } => "found",
             Self::Missing => "missing",
             Self::Applied => "applied",
-            Self::Rejected => "rejected",
+            Self::Rejected { .. } => "rejected",
             Self::Error(_) => "error",
         }
     }
@@ -1182,6 +1192,10 @@ fn log_lease_request(
         duration_us = crate::asyncrt::mono_us().saturating_sub(started_us),
         generation = match &outcome {
             LeaseRequestOutcome::Found { generation } => Some(*generation),
+            _ => None,
+        },
+        conflict = match &outcome {
+            LeaseRequestOutcome::Rejected { conflict } => Some(*conflict),
             _ => None,
         },
         error = error.as_deref(),
