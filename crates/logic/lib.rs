@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): round-level fence settlement (0062); renewal lease readback carries the authority bound (upstream #264).
+// Modified by ryuzcorp (ryuzcorp/celld): round-level fence settlement (0062); renewal lease readback carries the authority bound (upstream #264); first alarm-deadline expiry only marks the firing (upstream #256).
 // Modified by ryuzcorp (ryuzcorp/celld): ported from meln1k/celld: coordination-core fixes (ea471ee, e46a685, 6d61462, 18d3bf9, 9d4c163, 468b456, 01522b3, b026226, 65fdb13); shared bucket-posture ownership reads across concurrent gates (0056).
 // Modified by ryuzcorp (ryuzcorp/celld): MergeTree-style lazy handoff policy (0078).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
@@ -584,6 +584,12 @@ enum AlarmState {
         /// The newest runtime observation that arrived before the firing's
         /// durability result. It cannot settle the alarm by itself.
         observed: Option<(wake::AlarmSnapshot, bool)>,
+        /// The operation deadline fired while this copy was still running.
+        /// The first expiry only marks: the running copy settles the alarm
+        /// when it answers, so a slow handler is never doubled (upstream
+        /// #256). A second expiry with the op still outstanding treats the
+        /// op as lost and retires it, preserving at-least-once.
+        expired: bool,
     },
 }
 
@@ -3069,10 +3075,29 @@ impl State {
             return;
         }
         // A firing alarm is tracked on the cell rather than in its phase, so
-        // it is looked for first. Expiry re-arms it exactly as a failed
-        // handler would, which keeps alarms at-least-once instead of turning
-        // a stuck handler into a lost one.
+        // it is looked for first. The first expiry only MARKS the firing:
+        // the handler may still be running, and retiring the op here would
+        // re-fire while the first copy runs (upstream #256). The running
+        // copy settles the alarm when it answers; a second expiry with the
+        // op still outstanding treats the op as lost and retires it exactly
+        // as a failed handler would, which keeps alarms at-least-once
+        // instead of turning a stuck handler into a lost one.
         if matches!(cell.alarm, Some(AlarmState::Firing { op: current, .. }) if current == op) {
+            if !matches!(cell.alarm, Some(AlarmState::Firing { expired: true, .. })) {
+                if let Some(cell) = self.cells.get_mut(&id) {
+                    if let Some(AlarmState::Firing { expired, .. }) = cell.alarm.as_mut() {
+                        *expired = true;
+                    }
+                }
+                self.probe(Probe::AlarmDeadline);
+                if let Some(deadline_ms) = self.config.operation_deadline_ms {
+                    effects.push(Effect::ScheduleTimer {
+                        timer: Timer::OperationDeadline { op },
+                        at_mono_ms: self.now_mono_ms.saturating_add(deadline_ms),
+                    });
+                }
+                return;
+            }
             // The cell comes from the index here, unlike the event, which
             // carries its own: an expiry that cannot find the op has nothing
             // to time out, so depending on the index is safe, while the event
@@ -3600,6 +3625,7 @@ impl State {
             generation,
             covered,
             observed: None,
+            expired: false,
         });
         cell.alarm_wake = false;
         self.cells.insert(id.to_string(), cell);
