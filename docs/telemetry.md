@@ -24,6 +24,7 @@ stable release. Each file carries the version in the object metadata name
 | `OTEL_EXPORTER_OTLP_TIMEOUT` | `10000` | The collector request timeout in milliseconds. |
 | `OTEL_SERVICE_NAME` | `celld` | The service name in the exported OTLP resource. Wins over `service.name` in `OTEL_RESOURCE_ATTRIBUTES`, which itself wins over the default. |
 | `OTEL_RESOURCE_ATTRIBUTES` | unset | A comma-separated list of `key=value` resource attributes added to every exported OTLP span and log batch. Percent-encoded separators decode before export. `service.version` names the application version for deployment tracking; celld's own build is always reported separately as `celld.version`. The bucket Parquet files carry only the `node` and `region` columns, not these attributes. |
+| `CELLD_OTEL_LOGS` | follow the traces sink | Where log records go: unset sends them wherever the traces go, `bucket` writes them as Parquet to the bucket while traces keep their sink, and `0` drops them. Anything else stops the node. |
 
 The bucket sink requires `CELLD_BUCKET`. The OTLP sink does not.
 
