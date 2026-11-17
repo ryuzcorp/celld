@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): bound the renewal lease readback to half the remaining authority (upstream #264).
+// Modified by ryuzcorp (ryuzcorp/celld): bound the renewal lease readback to half the remaining authority (upstream #264); report lease CAS conflicts distinctly (upstream #239).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! Effect dispatch keeps ordinary work off the core's lease timer thread.
@@ -195,6 +195,7 @@ impl StepOutput {
                 let outcome = match &result {
                     Ok(LeaseCasOutcome::Applied { .. }) => "applied",
                     Ok(LeaseCasOutcome::Rejected) => "rejected",
+                    Ok(LeaseCasOutcome::Conflict) => "conflict",
                     Err(Failure::Ambiguous) => "ambiguous",
                     Err(Failure::Definite) => "definite_failure",
                 };
