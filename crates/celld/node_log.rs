@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): operator token for the internal listener; list_page resume is a cursor; ported from meln1k/celld: seal a dead lease that never opened a log (01522b3); seal_absent_log regression tests; lone-node repair backoff; bucket-posture group commit: bucket-session record encoding + old-reader interop tests (0059); bucket-posture group commit: bucket executor without ensemble (0060); bucket-posture group commit: successor fold of bucket bundles (0063); bucket-posture group commit: bucket-session drain, per-cell seal, bundle GC without ensemble, linger holds only while the dirty set is shared (0064); bucket-posture group commit: lone-cell-per-cell vs shared-bundle executor tests, and idle bucket sessions skip empty bundle-GC scans (0071); stale-target 409 proves the member gone in recovery (upstream #273).
+// Modified by ryuzcorp (ryuzcorp/celld): operator token for the internal listener; list_page resume is a cursor; ported from meln1k/celld: seal a dead lease that never opened a log (01522b3); seal_absent_log regression tests; lone-node repair backoff; bucket-posture group commit: bucket-session record encoding + old-reader interop tests (0059); bucket-posture group commit: bucket executor without ensemble (0060); bucket-posture group commit: successor fold of bucket bundles (0063); bucket-posture group commit: bucket-session drain, per-cell seal, bundle GC without ensemble, linger holds only while the dirty set is shared (0064); bucket-posture group commit: lone-cell-per-cell vs shared-bundle executor tests, and idle bucket sessions skip empty bundle-GC scans (0071); stale-target 409 proves the member gone in recovery (upstream #273); tail reads stream under a progress timeout (upstream #250).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! v0 of the in-fleet replicated log tier (`CELLD_DURABILITY=fleet`).
@@ -65,6 +65,25 @@ pub trait LogTransport: Send + Sync + 'static {
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = anyhow::Result<bytes::Bytes>> + Send + 'a>,
     >;
+
+    /// POST a body and read a potentially large response with a progress
+    /// timeout instead of a whole-request timeout (upstream #250): every
+    /// byte batch must arrive within `progress`, but a steadily progressing
+    /// transfer is never cut for its size. The default keeps the
+    /// whole-request behavior, so every test transport keeps its
+    /// request-shaped world unless it opts in.
+    fn post_progress<'a>(
+        &'a self,
+        node: &'a str,
+        addr: &'a str,
+        path: &'a str,
+        body: Vec<u8>,
+        progress: std::time::Duration,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = anyhow::Result<bytes::Bytes>> + Send + 'a>,
+    > {
+        self.post(node, addr, path, body, Some(progress))
+    }
 
     /// Open one long-lived ordered byte stream to a member
     /// (the ordered-transport design). The default refuses, so
@@ -290,6 +309,11 @@ const RECRUIT_FOLLOWERS: usize = 2;
 /// and at eight in flight the 2026-09-03 restart spent 388 s of its 403 s
 /// recovery in this phase; the bucket takes far more in flight than that.
 const RECOVERY_UPLOAD_CONCURRENCY: usize = 32;
+/// How long one follower-tail byte batch may take to arrive before the read
+/// fails (upstream #250). This is a PROGRESS budget, not a transfer budget:
+/// it matches the old whole-request timeout for a stalled peer, while a
+/// steadily progressing large tail — 607 MB in the issue — completes.
+const TAIL_PROGRESS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 /// How many bytes of retained bundles one recovery gather window reads
 /// before it folds that window's rows into the per-cell layout and releases
 /// them. The whole-session gather held every row of every retained bundle
@@ -465,8 +489,9 @@ pub(crate) enum RecoverMode {
 }
 
 /// The claimant's heartbeat while it gathers, beaten cooperatively at each
-/// step of the gather and the upload. A cooperative beat cannot race the
-/// seal, and it is deterministic under the simulated clock.
+/// step of the gather and the upload, and while a tail streams. A
+/// cooperative beat cannot race the seal, and it is deterministic under the
+/// simulated clock.
 struct ClaimBeat {
     last_mono_ms: u64,
 }
@@ -2479,6 +2504,10 @@ fn tail_covers_sealed_range(base: u64, end: u64, entries: &[Entry]) -> bool {
 /// construction, authentication, response validation, and timeout behavior.
 struct SignedPeerTransport {
     http: reqwest::Client,
+    /// Large-response reads (follower tails) ride this client with no
+    /// whole-request timeout: the response body streams under a progress
+    /// timeout instead (upstream #250). Connection setup stays bounded.
+    stream_http: reqwest::Client,
     auth: Arc<PeerAuth>,
 }
 
@@ -2490,7 +2519,35 @@ impl SignedPeerTransport {
                 .tcp_nodelay(true)
                 .build()
                 .expect("build log peer client"),
+            stream_http: reqwest::Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(5))
+                .tcp_nodelay(true)
+                .build()
+                .expect("build log peer stream client"),
             auth,
+        }
+    }
+}
+
+/// Read a byte stream with a progress timeout: every batch must arrive
+/// within `progress`, but a steadily progressing transfer is never cut for
+/// its size. A stalled transfer fails like the old whole-request timeout
+/// did; a 607 MB tail on a slow link (upstream #250) completes.
+async fn read_progress_bounded<S, E>(
+    mut stream: S,
+    progress: std::time::Duration,
+) -> anyhow::Result<bytes::Bytes>
+where
+    S: futures_util::Stream<Item = Result<bytes::Bytes, E>> + Unpin,
+    E: Into<anyhow::Error>,
+{
+    let mut out = Vec::new();
+    loop {
+        match crate::asyncrt::timeout(progress, stream.next()).await {
+            Err(_) => anyhow::bail!("log tail stalled: no bytes for {progress:?}"),
+            Ok(None) => return Ok(out.into()),
+            Ok(Some(Err(error))) => return Err(error.into()),
+            Ok(Some(Ok(chunk))) => out.extend_from_slice(&chunk),
         }
     }
 }
@@ -2531,6 +2588,47 @@ impl LogTransport for SignedPeerTransport {
             }
             crate::peer_auth::validate_response(response.headers())?;
             Ok(response.bytes().await?)
+        })
+    }
+
+    fn post_progress<'a>(
+        &'a self,
+        node: &'a str,
+        addr: &'a str,
+        path: &'a str,
+        body: Vec<u8>,
+        progress: std::time::Duration,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = anyhow::Result<bytes::Bytes>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            let request = self.stream_http.post(format!("http://{addr}{path}"));
+            let request = self.auth.sign(request, "POST", path, &body, node)?;
+            let request = crate::operator_token::authenticate(request)?;
+            // The stream client carries no whole-request timeout (upstream
+            // #250 reads under a progress budget instead), so a peer that
+            // accepts TCP and then stalls before the response headers would
+            // hang this send forever. Bound it with the same progress budget
+            // so a stalled peer fails like the old whole-request timeout did.
+            let response = match crate::asyncrt::timeout(progress, request.body(body).send()).await
+            {
+                Err(_) => anyhow::bail!("log tail stalled: no response for {progress:?}"),
+                Ok(response) => response?,
+            };
+            if !response.status().is_success() {
+                let status = response.status();
+                let stale_route = response
+                    .headers()
+                    .get(crate::peer_auth::STALE_ROUTE_HEADER)
+                    .is_some_and(|value| value == crate::peer_auth::STALE_ROUTE_VALUE);
+                return Err(anyhow::Error::new(PeerHttpError {
+                    status,
+                    stale_route,
+                })
+                .context(format!("peer {node} answered {status}")));
+            }
+            crate::peer_auth::validate_response(response.headers())?;
+            read_progress_bounded(response.bytes_stream(), progress).await
         })
     }
 
@@ -4587,6 +4685,282 @@ mod seal_gone_tests {
         )));
     }
 }
+
+#[cfg(test)]
+mod tail_progress_tests {
+    use super::*;
+
+    fn chunks(
+        chunks: Vec<Result<bytes::Bytes, anyhow::Error>>,
+    ) -> impl futures_util::Stream<Item = Result<bytes::Bytes, anyhow::Error>> + Unpin {
+        futures_util::stream::iter(chunks)
+    }
+
+    /// A steadily progressing transfer completes no matter how long the
+    /// whole response takes: the 607 MB tail in upstream #250 died at the
+    /// 10 s whole-request timeout while bytes were still arriving.
+    #[test]
+    fn steady_chunks_complete() {
+        let runtime = crate::asyncrt::shared_test_runtime();
+        runtime.block_on(async {
+            let body = read_progress_bounded(
+                chunks(vec![
+                    Ok(bytes::Bytes::from_static(b"hel")),
+                    Ok(bytes::Bytes::from_static(b"lo")),
+                ]),
+                std::time::Duration::from_millis(50),
+            )
+            .await
+            .expect("steady chunks complete");
+            assert_eq!(&body[..], b"hello");
+        });
+    }
+
+    /// Silence past the progress budget still fails like the old
+    /// whole-request timeout did: fail-closed, recovery refuses to seal.
+    #[test]
+    fn stalled_stream_fails_at_the_progress_budget() {
+        let runtime = crate::asyncrt::shared_test_runtime();
+        runtime.block_on(async {
+            let silent = futures_util::stream::pending::<Result<bytes::Bytes, anyhow::Error>>();
+            let started_ms = crate::asyncrt::mono_ms();
+            let error = read_progress_bounded(silent, std::time::Duration::from_millis(50))
+                .await
+                .expect_err("silence fails");
+            assert!(
+                crate::asyncrt::mono_ms().saturating_sub(started_ms) < 5_000,
+                "the stall fails at the budget, not at the transfer end"
+            );
+            assert!(
+                format!("{error:#}").contains("stalled"),
+                "the stall says what happened: {error:#}"
+            );
+        });
+    }
+
+    /// A peer that accepts TCP and then stalls before the response headers
+    /// fails at the progress budget instead of hanging `post_tail` forever
+    /// (upstream #250): the stream client carries no whole-request timeout,
+    /// so the send itself rides the budget. Fail-before: the send never
+    /// resolves and only the outer bound below trips, which carries no
+    /// "no response" message.
+    #[test]
+    fn stalled_response_headers_fail_at_the_progress_budget() {
+        let runtime = crate::asyncrt::shared_test_runtime();
+        runtime.block_on(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("blackhole binds");
+            let addr = listener.local_addr().expect("blackhole has an address");
+            crate::asyncrt::spawn(async move {
+                loop {
+                    let Ok((stream, _)) = listener.accept().await else {
+                        return;
+                    };
+                    // Hold the socket open and never answer: the accept
+                    // succeeds, the response headers never arrive.
+                    std::mem::forget(stream);
+                }
+            })
+            .detach();
+            let auth = std::sync::Arc::new(PeerAuth::new([0u8; 32], "n0").expect("test auth"));
+            let transport = SignedPeerTransport::new(auth);
+            let started_ms = crate::asyncrt::mono_ms();
+            let bounded = crate::asyncrt::timeout(
+                std::time::Duration::from_secs(10),
+                transport.post_progress(
+                    "n0",
+                    &addr.to_string(),
+                    "/peer/log/tail",
+                    Vec::new(),
+                    std::time::Duration::from_millis(200),
+                ),
+            )
+            .await
+            .expect("the stall fails well inside the outer bound");
+            let error = bounded.expect_err("a stalled peer fails");
+            assert!(
+                crate::asyncrt::mono_ms().saturating_sub(started_ms) < 5_000,
+                "the stall fails at the budget, not at the transfer end"
+            );
+            assert!(
+                format!("{error:#}").contains("no response"),
+                "the stall says what happened: {error:#}"
+            );
+        });
+    }
+}
+
+#[cfg(test)]
+mod recovery_heartbeat_tests {
+    use super::*;
+    use crate::ownership_store::{NodeLeaseWire, NodeLoadWire, NodeLogWire};
+    use std::future::Future;
+
+    /// A transport whose tail answers after `delay`: a healthy large tail
+    /// on a slow link, which outlasts `RECOVERY_CLAIM_TTL` mid-transfer.
+    struct SlowTailTransport {
+        delay: std::time::Duration,
+        body: Vec<u8>,
+    }
+
+    impl LogTransport for SlowTailTransport {
+        fn post<'a>(
+            &'a self,
+            _node: &'a str,
+            _addr: &'a str,
+            _path: &'a str,
+            _body: Vec<u8>,
+            _deadline: Option<std::time::Duration>,
+        ) -> std::pin::Pin<
+            Box<dyn Future<Output = anyhow::Result<bytes::Bytes>> + Send + 'a>,
+        > {
+            Box::pin(async move { anyhow::bail!("slow tails never seal") })
+        }
+
+        fn post_progress<'a>(
+            &'a self,
+            _node: &'a str,
+            _addr: &'a str,
+            _path: &'a str,
+            _body: Vec<u8>,
+            _progress: std::time::Duration,
+        ) -> std::pin::Pin<
+            Box<dyn Future<Output = anyhow::Result<bytes::Bytes>> + Send + 'a>,
+        > {
+            let delay = self.delay;
+            let body = self.body.clone();
+            Box::pin(async move {
+                crate::asyncrt::sleep(delay).await;
+                Ok(bytes::Bytes::from(body))
+            })
+        }
+    }
+
+    fn recovering_lease(claimed_ms: u64) -> NodeLeaseWire {
+        NodeLeaseWire {
+            node: "dead".into(),
+            expires_ms: 1,
+            addr: String::new(),
+            probe_public_key: String::new(),
+            peer_protocol: 1,
+            paced_handoff: false,
+            generation: "gen9".into(),
+            log: Some(NodeLogWire {
+                state: "recovering".into(),
+                epoch: 3,
+                ensemble: Vec::new(),
+                tiered: 0,
+                may_have_fleet_acks: false,
+                bucket: false,
+                claimant: Some("n0".into()),
+                claimed_ms: Some(claimed_ms),
+            }),
+            load: NodeLoadWire::default(),
+        }
+    }
+
+    /// A healthy tail slower than the heartbeat still holds the claim when
+    /// it lands: the transfer beats the claim while streaming. Fail-before:
+    /// the tail streamed with no heartbeat, and the claim read 30 s stale
+    /// at landing — a rival takes it over and the pass fails.
+    #[test]
+    fn slow_tail_holds_the_recovery_claim() {
+        let runtime = crate::asyncrt::shared_test_runtime();
+        runtime.block_on(async {
+            let dir = tempfile::tempdir().expect("test dir");
+            let bucket =
+                Arc::new(Bucket::with_store_for_test(Arc::new(
+                    object_store::memory::InMemory::new(),
+                )));
+            let database = dir.path().join("objects.sqlite3");
+            let dev = Arc::new(crate::dev::open_local_bucket(&database).expect("dev bucket"));
+            let replication = crate::ltx_replication::Replication::start(
+                dev.as_ref().clone(),
+                &dir.path().join("watch"),
+                None,
+                "test".into(),
+                None,
+            )
+            .expect("replication starts");
+            let ownership = Arc::new(crate::ownership_store::BucketOwnership::new(
+                bucket.as_ref().clone(),
+                bucket.as_ref().clone(),
+                "n0".into(),
+                "test-probe-key".into(),
+            ));
+            let body = encode_tail_resp(&TailResp {
+                range: TailRange {
+                    fragment_epoch: 3,
+                    base: 0,
+                    end: 0,
+                    complete: true,
+                },
+                entries: Vec::new(),
+            });
+            let transport: Arc<dyn LogTransport> = Arc::new(SlowTailTransport {
+                delay: std::time::Duration::from_secs(8),
+                body,
+            });
+            let own_log = Arc::new(OwnLog {
+                ownership,
+                nudge: Box::new(|| {}),
+                write_lock: tokio::sync::Mutex::new(()),
+            });
+            let manager = NodeLogManager::new_with_log_transport(
+                "n0/gen1",
+                bucket.clone(),
+                own_log,
+                replication.ltx(),
+                transport,
+                celld_logic::log_evict::EvictionPolicy::default(),
+            );
+            // The claim is already 25 s old: without a mid-transfer beat it
+            // expires before the 8 s tail lands.
+            let now = crate::ownership_store::now_ms();
+            bucket
+                .put(
+                    &lease_key("dead"),
+                    serde_json::to_vec(&recovering_lease(now.saturating_sub(25_000)))
+                        .expect("wire encodes"),
+                )
+                .await
+                .expect("seed claim");
+            let mut beat = ClaimBeat { last_mono_ms: 0 };
+            let tail = manager
+                .post_tail_with_beats(
+                    "dead/gen9",
+                    &mut beat,
+                    "member",
+                    "addr",
+                    &TailReq {
+                        leader: "dead/gen9".into(),
+                    },
+                )
+                .await
+                .expect("a healthy slow tail completes");
+            assert!(
+                matches!(tail, TailReply::Ranged(_)),
+                "the slow tail still parses"
+            );
+            let folded = read_record(&bucket, "dead/gen9")
+                .await
+                .expect("read back")
+                .expect("claim survives the transfer");
+            let claimed_ms = folded.record.claimed_ms.expect("the beat stamps the claim");
+            let age = crate::ownership_store::now_ms().saturating_sub(claimed_ms);
+            assert!(
+                age < 8_000,
+                "the claim was beaten mid-transfer, not left to expire: {age}ms old"
+            );
+            assert_eq!(
+                folded.record.claimant.as_deref(),
+                Some("n0"),
+                "no rival took the claim over mid-transfer"
+            );
+        });
+    }
+}
 impl NodeLogManager {
     #[cfg(all(test, celld_internal_tests))]
     pub fn reset_shipper_injection_calls_for_world(&self) {
@@ -4928,16 +5302,18 @@ impl NodeLogManager {
     }
 
     /// The tail POST: a JSON request, a binary response (the entries
-    /// dominate it).
+    /// dominate it). Reads stream under a progress timeout instead of the
+    /// shared client's whole-request timeout: a large tail on a slow link
+    /// must not fail for its size (upstream #250).
     async fn post_tail(&self, node: &str, addr: &str, req: &TailReq) -> anyhow::Result<TailReply> {
         let bytes = self
             .transport
-            .post(
+            .post_progress(
                 node,
                 addr,
                 "/peer/log/tail",
                 serde_json::to_vec(&TailWireReq::ranged(req.clone()))?,
-                None,
+                TAIL_PROGRESS_TIMEOUT,
             )
             .await?;
         decode_tail_resp(&bytes)
@@ -5112,6 +5488,34 @@ impl NodeLogManager {
         .await?;
         beat.last_mono_ms = mono_ms();
         Ok(())
+    }
+
+    /// The tail POST with the recovery claim beaten while the bytes stream:
+    /// a healthy large tail on a slow link outlasts `RECOVERY_CLAIM_TTL`
+    /// (upstream #250), and without a heartbeat mid-transfer a rival takes
+    /// the claim over and the pass fails its later claim check. The
+    /// per-chunk progress timeout still bounds a stalled transfer.
+    async fn post_tail_with_beats(
+        &self,
+        dead: &str,
+        beat: &mut ClaimBeat,
+        member: &str,
+        addr: &str,
+        req: &TailReq,
+    ) -> anyhow::Result<TailReply> {
+        // The seal round trips above already spent some of the TTL: beat
+        // before the first byte, then once per heartbeat while streaming.
+        self.beat_claim(dead, beat).await?;
+        let mut tail = std::pin::pin!(self.post_tail(member, addr, req));
+        loop {
+            crate::asyncrt::select_biased! {
+                "a finished tail wins the tie so a due heartbeat does not delay it";
+                result = &mut tail => return result,
+                _ = crate::asyncrt::sleep(RECOVERY_HEARTBEAT) => {
+                    self.beat_claim(dead, beat).await?;
+                }
+            }
+        }
     }
 
     async fn recover_serial(&self, dead: &str, mode: RecoverMode) -> anyhow::Result<()> {
@@ -5336,7 +5740,10 @@ impl NodeLogManager {
                 let tail = TailReq {
                     leader: dead.to_string(),
                 };
-                let mut tail = match self.post_tail(member, &addr, &tail).await {
+                let mut tail = match self
+                    .post_tail_with_beats(dead, &mut beat, member, &addr, &tail)
+                    .await
+                {
                     Ok(TailReply::Ranged(tail)) => tail,
                     Ok(TailReply::Legacy { .. }) => {
                         // A legacy body has no retained range, even when the
