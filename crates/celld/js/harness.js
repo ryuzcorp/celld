@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): ctx.container.images; clone() of streaming and disturbed bodies; __celld$do on the service-binding RPC path; container exec pty/resize; cross-isolate RPC stubs and streams; container exec AbortSignal; test-only fake kill completion; exec reads survive their subscribing event; context end aborts finished uploads; tenant egress policy; D1 export; D1 export operator gate; D1 batch; test-only fake close/signal completion; binding-forgery enforcement; Queue/KV operator fetch gate; Queue/KV stub-RPC allowlists; Queue DLQ host-op forward; Queue send/DLQ cell-side validation; trusted-RPC target pin; Queue operator internal re-checks; receiver-held RPC streams.; dropped timer ops fire their callback early so sleepers settle (upstream #317); unrefed AbortSignal.timeout timer (upstream #306); loader-fetch 101 webSocket join (upstream #305); nodejs process.env population (upstream #296); writable request /tmp files (upstream #280); Worker WebSocket close codes (upstream #279); Symbol.dispose on plain RPC results (upstream #260).
+// Modified by ryuzcorp (ryuzcorp/celld): ctx.container.images; clone() of streaming and disturbed bodies; __celld$do on the service-binding RPC path; container exec pty/resize; cross-isolate RPC stubs and streams; container exec AbortSignal; test-only fake kill completion; exec reads survive their subscribing event; context end aborts finished uploads; tenant egress policy; D1 export; D1 export operator gate; D1 batch; test-only fake close/signal completion; binding-forgery enforcement; Queue/KV operator fetch gate; Queue/KV stub-RPC allowlists; Queue DLQ host-op forward; Queue send/DLQ cell-side validation; trusted-RPC target pin; Queue operator internal re-checks; receiver-held RPC streams.; dropped timer ops fire their callback early so sleepers settle (upstream #317); unrefed AbortSignal.timeout timer (upstream #306); loader-fetch 101 webSocket join (upstream #305); nodejs process.env population (upstream #296); writable request /tmp files (upstream #280); Worker WebSocket close codes (upstream #279); Symbol.dispose on plain RPC results (upstream #260); workflow alarm forgets budget-orphaned drives (upstream #299).
 // The DO object model and the Cloudflare-compatible runtime surface, run
 // once per isolate by `js.rs::install_harness` after the Web-API prelude.
 // Lived as a 4,000-line raw string inside js.rs until 2026-07-29; it is a
@@ -10906,7 +10906,7 @@ const __WorkflowCell = (() => {
       }
     });
   }
-  async alarm() {
+  async alarm(info) {
     const storage = this._state.storage;
     // One drive at a time. A sendEvent nudge (setAlarm(now)) landing
     // mid-fire replaces the firing alarm in the core, and the replacement
@@ -10921,19 +10921,35 @@ const __WorkflowCell = (() => {
     // A failed drive is not re-raised here: the engine already retries the
     // alarm that fired it.
     if (this._wfDriving !== undefined) {
-      this._wfNudge = Date.now();
-      await this._wfDriving.catch(() => {});
-      if (this._wfNudge !== undefined) {
-        this._wfNudge = undefined;
-        const meta = await storage.get("__wf.meta");
-        if (
-          meta !== undefined && !__wfTerminal(meta.status) &&
-          meta.status !== "paused" && meta.status !== "waitingForPause"
-        ) {
-          await storage.setAlarm(Date.now());
+      // A retry dispatch after failed attempts is not a concurrent nudge:
+      // the in-flight drive is orphaned. Its entry died (budget, disconnect)
+      // without settling the drive, and the promise it left behind only the
+      // dropped entry's ops could resolve. Awaiting it would park this
+      // dispatch behind a promise that never settles, and every redrive
+      // would fail the same way while the instance reads "running" forever
+      // (denoland/celld#299). A concurrent nudge always arrives with retry
+      // count zero -- every setAlarm resets it -- so it still waits below
+      // and two live drives never double-execute steps. Forget the orphan
+      // and fall through to a fresh drive; the ledger replay picks up where
+      // it left off.
+      if (info !== undefined && info.retryCount > 0) {
+        this._wfNudge = Date.now();
+        this._wfDriving = undefined;
+      } else {
+        this._wfNudge = Date.now();
+        await this._wfDriving.catch(() => {});
+        if (this._wfNudge !== undefined) {
+          this._wfNudge = undefined;
+          const meta = await storage.get("__wf.meta");
+          if (
+            meta !== undefined && !__wfTerminal(meta.status) &&
+            meta.status !== "paused" && meta.status !== "waitingForPause"
+          ) {
+            await storage.setAlarm(Date.now());
+          }
         }
+        return;
       }
-      return;
     }
     const meta = await storage.get("__wf.meta");
     // A terminal instance's pending alarm can still fire. It owns retention:
