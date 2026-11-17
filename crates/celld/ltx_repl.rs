@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): an eviction skips the visibility LISTs its own uploads already prove and the time-based checkpoint before the handoff; an eviction deletes the per-cell L0/L1 objects its handoff snapshot supersedes; bucket-posture group commit: paged gate judges PAGED_FORMAT (0059); bucket-posture group commit: bucket bundle gate, sync pacing and event-driven bundle flush (0060); the eviction guard proves a journaled epoch with a HEAD on the newest journaled key, falling back to the listing on a miss, an error, or an empty journal (0061); bucket-posture group commit: bundled-cell eviction guard, graceful-close per-cell drain, bundle GC without ensemble, linger holds only while the dirty set is shared (0064).; bucket-posture group commit: bucket switch on by default (0070); bucket-posture group commit: a sync worker yields once the bundle loop owns tiering, and a lone-cell round uploads per-cell instead of bundling (0071); bucket-posture group commit: bundle switch defaults off (0075); MergeTree-style lazy handoff: an eviction skips the snapshot for a short chain born in this epoch (0078); local L0/epoch LTX retention on compaction, activation, and startup (upstream #311).
+// Modified by ryuzcorp (ryuzcorp/celld): an eviction skips the visibility LISTs its own uploads already prove and the time-based checkpoint before the handoff; an eviction deletes the per-cell L0/L1 objects its handoff snapshot supersedes; bucket-posture group commit: paged gate judges PAGED_FORMAT (0059); bucket-posture group commit: bucket bundle gate, sync pacing and event-driven bundle flush (0060); the eviction guard proves a journaled epoch with a HEAD on the newest journaled key, falling back to the listing on a miss, an error, or an empty journal (0061); bucket-posture group commit: bundled-cell eviction guard, graceful-close per-cell drain, bundle GC without ensemble, linger holds only while the dirty set is shared (0064).; bucket-posture group commit: bucket switch on by default (0070); bucket-posture group commit: a sync worker yields once the bundle loop owns tiering, and a lone-cell round uploads per-cell instead of bundling (0071); bucket-posture group commit: bundle switch defaults off (0075); MergeTree-style lazy handoff: an eviction skips the snapshot for a short chain born in this epoch (0078); local L0/epoch LTX retention on compaction, activation, and startup (upstream #311); unclean-restart prune of live-named epochs (upstream #290).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! In-process replication backend built on `celld-ltx`.
@@ -1489,6 +1489,10 @@ pub struct LtxRepl {
     /// prune answers without walking the data directory. See
     /// [`crate::replication::PreservedCache`].
     preserved: Mutex<crate::replication::PreservedCache>,
+    /// The live-named epochs `prune_unclean_restart` deleted. The ownership
+    /// confirmation after the first node lease reads them once, so a crash
+    /// restart still finds the cells that were resident when it died.
+    pruned_at_boot: Mutex<Vec<celld_logic::LocalCell>>,
     /// Woken when a gate ticket arrives, so the ship loop group-commits
     /// without polling.
     dirty_ship: Arc<Notify>,
@@ -1836,6 +1840,7 @@ impl LtxRepl {
             hydrate_bytes_per_s: config.hydrate_bytes_per_s,
             hydrations: Arc::new(Semaphore::new(1)),
             preserved,
+            pruned_at_boot: Mutex::new(Vec::new()),
             dirty_ship,
             dirty_bundle,
             dirty_tails: Mutex::new(BTreeMap::new()),
@@ -4841,6 +4846,32 @@ impl LtxRepl {
             remaining.len()
         );
         Ok(stale.len())
+    }
+
+    /// Delete every live-named epoch that an unclean predecessor (a crash, or
+    /// a stop without a clean-reload marker) left. Only a clean reload resumes
+    /// a live-named epoch, and a restart claims each cell at a new epoch from
+    /// the bucket, so no activation opens these files again. The caller runs
+    /// this after predecessor recovery and before the core starts.
+    pub fn prune_unclean_restart(&self) -> anyhow::Result<usize> {
+        let (live, keep): (Vec<_>, Vec<_>) =
+            self.local_cells().into_iter().partition(|cell| cell.live);
+        let keep = keep.into_iter().map(|cell| (cell.id, cell.epoch)).collect();
+        *self
+            .pruned_at_boot
+            .lock()
+            .expect("boot prune list poisoned") = live;
+        self.prune_stale_live(&keep)
+    }
+
+    /// The live-named epochs `prune_unclean_restart` deleted, at most once.
+    pub fn take_pruned_at_boot(&self) -> Vec<celld_logic::LocalCell> {
+        std::mem::take(
+            &mut *self
+                .pruned_at_boot
+                .lock()
+                .expect("boot prune list poisoned"),
+        )
     }
 
     /// Delete live-named epoch dirs of `cell` below `keep_epoch`.
@@ -8379,6 +8410,73 @@ mod evict_trim_tests {
             assert!(
                 db_path(&watch, "f", 1).exists(),
                 "the resident older epoch stays"
+            );
+            shutdown(repl).await;
+        });
+    }
+
+    /// Upstream #290: an unclean restart deletes every live-named epoch its
+    /// predecessor left — no activation reopens them — while preserved
+    /// snapshots stay cached. The deleted cells still read back once, so
+    /// the ownership confirmation after the first node lease finds the
+    /// cells that were resident when the predecessor died.
+    #[test]
+    fn unclean_restart_prunes_live_keeps_snapshots() {
+        let runtime = asyncrt::shared_test_runtime();
+        runtime.block_on(async {
+            let _temp = test_watch();
+            let watch = _temp.path().to_path_buf();
+            let store = Arc::new(InMemory::new());
+            let repl = LtxRepl::start_with_store_for_test(&watch, store);
+            // Two live epochs of a plus a preserved snapshot of b.
+            plant_live_epoch(&watch, "a", 1);
+            plant_live_epoch(&watch, "a", 2);
+            let snapshot = watch.join("b").join("ltx").join("e5");
+            std::fs::create_dir_all(&snapshot).unwrap();
+            std::fs::write(snapshot.join("db.evicted"), b"stale").unwrap();
+            assert_eq!(repl.prune_unclean_restart().unwrap(), 2);
+            assert!(
+                !db_path(&watch, "a", 1).exists(),
+                "the dead e1 dir is gone"
+            );
+            assert!(
+                !db_path(&watch, "a", 2).exists(),
+                "the dead e2 dir is gone"
+            );
+            assert!(
+                snapshot.join("db.evicted").exists(),
+                "the preserved snapshot stays"
+            );
+            assert_eq!(
+                repl.local_cells(),
+                vec![celld_logic::LocalCell {
+                    id: "b".to_string(),
+                    epoch: 5,
+                    live: false,
+                }],
+                "the inventory lists only the snapshot"
+            );
+            let mut listed = repl.take_pruned_at_boot();
+            listed.sort();
+            assert_eq!(
+                listed,
+                vec![
+                    celld_logic::LocalCell {
+                        id: "a".to_string(),
+                        epoch: 1,
+                        live: true,
+                    },
+                    celld_logic::LocalCell {
+                        id: "a".to_string(),
+                        epoch: 2,
+                        live: true,
+                    },
+                ],
+                "confirmation still finds the resident-at-death cells"
+            );
+            assert!(
+                repl.take_pruned_at_boot().is_empty(),
+                "the boot list reads back at most once"
             );
             shutdown(repl).await;
         });
