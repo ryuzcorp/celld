@@ -7298,6 +7298,7 @@ mod legacy_import_tests {
     }
 }
 
+#[cfg(test)]
 mod statement_timeout_tests {
     use super::d1_test_db::TestDb;
     use super::*;
