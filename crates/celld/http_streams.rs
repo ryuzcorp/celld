@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): WebSocket join tokens; joinable targets for loaded-worker 101s (upstream #305). Apache-2.0.
+// Modified by ryuzcorp (ryuzcorp/celld): WebSocket join tokens; joinable targets for loaded-worker 101s (upstream #305); transparent fetch gzip/deflate decode (upstream #238). Apache-2.0.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! The HTTP stream registry: request and response bodies that cross the host
@@ -1990,6 +1990,152 @@ pub(crate) async fn response_stream_close(
     }
     activity.lease.succeed(true);
     Ok(())
+}
+
+/// How a fetch response body reaches the worker: as sent, or transparently
+/// decoded. workerd decodes a lone `gzip`/`x-gzip`/`deflate` content coding
+/// when the worker left `accept-encoding` to the runtime; an explicit worker
+/// coding, several codings, or anything else (notably `br`, which needs a
+/// decoder this build does not carry) passes through untouched.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FetchBodyEncoding {
+    Identity,
+    Gzip,
+    Deflate,
+}
+
+/// The response's content coding when the worker left `accept-encoding` to
+/// the runtime. `auto_decode` is false when the worker named its own coding,
+/// and then the body always passes through: decoding under an explicit
+/// coding would corrupt what the worker asked to see raw.
+pub(crate) fn fetch_body_encoding(
+    response: &reqwest::Response,
+    auto_decode: bool,
+) -> FetchBodyEncoding {
+    if !auto_decode {
+        return FetchBodyEncoding::Identity;
+    }
+    let mut codings = response
+        .headers()
+        .get_all(reqwest::header::CONTENT_ENCODING)
+        .iter();
+    let (Some(only), None) = (codings.next(), codings.next()) else {
+        return FetchBodyEncoding::Identity;
+    };
+    match only
+        .to_str()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "gzip" | "x-gzip" => FetchBodyEncoding::Gzip,
+        "deflate" => FetchBodyEncoding::Deflate,
+        _ => FetchBodyEncoding::Identity,
+    }
+}
+
+/// A fetch response body as a chunk stream with the transparent coding
+/// removed. The `content-encoding` header itself is retained — the caller
+/// keeps it — while `content-length` is the caller's to drop, since it names
+/// the wire size, not the decoded one.
+///
+/// The decoder is a live flate2 writer whose `Vec` sink is drained after
+/// every input chunk, the same shape `CompressionStream` uses: feeding is
+/// fallible chunk by chunk, and `try_finish` at the end turns a truncated
+/// body into an error instead of hanging the consumer.
+pub(crate) fn decoded_fetch_stream(
+    response: reqwest::Response,
+    encoding: FetchBodyEncoding,
+) -> HttpChunkStream {
+    use futures_util::StreamExt as _;
+    use std::io::Write as _;
+    enum Decoder {
+        Gzip(flate2::write::GzDecoder<Vec<u8>>),
+        Zlib(flate2::write::ZlibDecoder<Vec<u8>>),
+    }
+    impl Decoder {
+        fn feed(&mut self, chunk: &[u8]) -> std::io::Result<Vec<u8>> {
+            match self {
+                Decoder::Gzip(decoder) => {
+                    decoder.write_all(chunk)?;
+                    Ok(std::mem::take(decoder.get_mut()))
+                }
+                Decoder::Zlib(decoder) => {
+                    decoder.write_all(chunk)?;
+                    Ok(std::mem::take(decoder.get_mut()))
+                }
+            }
+        }
+        fn finish(&mut self) -> std::io::Result<Vec<u8>> {
+            match self {
+                Decoder::Gzip(decoder) => {
+                    decoder.try_finish()?;
+                    Ok(std::mem::take(decoder.get_mut()))
+                }
+                Decoder::Zlib(decoder) => {
+                    decoder.try_finish()?;
+                    Ok(std::mem::take(decoder.get_mut()))
+                }
+            }
+        }
+    }
+    struct DecodeState<S> {
+        input: S,
+        decoder: Decoder,
+        eof: bool,
+        finished: bool,
+    }
+    let decoder = match encoding {
+        FetchBodyEncoding::Gzip => Decoder::Gzip(flate2::write::GzDecoder::new(Vec::new())),
+        FetchBodyEncoding::Deflate => Decoder::Zlib(flate2::write::ZlibDecoder::new(Vec::new())),
+        FetchBodyEncoding::Identity => {
+            unreachable!("decoded_fetch_stream runs only for a coded body")
+        }
+    };
+    let input = response.bytes_stream();
+    Box::pin(futures_util::stream::unfold(
+        DecodeState {
+            input,
+            decoder,
+            eof: false,
+            finished: false,
+        },
+        |mut state| async move {
+            loop {
+                if state.finished {
+                    return None;
+                }
+                if state.eof {
+                    match state.decoder.finish() {
+                        Ok(out) if out.is_empty() => return None,
+                        // Deliver the tail, then end: no more input can
+                        // follow a finished decoder.
+                        Ok(out) => {
+                            state.finished = true;
+                            return Some((Ok(out), state));
+                        }
+                        Err(error) => {
+                            return Some((Err(format!("response stream: {error}")), state));
+                        }
+                    }
+                }
+                match state.input.next().await {
+                    Some(Ok(chunk)) => match state.decoder.feed(&chunk) {
+                        Ok(out) if out.is_empty() => continue,
+                        Ok(out) => return Some((Ok(out), state)),
+                        Err(error) => {
+                            return Some((Err(format!("response stream: {error}")), state));
+                        }
+                    },
+                    Some(Err(error)) => {
+                        return Some((Err(format!("response stream: {error}")), state));
+                    }
+                    None => state.eof = true,
+                }
+            }
+        },
+    ))
 }
 
 /// Move a host response source into a directly-polled stream. No pump task is
