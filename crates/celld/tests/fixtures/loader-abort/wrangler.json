@@ -1,0 +1,7 @@
+{
+  "name": "loader-abort",
+  "main": "worker.js",
+  "compatibility_date": "2026-05-02",
+  "no_bundle": true,
+  "worker_loaders": [{ "binding": "LOADER" }]
+}
