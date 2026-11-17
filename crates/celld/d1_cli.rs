@@ -888,10 +888,11 @@ needs.
 
 `--local` runs the subcommand against the `celld dev` node instead of the
 fleet: it reads the database identity from PROJECT as usual, then reaches
-the running dev node through PROJECT/.celld/dev — the local store carries
-that node's leases and secret, so execute, export, and migrations work
-unchanged. The dev node must be running. `--local` takes no --bucket,
---endpoint, CELLD_BUCKET, or S3_ENDPOINT.
+the running dev node through the project's local state (PROJECT/.celld/dev,
+or the `--state`/`CELLD_DEV_STATE` directory when one is set) — the local
+store carries that node's leases and secret, so execute, export, and
+migrations work unchanged. The dev node must be running. `--local` takes
+no --bucket, --endpoint, CELLD_BUCKET, or S3_ENDPOINT.
 
 Migration files are `NNNN_description.sql` in `migrations/`. The `sql`
 extension is ASCII case-insensitive. celld applies the files in the order of

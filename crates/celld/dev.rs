@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): operator token for the internal listener; `celld dev --port 0` assigns an ephemeral port; staged activation; deploy --read-root option; non-dumpable serving process; local state path helper for d1 --local (upstream #272).
+// Modified by ryuzcorp (ryuzcorp/celld): operator token for the internal listener; `celld dev --port 0` assigns an ephemeral port; staged activation; deploy --read-root option; non-dumpable serving process; local state path helper for d1 --local (upstream #272); dev --state with marker-guarded clean (upstream #302).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 // Modified by ryuzcorp (ryuzcorp/celld): deploy --sourcemap writes the bundle's external map.
 
@@ -39,17 +39,20 @@ pub fn open_local_bucket(database: &Path) -> anyhow::Result<Bucket> {
 struct Options {
     project: Option<PathBuf>,
     clean: bool,
+    state: Option<PathBuf>,
     stack: StackOptions,
 }
 
 /// The local state directory of one project.
 ///
-/// `--clean` deletes this directory and everything below it. The path is
-/// private and the only constructor takes the project directory that `run`
-/// resolved, so a command-line value can never become the target of the
-/// delete. A newtype carries that rule instead of a comment, because a
-/// `PathBuf` field would let a later caller pass any path and lose nothing at
-/// compile time.
+/// `--clean` deletes this directory and everything below it. The
+/// project-relative path is private and the only constructor takes the
+/// project directory that `run` resolved, so a command-line value can
+/// never become the target of the delete — except through `--state`,
+/// which names the directory outright and is therefore guarded by the
+/// marker file instead. A newtype carries that rule instead of a comment,
+/// because a `PathBuf` field would let a later caller pass any path and
+/// lose nothing at compile time.
 #[derive(Debug)]
 pub(crate) struct DevState {
     path: PathBuf,
@@ -57,8 +60,15 @@ pub(crate) struct DevState {
 
 impl DevState {
     /// The project-relative location of the local state, and also the suffix
-    /// that `discard` requires before it deletes.
+    /// that `discard` requires before it deletes a directory it did not
+    /// create.
     const DIRECTORY: &'static str = ".celld/dev";
+
+    /// The marker `prepare_state` writes into every state directory it
+    /// creates. `--clean` over an explicit `--state` directory deletes
+    /// only when the marker proves celld created it: the directory is
+    /// arbitrary, so the `.celld/dev` suffix cannot prove that.
+    const MARKER: &'static str = ".celld-dev-state";
 
     fn for_project(project: &Path) -> Self {
         Self {
@@ -66,11 +76,40 @@ impl DevState {
         }
     }
 
+    /// An explicit state directory, from `--state` or `CELLD_DEV_STATE`.
+    /// Unlike `for_project` this names an arbitrary directory, so only
+    /// the marker authorizes a delete.
+    fn for_state(dir: PathBuf) -> Self {
+        Self { path: dir }
+    }
+
+    /// The state directory for one project: the `--state` flag wins, then
+    /// `CELLD_DEV_STATE`, then `PROJECT/.celld/dev`. Operator commands
+    /// (`d1 --local`) resolve through this too, so they follow the same
+    /// override without their own flag.
+    pub(crate) fn resolve(project: &Path, flag: Option<PathBuf>) -> Self {
+        Self::resolve_with(
+            project,
+            flag,
+            std::env::var_os("CELLD_DEV_STATE").map(PathBuf::from),
+        )
+    }
+
+    fn resolve_with(project: &Path, flag: Option<PathBuf>, env: Option<PathBuf>) -> Self {
+        match flag
+            .filter(|dir| !dir.as_os_str().is_empty())
+            .or_else(|| env.filter(|dir| !dir.as_os_str().is_empty()))
+        {
+            Some(dir) => Self::for_state(dir),
+            None => Self::for_project(project),
+        }
+    }
+
     /// The SQLite file behind one project's local state, for operator
     /// commands that reach the `celld dev` node through it (`d1 --local`).
     /// Pure path math: the caller decides what a missing file means.
     pub(crate) fn database_for_project(project: &Path) -> PathBuf {
-        Self::for_project(project).path.join("objects.sqlite3")
+        Self::resolve(project, None).path.join("objects.sqlite3")
     }
 
     fn path(&self) -> &Path {
@@ -85,20 +124,31 @@ impl DevState {
     /// an error.
     #[allow(clippy::disallowed_methods)] // Local development state is an operator-owned host path.
     fn discard(&self) -> anyhow::Result<bool> {
-        // The constructor already guarantees this. The check stays because it
-        // is the tripwire for a future constructor that takes a path: a
-        // recursive delete must never widen by accident.
-        anyhow::ensure!(
-            self.path.ends_with(Self::DIRECTORY),
-            "refusing to discard {}, which is not a celld dev state directory",
-            self.path.display()
-        );
+        // A project-relative state directory proves itself by suffix. An
+        // explicit `--state` directory is arbitrary, so only the marker
+        // that `prepare_state` writes proves celld created it: `--clean`
+        // must never delete a directory the operator pointed at by
+        // mistake. The check stays a refusal rather than a fallback,
+        // because a recursive delete must never widen by accident.
+        if !self.path.ends_with(Self::DIRECTORY) && !self.marker().exists() {
+            if !self.path.exists() {
+                return Ok(false);
+            }
+            anyhow::bail!(
+                "refusing to discard {}, which is not a celld dev state directory",
+                self.path.display()
+            );
+        }
         match std::fs::remove_dir_all(&self.path) {
             Ok(()) => Ok(true),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
             Err(error) => Err(error)
                 .with_context(|| format!("discard local state directory {}", self.path.display())),
         }
+    }
+
+    fn marker(&self) -> PathBuf {
+        self.path.join(Self::MARKER)
     }
 }
 
@@ -342,17 +392,19 @@ impl ShutdownSignals {
 pub fn print_help() -> anyhow::Result<()> {
     crate::cli_output::Output::new(crate::cli_output::Format::Text).help(
         &format!("celld dev — run an application with persistent local storage\n\n\
-USAGE:\n  celld dev [PROJECT] [--host IP] [--port PORT] [--logs] [--no-watch] [--clean]\n\n\
+USAGE:\n  celld dev [PROJECT] [--host IP] [--port PORT] [--logs] [--no-watch] [--clean] [--state DIR]\n\n\
 PROJECT is a directory or a Wrangler config. It defaults to the current\n\
-directory. celld stores all local state in PROJECT/.celld/dev, and it keeps\n\
-that state across a restart. A configuration change does not migrate the\n\
-state, so a cell can keep a value that the new configuration rejects. Use\n\
---clean to start from an empty local state.\n\n\
+directory. celld stores all local state in PROJECT/.celld/dev — or in DIR\n\
+when --state (or CELLD_DEV_STATE) names one, keeping the state outside the\n\
+source tree — and it keeps that state across a restart. A configuration\n\
+change does not migrate the state, so a cell can keep a value that the new\n\
+configuration rejects. Use --clean to start from an empty local state;\n\
+over an explicit state directory --clean deletes only what celld created.\n\n\
 A .dev.vars file beside the config supplies Worker variables in dotenv form,\n\
 as for wrangler dev. Without one, .env and then .env.local supply them, and\n\
 an entry of these files that cannot be a binding is skipped with a warning.\n\
 The entries override the vars of the config.\n\n\
-OPTIONS:\n  --host IP              Worker listener host (default: 127.0.0.1)\n  --port PORT            Worker listener port (default: {DEFAULT_PORT}; 0 assigns an ephemeral port)\n  --clean                Delete PROJECT/.celld/dev before the server starts\n  --logs                 Show the node warning and information logs\n  --no-watch             Do not rebuild when a project file changes\n  --watch-ignore PATTERN Ignore a project-relative glob; repeat as needed\n  -h, --help             Show this help"
+OPTIONS:\n  --host IP              Worker listener host (default: 127.0.0.1)\n  --port PORT            Worker listener port (default: {DEFAULT_PORT}; 0 assigns an ephemeral port)\n  --clean                Delete the local state before the server starts\n  --state DIR            Keep local state in DIR instead of PROJECT/.celld/dev\n                         (CELLD_DEV_STATE sets the same); --clean removes DIR\n                         only when celld created it\n  --logs                 Show the node warning and information logs\n  --no-watch             Do not rebuild when a project file changes\n  --watch-ignore PATTERN Ignore a project-relative glob; repeat as needed\n  -h, --help             Show this help"
         ),
     )
 }
@@ -362,6 +414,7 @@ fn options_from_arguments(arguments: Vec<String>) -> anyhow::Result<Option<Optio
     let mut host = IpAddr::V4(Ipv4Addr::LOCALHOST);
     let mut port = DEFAULT_PORT;
     let mut clean = false;
+    let mut state = None;
     let mut logs = false;
     let mut watch = true;
     let mut watch_ignores = Vec::new();
@@ -370,6 +423,11 @@ fn options_from_arguments(arguments: Vec<String>) -> anyhow::Result<Option<Optio
         match argument.as_str() {
             "--help" | "-h" => return Ok(None),
             "--clean" => clean = true,
+            "--state" => {
+                state = Some(PathBuf::from(
+                    arguments.next().context("--state requires a value")?,
+                ));
+            }
             "--logs" => logs = true,
             "--no-watch" => watch = false,
             "--watch-ignore" => {
@@ -408,6 +466,7 @@ fn options_from_arguments(arguments: Vec<String>) -> anyhow::Result<Option<Optio
     Ok(Some(Options {
         project,
         clean,
+        state,
         stack: StackOptions {
             listener: SocketAddr::new(host, port),
             logs,
@@ -429,7 +488,7 @@ pub async fn run(arguments: Vec<String>) -> anyhow::Result<()> {
     let project = config
         .parent()
         .context("the Wrangler config has no project directory")?;
-    let state = DevState::for_project(project);
+    let state = DevState::resolve(project, options.state);
     let console = Console::new();
     console.header();
     console.detail("Project", &config.display().to_string());
@@ -478,6 +537,11 @@ fn prepare_state(state: &Path) -> anyhow::Result<()> {
         std::fs::create_dir_all(&directory)
             .with_context(|| format!("create local state directory {}", directory.display()))?;
     }
+    // The proof of authorship `--clean` requires before it deletes an
+    // explicit `--state` directory. Written on every start, so a state
+    // directory made by an older celld gains it on first use.
+    std::fs::write(state.join(DevState::MARKER), "celld dev state\n")
+        .with_context(|| format!("mark local state directory {}", state.display()))?;
     Ok(())
 }
 
@@ -982,6 +1046,7 @@ async fn stop_child(child: &mut Child, internal: Option<&str>) {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)] // Operator-side tests use real tempdirs, not node storage.
 mod dev_tests {
     use super::*;
 
@@ -997,6 +1062,71 @@ mod dev_tests {
         assert_eq!(options.stack.listener.port(), 0);
         let options = options_of(&["--port", "8484"]);
         assert_eq!(options.stack.listener.port(), 8484);
+    }
+
+    #[test]
+    fn state_flag_reaches_options() {
+        let options = options_of(&["--state", "/tmp/elsewhere"]);
+        assert_eq!(
+            options.state.as_deref(),
+            Some(std::path::Path::new("/tmp/elsewhere"))
+        );
+        assert_eq!(options_of(&[]).state, None);
+    }
+
+    #[test]
+    fn state_resolution_prefers_flag_then_environment_then_project() {
+        let project = std::path::Path::new("/proj");
+        let resolve = |flag: Option<&str>, env: Option<&str>| {
+            DevState::resolve_with(
+                project,
+                flag.map(PathBuf::from),
+                env.map(PathBuf::from),
+            )
+            .path
+        };
+        assert_eq!(resolve(None, None), project.join(".celld/dev"));
+        assert_eq!(
+            resolve(None, Some("/env/state")),
+            std::path::PathBuf::from("/env/state")
+        );
+        assert_eq!(
+            resolve(Some("/flag/state"), Some("/env/state")),
+            std::path::PathBuf::from("/flag/state")
+        );
+        // An empty flag or variable is unset, not a directory.
+        assert_eq!(
+            resolve(Some(""), Some("/env/state")),
+            std::path::PathBuf::from("/env/state")
+        );
+        assert_eq!(resolve(Some(""), None), project.join(".celld/dev"));
+    }
+
+    /// `--clean` over an explicit state directory deletes only what celld
+    /// created: a marked directory goes away, a foreign one is refused
+    /// with its contents intact, and a missing one is already clean.
+    #[test]
+    fn discard_guards_explicit_state_directories() {
+        let marked = tempfile::tempdir().unwrap();
+        let state = DevState::for_state(marked.path().to_path_buf());
+        prepare_state(&state.path).unwrap();
+        assert!(state.marker().exists());
+        assert!(state.discard().unwrap());
+        assert!(!marked.path().exists());
+
+        let foreign = tempfile::tempdir().unwrap();
+        std::fs::write(foreign.path().join("precious.txt"), "keep\n").unwrap();
+        let error = DevState::for_state(foreign.path().to_path_buf())
+            .discard()
+            .expect_err("a foreign directory must be refused");
+        assert!(
+            format!("{error:?}").contains("refusing to discard"),
+            "the refusal must say so: {error:?}"
+        );
+        assert!(foreign.path().join("precious.txt").exists());
+
+        let missing = DevState::for_state(foreign.path().join("no-such-dir"));
+        assert!(!missing.discard().unwrap());
     }
 
     #[test]
