@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): cross-isolate RPC stubs and streams; operator token for the internal listener; Workers Cache pressure shedding; ported from meln1k/celld: report wake coverage after maintenance (e6cb9a3); staged invoke reads the deploy bucket.
+// Modified by ryuzcorp (ryuzcorp/celld): cross-isolate RPC stubs and streams; operator token for the internal listener; Workers Cache pressure shedding; ported from meln1k/celld: report wake coverage after maintenance (e6cb9a3); staged invoke reads the deploy bucket; pass the renewal readback authority bound through (upstream #264).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! The serial lifecycle executor and its shell-side request drivers.
@@ -3295,11 +3295,15 @@ impl Actor {
                 let (arm, _) = self.timer_slots.arm(timer, at_mono_ms, ());
                 out.timers.push(arm);
             }
-            Effect::ReadSelfNodeLease { op } => {
+            Effect::ReadSelfNodeLease {
+                op,
+                authority_expires_ms,
+            } => {
                 out.lease(
                     LeaseRequest::ReadSelf {
                         op,
                         node: self.state.node().to_string(),
+                        authority_expires_ms,
                     },
                     &self.ownership,
                 );
