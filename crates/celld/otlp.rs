@@ -1,3 +1,4 @@
+// Modified by ryuzcorp (ryuzcorp/celld): honor OTEL_RESOURCE_ATTRIBUTES in the OTLP resource; report celld's build as celld.version (upstream #314)
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! OTLP/HTTP protobuf encoding for the telemetry sink, by hand.
@@ -80,18 +81,47 @@ fn key_value(out: &mut Vec<u8>, field: u64, name: &str, value: Vec<u8>) {
     field_bytes(out, field, &kv);
 }
 
-/// resource.v1.Resource: attributes=1.
-fn resource(node: &str, region: &str, service: &str) -> Vec<u8> {
+/// `extra` carries the operator's `OTEL_RESOURCE_ATTRIBUTES` entries.
+/// `service.name` in `extra` is ignored (the configured service name wins),
+/// `service.version` in `extra` names the application version, and celld's
+/// own build stays visible under `celld.version`, which cannot collide with
+/// an application key. Without an operator version there is no
+/// `service.version` at all: reporting celld's version there told every
+/// deployment-tracking backend that all applications run celld's build
+/// (denoland/celld#314). Entries that collide with a built-in key
+/// (`service.instance.id`, `celld.region`, `celld.version`) are dropped in
+/// favor of the built-in value: OTLP requires unique resource attribute
+/// keys, and the node's own identity must win over operator input.
+fn resource(node: &str, region: &str, service: &str, extra: &[(String, String)]) -> Vec<u8> {
     let mut out = Vec::new();
     key_value(&mut out, 1, "service.name", any_string(service));
+    if let Some(version) = extra
+        .iter()
+        .find(|(key, _)| key == "service.version")
+        .map(|(_, value)| value.as_str())
+    {
+        key_value(&mut out, 1, "service.version", any_string(version));
+    }
+    key_value(&mut out, 1, "service.instance.id", any_string(node));
+    key_value(&mut out, 1, "celld.region", any_string(region));
     key_value(
         &mut out,
         1,
-        "service.version",
+        "celld.version",
         any_string(env!("CARGO_PKG_VERSION")),
     );
-    key_value(&mut out, 1, "service.instance.id", any_string(node));
-    key_value(&mut out, 1, "celld.region", any_string(region));
+    for (key, value) in extra {
+        if key.is_empty()
+            || key == "service.name"
+            || key == "service.version"
+            || key == "service.instance.id"
+            || key == "celld.region"
+            || key == "celld.version"
+        {
+            continue;
+        }
+        key_value(&mut out, 1, key, any_string(value));
+    }
     out
 }
 
@@ -163,14 +193,24 @@ fn span_message(span: &Span) -> Vec<u8> {
 
 /// collector.v1.ExportTraceServiceRequest: resource_spans=1, holding one
 /// ResourceSpans{resource=1, scope_spans=2{scope=1, spans=2}}.
-pub fn traces_request(spans: &[Span], node: &str, region: &str, service: &str) -> Vec<u8> {
+pub fn traces_request(
+    spans: &[Span],
+    node: &str,
+    region: &str,
+    service: &str,
+    extra: &[(String, String)],
+) -> Vec<u8> {
     let mut scope_spans = Vec::new();
     field_bytes(&mut scope_spans, 1, &scope());
     for span in spans {
         field_bytes(&mut scope_spans, 2, &span_message(span));
     }
     let mut resource_spans = Vec::new();
-    field_bytes(&mut resource_spans, 1, &resource(node, region, service));
+    field_bytes(
+        &mut resource_spans,
+        1,
+        &resource(node, region, service, extra),
+    );
     field_bytes(&mut resource_spans, 2, &scope_spans);
     let mut out = Vec::new();
     field_bytes(&mut out, 1, &resource_spans);
@@ -198,16 +238,106 @@ fn log_message(log: &Log) -> Vec<u8> {
 
 /// collector.v1.ExportLogsServiceRequest: resource_logs=1, holding one
 /// ResourceLogs{resource=1, scope_logs=2{scope=1, log_records=2}}.
-pub fn logs_request(logs: &[Log], node: &str, region: &str, service: &str) -> Vec<u8> {
+pub fn logs_request(
+    logs: &[Log],
+    node: &str,
+    region: &str,
+    service: &str,
+    extra: &[(String, String)],
+) -> Vec<u8> {
     let mut scope_logs = Vec::new();
     field_bytes(&mut scope_logs, 1, &scope());
     for log in logs {
         field_bytes(&mut scope_logs, 2, &log_message(log));
     }
     let mut resource_logs = Vec::new();
-    field_bytes(&mut resource_logs, 1, &resource(node, region, service));
+    field_bytes(
+        &mut resource_logs,
+        1,
+        &resource(node, region, service, extra),
+    );
     field_bytes(&mut resource_logs, 2, &scope_logs);
     let mut out = Vec::new();
     field_bytes(&mut out, 1, &resource_logs);
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn contains(haystack: &[u8], needle: &str) -> bool {
+        haystack
+            .windows(needle.len())
+            .any(|window| window == needle.as_bytes())
+    }
+
+    #[test]
+    fn resource_honors_operator_attributes() {
+        let extra = vec![
+            ("service.version".to_string(), "abc123".to_string()),
+            (
+                "deployment.environment.name".to_string(),
+                "play".to_string(),
+            ),
+            ("service.name".to_string(), "ignored".to_string()),
+        ];
+        let encoded = traces_request(&[], "node-1", "us-east-1", "trace-probe", &extra);
+        assert!(contains(&encoded, "service.name"));
+        assert!(contains(&encoded, "trace-probe"));
+        // The application version lands where deployment tracking reads it,
+        // and the configured service name wins over the attribute.
+        assert!(contains(&encoded, "service.version"));
+        assert!(contains(&encoded, "abc123"));
+        assert!(!contains(&encoded, "ignored"));
+        assert!(contains(&encoded, "deployment.environment.name"));
+        assert!(contains(&encoded, "play"));
+        // celld's own build stays visible under a key that cannot collide.
+        assert!(contains(&encoded, "celld.version"));
+        assert!(contains(&encoded, env!("CARGO_PKG_VERSION")));
+    }
+
+    #[test]
+    fn resource_omits_service_version_without_operator_value() {
+        let encoded = traces_request(&[], "node-1", "us-east-1", "celld", &[]);
+        assert!(contains(&encoded, "service.name"));
+        assert!(!contains(&encoded, "service.version"));
+        assert!(contains(&encoded, "celld.version"));
+    }
+
+    fn count(haystack: &[u8], needle: &str) -> usize {
+        haystack
+            .windows(needle.len())
+            .filter(|window| *window == needle.as_bytes())
+            .count()
+    }
+
+    #[test]
+    fn resource_emits_each_builtin_key_once() {
+        let extra = vec![
+            ("service.instance.id".to_string(), "operator-id".to_string()),
+            ("celld.region".to_string(), "operator-region".to_string()),
+            ("celld.version".to_string(), "9.9.9".to_string()),
+            (
+                "deployment.environment.name".to_string(),
+                "play".to_string(),
+            ),
+        ];
+        let encoded = traces_request(&[], "node-1", "us-east-1", "celld", &extra);
+        // The built-ins win: one key each, carrying the node's own values.
+        for key in [
+            "service.instance.id",
+            "celld.region",
+            "celld.version",
+            "deployment.environment.name",
+        ] {
+            assert_eq!(count(&encoded, key), 1, "exactly one {key}");
+        }
+        assert!(contains(&encoded, "node-1"));
+        assert!(contains(&encoded, "us-east-1"));
+        assert!(contains(&encoded, env!("CARGO_PKG_VERSION")));
+        assert!(!contains(&encoded, "operator-id"));
+        assert!(!contains(&encoded, "operator-region"));
+        assert!(!contains(&encoded, "9.9.9"));
+    }
 }
