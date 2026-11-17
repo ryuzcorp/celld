@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): node:crypto scrypt; container exec resize op; cross-isolate RPC stubs and streams; test-only fake exec ops; fake kill completion op; exec reads survive their subscribing event; per-node Workers Cache API ops; tenant egress policy; D1 export operator-ingress marker; stateless attribution tokens; reaction-aware request resources; fake close/signal completion ops; binding-forgery enforcement; trusted cell RPC; Queue DLQ forward host op; DLQ forward caller identity; WebSocket and TCP socket ownership; receiver-held stream lifetime; deployment cache scope key; share the /bundle tree per deployment generation.; cancelled requests reject pending ops so co-awaiters settle (upstream #317); answered drivers poll while waitUntil background is outstanding (upstream #300); refused handoffs reject instead of dropping resolvers (upstream #309); facet adoption drops the restored flag (upstream #292); background expiry for orphaned drives (upstream #275).
+// Modified by ryuzcorp (ryuzcorp/celld): node:crypto scrypt; container exec resize op; cross-isolate RPC stubs and streams; test-only fake exec ops; fake kill completion op; exec reads survive their subscribing event; per-node Workers Cache API ops; tenant egress policy; D1 export operator-ingress marker; stateless attribution tokens; reaction-aware request resources; fake close/signal completion ops; binding-forgery enforcement; trusted cell RPC; Queue DLQ forward host op; DLQ forward caller identity; WebSocket and TCP socket ownership; receiver-held stream lifetime; deployment cache scope key; share the /bundle tree per deployment generation.; cancelled requests reject pending ops so co-awaiters settle (upstream #317); answered drivers poll while waitUntil background is outstanding (upstream #300); refused handoffs reject instead of dropping resolvers (upstream #309); facet adoption drops the restored flag (upstream #292); background expiry for orphaned drives (upstream #275); unrefed AbortSignal.timeout timer (upstream #306).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 // The raw V8 adapter and its child modules remain outside the Actor execution
@@ -7330,6 +7330,7 @@ ops! { OP_NAMES, install_op_functions,
         "__response_stream_closed" => op_response_stream_closed,
         "__response_stream_close" => op_response_stream_close,
         "__op_timer" => op_timer,
+        "__op_timer_unrefed" => op_timer_unrefed,
         "__isolate_condemn" => op_isolate_condemn,
         "__timer_alloc" => op_timer_alloc,
         "__io_context_id" => op_io_context_id,
@@ -10789,6 +10790,24 @@ fn op_timer(
     });
     let p = promise_for(scope, id);
     rv.set(p);
+}
+
+/// Timer behind `AbortSignal.timeout`: `op_timer`'s wait, but enqueued
+/// unreferenced, so a pending timeout never keeps its event (or its admission
+/// slot) alive. It carries no timer id and registers no cancellation: the
+/// signal holds no handle by design, and matching workerd the timer fires or
+/// dies with the request, whichever comes first (upstream #306).
+fn op_timer_unrefed(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let ms = args.get(0).number_value(scope).unwrap_or(0.0).max(0.0) as u64;
+    let id = asyncrt::enqueue_unrefed(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+        Ok(String::new())
+    });
+    rv.set(promise_for(scope, id));
 }
 
 /// `__io_context_id(operationDriver = false)` — return the live context id.
