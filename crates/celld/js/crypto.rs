@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): node:crypto scrypt; AES-KW key wrap/unwrap (upstream #295).
+// Modified by ryuzcorp (ryuzcorp/celld): node:crypto scrypt; AES-KW key wrap/unwrap (upstream #295); raw EC key import/export (upstream #271).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! Web Crypto and node:crypto: the key formats and the primitives.
@@ -998,35 +998,58 @@ fn crypto_operation(operation: &str, args: &serde_json::Value) -> Result<serde_j
                 let jwk = args.get("key").ok_or_else(|| anyhow!("missing JWK"))?;
                 (key_from_jwk(jwk, want_private)?, want_private)
             } else if format == "raw" {
-                // Web Crypto's `raw` format for the Secure Curves: a public
-                // key is its 32-byte point, with no structure around it. The
-                // curve therefore cannot be read off the bytes and arrives in
-                // `type`. Only a public key has a `raw` form, so `visibility`
-                // is not consulted.
                 let key = crypto_bytes(args, "key")?;
                 let curve = args
                     .get("type")
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or_default();
-                let point: [u8; 32] = key
-                    .as_slice()
-                    .try_into()
-                    .map_err(|_| anyhow!("a {curve} raw public key must be 32 bytes"))?;
-                let der = match curve {
-                    "X25519" => x25519_spki(&point),
-                    "Ed25519" => {
-                        use ed25519_dalek::pkcs8::EncodePublicKey;
-                        // Unlike X25519, an Ed25519 point has to decompress
-                        // to a curve point, so a bad one fails here.
-                        ed25519_dalek::VerifyingKey::from_bytes(&point)
-                            .map_err(|_| anyhow!("invalid Ed25519 public key"))?
-                            .to_public_key_der()?
-                            .as_bytes()
-                            .to_vec()
+                // An EC public key's `raw` form is the SEC1 point,
+                // uncompressed or compressed (upstream #271). The curve
+                // cannot be read off the bytes and arrives in `namedCurve`.
+                // Only a public key has a `raw` form, so `visibility` is
+                // not consulted.
+                if curve == "ec" {
+                    let named = args
+                        .get("namedCurve")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default();
+                    macro_rules! import_ec {
+                        ($c:ident) => {{
+                            use $c::pkcs8::EncodePublicKey;
+                            let key = $c::PublicKey::from_sec1_bytes(&key)
+                                .map_err(|_| anyhow!("invalid {named} public key"))?;
+                            key.to_public_key_der()
+                                .map_err(|_| anyhow!("invalid {named} public key"))?
+                                .as_bytes()
+                                .to_vec()
+                        }};
                     }
-                    other => return Err(anyhow!("cannot import a raw {other} key")),
-                };
-                (der, false)
+                    (ec_curve!(named, import_ec), false)
+                } else {
+                    // Web Crypto's `raw` format for the Secure Curves: a public
+                    // key is its 32-byte point, with no structure around it. The
+                    // curve therefore cannot be read off the bytes and arrives in
+                    // `type`.
+                    let point: [u8; 32] = key
+                        .as_slice()
+                        .try_into()
+                        .map_err(|_| anyhow!("a {curve} raw public key must be 32 bytes"))?;
+                    let der = match curve {
+                        "X25519" => x25519_spki(&point),
+                        "Ed25519" => {
+                            use ed25519_dalek::pkcs8::EncodePublicKey;
+                            // Unlike X25519, an Ed25519 point has to decompress
+                            // to a curve point, so a bad one fails here.
+                            ed25519_dalek::VerifyingKey::from_bytes(&point)
+                                .map_err(|_| anyhow!("invalid Ed25519 public key"))?
+                                .to_public_key_der()?
+                                .as_bytes()
+                                .to_vec()
+                        }
+                        other => return Err(anyhow!("cannot import a raw {other} key")),
+                    };
+                    (der, false)
+                }
             } else {
                 let key = crypto_bytes(args, "key")?;
                 let stated = args.get("type").and_then(serde_json::Value::as_str);
@@ -1317,6 +1340,21 @@ fn crypto_operation(operation: &str, args: &serde_json::Value) -> Result<serde_j
                         .map_err(|_| anyhow!("invalid Ed25519 public key"))?
                         .to_bytes()
                         .to_vec()
+                }
+                // An EC public key exports as its uncompressed SEC1 point,
+                // not its SPKI document (upstream #271).
+                "ec" => {
+                    let crv = ec_jwk_crv(&parsed)?;
+                    macro_rules! export_raw {
+                        ($c:ident) => {{
+                            use $c::elliptic_curve::sec1::ToEncodedPoint;
+                            use $c::pkcs8::DecodePublicKey;
+                            let key = $c::PublicKey::from_public_key_der(&der)
+                                .map_err(|_| anyhow!("invalid {crv} public key"))?;
+                            key.to_encoded_point(false).as_bytes().to_vec()
+                        }};
+                    }
+                    ec_curve!(crv, export_raw)
                 }
                 other => return Err(anyhow!("cannot export a {other} key as raw")),
             };

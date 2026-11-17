@@ -1,4 +1,4 @@
-<!-- Modified by ryuzcorp (ryuzcorp/celld): node:crypto scrypt; cloned streaming bodies; cross-isolate RPC stubs and streams; per-node Workers Cache API; receiver-held RPC streams; AbortSignal.timeout is unreferenced (upstream #306); loader 101 webSocket target (upstream #305); loader sibling cloudflare:workers imports (upstream #304); AES-KW and symmetric JWK (upstream #295). -->
+<!-- Modified by ryuzcorp (ryuzcorp/celld): node:crypto scrypt; cloned streaming bodies; cross-isolate RPC stubs and streams; per-node Workers Cache API; receiver-held RPC streams; AbortSignal.timeout is unreferenced (upstream #306); loader 101 webSocket target (upstream #305); loader sibling cloudflare:workers imports (upstream #304); AES-KW and symmetric JWK (upstream #295); EC raw point format (upstream #271). -->
 # Cloudflare compatibility
 
 This page lists only the differences from the linked Cloudflare APIs. An entry
@@ -201,6 +201,7 @@ The `tail` and `email` handlers are unavailable.
   of all zero bytes, so `deriveBits()` rejects that key instead.
 - An Ed25519 or X25519 public key uses its 32-byte point for the `raw` format,
   so `importKey()` and `exportKey()` both carry the point alone.
+- An EC public key imports and exports the uncompressed point as `raw`.
 
 ### [Web standards](https://developers.cloudflare.com/workers/runtime-apis/web-standards/)
 `AbortSignal.timeout()` never keeps its event (or its admission slot) alive:
