@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): ctx.container.images; clone() of streaming and disturbed bodies; __celld$do on the service-binding RPC path; container exec pty/resize; cross-isolate RPC stubs and streams; container exec AbortSignal; test-only fake kill completion; exec reads survive their subscribing event; context end aborts finished uploads; tenant egress policy; D1 export; D1 export operator gate; D1 batch; test-only fake close/signal completion; binding-forgery enforcement; Queue/KV operator fetch gate; Queue/KV stub-RPC allowlists; Queue DLQ host-op forward; Queue send/DLQ cell-side validation; trusted-RPC target pin; Queue operator internal re-checks; receiver-held RPC streams.; dropped timer ops fire their callback early so sleepers settle (upstream #317); unrefed AbortSignal.timeout timer (upstream #306); loader-fetch 101 webSocket join (upstream #305); nodejs process.env population (upstream #296); writable request /tmp files (upstream #280).
+// Modified by ryuzcorp (ryuzcorp/celld): ctx.container.images; clone() of streaming and disturbed bodies; __celld$do on the service-binding RPC path; container exec pty/resize; cross-isolate RPC stubs and streams; container exec AbortSignal; test-only fake kill completion; exec reads survive their subscribing event; context end aborts finished uploads; tenant egress policy; D1 export; D1 export operator gate; D1 batch; test-only fake close/signal completion; binding-forgery enforcement; Queue/KV operator fetch gate; Queue/KV stub-RPC allowlists; Queue DLQ host-op forward; Queue send/DLQ cell-side validation; trusted-RPC target pin; Queue operator internal re-checks; receiver-held RPC streams.; dropped timer ops fire their callback early so sleepers settle (upstream #317); unrefed AbortSignal.timeout timer (upstream #306); loader-fetch 101 webSocket join (upstream #305); nodejs process.env population (upstream #296); writable request /tmp files (upstream #280); Worker WebSocket close codes (upstream #279).
 // The DO object model and the Cloudflare-compatible runtime surface, run
 // once per isolate by `js.rs::install_harness` after the Web-API prelude.
 // Lived as a 4,000-line raw string inside js.rs until 2026-07-29; it is a
@@ -12508,10 +12508,16 @@ globalThis.WebSocket = class WebSocket extends EventTarget {
     }
   }
   close(code = 1000, reason = "") {
-    // WHATWG: an application may send 1000 or 3000-4999. Everything else is
-    // reserved for the protocol itself.
+    // workerd parity, not the WHATWG-only 1000/3000-4999 rule: an endpoint
+    // may send 1000, the 1001-1014 application range, and 3000-4999. The
+    // reserved no-status codes (1004, 1005, 1006, 1015) must never appear on
+    // the wire, so they stay refused. Refusing the 1008 policy-violation
+    // close dropped a Worker's refusal on the floor: the listener threw,
+    // and the client hung (upstream #279).
     const wanted = Number(code);
-    if (wanted !== 1000 && !(wanted >= 3000 && wanted <= 4999)) {
+    const reserved = wanted === 1004 || wanted === 1005 || wanted === 1006 ||
+      wanted === 1015;
+    if (!(wanted >= 1000 && wanted <= 4999) || reserved) {
       throw new DOMException(
         `WebSocket close code ${code} is not permitted`,
         "InvalidAccessError");

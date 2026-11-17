@@ -592,6 +592,10 @@ async fn local_isolate_websocket_pipe(
             false,
         );
     } else if let Some((code, reason)) = caller_close {
+        // A close the caller sent still ends at the caller: without a
+        // terminal on its own pull queue, unregistering below would make
+        // its pump report an abnormal 1006 instead of the close it sent.
+        let _ = pull.send_close(code, reason.clone(), true);
         let _ = inbound.send_close(code, reason, true);
     } else if let Some((code, reason)) = loaded_close {
         let _ = pull.send_close(code, reason, true);
@@ -726,12 +730,18 @@ async fn local_websocket_pipe(
         )
         .await;
     } else if let Some((code, reason)) = caller_close {
+        // A close the caller sent still ends at the caller: without a
+        // terminal on its own pull queue, unregistering below would make
+        // its pump report an abnormal 1006 instead of the close it sent.
+        let _ = pull.send_close(code, reason.clone(), true);
         let _ = dispatch_ws_closed(&app, &socket, target.id, code, reason, true).await;
     }
     app.websocket_closed(socket.cell().to_string(), target.id);
     celld::js::ws_unregister(target.id);
     celld::js::ws_unregister(id);
-    celld::js::ws_pull_unregister(id);
+    // The caller's pull endpoint stays reachable, owner-checked, until its
+    // terminal is consumed or its request retires — same rule as the
+    // isolate-to-isolate pipe.
     Ok(())
 }
 

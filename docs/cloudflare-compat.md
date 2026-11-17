@@ -1,4 +1,4 @@
-<!-- Modified by ryuzcorp (ryuzcorp/celld): node:crypto scrypt; cloned streaming bodies; cross-isolate RPC stubs and streams; per-node Workers Cache API; receiver-held RPC streams; AbortSignal.timeout is unreferenced (upstream #306); loader 101 webSocket target (upstream #305); loader sibling cloudflare:workers imports (upstream #304); AES-KW and symmetric JWK (upstream #295); EC raw point format (upstream #271); writable request /tmp, node:url file helpers, and the CELLD_TMP_MAX_BYTES /tmp cap (upstream #280). -->
+<!-- Modified by ryuzcorp (ryuzcorp/celld): node:crypto scrypt; cloned streaming bodies; cross-isolate RPC stubs and streams; per-node Workers Cache API; receiver-held RPC streams; AbortSignal.timeout is unreferenced (upstream #306); loader 101 webSocket target (upstream #305); loader sibling cloudflare:workers imports (upstream #304); AES-KW and symmetric JWK (upstream #295); EC raw point format (upstream #271); writable request /tmp, node:url file helpers, and the CELLD_TMP_MAX_BYTES /tmp cap (upstream #280).; workerd close codes (upstream #279). -->
 # Cloudflare compatibility
 
 This page lists only the differences from the linked Cloudflare APIs. An entry
@@ -184,6 +184,10 @@ The `tail` and `email` handlers are unavailable.
   way: a `101` response carrying `webSocket` routes to its target whether the
   loaded worker made the socket itself or forwards the upgrade to a Durable
   Object.
+- `close()` sends 1000–4999 except the reserved no-status codes 1004, 1005,
+  1006, and 1015, which stay refused. Codes 1001–1014 that the old
+  WHATWG-only rule rejected now close, so a 1008 policy-violation refusal
+  reaches the peer instead of throwing.
 
 ### [Web Crypto](https://developers.cloudflare.com/workers/runtime-apis/web-crypto/)
 

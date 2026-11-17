@@ -236,3 +236,288 @@ fn loader_101_response_carries_its_websocket() {
         assert_eq!(echo, "echo:hi", "{path} socket: {echo}");
     }
 }
+
+#[test]
+fn caller_initiated_close_reaches_the_caller() {
+    let fixture = fixture_dir();
+    let project = fixture_tempdir("celld-ws-loader-close-");
+    copy_dir(&fixture, project.path());
+    let node = TestNode::boot(project.path());
+
+    // The caller accepts the loaded socket and closes it: its own close
+    // event carries the code, reason, and clean flag it sent. Before the
+    // fix the caller's pull queue was unregistered with no terminal, so
+    // its pump reported an abnormal 1006 instead.
+    let (status, body) = plain_get(&node.public, "/caller-close").expect("GET /caller-close");
+    assert_eq!(status, 200, "GET /caller-close: {body}");
+    let info: serde_json::Value = serde_json::from_str(&body).expect("close JSON");
+    let field = |name: &str| {
+        info.get(name)
+            .unwrap_or_else(|| panic!("{name} missing: {body}"))
+            .clone()
+    };
+    assert_eq!(field("code").as_u64(), Some(1000), "close code: {body}");
+    assert_eq!(
+        field("reason").as_str(),
+        Some("done"),
+        "close reason: {body}"
+    );
+    assert_eq!(field("wasClean").as_bool(), Some(true), "wasClean: {body}");
+}
+
+#[test]
+fn flooded_pipe_still_delivers_caller_close() {
+    let fixture = fixture_dir();
+    let project = fixture_tempdir("celld-ws-loader-flood-");
+    copy_dir(&fixture, project.path());
+    let node = TestNode::boot(project.path());
+
+    // The loaded worker accepts but stops reading on the first message (a
+    // throwing listener ends its pump), so the caller's flood fills the
+    // loaded queue and the close queues behind the flooded frames. Before the
+    // fix the pipe parked in a queue send while frames were pending and never
+    // observed the close: both sockets stayed open and the caller's close
+    // event never arrived (the handler times out with a 500).
+    let (status, body) = plain_get(&node.public, "/flood-close").expect("GET /flood-close");
+    assert_eq!(status, 200, "GET /flood-close: {body}");
+    let info: serde_json::Value = serde_json::from_str(&body).expect("close JSON");
+    let field = |name: &str| {
+        info.get(name)
+            .unwrap_or_else(|| panic!("{name} missing: {body}"))
+            .clone()
+    };
+    assert_eq!(field("code").as_u64(), Some(1000), "close code: {body}");
+    assert_eq!(
+        field("reason").as_str(),
+        Some("done"),
+        "close reason: {body}"
+    );
+    assert_eq!(field("wasClean").as_bool(), Some(true), "wasClean: {body}");
+}
+
+#[test]
+fn overloaded_pipe_closes_with_1011() {
+    let fixture = fixture_dir();
+    let project = fixture_tempdir("celld-ws-loader-overload-");
+    copy_dir(&fixture, project.path());
+    let node = TestNode::boot(project.path());
+
+    // The caller floods past the pipe's staged-bytes cap into a worker that
+    // stopped reading, and never closes. The pipe must tear itself down
+    // with 1011 instead of staging the flood without bound; the cap makes
+    // the flood fail closed instead of hanging the socket (the handler
+    // times out with a 500 when no close arrives).
+    let (status, body) = plain_get(&node.public, "/flood-overload").expect("GET /flood-overload");
+    assert_eq!(status, 200, "GET /flood-overload: {body}");
+    let info: serde_json::Value = serde_json::from_str(&body).expect("close JSON");
+    let field = |name: &str| {
+        info.get(name)
+            .unwrap_or_else(|| panic!("{name} missing: {body}"))
+            .clone()
+    };
+    assert_eq!(field("code").as_u64(), Some(1011), "close code: {body}");
+    assert_eq!(field("wasClean").as_bool(), Some(false), "wasClean: {body}");
+}
+
+#[test]
+fn closing_pipe_flushes_queued_frames_first() {
+    let fixture = fixture_dir();
+    let project = fixture_tempdir("celld-ws-loader-order-");
+    copy_dir(&fixture, project.path());
+    let node = TestNode::boot(project.path());
+
+    // The caller floods a slow reader, then sends one text and closes. The
+    // close queued behind the flood must deliver every frame first, in
+    // order, and then arrive as the caller's own close event. Dropping the
+    // queued frames with the close loses the trailing text.
+    let (status, body) = plain_get(&node.public, "/order-close").expect("GET /order-close");
+    assert_eq!(status, 200, "GET /order-close: {body}");
+    let info: serde_json::Value = serde_json::from_str(&body).expect("close JSON");
+    let field = |name: &str| {
+        info.get(name)
+            .unwrap_or_else(|| panic!("{name} missing: {body}"))
+            .clone()
+    };
+    assert_eq!(field("code").as_u64(), Some(1000), "close code: {body}");
+    assert_eq!(
+        field("reason").as_str(),
+        Some("done"),
+        "close reason: {body}"
+    );
+    assert_eq!(field("wasClean").as_bool(), Some(true), "wasClean: {body}");
+    let (status, body) = plain_get(&node.public, "/room-messages").expect("GET /room-messages");
+    assert_eq!(status, 200, "GET /room-messages: {body}");
+    let recorded: serde_json::Value = serde_json::from_str(&body).expect("messages JSON");
+    let messages = recorded
+        .get("messages")
+        .and_then(|value| value.as_array())
+        .unwrap_or_else(|| panic!("messages missing: {body}"));
+    assert_eq!(
+        messages.len(),
+        34,
+        "every flooded frame must flush first: {body}"
+    );
+    assert_eq!(
+        messages.last().and_then(|value| value.as_str()),
+        Some("last"),
+        "the trailing text must arrive before the close: {body}"
+    );
+}
+
+#[test]
+fn queued_close_reaches_the_caller() {
+    let fixture = fixture_dir();
+    let project = fixture_tempdir("celld-ws-loader-queued-");
+    copy_dir(&fixture, project.path());
+    let node = TestNode::boot(project.path());
+
+    // The caller receives a text, then blocks its event loop while the
+    // loaded side closes: the close queued behind the text must still
+    // arrive as its own close event. Unregistering the pull endpoint at
+    // teardown makes the next `__ws_next` report a synthetic 1006 instead.
+    let (status, body) = plain_get(&node.public, "/queued-close").expect("GET /queued-close");
+    assert_eq!(status, 200, "GET /queued-close: {body}");
+    let info: serde_json::Value = serde_json::from_str(&body).expect("close JSON");
+    let field = |name: &str| {
+        info.get(name)
+            .unwrap_or_else(|| panic!("{name} missing: {body}"))
+            .clone()
+    };
+    assert_eq!(field("code").as_u64(), Some(1000), "close code: {body}");
+    assert_eq!(
+        field("reason").as_str(),
+        Some("bye"),
+        "close reason: {body}"
+    );
+    assert_eq!(field("wasClean").as_bool(), Some(true), "wasClean: {body}");
+}
+
+#[test]
+fn queued_close_sync_reaches_the_caller() {
+    let fixture = fixture_dir();
+    let project = fixture_tempdir("celld-ws-loader-queued-sync-");
+    copy_dir(&fixture, project.path());
+    let node = TestNode::boot(project.path());
+
+    // The loaded side echoes and closes synchronously, so both frames reach
+    // the pipe before the caller's post-message burn ends: the next
+    // `__ws_next` necessarily runs after teardown. A teardown that
+    // unregisters the pull endpoint reports a synthetic 1006 here; keeping
+    // the endpoint until its terminal is consumed delivers the queued close.
+    // No timers: the burn outlasts native pipe teardown by orders of
+    // magnitude, so this fails before the fix without racing.
+    let (status, body) =
+        plain_get(&node.public, "/queued-close-sync").expect("GET /queued-close-sync");
+    assert_eq!(status, 200, "GET /queued-close-sync: {body}");
+    let info: serde_json::Value = serde_json::from_str(&body).expect("close JSON");
+    let field = |name: &str| {
+        info.get(name)
+            .unwrap_or_else(|| panic!("{name} missing: {body}"))
+            .clone()
+    };
+    assert_eq!(field("code").as_u64(), Some(1000), "close code: {body}");
+    assert_eq!(
+        field("reason").as_str(),
+        Some("bye"),
+        "close reason: {body}"
+    );
+    assert_eq!(field("wasClean").as_bool(), Some(true), "wasClean: {body}");
+}
+
+#[test]
+fn loaded_queued_close_reaches_the_loaded() {
+    let fixture = fixture_dir();
+    let project = fixture_tempdir("celld-ws-loader-loaded-queued-");
+    copy_dir(&fixture, project.path());
+    let node = TestNode::boot(project.path());
+
+    // The caller floods a slow reader and closes at once: the loaded
+    // socket's close event must carry the caller's code even though text
+    // was queued ahead of the terminal when the pipe tore down.
+    let (status, body) =
+        plain_get(&node.public, "/loaded-queued-close").expect("GET /loaded-queued-close");
+    assert_eq!(status, 200, "GET /loaded-queued-close: {body}");
+    let (status, body) = plain_get(&node.public, "/room-messages").expect("GET /room-messages");
+    assert_eq!(status, 200, "GET /room-messages: {body}");
+    let recorded: serde_json::Value = serde_json::from_str(&body).expect("messages JSON");
+    let messages = recorded
+        .get("messages")
+        .and_then(|value| value.as_array())
+        .unwrap_or_else(|| panic!("messages missing: {body}"));
+    let closes = recorded
+        .get("closes")
+        .and_then(|value| value.as_array())
+        .unwrap_or_else(|| panic!("closes missing: {body}"));
+    let texts: Vec<&str> = messages.iter().filter_map(|value| value.as_str()).collect();
+    assert_eq!(
+        texts,
+        vec!["a", "b"],
+        "queued text must flush before the close: {body}"
+    );
+    assert_eq!(
+        closes.len(),
+        1,
+        "the loaded socket must see exactly one close: {body}"
+    );
+    assert_eq!(
+        closes[0].get("code").and_then(|code| code.as_u64()),
+        Some(1000),
+        "loaded close code: {body}"
+    );
+}
+
+#[test]
+fn cell_queued_close_reaches_the_caller() {
+    let fixture = fixture_dir();
+    let project = fixture_tempdir("celld-ws-do-queued-");
+    copy_dir(&fixture, project.path());
+    let node = TestNode::boot(project.path());
+
+    // Same queued-close shape through a cell target: the caller accepts the
+    // Durable Object's socket, receives a text, blocks, and the cell side
+    // closes. Its own close event must carry the cell's code.
+    let (status, body) = plain_get(&node.public, "/do-queued-close").expect("GET /do-queued-close");
+    assert_eq!(status, 200, "GET /do-queued-close: {body}");
+    let info: serde_json::Value = serde_json::from_str(&body).expect("close JSON");
+    let field = |name: &str| {
+        info.get(name)
+            .unwrap_or_else(|| panic!("{name} missing: {body}"))
+            .clone()
+    };
+    assert_eq!(field("code").as_u64(), Some(1000), "close code: {body}");
+    assert_eq!(
+        field("reason").as_str(),
+        Some("bye"),
+        "close reason: {body}"
+    );
+    assert_eq!(field("wasClean").as_bool(), Some(true), "wasClean: {body}");
+}
+
+#[test]
+fn cell_target_caller_initiated_close_reaches_the_caller() {
+    let fixture = fixture_dir();
+    let project = fixture_tempdir("celld-ws-do-close-");
+    copy_dir(&fixture, project.path());
+    let node = TestNode::boot(project.path());
+
+    // Same shape through a cell target: the caller accepts the Durable
+    // Object's socket and closes it, and its own close event carries the
+    // code, reason, and clean flag it sent. Before the fix the caller's
+    // pull queue was unregistered with no terminal, so its pump reported
+    // an abnormal 1006 instead.
+    let (status, body) = plain_get(&node.public, "/do-caller-close").expect("GET /do-caller-close");
+    assert_eq!(status, 200, "GET /do-caller-close: {body}");
+    let info: serde_json::Value = serde_json::from_str(&body).expect("close JSON");
+    let field = |name: &str| {
+        info.get(name)
+            .unwrap_or_else(|| panic!("{name} missing: {body}"))
+            .clone()
+    };
+    assert_eq!(field("code").as_u64(), Some(1000), "close code: {body}");
+    assert_eq!(
+        field("reason").as_str(),
+        Some("done"),
+        "close reason: {body}"
+    );
+    assert_eq!(field("wasClean").as_bool(), Some(true), "wasClean: {body}");
+}
