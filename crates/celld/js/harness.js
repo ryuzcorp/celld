@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): ctx.container.images; clone() of streaming and disturbed bodies; __celld$do on the service-binding RPC path; container exec pty/resize; cross-isolate RPC stubs and streams; container exec AbortSignal; test-only fake kill completion; exec reads survive their subscribing event; context end aborts finished uploads; tenant egress policy; D1 export; D1 export operator gate; D1 batch; test-only fake close/signal completion; binding-forgery enforcement; Queue/KV operator fetch gate; Queue/KV stub-RPC allowlists; Queue DLQ host-op forward; Queue send/DLQ cell-side validation; trusted-RPC target pin; Queue operator internal re-checks; receiver-held RPC streams.; dropped timer ops fire their callback early so sleepers settle (upstream #317); unrefed AbortSignal.timeout timer (upstream #306); loader-fetch 101 webSocket join (upstream #305); nodejs process.env population (upstream #296).
+// Modified by ryuzcorp (ryuzcorp/celld): ctx.container.images; clone() of streaming and disturbed bodies; __celld$do on the service-binding RPC path; container exec pty/resize; cross-isolate RPC stubs and streams; container exec AbortSignal; test-only fake kill completion; exec reads survive their subscribing event; context end aborts finished uploads; tenant egress policy; D1 export; D1 export operator gate; D1 batch; test-only fake close/signal completion; binding-forgery enforcement; Queue/KV operator fetch gate; Queue/KV stub-RPC allowlists; Queue DLQ host-op forward; Queue send/DLQ cell-side validation; trusted-RPC target pin; Queue operator internal re-checks; receiver-held RPC streams.; dropped timer ops fire their callback early so sleepers settle (upstream #317); unrefed AbortSignal.timeout timer (upstream #306); loader-fetch 101 webSocket join (upstream #305); nodejs process.env population (upstream #296); writable request /tmp files (upstream #280).
 // The DO object model and the Cloudflare-compatible runtime surface, run
 // once per isolate by `js.rs::install_harness` after the Web-API prelude.
 // Lived as a 4,000-line raw string inside js.rs until 2026-07-29; it is a
@@ -13043,6 +13043,109 @@ const __fsReadFileSync = (value, options) => {
   const buffer = Buffer.from(bytes);
   return encoding ? buffer.toString(encoding) : buffer;
 };
+// `writeFile` data is a string or a binary view, as Node accepts. Anything
+// else is an argument error, thrown synchronously by every form.
+const __fsWriteData = (data, encoding) => {
+  if (typeof data === "string") return Buffer.from(data, encoding);
+  if (data instanceof ArrayBuffer) return new Uint8Array(data);
+  if (ArrayBuffer.isView(data)) {
+    return new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+  }
+  const error = new TypeError(
+    "The \"data\" argument must be of type string or an instance of " +
+    "Buffer, TypedArray, or DataView",
+  );
+  error.code = "ERR_INVALID_ARG_TYPE";
+  throw error;
+};
+// Only `/tmp` is writable; the host answers `""` on success and a Node
+// error code otherwise, so the syscall name is the only thing added here.
+const __fsWriteFileSync = (value, data, options = {}) => {
+  const path = __fsPath(value);
+  const encoding = typeof options === "string" ? options : options?.encoding ?? "utf8";
+  const bytes = __fsWriteData(data, encoding);
+  const result = __vfs_write_file(path, bytes);
+  if (result && !result.startsWith("/")) throw __fsError(result, "open", path);
+};
+const __fsWriteFile = (value, data, options, callback) => {
+  [options, callback] = __fsCallbackArgs(options, callback);
+  __fsCallback(
+    () => {
+      __fsPath(value);
+      __fsWriteData(data, typeof options === "string" ? options : options?.encoding);
+    },
+    () => __fsWriteFileSync(value, data, options),
+    callback,
+  );
+};
+// `node:stream` classes for the file streams below, loaded on first use:
+// the fs surface is eager but an isolate that never opens a file stream
+// must not pay for the stream bundle.
+const __fsStreamClasses = () => globalThis.process.getBuiltinModule("node:stream");
+// A writable `/tmp` file. Chunks buffer until `end`/`close`, which commits
+// them with one host write; `flags` and `mode` are accepted and ignored, as
+// the tree has no modes and every write truncates. `start` is not supported.
+const __fsCreateWriteStream = (value, options = {}) => {
+  const path = __fsPath(value);
+  if (options !== undefined && (options === null || typeof options !== "object")) {
+    const error = new TypeError("The \"options\" argument must be of type object");
+    error.code = "ERR_INVALID_ARG_TYPE";
+    throw error;
+  }
+  const { Writable } = __fsStreamClasses();
+  const chunks = [];
+  const stream = new Writable({
+    write(chunk, encoding, cb) {
+      chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk, encoding));
+      cb();
+    },
+    final(cb) {
+      try {
+        __fsWriteFileSync(path, Buffer.concat(chunks));
+        cb();
+      } catch (error) { cb(error); }
+    },
+  });
+  stream.path = path;
+  stream.pending = true;
+  queueMicrotask(() => {
+    stream.pending = false;
+    stream.emit("open");
+  });
+  return stream;
+};
+// A readable `/tmp` (or `/bundle`) file. The whole file is read up front
+// and pushed in 64 KiB chunks; `start`/`end` ranges and `encoding` are not
+// supported. A missing path destroys the stream with `ENOENT` (or `EISDIR`
+// for a directory), asynchronously like Node.
+const __fsCreateReadStream = (value, options = {}) => {
+  const path = __fsPath(value);
+  if (options !== undefined && (options === null || typeof options !== "object")) {
+    const error = new TypeError("The \"options\" argument must be of type object");
+    error.code = "ERR_INVALID_ARG_TYPE";
+    throw error;
+  }
+  const { Readable } = __fsStreamClasses();
+  const stream = new Readable({ read() {} });
+  stream.path = path;
+  stream.pending = true;
+  queueMicrotask(() => {
+    stream.pending = false;
+    const data = __vfs_read_file(path);
+    if (data === undefined) {
+      const [kind] = __vfs_stat(path);
+      stream.destroy(kind ? __fsError("EISDIR", "read", path) : __fsError("ENOENT", "open", path));
+      return;
+    }
+    stream.emit("open");
+    const bytes = new Uint8Array(data);
+    for (let offset = 0; offset < bytes.byteLength; offset += 65536) {
+      stream.push(bytes.subarray(offset, offset + 65536));
+    }
+    stream.push(null);
+  });
+  return stream;
+};
 // `fs.constants`, with the four access modes from workerd's
 // `src/node/internal/internal_fs_constants.ts`. The table carries only the
 // modes `access` reads. Every other constant belongs to an operation the
@@ -13186,6 +13289,7 @@ const __fsPromisesSurface = {
   async lstat(...args) { return __fsLstatSync(...args); },
   async realpath(...args) { return __fsRealpathSync(...args); },
   async readFile(...args) { return __fsReadFileSync(...args); },
+  async writeFile(...args) { return __fsWriteFileSync(...args); },
 };
 // A namespace import gets a fixed export set when V8 links the module, so a
 // partial module must enumerate unsupported Node exports too. A get trap alone
@@ -13228,7 +13332,7 @@ const __fsPromises = __celld.__fsPromises = __fsNamespaceProxy(
     "appendFile", "chmod", "chown", "copyFile", "cp", "lchmod", "lchown",
     "link", "lutimes", "mkdtemp", "open", "opendir", "readdir", "readlink",
     "rename", "rm", "rmdir", "statfs", "symlink", "truncate", "unlink",
-    "utimes", "watch", "writeFile",
+    "utimes", "watch",
   ],
 );
 const __fsSurface = {
@@ -13243,17 +13347,21 @@ const __fsSurface = {
   lstatSync: __fsLstatSync,
   realpathSync: __fsRealpathSync,
   readFileSync: __fsReadFileSync,
+  writeFileSync: __fsWriteFileSync,
   stat: __fsStat,
   lstat: __fsLstat,
   realpath: __fsRealpath,
   readFile: __fsReadFile,
   mkdir: __fsMkdir,
+  writeFile: __fsWriteFile,
+  createWriteStream: __fsCreateWriteStream,
+  createReadStream: __fsCreateReadStream,
 };
 const __fsNamespaceNames = [
   "Dir", "Dirent", "ReadStream", "WriteStream", "_toUnixTimestamp",
   "appendFile", "appendFileSync", "chmod", "chmodSync", "chown", "chownSync",
   "close", "closeSync", "copyFile", "copyFileSync", "cp", "cpSync",
-  "createReadStream", "createWriteStream", "exists", "fchmod", "fchmodSync",
+  "exists", "fchmod", "fchmodSync",
   "fchown", "fchownSync", "fdatasync", "fdatasyncSync", "fstat", "fstatSync",
   "fsync", "fsyncSync", "ftruncate", "ftruncateSync", "futimes", "futimesSync",
   "lchmod", "lchmodSync", "lchown", "lchownSync", "link", "linkSync",
@@ -13263,7 +13371,7 @@ const __fsNamespaceNames = [
   "rm", "rmSync", "rmdir", "rmdirSync", "statfs", "statfsSync", "symlink",
   "symlinkSync", "truncate", "truncateSync", "unlink", "unlinkSync",
   "unwatchFile", "utimes", "utimesSync", "watch", "watchFile", "write",
-  "writeFile", "writeFileSync", "writeSync", "writev", "writevSync",
+  "writeSync", "writev", "writevSync",
 ];
 // Writable file contents and every mutation remain explicit unsupported
 // surfaces until a failing application seam requires them. These two reads
