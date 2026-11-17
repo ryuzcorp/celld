@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): idempotent content-tagged image create; tag-race tests run the fake engine through sh; deploy --sourcemap writes the bundle's external map; service binding targets validated at deploy; staged activation; deploy --sourcemap collects the no_bundle sibling map; staged invoke shares the version-ref parsing; deploy reads stay inside the project; deploy --read-root bounds bundling and container builds; durable object bindings with a foreign script_name are refused (upstream #312); image tars upload multipart (upstream #307); celld versions lists deployed versions (upstream #181).
+// Modified by ryuzcorp (ryuzcorp/celld): idempotent content-tagged image create; tag-race tests run the fake engine through sh; deploy --sourcemap writes the bundle's external map; service binding targets validated at deploy; staged activation; deploy --sourcemap collects the no_bundle sibling map; staged invoke shares the version-ref parsing; deploy reads stay inside the project; deploy --read-root bounds bundling and container builds; durable object bindings with a foreign script_name are refused (upstream #312); image tars upload multipart (upstream #307); celld versions lists deployed versions (upstream #181); CELLD_NODE binding reservation (upstream #219).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 // Deployment is an operator control-plane path outside the Actor execution
@@ -89,6 +89,16 @@ pub const QUEUE_CLASS: &str = celld_logic::queue::RESERVED_CLASS;
 
 /// Every runtime-supplied Durable Object class.
 pub const RESERVED_CLASSES: &[&str] = &[D1_CLASS, WORKFLOW_CLASS, KV_CLASS, QUEUE_CLASS];
+
+/// The `env` name that carries the node's own identity, injected by the
+/// host into every deployment isolate after the deployment's bindings
+/// (denoland/celld#219). Read-only from the bundle's perspective:
+/// deployments cannot bind it (see the reservation in `read_project`), and
+/// a loaded Worker's props cannot smuggle it past the host value of an
+/// isolate that has one (see `__installLoaderEnv`). Dynamically loaded
+/// Workers carry no node in their config, so they receive no injection and
+/// their loader's props pass through untouched.
+pub const NODE_IDENTITY_ENV: &str = "CELLD_NODE";
 
 /// The Durable Object class a script's workflow instances run as.
 ///
@@ -3666,6 +3676,12 @@ fn read_project(path: &Path, root: &Path, overrides: &VarOverrides) -> anyhow::R
                         note!("warning: skipped the dotenv entry {name:?}, which is not a valid binding name");
                     } else if taken.contains(name.as_str()) {
                         note!("warning: skipped the dotenv entry {name:?}, whose name another binding uses");
+                    } else if name == NODE_IDENTITY_ENV {
+                        // A dotenv file serves other tools too, so unlike an
+                        // explicit `vars` entry this is skipped with a warning
+                        // rather than refused: the host value wins at runtime
+                        // regardless (denoland/celld#219).
+                        note!("warning: skipped the dotenv entry {name:?}, which the host injects as the node identity");
                     } else {
                         vars.insert(name, value);
                     }
@@ -3709,6 +3725,17 @@ fn read_project(path: &Path, root: &Path, overrides: &VarOverrides) -> anyhow::R
     for binding in &bindings {
         let name = binding.get("name").and_then(Value::as_str).unwrap_or("");
         let kind = binding.get("type").and_then(Value::as_str).unwrap_or("");
+        // `CELLD_NODE` is the host-injected node identity every isolate's
+        // `env` carries (denoland/celld#219). A binding of the same name
+        // would be shadowed by it — or shadow it for readers that run
+        // before the injection — so the name is refused loudly at deploy
+        // time instead of reading as a missing secret in the Worker.
+        if name == NODE_IDENTITY_ENV {
+            bail!(
+                "binding name {name:?} is reserved for the node's own identity \
+                 (`env.{name}` names the node the Worker runs on); rename the binding"
+            );
+        }
         if let Some(previous) = binding_names.insert(name, kind) {
             bail!(
                 "binding name {name:?} is declared by both a {previous} and a {kind} \
@@ -5280,6 +5307,93 @@ mod deploy_contract {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `CELLD_NODE` names the node the Worker runs on, injected by the host
+    /// into every isolate's `env` (denoland/celld#219). A deployment binding
+    /// of the same name would be shadowed by it, so `read_project` refuses
+    /// the name loudly — from `vars`, from `.dev.vars`, and from any other
+    /// binding kind — instead of letting the Worker read a missing secret.
+    #[test]
+    fn node_identity_binding_name_is_reserved() {
+        fn project_with_vars(dir: &Path, vars: &str) {
+            std::fs::write(
+                dir.join("wrangler.json"),
+                format!(
+                    "{{\"name\": \"nodetest\", \"main\": \"index.js\", \
+                      \"compatibility_date\": \"2026-01-01\", \"vars\": {{{vars}}}}}"
+                ),
+            )
+            .unwrap();
+            std::fs::write(
+                dir.join("index.js"),
+                "export default { fetch() { return new Response('ok'); } }",
+            )
+            .unwrap();
+        }
+        let dir = tempfile::tempdir().unwrap();
+        project_with_vars(dir.path(), "\"REGION\": \"us-east-1\"");
+        let config = dir.path().join("wrangler.json");
+        read_project(&config, dir.path(), &VarOverrides::None).expect("an ordinary var must parse");
+        project_with_vars(dir.path(), "\"CELLD_NODE\": \"spoofed\"");
+        match read_project(&config, dir.path(), &VarOverrides::None) {
+            Ok(_) => panic!("a CELLD_NODE var must be refused, not shadowed"),
+            Err(error) => assert!(
+                format!("{error:?}").contains("reserved for the node's own identity"),
+                "the refusal must name the reservation: {error:?}"
+            ),
+        }
+        project_with_vars(dir.path(), "");
+        let mut dev_vars = BTreeMap::new();
+        dev_vars.insert("CELLD_NODE".to_string(), "spoofed".to_string());
+        match read_project(&config, dir.path(), &VarOverrides::DevVars(dev_vars)) {
+            Ok(_) => panic!("a CELLD_NODE .dev.vars entry must be refused too"),
+            Err(error) => assert!(
+                format!("{error:?}").contains("reserved for the node's own identity"),
+                "the refusal must name the reservation: {error:?}"
+            ),
+        }
+    }
+
+    /// A `CELLD_NODE` entry in `.env`/`.env.local` is skipped with a warning,
+    /// not refused: dotenv files serve other tools too, and the `DotEnv`
+    /// contract is "skipped", while the host value wins at runtime regardless
+    /// (denoland/celld#219). Explicit `vars` and `.dev.vars` keep the hard
+    /// refusal above.
+    #[test]
+    fn node_identity_dotenv_entry_is_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("wrangler.json"),
+            "{\"name\": \"nodetest\", \"main\": \"index.js\", \
+              \"compatibility_date\": \"2026-01-01\"}",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("index.js"),
+            "export default { fetch() { return new Response('ok'); } }",
+        )
+        .unwrap();
+        let config = dir.path().join("wrangler.json");
+        let mut entries = BTreeMap::new();
+        entries.insert("CELLD_NODE".to_string(), "spoofed".to_string());
+        entries.insert("REGION".to_string(), "us-east-1".to_string());
+        let project = read_project(&config, dir.path(), &VarOverrides::DotEnv(entries))
+            .expect("a dotenv CELLD_NODE entry must be skipped, not refused");
+        let names: Vec<&str> = project.metadata["bindings"]
+            .as_array()
+            .expect("bindings metadata")
+            .iter()
+            .filter_map(|binding| binding.get("name").and_then(Value::as_str))
+            .collect();
+        assert!(
+            !names.contains(&"CELLD_NODE"),
+            "the dotenv identity must not become a binding: {names:?}"
+        );
+        assert!(
+            names.contains(&"REGION"),
+            "an ordinary dotenv entry still lands: {names:?}"
+        );
+    }
 
     /// A fake engine CLI script: builds answer with `built_id`, inspects of
     /// that id answer with `built_content`, inspects of anything else (the
