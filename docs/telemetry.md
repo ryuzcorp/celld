@@ -22,7 +22,8 @@ stable release. Each file carries the version in the object metadata name
 | `OTEL_TRACES_SAMPLER` | `parentbased_always_on` | A standard sampler name. `traceidratio` with `OTEL_TRACES_SAMPLER_ARG` records a fraction of the traces. |
 | `OTEL_EXPORTER_OTLP_HEADERS` | unset | A comma-separated list of `name=value` headers for the collector. |
 | `OTEL_EXPORTER_OTLP_TIMEOUT` | `10000` | The collector request timeout in milliseconds. |
-| `OTEL_SERVICE_NAME` | `celld` | The service name in the exported resource. |
+| `OTEL_SERVICE_NAME` | `celld` | The service name in the exported resource. Wins over `service.name` in `OTEL_RESOURCE_ATTRIBUTES`. |
+| `OTEL_RESOURCE_ATTRIBUTES` | unset | A comma-separated list of `key=value` resource attributes added to every exported span and log batch. `service.version` names the application version for deployment tracking; celld's own build is always reported separately as `celld.version`. |
 
 The bucket sink requires `CELLD_BUCKET`. The OTLP sink does not.
 
