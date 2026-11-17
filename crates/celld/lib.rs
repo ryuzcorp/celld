@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): cross-isolate RPC stubs and streams; operator token for the internal listener; per-node Workers Cache API; tenant egress policy; the full build version for --version; staged invoke modules; the hardening module; nodejs process.env population flag (upstream #296).
+// Modified by ryuzcorp (ryuzcorp/celld): cross-isolate RPC stubs and streams; operator token for the internal listener; per-node Workers Cache API; tenant egress policy; the full build version for --version; staged invoke modules; the hardening module; nodejs process.env population flag (upstream #296); shared TLS roots module (upstream #230).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 #![warn(clippy::disallowed_methods, clippy::disallowed_types)]
@@ -102,6 +102,7 @@ pub mod startup;
 pub mod storage;
 pub mod stub_table;
 pub mod telemetry;
+pub mod tls_roots;
 pub mod upload_table;
 pub mod version;
 pub mod wake;

@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): tenant egress policy; reaction-aware request resources; TCP socket ownership.
+// Modified by ryuzcorp (ryuzcorp/celld): tenant egress policy; reaction-aware request resources; TCP socket ownership; shared TLS roots with fetch (upstream #230).
 //! Outbound TCP host ops for `cloudflare:sockets` `connect()`.
 //!
 //! A socket is a split tokio stream in a process-global registry: the
@@ -90,8 +90,9 @@ fn owns(owner: &Weak<IoContext>, context: &Arc<IoContext>) -> bool {
         .is_some_and(|owner| Arc::ptr_eq(&owner, context))
 }
 
-/// Mozilla's roots, the same choice `ws_client` makes and for the same
-/// reason: a downloaded celld must reach TLS hosts on a machine with no
+/// The shared tenant roots (`crate::tls_roots`), the same choice `ws_client`
+/// makes: Mozilla's plus the OS store and `SSL_CERT_FILE`, so a downloaded
+/// celld still reaches public TLS hosts on a machine with no
 /// `/etc/ssl/certs`. Test TLS servers use a root injected through the
 /// gated seam below.
 #[cfg(celld_internal_tests)]
@@ -122,9 +123,10 @@ fn tls_connector() -> tokio_rustls::TlsConnector {
 }
 
 fn build_tls_connector(extra_root: Option<Vec<u8>>) -> tokio_rustls::TlsConnector {
-    let mut roots = rustls::RootCertStore {
-        roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
-    };
+    // The shared tenant roots: Mozilla's plus the OS store and
+    // `SSL_CERT_FILE`, so a private-CA database driver over `startTls()`
+    // verifies exactly where `fetch()` does (denoland/celld#230).
+    let mut roots = crate::tls_roots::root_store();
     if let Some(der) = extra_root {
         let _ = roots.add(rustls::pki_types::CertificateDer::from(der));
     }

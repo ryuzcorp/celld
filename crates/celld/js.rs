@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): node:crypto scrypt; container exec resize op; cross-isolate RPC stubs and streams; test-only fake exec ops; fake kill completion op; exec reads survive their subscribing event; per-node Workers Cache API ops; tenant egress policy; D1 export operator-ingress marker; stateless attribution tokens; reaction-aware request resources; fake close/signal completion ops; binding-forgery enforcement; trusted cell RPC; Queue DLQ forward host op; DLQ forward caller identity; WebSocket and TCP socket ownership; receiver-held stream lifetime; deployment cache scope key; share the /bundle tree per deployment generation.; cancelled requests reject pending ops so co-awaiters settle (upstream #317); answered drivers poll while waitUntil background is outstanding (upstream #300); refused handoffs reject instead of dropping resolvers (upstream #309); facet adoption drops the restored flag (upstream #292); background expiry for orphaned drives (upstream #275); unrefed AbortSignal.timeout timer (upstream #306); loader-fetch 101 webSocket join (upstream #305); nodejs process.env population (upstream #296); writable request /tmp files (upstream #280); synchronous loader abort publish (upstream #281).
+// Modified by ryuzcorp (ryuzcorp/celld): node:crypto scrypt; container exec resize op; cross-isolate RPC stubs and streams; test-only fake exec ops; fake kill completion op; exec reads survive their subscribing event; per-node Workers Cache API ops; tenant egress policy; D1 export operator-ingress marker; stateless attribution tokens; reaction-aware request resources; fake close/signal completion ops; binding-forgery enforcement; trusted cell RPC; Queue DLQ forward host op; DLQ forward caller identity; WebSocket and TCP socket ownership; receiver-held stream lifetime; deployment cache scope key; share the /bundle tree per deployment generation.; cancelled requests reject pending ops so co-awaiters settle (upstream #317); answered drivers poll while waitUntil background is outstanding (upstream #300); refused handoffs reject instead of dropping resolvers (upstream #309); facet adoption drops the restored flag (upstream #292); background expiry for orphaned drives (upstream #275); unrefed AbortSignal.timeout timer (upstream #306); loader-fetch 101 webSocket join (upstream #305); nodejs process.env population (upstream #296); writable request /tmp files (upstream #280); synchronous loader abort publish (upstream #281); tenant fetch trusts the shared TLS roots (upstream #230).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 // The raw V8 adapter and its child modules remain outside the Actor execution
@@ -792,6 +792,23 @@ impl CellJob {
     }
 }
 
+/// Trust the shared tenant roots for `fetch()`: Mozilla's plus the OS store
+/// and `SSL_CERT_FILE`, exactly what worker sockets and outbound WebSockets
+/// verify against (denoland/celld#230). `reqwest` cannot take a
+/// `RootCertStore`, so each cached native anchor is added as a certificate;
+/// an anchor one parser rejects is skipped, as the rustls clients skip what
+/// they cannot add.
+fn tenant_tls(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+    let mut builder = builder;
+    for der in crate::tls_roots::native_der() {
+        match reqwest::Certificate::from_der(der) {
+            Ok(cert) => builder = builder.add_root_certificate(cert),
+            Err(_) => continue,
+        }
+    }
+    builder
+}
+
 /// The tenant `fetch()` client for `redirect: "follow"`: the default
 /// client in open mode, and the policy-enforcing client (filtering
 /// resolver plus a redirect policy that refuses refused literals) in
@@ -800,17 +817,19 @@ impl CellJob {
 fn tenant_follow_client() -> reqwest::Client {
     let policy = crate::egress::EgressPolicy::global();
     if policy.is_open() {
-        return reqwest::Client::new();
+        return tenant_tls(reqwest::Client::builder())
+            .build()
+            .expect("build the open tenant fetch client");
     }
     debug_assert!(
         !policy.has_port_scoped_entries(),
         "port-scoped policies take pinned per-request clients"
     );
-    crate::egress::apply_tenant_policy(
+    tenant_tls(crate::egress::apply_tenant_policy(
         reqwest::Client::builder().redirect(crate::egress::follow_redirect_policy(policy.clone())),
         &policy,
         crate::egress::HopPort::unpinned(),
-    )
+    ))
     .build()
     .expect("build the tenant fetch client")
 }
@@ -821,11 +840,11 @@ fn tenant_manual_client() -> reqwest::Client {
         policy.is_open() || !policy.has_port_scoped_entries(),
         "port-scoped policies take pinned per-request clients"
     );
-    crate::egress::apply_tenant_policy(
+    tenant_tls(crate::egress::apply_tenant_policy(
         reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()),
         &policy,
         crate::egress::HopPort::unpinned(),
-    )
+    ))
     .build()
     .expect("build the tenant manual-redirect fetch client")
 }
@@ -836,13 +855,13 @@ fn tenant_error_client() -> reqwest::Client {
         policy.is_open() || !policy.has_port_scoped_entries(),
         "port-scoped policies take pinned per-request clients"
     );
-    crate::egress::apply_tenant_policy(
+    tenant_tls(crate::egress::apply_tenant_policy(
         reqwest::Client::builder().redirect(reqwest::redirect::Policy::custom(|attempt| {
             attempt.error("fetch redirect mode is error")
         })),
         &policy,
         crate::egress::HopPort::unpinned(),
-    )
+    ))
     .build()
     .expect("build the tenant error-redirect fetch client")
 }
@@ -874,11 +893,11 @@ fn tenant_pinned_client(
         }),
         _ => unreachable!("the redirect mode was validated above"),
     };
-    crate::egress::apply_tenant_policy(
+    tenant_tls(crate::egress::apply_tenant_policy(
         reqwest::Client::builder().redirect(redirect_policy),
         policy,
         pin,
-    )
+    ))
     .build()
     .expect("build the pinned tenant fetch client")
 }
