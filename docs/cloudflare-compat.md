@@ -80,6 +80,13 @@ An unsupported feature that does not cause an error is a defect.
 
 Only the binding types in the [services table](#services) are available.
 
+`env` additionally carries `CELLD_NODE`: the name of the node running the
+code, injected by the host after every deployment binding. A bundle that must
+refuse a credential minted for another region reads this, not placement. No
+deployment may bind the name — `vars`, `.dev.vars`, and every other binding
+kind are refused at deploy time — and a loaded Worker's props cannot smuggle
+it past the host value of an isolate that has one.
+
 ### [Context](https://developers.cloudflare.com/workers/runtime-apis/context/)
 
 - `passThroughOnException()` has no effect because celld has no CDN fallback.
