@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): honor OTEL_RESOURCE_ATTRIBUTES in the OTLP resource; report celld's build as celld.version (upstream #314)
+// Modified by ryuzcorp (ryuzcorp/celld): honor OTEL_RESOURCE_ATTRIBUTES in the OTLP resource; report celld's build as celld.version (upstream #314); export incoming HTTP method (upstream #285).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! OTLP/HTTP protobuf encoding for the telemetry sink, by hand.
@@ -144,6 +144,9 @@ fn span_message(span: &Span) -> Vec<u8> {
     // under otel semantic-convention names where one exists.
     if let Some(url) = &span.url {
         key_value(&mut out, 9, "url.full", any_string(url));
+    }
+    if let Some(method) = &span.http_method {
+        key_value(&mut out, 9, "http.request.method", any_string(method));
     }
     if let Some(status) = span.http_status {
         key_value(
