@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): cross-isolate RPC stubs and streams; D1 export operator-ingress marker; ported from meln1k/celld: report wake coverage after maintenance (e6cb9a3); wake coverage follow-ups: startup observation ordering, installation comparison; trusted cell RPC; deployment cache scope purge on generation free; staged invoke joins the driver past the reply.; answered drivers poll while waitUntil background is outstanding (upstream #300); drivers take the mailbox once more before retiring (upstream #309); answered waitUntil with no ops polls for settlement (upstream #289); post-response background budget ends orphaned drives (upstream #275); storage-poisoned cells restart on a fresh isolate (upstream #291); restore fails a vanished class before touching disk (upstream #276); incoming spans carry HTTP method/status and 5xx without exception marks error (upstream #285).
+// Modified by ryuzcorp (ryuzcorp/celld): cross-isolate RPC stubs and streams; D1 export operator-ingress marker; ported from meln1k/celld: report wake coverage after maintenance (e6cb9a3); wake coverage follow-ups: startup observation ordering, installation comparison; trusted cell RPC; deployment cache scope purge on generation free; staged invoke joins the driver past the reply.; answered drivers poll while waitUntil background is outstanding (upstream #300); drivers take the mailbox once more before retiring (upstream #309); answered waitUntil with no ops polls for settlement (upstream #289); post-response background budget ends orphaned drives (upstream #275); storage-poisoned cells restart on a fresh isolate (upstream #291); restore fails a vanished class before touching disk (upstream #276); incoming spans carry HTTP method/status and 5xx without exception marks error (upstream #285); CELLD_MAX_CELLS_PER_ISOLATE knob (upstream #278).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 // RuntimeManager is the V8 cell-host arm, so its executor and observability
@@ -454,7 +454,7 @@ impl Drop for AlarmRequestGuard {
 pub fn pool_limits() -> celld_logic::isolate::PoolLimits {
     const GROW_AT: usize = 2;
     const SHRINK_UNDER: usize = 1;
-    const MAX_CELLS_PER_ISOLATE: usize = 32;
+    const DEFAULT_CELLS_PER_ISOLATE: usize = 32;
     let cores = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4);
@@ -466,8 +466,14 @@ pub fn pool_limits() -> celld_logic::isolate::PoolLimits {
         max_stateless: env_usize("CELLD_MAX_STATELESS_ISOLATES").unwrap_or(cores),
         max_requests: env_usize("CELLD_MAX_REQUESTS"),
         // This is an engine blast-radius policy. The resident-cell and RSS
-        // limits are the operator controls for node memory.
-        max_cells: MAX_CELLS_PER_ISOLATE,
+        // limits are the operator controls for node memory. Heavy-weight
+        // cells (agents being the reported case) can lower the per-isolate
+        // packing so one heap holds fewer of them (denoland/celld#278).
+        max_cells: crate::env_vars::positive_or(
+            "CELLD_MAX_CELLS_PER_ISOLATE",
+            DEFAULT_CELLS_PER_ISOLATE,
+        )
+        .expect("validated positive runtime limit"),
     }
 }
 
@@ -4446,6 +4452,30 @@ export default {
         assert!(
             entry_b.finished(),
             "the settled background retires the entry"
+        );
+    }
+}
+
+#[cfg(test)]
+mod pool_limit_tests {
+    use super::*;
+
+    /// `CELLD_MAX_CELLS_PER_ISOLATE` overrides the per-isolate cell packing;
+    /// unset restores the historical 32 (denoland/celld#278).
+    #[test]
+    fn max_cells_per_isolate_is_configurable() {
+        let previous = std::env::var_os("CELLD_MAX_CELLS_PER_ISOLATE");
+        std::env::set_var("CELLD_MAX_CELLS_PER_ISOLATE", "4");
+        let configured = pool_limits().max_cells;
+        match previous {
+            Some(value) => std::env::set_var("CELLD_MAX_CELLS_PER_ISOLATE", value),
+            None => std::env::remove_var("CELLD_MAX_CELLS_PER_ISOLATE"),
+        }
+        assert_eq!(configured, 4, "the knob must reach the pool limits");
+        assert_eq!(
+            pool_limits().max_cells,
+            32,
+            "unset must restore the historical default"
         );
     }
 }
