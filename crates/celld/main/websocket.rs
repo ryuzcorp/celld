@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): WebSocket ownership. Apache-2.0.
+// Modified by ryuzcorp (ryuzcorp/celld): WebSocket ownership; isolate pipe for loaded-worker 101 joins (upstream #305). Apache-2.0.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! WebSockets on the ingress: accepting them, proxying them to the owner,
@@ -477,6 +477,86 @@ impl OutboundWebSocketSink {
 /// which is also why a hibernatable server end needs nothing special here.
 ///
 /// The task ends when either side closes, and it unregisters both.
+/// Carry frames between a loaded worker's socket and a client end another
+/// isolate in this process kept, after a loader-fetch upgrade.
+///
+/// The cell pipe above cannot serve this pair: the worker end is an
+/// isolate-polled socket, not a cell, so there is no cell to dispatch into.
+/// Each direction instead takes the isolate-queue route — the caller's
+/// `WsOut` frames cross into the loaded socket's pull queue, and the loaded
+/// socket's `WsOut` frames cross into the caller's pull queue — which is the
+/// same exchange the top-level upgrade task runs for a Worker socket.
+///
+/// The task ends when either side closes, and it unregisters both. The
+/// stashed handoff is dropped with the task: it owns the only remaining
+/// `WsPullSender` for the loaded socket, and dropping it lets that input
+/// queue drain.
+async fn local_isolate_websocket_pipe(
+    id: u64,
+    target: celld::js::WsTarget,
+    worker: celld::js::WorkerWebSocket,
+    pull: celld::js::WsPullSender,
+    reply: tokio::sync::oneshot::Sender<anyhow::Result<celld::js::OutboundWsOpen>>,
+) -> anyhow::Result<()> {
+    use celld::js::{WsOut, WsPull};
+    let inbound = worker.inbound();
+    let loaded_id = worker.id();
+    // Both registrations flush whatever each end queued before it had
+    // anywhere to send, as in the cell pipe above.
+    let (caller_tx, mut from_caller) = mpsc::unbounded_channel();
+    let (loaded_tx, mut from_loaded) = mpsc::unbounded_channel();
+    celld::js::ws_register(id, caller_tx);
+    celld::js::ws_register(loaded_id, loaded_tx);
+    let _ = reply.send(Ok(celld::js::OutboundWsOpen {
+        protocol: None,
+        declined: None,
+    }));
+    // Set only by a close the caller sent. A close from the loaded worker
+    // is forwarded to the caller below; telling the loaded socket again
+    // would be a second close.
+    let mut caller_close: Option<(u16, String)> = None;
+    loop {
+        celld::asyncrt::select! {
+            frame = from_caller.recv() => match frame {
+                Some(WsOut::Text(text)) => {
+                    if inbound.send(WsPull::Text(text)).await.is_err() { break; }
+                }
+                Some(WsOut::Binary(bytes)) => {
+                    if inbound.send(WsPull::Binary(bytes)).await.is_err() { break; }
+                }
+                Some(WsOut::Close(code, reason)) => {
+                    caller_close = Some((code, reason));
+                    break;
+                }
+                // The caller's request retired and took its socket with it.
+                None => break,
+            },
+            frame = from_loaded.recv() => match frame {
+                Some(WsOut::Text(text)) => {
+                    if pull.send(WsPull::Text(text)).await.is_err() { break; }
+                }
+                Some(WsOut::Binary(bytes)) => {
+                    if pull.send(WsPull::Binary(bytes)).await.is_err() { break; }
+                }
+                Some(WsOut::Close(code, reason)) => {
+                    let _ = pull.send_close(code, reason, true);
+                    break;
+                }
+                None => break,
+            },
+        }
+    }
+    if let Some((code, reason)) = caller_close {
+        let _ = inbound.send_close(code, reason, true);
+    }
+    celld::js::ws_unregister(loaded_id);
+    celld::js::ws_unregister(id);
+    celld::js::ws_pull_unregister(id);
+    drop(worker);
+    let _ = target;
+    Ok(())
+}
+
 async fn local_websocket_pipe(
     app: AppHandle,
     id: u64,
@@ -490,6 +570,12 @@ async fn local_websocket_pipe(
         )));
         return Ok(());
     };
+    // A loaded worker's own 101 joins isolate-to-isolate: the stash holds
+    // its handoff, and only the single-use bind token could have authorized
+    // this request. A cell target has no stash and takes the cell pipe.
+    if let Some(worker) = celld::js::ws_take_join_handoff(target.id) {
+        return local_isolate_websocket_pipe(id, target, worker, pull, reply).await;
+    }
     // Both registrations flush whatever each end queued before it had
     // anywhere to send: the cell's greeting frame is queued while its own
     // fetch handler still runs, and the caller can send the moment it

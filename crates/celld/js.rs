@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): node:crypto scrypt; container exec resize op; cross-isolate RPC stubs and streams; test-only fake exec ops; fake kill completion op; exec reads survive their subscribing event; per-node Workers Cache API ops; tenant egress policy; D1 export operator-ingress marker; stateless attribution tokens; reaction-aware request resources; fake close/signal completion ops; binding-forgery enforcement; trusted cell RPC; Queue DLQ forward host op; DLQ forward caller identity; WebSocket and TCP socket ownership; receiver-held stream lifetime; deployment cache scope key; share the /bundle tree per deployment generation.; cancelled requests reject pending ops so co-awaiters settle (upstream #317); answered drivers poll while waitUntil background is outstanding (upstream #300); refused handoffs reject instead of dropping resolvers (upstream #309); facet adoption drops the restored flag (upstream #292); background expiry for orphaned drives (upstream #275); unrefed AbortSignal.timeout timer (upstream #306).
+// Modified by ryuzcorp (ryuzcorp/celld): node:crypto scrypt; container exec resize op; cross-isolate RPC stubs and streams; test-only fake exec ops; fake kill completion op; exec reads survive their subscribing event; per-node Workers Cache API ops; tenant egress policy; D1 export operator-ingress marker; stateless attribution tokens; reaction-aware request resources; fake close/signal completion ops; binding-forgery enforcement; trusted cell RPC; Queue DLQ forward host op; DLQ forward caller identity; WebSocket and TCP socket ownership; receiver-held stream lifetime; deployment cache scope key; share the /bundle tree per deployment generation.; cancelled requests reject pending ops so co-awaiters settle (upstream #317); answered drivers poll while waitUntil background is outstanding (upstream #300); refused handoffs reject instead of dropping resolvers (upstream #309); facet adoption drops the restored flag (upstream #292); background expiry for orphaned drives (upstream #275); unrefed AbortSignal.timeout timer (upstream #306); loader-fetch 101 webSocket join (upstream #305).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 // The raw V8 adapter and its child modules remain outside the Actor execution
@@ -8369,7 +8369,7 @@ fn op_loader_fetch(
         // context. That context owns an unread body tail through its
         // waitUntil work.
         body_guard.disarm();
-        encode_http_response(response, false, &stream_service)
+        encode_http_response(response, true, &stream_service)
     });
     let response = promise_for(scope, async_id);
     if let Some(request_id) = cancel_id {
@@ -14143,7 +14143,7 @@ fn read_response(scope: &mut v8::PinScope, ret: v8::Local<v8::Value>) -> Result<
         .get(scope, wk.into())
         .map(|v| v.to_rust_string_lossy(scope))
         .unwrap_or_else(|| "null".into());
-    let ws = serde_json::from_str(&ws_json).ok();
+    let ws: Option<WsTarget> = serde_json::from_str(&ws_json).ok();
     let worker_id = out
         .get(scope, worker_wk.into())
         .and_then(|value| value.integer_value(scope))
@@ -14165,7 +14165,29 @@ fn read_response(scope: &mut v8::PinScope, ret: v8::Local<v8::Value>) -> Result<
         );
     }
     let websocket = match (ws, worker_ws) {
-        (Some(target), None) => Some(HttpResponseWebSocket::Cell(target)),
+        // A loaded worker's 101 passed straight through its caller: the
+        // target still names the loaded socket, and the stash still holds
+        // its handoff. Rebuild the Worker variant so the normal top-level
+        // upgrade owns it. The single-use bind token authorizes the take,
+        // exactly as a caller-side bind is authorized, so a forged target
+        // cannot steal another upgrade's socket; a target with no stash —
+        // notably a cell target carried through — is untouched, and its
+        // token stays minted for the response verifier below.
+        (Some(target), None) => {
+            let handoff = websocket::ws_take_join_handoff(target.id);
+            match (handoff, target.bind) {
+                (Some(worker), Some(token))
+                    if websocket::ws_consume_bind_token(target.id, token) =>
+                {
+                    Some(HttpResponseWebSocket::Worker(worker))
+                }
+                (Some(worker), _) => {
+                    websocket::ws_stash_join_handoff(worker);
+                    Some(HttpResponseWebSocket::Cell(target))
+                }
+                (None, _) => Some(HttpResponseWebSocket::Cell(target)),
+            }
+        }
         (None, Some(worker)) => Some(HttpResponseWebSocket::Worker(worker)),
         (None, None) => None,
         (Some(_), Some(_)) => return Err(anyhow!("Worker response has two WebSocket targets")),
