@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): validate CELLD_MEMORY_SCOPE.
+// Modified by ryuzcorp (ryuzcorp/celld): validate CELLD_MEMORY_SCOPE; pin the node-session id in the data dir (upstream #249).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! What the process can learn about where it is running.
@@ -19,6 +19,89 @@ pub(crate) fn validate_node_name(node: &str) -> anyhow::Result<()> {
         anyhow::bail!(
             "must be a safe node name of 1 to 128 ASCII letters, numbers, dots, dashes, or underscores"
         )
+    }
+}
+
+/// The file beside the follower peerlog that pins this disk's node-session
+/// id across restarts (upstream #249).
+pub const NODE_ID_FILE: &str = "node-id";
+
+/// Resolve the node-session id: an explicit `CELLD_NODE` wins outright and
+/// is recorded for the next boot; otherwise reuse the id the data directory
+/// already pins, generating and pinning one on first boot. The pin lives
+/// beside the follower fragments, so the id and the disks it recovers share
+/// a fate: a restarted process answers for its predecessor's leases and
+/// fragments instead of stranding them behind `WrongTarget` (upstream
+/// #249). A missing pin (first boot) generates and pins a fresh id. A pin
+/// that cannot be read at all — I/O error, permissions, or a non-file at
+/// the pin path — degrades to today's ephemeral id with a loud line and
+/// leaves the pin untouched: minting a fresh identity over retained
+/// fragments would orphan them, and the safest repair is operator action,
+/// never a boot failure. A corrupt pin warns and regenerates, naming the
+/// discarded id for operator recovery.
+#[allow(clippy::disallowed_methods)] // The pin is read before any injected filesystem exists.
+pub fn resolve_node_session_id(explicit: Option<String>, data_dir: &std::path::Path) -> String {
+    if let Some(node) = explicit {
+        if validate_node_name(&node).is_ok() {
+            record_node_session_id(data_dir, &node);
+        }
+        return node;
+    }
+    let path = data_dir.join(NODE_ID_FILE);
+    match std::fs::read_to_string(&path) {
+        Ok(pinned) => {
+            let pinned = pinned.trim().to_string();
+            if validate_node_name(&pinned).is_ok() {
+                return pinned;
+            }
+            tracing::warn!(
+                path = %path.display(),
+                discarded = %pinned,
+                "pinned node id is corrupt; generating a fresh session id"
+            );
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            tracing::warn!(
+                path = %path.display(),
+                %error,
+                "pinned node id is unreadable; starting with an ephemeral session id without overwriting the pin"
+            );
+            return random_node_session_id();
+        }
+    }
+    let node = random_node_session_id();
+    record_node_session_id(data_dir, &node);
+    node
+}
+
+/// Durably pin the node-session id: tmp file, fsync, rename, dir fsync —
+/// the follower-fragment pattern — so the pin survives a power loss or OS
+/// crash before the next boot reads it. Best effort: an unwritable
+/// directory keeps today's ephemeral behavior, loudly.
+#[allow(clippy::disallowed_methods)] // The pin is written before any injected filesystem exists.
+fn persist_node_session_id(data_dir: &std::path::Path, node: &str) -> std::io::Result<()> {
+    use std::io::Write as _;
+    std::fs::create_dir_all(data_dir)?;
+    let path = data_dir.join(NODE_ID_FILE);
+    let tmp = data_dir.join(format!("{NODE_ID_FILE}.tmp"));
+    let mut file = std::fs::File::create(&tmp)?;
+    file.write_all(format!("{node}\n").as_bytes())?;
+    file.sync_all()?;
+    std::fs::rename(&tmp, &path)?;
+    std::fs::File::open(data_dir)?.sync_all()?;
+    Ok(())
+}
+
+/// Reflect the effective node-session id in the data directory's pin. Best
+/// effort: an unwritable directory keeps today's ephemeral behavior, loudly.
+fn record_node_session_id(data_dir: &std::path::Path, node: &str) {
+    if let Err(error) = persist_node_session_id(data_dir, node) {
+        tracing::warn!(
+            path = %data_dir.join(NODE_ID_FILE).display(),
+            %error,
+            "cannot pin the node-session id; restarts will mint fresh ids"
+        );
     }
 }
 
@@ -193,4 +276,88 @@ pub fn local_cache_max_bytes_from_environment() -> anyhow::Result<Option<u64>> {
 #[cfg(all(test, celld_internal_tests))]
 mod internal_tests {
     include!(env!("CELLD_INTERNAL_MACHINE_TESTS"));
+}
+
+#[cfg(test)]
+#[allow(clippy::disallowed_methods)] // Test tempdirs live outside the injected filesystem.
+mod node_id_tests {
+    use super::*;
+
+    /// An explicit CELLD_NODE wins and is recorded for the next boot.
+    #[test]
+    fn explicit_id_wins_and_is_recorded() {
+        let dir = tempfile::tempdir().expect("test dir");
+        let node = resolve_node_session_id(Some("node_fixed".into()), dir.path());
+        assert_eq!(node, "node_fixed");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(NODE_ID_FILE)).expect("pin written"),
+            "node_fixed\n"
+        );
+    }
+
+    /// A restart with no explicit id reuses the pin: the process answers
+    /// for its predecessor's leases and fragments (upstream #249).
+    /// Fail-before: every boot minted a stranger and recovery looped on
+    /// `WrongTarget` forever.
+    #[test]
+    fn restart_reuses_the_pinned_id() {
+        let dir = tempfile::tempdir().expect("test dir");
+        let first = resolve_node_session_id(None, dir.path());
+        assert!(validate_node_name(&first).is_ok());
+        let second = resolve_node_session_id(None, dir.path());
+        assert_eq!(second, first, "the restart keeps its predecessor's id");
+    }
+
+    /// A corrupt pin warns and regenerates instead of bricking boot or
+    /// pinning an unusable identity.
+    #[test]
+    fn corrupt_pin_regenerates() {
+        let dir = tempfile::tempdir().expect("test dir");
+        std::fs::write(dir.path().join(NODE_ID_FILE), "not a node id!!!\n").expect("pin written");
+        let node = resolve_node_session_id(None, dir.path());
+        assert!(validate_node_name(&node).is_ok());
+        assert_ne!(node, "not a node id!!!");
+    }
+
+    /// An unreadable pin is left untouched: the boot takes an ephemeral id
+    /// without minting over the retained fragments. A directory stands in
+    /// for the unreadable pin (mode bits are no barrier to root).
+    /// Fail-before: the read error fell through to mint-and-record, which
+    /// left a `node-id.tmp` beside the pin it could not replace.
+    #[test]
+    fn unreadable_pin_stays_untouched_and_ephemeral() {
+        let dir = tempfile::tempdir().expect("test dir");
+        std::fs::create_dir(dir.path().join(NODE_ID_FILE)).expect("pin dir");
+        let node = resolve_node_session_id(None, dir.path());
+        assert!(validate_node_name(&node).is_ok());
+        assert!(
+            dir.path().join(NODE_ID_FILE).is_dir(),
+            "the unreadable pin is never replaced"
+        );
+        assert!(
+            !dir.path().join(format!("{NODE_ID_FILE}.tmp")).exists(),
+            "no mint-and-record attempt touches the pin"
+        );
+    }
+
+    /// The pin lands through tmp + rename: a stale tmp from a crashed boot
+    /// is consumed, never left beside the pin, and the pin carries the id.
+    /// Fail-before: `std::fs::write` straight to the pin left the stale
+    /// tmp in place.
+    #[test]
+    fn pin_write_consumes_a_stale_tmp() {
+        let dir = tempfile::tempdir().expect("test dir");
+        std::fs::write(dir.path().join(format!("{NODE_ID_FILE}.tmp")), "stale\n")
+            .expect("stale tmp");
+        let node = resolve_node_session_id(Some("node_durable".into()), dir.path());
+        assert_eq!(node, "node_durable");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(NODE_ID_FILE)).expect("pin written"),
+            "node_durable\n"
+        );
+        assert!(
+            !dir.path().join(format!("{NODE_ID_FILE}.tmp")).exists(),
+            "the rename consumes the tmp; no stale tmp survives beside the pin"
+        );
+    }
 }
