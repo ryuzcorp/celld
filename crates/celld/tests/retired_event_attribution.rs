@@ -1,6 +1,6 @@
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 //
-// Modified by ryuzcorp (ryuzcorp/celld): retired-event attribution test; cancelled-request shared-work regression tests (upstream #317); shared-promise attribution regression test (upstream #316); trailing-handoff rejection test (upstream #309). Apache-2.0.
+// Modified by ryuzcorp (ryuzcorp/celld): retired-event attribution test; cancelled-request shared-work regression tests (upstream #317); shared-promise attribution regression test (upstream #316); trailing-handoff rejection test (upstream #309); refused-handoff settlement test (upstream #207). Apache-2.0.
 
 // A white-box driver test, not node code: it builds a Worker in-process and
 // runs its turns directly, so the execution boundary's injected
@@ -466,6 +466,65 @@ fn shared_promise_waiter_owns_its_next_op() {
         .expect("A answered")
         .unwrap_or_else(|error| panic!("A must answer: {error:#}"));
     assert_eq!(response.status, 200);
+}
+
+const STALE_HANDOFF: &str = r#"
+let releaseGate;
+const gate = new Promise((resolve) => {
+  releaseGate = resolve;
+});
+let outcome = "unset";
+
+export default {
+  async fetch(request) {
+    const url = new URL(request.url);
+    if (url.pathname === "/arm") {
+      // Attached, never awaited: runs after this event retires.
+      gate.then(() => {
+        // A timer op, entangled with nothing else. Its owner is this
+        // retired event, so the releasing turn cannot hand it over.
+        new Promise((resolve) => setTimeout(resolve, 60000)).then(
+          () => { outcome = "fired"; },
+          (error) => { outcome = "rejected:" + String((error && error.message) || error); },
+        );
+      });
+      return Response.json({ ok: true });
+    }
+    if (url.pathname === "/release") {
+      releaseGate();
+      return Response.json({ ok: true });
+    }
+    if (url.pathname === "/outcome") {
+      return Response.json({ outcome });
+    }
+    return Response.json({ ok: true });
+  },
+};
+"#;
+
+/// An op handed to an event that is already gone must settle instead of
+/// vanishing: dropping its resolver left the waiter pending forever with
+/// nothing logged (denoland/celld#207). A timer, which the harness fires
+/// early when its op rejects, settles its dependents so background loops
+/// retired with their starter keep running (denoland/celld#309).
+#[test]
+fn refused_handoff_settles_instead_of_vanishing() {
+    ensure_engine();
+    let mut worker = load_worker(STALE_HANDOFF, "stale-handoff");
+
+    // Arm, then retire: dropping the entry retires its token exactly.
+    let (status, _) = turn_once(&mut worker, "http://test/arm");
+    assert_eq!(status, 200);
+    // Release: the stale continuation runs in this turn with a retired
+    // token. Its timer op names the dead owner, so the handoff is refused
+    // and the promise must settle here rather than hang on a dropped
+    // resolver.
+    let (status, _) = turn_once(&mut worker, "http://test/release");
+    assert_eq!(status, 200);
+    let (status, body) = turn_once(&mut worker, "http://test/outcome");
+    assert_eq!(status, 200);
+    let outcome: serde_json::Value = serde_json::from_slice(&body).expect("JSON body");
+    assert_eq!(outcome["outcome"], "fired", "{outcome}");
 }
 
 #[test]
