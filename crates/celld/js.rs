@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): node:crypto scrypt; container exec resize op; cross-isolate RPC stubs and streams; test-only fake exec ops; fake kill completion op; exec reads survive their subscribing event; per-node Workers Cache API ops; tenant egress policy; D1 export operator-ingress marker; stateless attribution tokens; reaction-aware request resources; fake close/signal completion ops; binding-forgery enforcement; trusted cell RPC; Queue DLQ forward host op; DLQ forward caller identity; WebSocket and TCP socket ownership; receiver-held stream lifetime; deployment cache scope key; share the /bundle tree per deployment generation.; cancelled requests reject pending ops so co-awaiters settle (upstream #317); answered drivers poll while waitUntil background is outstanding (upstream #300); refused handoffs reject instead of dropping resolvers (upstream #309); facet adoption drops the restored flag (upstream #292); background expiry for orphaned drives (upstream #275); unrefed AbortSignal.timeout timer (upstream #306); loader-fetch 101 webSocket join (upstream #305).
+// Modified by ryuzcorp (ryuzcorp/celld): node:crypto scrypt; container exec resize op; cross-isolate RPC stubs and streams; test-only fake exec ops; fake kill completion op; exec reads survive their subscribing event; per-node Workers Cache API ops; tenant egress policy; D1 export operator-ingress marker; stateless attribution tokens; reaction-aware request resources; fake close/signal completion ops; binding-forgery enforcement; trusted cell RPC; Queue DLQ forward host op; DLQ forward caller identity; WebSocket and TCP socket ownership; receiver-held stream lifetime; deployment cache scope key; share the /bundle tree per deployment generation.; cancelled requests reject pending ops so co-awaiters settle (upstream #317); answered drivers poll while waitUntil background is outstanding (upstream #300); refused handoffs reject instead of dropping resolvers (upstream #309); facet adoption drops the restored flag (upstream #292); background expiry for orphaned drives (upstream #275); unrefed AbortSignal.timeout timer (upstream #306); loader-fetch 101 webSocket join (upstream #305); nodejs process.env population (upstream #296); writable request /tmp files (upstream #280).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 // The raw V8 adapter and its child modules remain outside the Actor execution
@@ -7526,6 +7526,7 @@ ops! { OP_NAMES, install_op_functions,
         "__vfs_mkdir" => op_vfs_mkdir,
         "__vfs_read_file" => op_vfs_read_file,
         "__vfs_stat" => op_vfs_stat,
+        "__vfs_write_file" => op_vfs_write_file,
         "__wait_until" => op_wait_until,
         "__wait_until_active" => op_wait_until_active,
         "__event_depth" => op_event_depth,
@@ -12234,13 +12235,44 @@ struct IoEventState {
 /// No path can escape into the host filesystem.
 struct RequestVfs {
     nodes: HashMap<String, VfsNode>,
+    /// Live file bytes plus one entry charge per path. Directories and
+    /// zero-byte files cost an entry charge each: names and `HashMap` slots
+    /// are host memory too, and the cap must bound the whole tree.
+    total_bytes: usize,
 }
 
 /// Keep the node kind in the tree, even while the first slice can only create
 /// directories. Deno's VFS uses the same entry-typed shape; a path-only set
 /// would make a later file node indistinguishable from its parent directory.
+#[derive(Clone)]
 enum VfsNode {
     Directory { writable: bool },
+    File { bytes: Vec<u8> },
+}
+
+/// Default per-request `/tmp` byte cap: 64 MiB, the same ceiling the loader
+/// places on dynamic worker code. A request that strays past it is buggy or
+/// hostile either way, and a multi-tenant node cannot let one request pin
+/// gigabytes of host memory. Raised with `CELLD_TMP_MAX_BYTES` (bytes).
+const DEFAULT_TMP_MAX_BYTES: usize = 64 * 1024 * 1024;
+
+/// Fixed per-entry overhead charged alongside the path itself: the
+/// `HashMap` slot, the key allocation, and the node. Entries never leave
+/// the tree — no delete, rename, or truncate op exists — so nothing ever
+/// releases this charge within a request.
+const ENTRY_OVERHEAD: usize = 64;
+
+/// The cap cost of creating `path`: its length plus the fixed overhead.
+fn entry_charge(path: &str) -> usize {
+    path.len().saturating_add(ENTRY_OVERHEAD)
+}
+
+fn tmp_max_bytes() -> usize {
+    static LIMIT: OnceLock<usize> = OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        crate::env_vars::positive_or("CELLD_TMP_MAX_BYTES", DEFAULT_TMP_MAX_BYTES)
+            .expect("validated CELLD_TMP_MAX_BYTES")
+    })
 }
 
 /// Test-only count of `/bundle` materializations, for the sharing test at
@@ -12355,6 +12387,7 @@ impl Default for RequestVfs {
             .into_iter()
             .map(|(path, writable)| (path.to_string(), VfsNode::Directory { writable }))
             .collect(),
+            total_bytes: 0,
         }
     }
 }
@@ -12380,33 +12413,72 @@ impl Default for InputGateClaims {
 }
 
 impl RequestVfs {
-    fn stat(&self, path: &str) -> Option<bool> {
+    /// The stat pair `op_vfs_stat` reports: kind 1 for a read-only directory,
+    /// 2 for a writable one, 3 for a read-only (bundle) file, and 4 for a
+    /// writable (request `/tmp`) file, each file with its byte size. `None`
+    /// means this tree claims nothing and the bundle projection is tried.
+    fn stat(&self, path: &str) -> Option<(u8, usize)> {
         self.nodes.get(path).map(|node| match node {
-            VfsNode::Directory { writable } => *writable,
+            VfsNode::Directory { writable } => (if *writable { 2 } else { 1 }, 0),
+            VfsNode::File { bytes } => (4, bytes.len()),
         })
     }
 
-    fn mkdir(&mut self, path: &str, recursive: bool) -> VfsMkdirResult {
+    fn read_file(&self, path: &str) -> Option<Vec<u8>> {
+        match self.nodes.get(path) {
+            Some(VfsNode::File { bytes }) => Some(bytes.clone()),
+            _ => None,
+        }
+    }
+
+    fn mkdir(&mut self, path: &str, recursive: bool, cap: usize) -> VfsMkdirResult {
         if path != "/tmp" && !path.starts_with("/tmp/") {
             return VfsMkdirResult::Error("EPERM");
         }
-        if self.stat(path).is_some() {
-            return VfsMkdirResult::Created(None);
+        match self.nodes.get(path) {
+            // An existing directory is success, recursive or not; a file is
+            // not a directory, and Node reports it as EEXIST either way.
+            Some(VfsNode::Directory { .. }) => return VfsMkdirResult::Created(None),
+            Some(VfsNode::File { .. }) => return VfsMkdirResult::Error("EEXIST"),
+            None => {}
         }
         if recursive {
+            // Collect first, insert after: the cap check below must not
+            // leave a half-created prefix behind on `ENOSPC`.
             let mut current = "/tmp".to_string();
             let mut first_created = None;
+            let mut missing = Vec::new();
+            // Each missing prefix is charged as it is collected, so the
+            // retained `missing` list never outgrows the cap: a 100,000-deep
+            // path fails with `ENOSPC` after cap-sized retention instead of
+            // materializing every prefix first. Tree insertion still waits
+            // for the full walk, so a refusal leaves no half-created prefix.
+            let mut next = self.total_bytes;
             for segment in path.trim_start_matches("/tmp/").split('/') {
                 current.push('/');
                 current.push_str(segment);
-                if self
-                    .nodes
-                    .insert(current.clone(), VfsNode::Directory { writable: true })
-                    .is_none()
-                    && first_created.is_none()
-                {
-                    first_created = Some(current.clone());
+                match self.nodes.get(&current) {
+                    // A file in the middle of the path is not a directory.
+                    Some(VfsNode::File { .. }) => {
+                        return VfsMkdirResult::Error("ENOTDIR");
+                    }
+                    Some(VfsNode::Directory { .. }) => {}
+                    None => {
+                        if first_created.is_none() {
+                            first_created = Some(current.clone());
+                        }
+                        next = match next.checked_add(entry_charge(&current)) {
+                            Some(sum) if sum <= cap => sum,
+                            _ => return VfsMkdirResult::Error("ENOSPC"),
+                        };
+                        missing.push(current.clone());
+                    }
                 }
+            }
+            self.total_bytes = next;
+            for pending in missing {
+                self.nodes
+                    .insert(pending, VfsNode::Directory { writable: true });
             }
             return VfsMkdirResult::Created(first_created);
         }
@@ -12421,12 +12493,130 @@ impl RequestVfs {
                     }
                 },
             );
-        if self.stat(parent).is_none() {
-            return VfsMkdirResult::Error("ENOENT");
+        match self.nodes.get(parent) {
+            Some(VfsNode::Directory { .. }) => {}
+            Some(VfsNode::File { .. }) => return VfsMkdirResult::Error("ENOTDIR"),
+            None => return VfsMkdirResult::Error("ENOENT"),
+        }
+        match self.total_bytes.checked_add(entry_charge(path)) {
+            Some(next) if next <= cap => self.total_bytes = next,
+            _ => return VfsMkdirResult::Error("ENOSPC"),
         }
         self.nodes
             .insert(path.to_string(), VfsNode::Directory { writable: true });
         VfsMkdirResult::Created(None)
+    }
+
+    /// The `total_bytes` a write of `len` bytes at `path` would leave
+    /// behind: an overwrite frees the replaced bytes first (`total_bytes`
+    /// always covers `old`), an append counts every byte, and a new path
+    /// costs its entry charge. `None` when the addition overflows.
+    /// `write_file` and the op's length pre-check share it, so the early
+    /// refusal fires exactly when the write itself would fail with
+    /// `ENOSPC` — never instead of another code.
+    fn write_next_total(
+        &self,
+        old: usize,
+        fresh: bool,
+        path: &str,
+        len: usize,
+        append: bool,
+    ) -> Option<usize> {
+        let base = if append {
+            self.total_bytes.checked_add(len)?
+        } else {
+            self.total_bytes.saturating_sub(old).checked_add(len)?
+        };
+        if fresh {
+            base.checked_add(entry_charge(path))
+        } else {
+            Some(base)
+        }
+    }
+
+    /// Store `bytes` at `path`, creating or replacing a file, or append them
+    /// when `append` is set. Only `/tmp` is writable, the parent must be a
+    /// directory that exists, and a directory is never overwritten by a file.
+    /// The request's live bytes plus entry charges must stay within `cap`:
+    /// an overwrite frees the replaced bytes first, so only the net growth
+    /// counts, while an append counts every byte and a new path costs its
+    /// entry charge. Over-cap writes fail with `ENOSPC`.
+    fn write_file(
+        &mut self,
+        path: &str,
+        bytes: Vec<u8>,
+        append: bool,
+        cap: usize,
+    ) -> Result<(), &'static str> {
+        if path == "/tmp" || !path.starts_with("/tmp/") {
+            return Err("EPERM");
+        }
+        let Some((parent, _)) = path.rsplit_once('/') else {
+            return Err("ENOENT");
+        };
+        let parent = if parent.is_empty() { "/" } else { parent };
+        match self.nodes.get(parent) {
+            Some(VfsNode::Directory { .. }) => {}
+            _ => return Err("ENOENT"),
+        }
+        if matches!(self.nodes.get(path), Some(VfsNode::Directory { .. })) {
+            return Err("EISDIR");
+        }
+        let old = match self.nodes.get(path) {
+            Some(VfsNode::File { bytes }) => bytes.len(),
+            _ => 0,
+        };
+        let fresh = !self.nodes.contains_key(path);
+        let next = self.write_next_total(old, fresh, path, bytes.len(), append);
+        let Some(next) = next else {
+            return Err("ENOSPC");
+        };
+        if next > cap {
+            return Err("ENOSPC");
+        }
+        if append {
+            match self.nodes.get_mut(path) {
+                Some(VfsNode::File { bytes: existing }) => existing.extend_from_slice(&bytes),
+                _ => {
+                    self.nodes.insert(path.to_string(), VfsNode::File { bytes });
+                }
+            }
+        } else {
+            self.nodes.insert(path.to_string(), VfsNode::File { bytes });
+        }
+        self.total_bytes = next;
+        Ok(())
+    }
+
+    /// True when `write_file` with these arguments would fail with
+    /// `ENOSPC`. Paths that would fail with another code answer false, so
+    /// the op's length pre-check preserves `write_file`'s error precedence
+    /// exactly and only skips the host copy for writes that are over the
+    /// cap however they are attempted.
+    fn would_exceed(&self, path: &str, len: usize, append: bool, cap: usize) -> bool {
+        if path == "/tmp" || !path.starts_with("/tmp/") {
+            return false;
+        }
+        let Some((parent, _)) = path.rsplit_once('/') else {
+            return false;
+        };
+        let parent = if parent.is_empty() { "/" } else { parent };
+        match self.nodes.get(parent) {
+            Some(VfsNode::Directory { .. }) => {}
+            _ => return false,
+        }
+        if matches!(self.nodes.get(path), Some(VfsNode::Directory { .. })) {
+            return false;
+        }
+        let old = match self.nodes.get(path) {
+            Some(VfsNode::File { bytes }) => bytes.len(),
+            _ => 0,
+        };
+        let fresh = !self.nodes.contains_key(path);
+        match self.write_next_total(old, fresh, path, len, append) {
+            Some(next) => next > cap,
+            None => true,
+        }
     }
 }
 
@@ -13479,7 +13669,7 @@ fn op_vfs_mkdir(
         .get_or_init(|| Mutex::new(RequestVfs::default()))
         .lock()
         .unwrap()
-        .mkdir(&path, recursive);
+        .mkdir(&path, recursive, tmp_max_bytes());
     let result = match result {
         VfsMkdirResult::Created(Some(path)) => path,
         VfsMkdirResult::Created(None) => String::new(),
@@ -13489,8 +13679,9 @@ fn op_vfs_mkdir(
 }
 
 /// Return `[kind, size]`, where kind is 0 for a missing path, 1 for a
-/// read-only directory, 2 for a writable directory, and 3 for a read-only
-/// file. Only a file has a size; a directory reports 0, matching workerd.
+/// read-only directory, 2 for a writable directory, 3 for a read-only
+/// (bundle) file, and 4 for a writable (request `/tmp`) file. Only a
+/// file has a size; a directory reports 0, matching workerd.
 ///
 /// The pair travels together because a caller that knows a path is a file
 /// always needs its size to build `Stats`, and a second lookup could observe a
@@ -13513,7 +13704,7 @@ fn op_vfs_stat(
             .stat(&path)
     });
     let (kind, size) = match vfs {
-        Some(writable) => (if writable { 2 } else { 1 }, 0),
+        Some(pair) => pair,
         // Only a path the writable tree does not claim can be a bundle path,
         // so the request tree stays authoritative for `/tmp`.
         None => match bundle_node(scope, &path) {
@@ -13523,7 +13714,7 @@ fn op_vfs_stat(
         },
     };
     let pair = v8::Array::new(scope, 2);
-    let kind = v8::Integer::new(scope, kind).into();
+    let kind = v8::Integer::new(scope, i32::from(kind)).into();
     let size = v8::Number::new(scope, size as f64).into();
     pair.set_index(scope, 0, kind);
     pair.set_index(scope, 1, size);
@@ -13545,15 +13736,32 @@ fn bundle_node(scope: &mut v8::PinScope, path: &str) -> Option<BundleStat> {
     }
 }
 
-/// Read a whole bundle file. Returns an `ArrayBuffer` of the module's bytes,
-/// or `null` when the path is not a bundle file, so the caller raises the
-/// `ENOENT` that names the syscall it was performing.
+/// Read a whole request-`/tmp` file, then a bundle file. Returns an
+/// `ArrayBuffer` of the file's bytes, or `null` when the path is neither, so
+/// the caller raises the `ENOENT` that names the syscall it was performing.
+/// A file the request wrote shadows the bundle, as the stat above does.
 fn op_vfs_read_file(
     scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
     let path = args.get(0).to_rust_string_lossy(scope);
+    // As for `mkdir`: a continuation resumed in a foreign checkpoint reads
+    // its own request's `/tmp`, never the turn owner's.
+    if let Some(context) = reaction_or_current_context(scope) {
+        let bytes = context
+            .vfs
+            .get_or_init(|| Mutex::new(RequestVfs::default()))
+            .lock()
+            .unwrap()
+            .read_file(&path);
+        if let Some(bytes) = bytes {
+            let store = v8::ArrayBuffer::new_backing_store_from_vec(bytes).make_shared();
+            let buffer = v8::ArrayBuffer::with_backing_store(scope, &store);
+            rv.set(buffer.into());
+            return;
+        }
+    }
     let Some(bundle) = scope.get_slot::<Arc<BundleFs>>().cloned() else {
         return;
     };
@@ -13566,6 +13774,66 @@ fn op_vfs_read_file(
     let store = v8::ArrayBuffer::new_backing_store_from_vec(bytes.to_vec()).make_shared();
     let buffer = v8::ArrayBuffer::with_backing_store(scope, &store);
     rv.set(buffer.into());
+}
+
+/// Store bytes at a request-`/tmp` path, or append them when the third
+/// argument is true. Answers `""` on success and a Node error code
+/// otherwise — the same disjoint representation `op_vfs_mkdir` uses, so no
+/// JS object is allocated per written file. A write that would push the
+/// request past `CELLD_TMP_MAX_BYTES` answers `ENOSPC`.
+fn op_vfs_write_file(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let path = args.get(0).to_rust_string_lossy(scope);
+    let append = args.get(2).boolean_value(scope);
+    // Refuse an oversize write before copying: `view_bytes` allocates the
+    // whole host `Vec` up front, transiently pinning exactly the memory the
+    // cap is meant to prevent. The check shares `write_file`'s accounting
+    // (and fires only for writes that would fail with `ENOSPC`), and a sync
+    // op cannot interleave between the two locked sections.
+    if let Ok(view) = v8::Local::<v8::ArrayBufferView>::try_from(args.get(1)) {
+        let len = view.byte_length();
+        if let Some(context) = reaction_or_current_context(scope) {
+            let capped = context
+                .vfs
+                .get_or_init(|| Mutex::new(RequestVfs::default()))
+                .lock()
+                .unwrap()
+                .would_exceed(&path, len, append, tmp_max_bytes());
+            if capped {
+                let code = v8::String::new(scope, "ENOSPC").unwrap();
+                rv.set(code.into());
+                return;
+            }
+        }
+    }
+    let bytes = match view_bytes(args.get(1)) {
+        Some(bytes) => bytes,
+        None => {
+            let code = v8::String::new(scope, "EINVAL").unwrap();
+            rv.set(code.into());
+            return;
+        }
+    };
+    // As for `mkdir`: the tree belongs to the entry whose code is running.
+    let Some(context) = reaction_or_current_context(scope) else {
+        let code = v8::String::new(scope, "ENOENT").unwrap();
+        rv.set(code.into());
+        return;
+    };
+    let result = context
+        .vfs
+        .get_or_init(|| Mutex::new(RequestVfs::default()))
+        .lock()
+        .unwrap()
+        .write_file(&path, bytes, append, tmp_max_bytes());
+    let result = match result {
+        Ok(()) => String::new(),
+        Err(code) => code.to_string(),
+    };
+    rv.set(v8::String::new(scope, &result).unwrap().into());
 }
 
 fn op_wait_until<'s>(
@@ -14438,5 +14706,223 @@ mod bundle_tree_tests {
         .tree();
         assert!(!Arc::ptr_eq(&first, &other));
         assert_eq!(PROJECT_COUNT.load(Ordering::Relaxed), 2);
+    }
+}
+
+#[cfg(test)]
+mod vfs_cap_tests {
+    use super::*;
+
+    #[test]
+    fn overwrite_frees_replaced_bytes() {
+        // The default tree carries no file bytes, so every assertion below
+        // measures exactly what the test wrote, plus a 70-byte entry charge
+        // per new `/tmp/x` path.
+        let mut vfs = RequestVfs::default();
+        assert_eq!(vfs.total_bytes, 0);
+        assert!(vfs.write_file("/tmp/a", vec![0; 48], false, 256).is_ok());
+        // 48 replaced bytes are freed: the rewrite bills the same total.
+        assert!(vfs.write_file("/tmp/a", vec![1; 48], false, 256).is_ok());
+        assert_eq!(vfs.total_bytes, 118);
+        // A smaller overwrite shrinks the total; growth past the cap fails.
+        assert!(vfs.write_file("/tmp/a", vec![2; 16], false, 256).is_ok());
+        assert_eq!(vfs.total_bytes, 86);
+        assert_eq!(
+            vfs.write_file("/tmp/b", vec![3; 200], false, 256),
+            Err("ENOSPC")
+        );
+        assert_eq!(vfs.total_bytes, 86);
+    }
+
+    #[test]
+    fn append_counts_every_byte() {
+        let mut vfs = RequestVfs::default();
+        assert!(vfs.write_file("/tmp/a", vec![0; 40], false, 256).is_ok());
+        assert!(vfs.write_file("/tmp/a", vec![1; 24], true, 256).is_ok());
+        assert_eq!(vfs.total_bytes, 134);
+        assert_eq!(
+            vfs.write_file("/tmp/a", vec![2; 200], true, 256),
+            Err("ENOSPC")
+        );
+        // A failed append leaves the file and the total untouched.
+        assert_eq!(vfs.total_bytes, 134);
+        assert_eq!(vfs.read_file("/tmp/a").map(|b| b.len()), Some(64));
+        // Appends create a missing file like a write does, entry charge
+        // included.
+        assert!(vfs.write_file("/tmp/b", vec![3; 0], true, 256).is_ok());
+        assert_eq!(vfs.total_bytes, 204);
+    }
+
+    #[test]
+    fn cap_errors_keep_their_codes() {
+        let mut vfs = RequestVfs::default();
+        assert_eq!(
+            vfs.write_file("/bundle/x", vec![0; 1], false, 8),
+            Err("EPERM")
+        );
+        assert_eq!(
+            vfs.write_file("/tmp/no/such", vec![0; 1], false, 8),
+            Err("ENOENT")
+        );
+        vfs.mkdir("/tmp/dir", false, 1024);
+        assert_eq!(
+            vfs.write_file("/tmp/dir", vec![0; 1], false, 8),
+            Err("EISDIR")
+        );
+        assert_eq!(vfs.total_bytes, 72);
+    }
+
+    #[test]
+    fn entries_cost_path_plus_overhead() {
+        // Each `/tmp/eN` costs 71 (7 path bytes + 64 overhead): three fit
+        // 256, the fourth does not, and the refused file is never created.
+        let mut vfs = RequestVfs::default();
+        for name in ["e0", "e1", "e2"] {
+            let path = format!("/tmp/{name}");
+            assert!(vfs.write_file(&path, Vec::new(), false, 256).is_ok());
+        }
+        assert_eq!(vfs.total_bytes, 213);
+        assert_eq!(
+            vfs.write_file("/tmp/e3", Vec::new(), false, 256),
+            Err("ENOSPC")
+        );
+        assert!(vfs.stat("/tmp/e3").is_none());
+        assert_eq!(vfs.total_bytes, 213);
+        // A single path whose charge alone exceeds the cap fails outright.
+        let long = format!("/tmp/{}", "p".repeat(300));
+        assert_eq!(vfs.write_file(&long, Vec::new(), false, 256), Err("ENOSPC"));
+        assert_eq!(vfs.total_bytes, 213);
+    }
+
+    #[test]
+    fn mkdir_bills_new_directories() {
+        let mut vfs = RequestVfs::default();
+        for name in ["d0", "d1", "d2"] {
+            let path = format!("/tmp/{name}");
+            assert!(matches!(
+                vfs.mkdir(&path, false, 256),
+                VfsMkdirResult::Created(None)
+            ));
+        }
+        assert_eq!(vfs.total_bytes, 213);
+        assert!(matches!(
+            vfs.mkdir("/tmp/d3", false, 256),
+            VfsMkdirResult::Error("ENOSPC")
+        ));
+        assert!(vfs.stat("/tmp/d3").is_none());
+        // Recursive creation checks the whole prefix before inserting: an
+        // over-cap prefix creates nothing, not a billed half-tree.
+        assert!(matches!(
+            vfs.mkdir("/tmp/r/a/b", true, 200),
+            VfsMkdirResult::Error("ENOSPC")
+        ));
+        assert!(vfs.stat("/tmp/r").is_none());
+        assert!(vfs.stat("/tmp/r/a").is_none());
+        assert!(vfs.stat("/tmp/r/a/b").is_none());
+        assert_eq!(vfs.total_bytes, 213);
+        // The same prefix fits a 216 cap and reports the first new entry.
+        assert!(matches!(
+            vfs.mkdir("/tmp/r/a/b", true, 429),
+            VfsMkdirResult::Created(Some(_))
+        ));
+        assert_eq!(vfs.total_bytes, 213 + 216);
+    }
+
+    #[test]
+    fn deep_recursive_mkdir_refuses_without_partial_tree() {
+        // A path deeper than the cap can fund fails outright: each missing
+        // prefix is charged as collected, so the refusal needs only
+        // cap-sized retention however deep the path runs, and a refusal
+        // still inserts nothing.
+        let mut vfs = RequestVfs::default();
+        let deep = (0..2000)
+            .map(|i| format!("d{i}"))
+            .collect::<Vec<_>>()
+            .join("/");
+        let path = format!("/tmp/{deep}");
+        assert!(matches!(
+            vfs.mkdir(&path, true, 256),
+            VfsMkdirResult::Error("ENOSPC")
+        ));
+        assert_eq!(vfs.total_bytes, 0);
+        assert!(vfs.stat("/tmp/d0").is_none());
+        // The same tree fits a generous cap and reports its first entry.
+        assert!(matches!(
+            vfs.mkdir(&path, true, usize::MAX),
+            VfsMkdirResult::Created(Some(_))
+        ));
+        assert!(vfs.stat(&path).is_some());
+    }
+
+    #[test]
+    fn would_exceed_agrees_with_write_file() {
+        // The op's length pre-check must fire exactly when `write_file`
+        // would fail with `ENOSPC` — never instead of another code.
+        let mut vfs = RequestVfs::default();
+        vfs.write_file("/tmp/e", vec![0; 10], false, usize::MAX)
+            .expect("setup write");
+        vfs.mkdir("/tmp/d", false, usize::MAX);
+        let cases = [
+            ("/tmp/n", 0, false),
+            ("/tmp/n", 1, false),
+            ("/tmp/n", 100, true),
+            ("/tmp/e", 0, false),
+            ("/tmp/e", 5, false),
+            ("/tmp/e", 100, false),
+            ("/tmp/e", 100, true),
+            ("/tmp/d", 10, false),
+            ("/tmp", 10, false),
+            ("/bundle/x", 10, false),
+            ("/tmp/no/such", 10, false),
+        ];
+        for cap in [0, 50, 150, 500, usize::MAX] {
+            for (path, len, append) in cases {
+                let mut probe = RequestVfs {
+                    nodes: vfs.nodes.clone(),
+                    total_bytes: vfs.total_bytes,
+                };
+                let predicted = vfs.would_exceed(path, len, append, cap);
+                let actual = probe.write_file(path, vec![0; len], append, cap);
+                assert_eq!(
+                    predicted,
+                    matches!(actual, Err("ENOSPC")),
+                    "path={path} len={len} append={append} cap={cap}: {actual:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn recursive_mkdir_on_a_file_is_eexist() {
+        // A file leaf is not a directory, recursive or not: Node reports
+        // EEXIST either way, while an existing directory still no-ops.
+        let mut vfs = RequestVfs::default();
+        vfs.write_file("/tmp/leaf", vec![0; 1], false, usize::MAX)
+            .expect("setup write");
+        assert!(matches!(
+            vfs.mkdir("/tmp/leaf", true, usize::MAX),
+            VfsMkdirResult::Error("EEXIST")
+        ));
+        assert!(matches!(
+            vfs.mkdir("/tmp/leaf", false, usize::MAX),
+            VfsMkdirResult::Error("EEXIST")
+        ));
+        assert_eq!(vfs.read_file("/tmp/leaf").map(|b| b.len()), Some(1));
+        assert!(matches!(
+            vfs.mkdir("/tmp", true, usize::MAX),
+            VfsMkdirResult::Created(None)
+        ));
+    }
+
+    #[test]
+    fn stat_marks_request_files_writable() {
+        // Request `/tmp` files stat as kind 4 (writable file), distinct
+        // from kind 3 bundle files and kind 2 writable directories.
+        let mut vfs = RequestVfs::default();
+        vfs.write_file("/tmp/a", vec![0; 3], false, usize::MAX)
+            .expect("setup write");
+        assert_eq!(vfs.stat("/tmp/a"), Some((4, 3)));
+        assert_eq!(vfs.stat("/tmp"), Some((2, 0)));
+        assert_eq!(vfs.stat("/"), Some((1, 0)));
     }
 }

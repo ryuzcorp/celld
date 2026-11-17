@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): loader external stubs from the union of main + sibling imports (upstream #304); node:process eager global (upstream #296).
+// Modified by ryuzcorp (ryuzcorp/celld): loader external stubs from the union of main + sibling imports (upstream #304); node:process eager global (upstream #296); node:url lazy module (upstream #280).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! ES module resolution and compilation.
@@ -31,6 +31,7 @@ static_source!(
     "node_diagnostics_channel.js"
 );
 static_source!(NODE_STREAM_SOURCE, "node_stream.js");
+static_source!(NODE_URL_SOURCE, "node_url.js");
 static_source!(
     IDENTITY_TRANSFORM_STREAM_SOURCE,
     "identity_transform_stream.js"
@@ -57,6 +58,7 @@ static INTERNAL_MODULE_SOURCES: &[(&str, &v8::OneByteConst)] = &[
         &NODE_DIAGNOSTICS_CHANNEL_SOURCE,
     ),
     ("node_stream.js", &NODE_STREAM_SOURCE),
+    ("node_url.js", &NODE_URL_SOURCE),
     (
         "identity_transform_stream.js",
         &IDENTITY_TRANSFORM_STREAM_SOURCE,
@@ -428,6 +430,11 @@ const LAZY_MODULES: &[LazyModule] = &[
         specs: &["stream", "node:stream"],
         global: "__streamModule",
         source: &NODE_STREAM_SOURCE,
+    },
+    LazyModule {
+        specs: &["url", "node:url"],
+        global: "__urlModule",
+        source: &NODE_URL_SOURCE,
     },
     LazyModule {
         specs: &["stream/promises", "node:stream/promises"],

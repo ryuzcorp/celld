@@ -1,4 +1,4 @@
-<!-- Modified by ryuzcorp (ryuzcorp/celld): node:crypto scrypt; cloned streaming bodies; cross-isolate RPC stubs and streams; per-node Workers Cache API; receiver-held RPC streams; AbortSignal.timeout is unreferenced (upstream #306); loader 101 webSocket target (upstream #305); loader sibling cloudflare:workers imports (upstream #304); AES-KW and symmetric JWK (upstream #295); EC raw point format (upstream #271). -->
+<!-- Modified by ryuzcorp (ryuzcorp/celld): node:crypto scrypt; cloned streaming bodies; cross-isolate RPC stubs and streams; per-node Workers Cache API; receiver-held RPC streams; AbortSignal.timeout is unreferenced (upstream #306); loader 101 webSocket target (upstream #305); loader sibling cloudflare:workers imports (upstream #304); AES-KW and symmetric JWK (upstream #295); EC raw point format (upstream #271); writable request /tmp, node:url file helpers, and the CELLD_TMP_MAX_BYTES /tmp cap (upstream #280). -->
 # Cloudflare compatibility
 
 This page lists only the differences from the linked Cloudflare APIs. An entry
@@ -228,9 +228,16 @@ execution.
 - `KeyObject.toCryptoKey()` applies the requested algorithm, extractability,
   and usages to an asymmetric key.
 - `node:zlib` implements only the synchronous gzip and deflate functions.
-- `node:fs` provides `access`, `mkdir`, `realpath`, `stat`, `lstat`, and
-  `readFile`. It exposes an empty, request-local `/tmp` and a read-only
-  `/bundle` that contains the Worker modules.
+- `node:fs` provides `access`, `mkdir`, `realpath`, `stat`, `lstat`,
+  `readFile`, `writeFile`, `writeFileSync`, `appendFile`, `appendFileSync`
+  (plus `fs.promises`), and read/write streams. `/tmp` is writable and
+  request-local: `writeFile` truncates unless `{ flag: "a" }` appends,
+  `createWriteStream` writes chunks as they arrive, and anything that would
+  push a request past `CELLD_TMP_MAX_BYTES` (default 64 MiB) fails with
+  `ENOSPC`, while an overwrite frees the replaced bytes. `/bundle`
+  is read-only and contains the Worker modules.
+- `node:url` provides `pathToFileURL`/`fileURLToPath` plus the WHATWG URL
+  API, with POSIX path rules only.
 - The global `process` matches workerd for each field that it defines, such
   as `process.execPath`, `process.argv`, and `process.title`. Other fields,
   such as `process.kill` and `process.features`, are undefined.
