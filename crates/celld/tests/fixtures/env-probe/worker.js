@@ -11,8 +11,61 @@ const probe = (read) => {
   };
 };
 
+// A dynamically loaded child: its strings arrive through the loader env,
+// not through deployment vars, and must still reach `process.env` under
+// `nodejs_compat` (upstream #296). `CELLD_NODE` rides along to prove the
+// host-owned name never crosses into `process.env`.
+const CHILD = `const MODULE_SCOPE = (() => {
+  const snapshot = (name) => {
+    try {
+      const v = globalThis.process?.env?.[name];
+      return { type: typeof v, value: typeof v === "string" ? v : undefined };
+    } catch (e) {
+      return { type: "threw", value: String((e && e.message) || e) };
+    }
+  };
+  // Runs while the module evaluates: loader strings must already sit in
+  // process.env here, not only once the handler runs.
+  return { feature: snapshot("FEATURE"), node: snapshot("CELLD_NODE") };
+})();
 export default {
   fetch(request, env) {
+    const read = (f) => {
+      try {
+        const v = f();
+        return { type: typeof v, value: typeof v === "string" ? v : undefined };
+      } catch (e) {
+        return { type: "threw", value: String((e && e.message) || e) };
+      }
+    };
+    return Response.json({
+      handlerEnv: read(() => env.FEATURE),
+      procEnv: read(() => globalThis.process.env.FEATURE),
+      moduleScopeFeature: MODULE_SCOPE.feature,
+      handlerNode: read(() => env.CELLD_NODE),
+      procNode: read(() => globalThis.process.env.CELLD_NODE),
+      moduleScopeNode: MODULE_SCOPE.node,
+      procCtor: read(() => globalThis.process.env.constructor),
+      ctorIsFunction:
+        typeof globalThis.process.env.constructor === "function",
+      protoIntact:
+        Object.getPrototypeOf(globalThis.process.env) === Object.prototype,
+    });
+  },
+};`;
+
+export default {
+  async fetch(request, env) {
+    if (new URL(request.url).pathname === "/loader") {
+      const child = env.LOADER.get("child", () => ({
+        compatibilityDate: "2026-01-01",
+        compatibilityFlags: ["nodejs_compat"],
+        mainModule: "child.js",
+        modules: { "child.js": CHILD },
+        env: { FEATURE: "1", CELLD_NODE: "spoofed", constructor: "evil-payload", ["__proto__"]: "polluted" },
+      }));
+      return child.getEntrypoint().fetch(request);
+    }
     return Response.json({
       vars: probe(() => env.FROM_VARS),
       devVars: probe(() => env.FROM_DEV_VARS),

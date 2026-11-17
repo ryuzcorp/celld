@@ -209,6 +209,70 @@ fn worker_vars_populate_process_env() {
     );
 }
 
+/// A dynamically loaded Worker's loader-supplied strings reach the handler's
+/// `env` and — under `nodejs_compat` — `process.env` alike, while the
+/// host-owned `CELLD_NODE` name never crosses into `process.env`
+/// (denoland/celld#296).
+#[test]
+fn loaded_worker_env_populates_process_env() {
+    let fixture = fixture_dir();
+    let project = fixture_tempdir("celld-env-probe-");
+    copy_dir(&fixture, project.path());
+    let node = TestNode::boot(project.path());
+
+    let (status, body) = get(&node.public, "/loader").expect("GET /loader");
+    assert_eq!(status, 200, "GET /loader: {body}");
+    let probe: serde_json::Value = serde_json::from_str(&body).expect("probe JSON");
+    let value = |name: &str| {
+        probe
+            .get(name)
+            .unwrap_or_else(|| panic!("probe lacks {name}: {body}"))
+            .get("value")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+    };
+    // The loader env reaches the handler, as before.
+    assert_eq!(value("handlerEnv"), Some("1".to_string()));
+    // And the same string reaches process.env.
+    assert_eq!(value("procEnv"), Some("1".to_string()));
+    // Module-scope reads agree: the strings were installed before the
+    // child's module evaluated, not only by the post-evaluation install
+    // the handler-time copy above observes.
+    assert_eq!(value("moduleScopeFeature"), Some("1".to_string()));
+    // The smuggled node name stays out of process.env.
+    let proc_node = probe
+        .get("procNode")
+        .unwrap_or_else(|| panic!("probe lacks procNode: {body}"));
+    assert_eq!(
+        proc_node.get("type").and_then(|v| v.as_str()),
+        Some("undefined"),
+        "CELLD_NODE must not cross into process.env: {body}"
+    );
+    // At module scope too: the reserved name never crosses, at either time.
+    let module_node = probe
+        .get("moduleScopeNode")
+        .unwrap_or_else(|| panic!("probe lacks moduleScopeNode: {body}"));
+    assert_eq!(
+        module_node.get("type").and_then(|v| v.as_str()),
+        Some("undefined"),
+        "CELLD_NODE must not cross into process.env at module scope: {body}"
+    );
+    // Dangerous keys never cross either: `constructor` would shadow the
+    // inherited member on `process.env`.
+    assert_eq!(
+        probe.get("ctorIsFunction").and_then(|v| v.as_bool()),
+        Some(true),
+        "the constructor key must not shadow process.env: {body}"
+    );
+    // The `__proto__` smuggle is dropped by the loader encoder, so this is
+    // a pin: `process.env` must keep its prototype either way.
+    assert_eq!(
+        probe.get("protoIntact").and_then(|v| v.as_bool()),
+        Some(true),
+        "process.env must keep its prototype: {body}"
+    );
+}
+
 /// The `nodejs_compat_do_not_populate_process_env` flag keeps worker vars
 /// out of `process.env` even with `nodejs_compat` set, while the handler's
 /// `env` argument still carries them (denoland/celld#296).

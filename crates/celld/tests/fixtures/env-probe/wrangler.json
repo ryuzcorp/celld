@@ -4,5 +4,6 @@
   "compatibility_date": "2026-01-01",
   "compatibility_flags": ["nodejs_compat"],
   "no_bundle": true,
-  "vars": { "FROM_VARS": "set-in-vars" }
+  "vars": { "FROM_VARS": "set-in-vars" },
+  "worker_loaders": [{ "binding": "LOADER" }]
 }
