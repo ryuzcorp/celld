@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): cross-isolate RPC stubs and streams; operator token for the internal listener; per-node Workers Cache API; tenant egress policy; the full build version for --version; staged invoke modules; the hardening module.
+// Modified by ryuzcorp (ryuzcorp/celld): cross-isolate RPC stubs and streams; operator token for the internal listener; per-node Workers Cache API; tenant egress policy; the full build version for --version; staged invoke modules; the hardening module; nodejs process.env population flag (upstream #296).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 #![warn(clippy::disallowed_methods, clippy::disallowed_types)]
@@ -319,5 +319,7 @@ pub fn worker_compat(metadata: &serde_json::Value) -> js::Compat {
         sqlite_vec: has_flag("sqlite_vec"),
         websocket_standard_binary_type: has_flag("websocket_standard_binary_type"),
         queue_json_messages: switch("queue_json_messages", "queue_v8_messages", "2024-03-18"),
+        nodejs_process_env: has_flag("nodejs_compat")
+            || has_flag("nodejs_compat_populate_process_env"),
     }
 }
