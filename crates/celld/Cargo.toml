@@ -96,4 +96,5 @@ libc.workspace = true
 nix.workspace = true
 
 [dev-dependencies]
+futures = "0.3"
 lz4_flex.workspace = true

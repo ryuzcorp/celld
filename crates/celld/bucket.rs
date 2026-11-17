@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): R2 startAfter compares decoded keys; listing pages carry walk-ordered rows; staged activation; separate CELLD_DEPLOY_AWS_* credentials for deployment-artifact reads; bucket-posture group commit: inject a store for GC-quiet tests (0071); conditional-write verdict keeps the 409 conflict kind (upstream #239); multipart byte upload for GB image tars (upstream #307).
+// Modified by ryuzcorp (ryuzcorp/celld): R2 startAfter compares decoded keys; listing pages carry walk-ordered rows; staged activation; separate CELLD_DEPLOY_AWS_* credentials for deployment-artifact reads; bucket-posture group commit: inject a store for GC-quiet tests (0071); conditional-write verdict keeps the 409 conflict kind (upstream #239); multipart byte upload for GB image tars (upstream #307); conditional-write retry on transient OperationAborted conflicts (upstream #283).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! The engine's single object-store client: the `object_store` crate
@@ -254,13 +254,44 @@ impl CasPut {
 /// Azure reports a failed `If-None-Match` as `Precondition`, while some
 /// stores report the same create conflict as `AlreadyExists`. Both are a
 /// clean lost race. Every other error remains ambiguous.
+///
+/// A 409 carrying `OperationAborted` is NOT a lost race even though
+/// `object_store` reports every 409 as `AlreadyExists`: some S3-compatible
+/// stores (OVH) hold a per-key lock while a conditional operation is in
+/// flight and abort concurrent writers transiently instead of serializing
+/// them into a deterministic winner and loser like AWS and R2 do
+/// (denoland/celld#283). The conflict is detected here so neither this
+/// classifier nor any caller can mistake it for proof that someone else
+/// won; `put_cas` retries it, and anything it cannot retry stays an
+/// ambiguous error for the caller to reconcile.
 #[doc(hidden)]
 pub fn is_clean_cas_rejection(error: &Error) -> bool {
     matches!(
         error,
         Error::Precondition { .. } | Error::AlreadyExists { .. }
-    )
+    ) && !is_transient_write_conflict(error)
 }
+
+/// Whether a conditional-write failure is a transient per-key serialization
+/// conflict rather than a lost race (denoland/celld#283; see
+/// [`is_clean_cas_rejection`] for why this 409 is excluded there).
+///
+/// `object_store` 0.12 keeps its HTTP error type private, so the S3 code in
+/// the response body is only reachable through the error's `Display`, which
+/// carries it. This match is scoped to retry classification only: unlike the
+/// fence decisions in [`cas_write_did_not_commit`], a misclassification
+/// here costs at most a wasted retry or a reconciled write, never a fence.
+#[doc(hidden)]
+pub fn is_transient_write_conflict(error: &Error) -> bool {
+    matches!(error, Error::AlreadyExists { .. })
+        && error.to_string().contains("OperationAborted")
+}
+
+/// Retries for one `put_cas` call against a transient per-key conflict.
+/// Enough to ride out the holder's in-flight operation (a conditional PUT is
+/// milliseconds) without turning a wedged key into a wedged caller: the
+/// backoff caps at ~300 ms total, after which the caller reconciles.
+const PUT_CAS_CONFLICT_RETRIES: u32 = 4;
 
 /// Whether a failed conditional write proves that the store holds no new
 /// object. A caller that renews a lease uses this to skip the readback
@@ -1326,50 +1357,77 @@ impl Bucket {
             None => PutMode::Create,
             Some(token) => PutMode::Update(this.backend.update(token)),
         };
-        match this
-            .cas_store
-            .put_opts(
-                &Path::from(key.as_str()),
-                body.into(),
-                PutOptions::from(mode),
-            )
-            .await
-        {
-            Ok(result) => {
-                // The write applied; a result without a usable token still
-                // surfaces as `Err`, which callers already treat as "may
-                // have committed" and reconcile.
-                let token = this
-                    .backend
-                    .token(result.e_tag, result.version)
-                    .with_context(|| {
-                        format!(
-                            "conditional write {}://{}/{key} applied without a CAS token",
-                            this.scheme(),
-                            this.name
-                        )
-                    })?;
-                Ok(CasPut::Applied(token))
+        // `PutPayload` is `Arc`-backed and `PutOptions` is `Clone`, so
+        // retrying a transient conflict reuses both without re-encoding.
+        // The retry loop is upstream #283's; the verdict shape stays the
+        // `CasPut` enum (upstream #239), because callers match on the
+        // rejection kind and `put_cas` funnels through `into_token`.
+        let body: PutPayload = body.into();
+        let options = PutOptions::from(mode);
+        let mut attempt = 0;
+        loop {
+            match this
+                .cas_store
+                .put_opts(
+                    &Path::from(key.as_str()),
+                    body.clone(),
+                    options.clone(),
+                )
+                .await
+            {
+                Ok(result) => {
+                    // The write applied; a result without a usable token still
+                    // surfaces as `Err`, which callers already treat as "may
+                    // have committed" and reconcile.
+                    let token = this
+                        .backend
+                        .token(result.e_tag, result.version)
+                        .with_context(|| {
+                            format!(
+                                "conditional write {}://{}/{key} applied without a CAS token",
+                                this.scheme(),
+                                this.name
+                            )
+                        })?;
+                    return Ok(CasPut::Applied(token));
+                }
+                // A store that serializes same-key conditional writes behind
+                // a per-key lock aborts the loser transiently instead of
+                // reporting a lost race (denoland/celld#283). Retry here, at
+                // the only layer that can tell the two apart; an exhausted
+                // retry budget falls through to the ambiguous error below,
+                // so the caller reconciles instead of acting on a loss that
+                // never happened.
+                Err(error)
+                    if is_transient_write_conflict(&error)
+                        && attempt < PUT_CAS_CONFLICT_RETRIES =>
+                {
+                    attempt += 1;
+                    crate::asyncrt::sleep(std::time::Duration::from_millis(20 * attempt as u64))
+                        .await;
+                }
+                Err(error) if is_clean_cas_rejection(&error) => {
+                    // Log the kind, not just the fact: a 409 `AlreadyExists`
+                    // is a transient conflict a same-guard retry may clear,
+                    // while a 412 `Precondition` is a lost race that needs a
+                    // fresh read (upstream #239).
+                    let conflict = matches!(error, Error::AlreadyExists { .. });
+                    tracing::debug!(
+                        key = key.as_str(),
+                        scheme = this.scheme(),
+                        conflict,
+                        "conditional write rejected"
+                    );
+                    return Ok(CasPut::Rejected { conflict });
+                }
+                Err(error) => {
+                    return Err(anyhow!(error).context(format!(
+                        "conditional write {}://{}/{key} may have committed",
+                        this.scheme(),
+                        this.name
+                    )));
+                }
             }
-            Err(error) if is_clean_cas_rejection(&error) => {
-                // Log the kind, not just the fact: a 409 `AlreadyExists`
-                // is a transient conflict a same-guard retry may clear,
-                // while a 412 `Precondition` is a lost race that needs a
-                // fresh read (upstream #239).
-                let conflict = matches!(error, Error::AlreadyExists { .. });
-                tracing::debug!(
-                    key = key.as_str(),
-                    scheme = this.scheme(),
-                    conflict,
-                    "conditional write rejected"
-                );
-                Ok(CasPut::Rejected { conflict })
-            }
-            Err(error) => Err(anyhow!(error).context(format!(
-                "conditional write {}://{}/{key} may have committed",
-                this.scheme(),
-                this.name
-            ))),
         }
     }
 
@@ -3174,5 +3232,201 @@ mod deploy_credential_routing_tests {
             .collect();
         assert_eq!(listed, ["deploy/current.json"]);
         assert!(!present(&deploy_store, "wake/format.json").await);
+    }
+}
+
+#[cfg(test)]
+mod cas_conflict_tests {
+    use super::*;
+    use object_store::memory::InMemory;
+
+    /// The OVH answer for a same-key conditional race: 409 carrying
+    /// `OperationAborted`, surfaced by `object_store` as `AlreadyExists`
+    /// (denoland/celld#283).
+    fn operation_aborted(path: &Path) -> Error {
+        Error::AlreadyExists {
+            path: path.to_string(),
+            source: "Server returned non-2xx status code: 409 Conflict: \
+                 <Error><Code>OperationAborted</Code>\
+                 <Message>A conflicting conditional operation is currently in \
+                 progress against this resource. Please try again.</Message></Error>"
+                .to_string()
+                .into(),
+        }
+    }
+
+    #[test]
+    fn operation_aborted_is_not_a_lost_race() {
+        let conflict = operation_aborted(&Path::from("probe/key"));
+        assert!(
+            is_transient_write_conflict(&conflict),
+            "a per-key-lock abort must read as transient, not as a loss"
+        );
+        assert!(
+            !is_clean_cas_rejection(&conflict),
+            "treating the abort as a lost race corrupts wake maintenance"
+        );
+        // A genuine create conflict still reads as a clean lost race: only
+        // the OperationAborted code takes the retry path.
+        let lost = Error::AlreadyExists {
+            path: "probe/key".to_string(),
+            source: "the key already exists".to_string().into(),
+        };
+        assert!(!is_transient_write_conflict(&lost));
+        assert!(is_clean_cas_rejection(&lost));
+        let precondition = Error::Precondition {
+            path: "probe/key".to_string(),
+            source: "precondition failed".to_string().into(),
+        };
+        assert!(!is_transient_write_conflict(&precondition));
+        assert!(is_clean_cas_rejection(&precondition));
+    }
+
+    /// A store that aborts the first `conflicts` conditional PUTs the way
+    /// OVH does, then behaves like memory. Everything else delegates, so
+    /// the test exercises `put_cas`'s retry rather than the wrapper.
+    #[derive(Debug)]
+    struct FlakyConflictStore {
+        inner: InMemory,
+        conflicts: std::sync::Mutex<u32>,
+        attempts: std::sync::atomic::AtomicU32,
+    }
+
+    impl std::fmt::Display for FlakyConflictStore {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("flaky-conflict-store")
+        }
+    }
+
+    impl FlakyConflictStore {
+        fn new(conflicts: u32) -> Self {
+            Self {
+                inner: InMemory::new(),
+                conflicts: std::sync::Mutex::new(conflicts),
+                attempts: std::sync::atomic::AtomicU32::new(0),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for FlakyConflictStore {
+        async fn put_opts(
+            &self,
+            location: &Path,
+            payload: PutPayload,
+            opts: PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            use std::sync::atomic::Ordering;
+            self.attempts.fetch_add(1, Ordering::SeqCst);
+            let conditional = !matches!(opts.mode, PutMode::Overwrite);
+            if conditional {
+                let mut conflicts = self.conflicts.lock().expect("conflict lock");
+                if *conflicts > 0 {
+                    *conflicts -= 1;
+                    return Err(operation_aborted(location));
+                }
+            }
+            self.inner.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart(
+            &self,
+            location: &Path,
+        ) -> object_store::Result<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart(location).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &Path,
+            opts: PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &Path,
+            options: GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+
+        async fn head(&self, location: &Path) -> object_store::Result<ObjectMeta> {
+            self.inner.head(location).await
+        }
+
+        async fn delete(&self, location: &Path) -> object_store::Result<()> {
+            self.inner.delete(location).await
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&Path>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<ObjectMeta>> {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&Path>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy(&self, from: &Path, to: &Path) -> object_store::Result<()> {
+            self.inner.copy(from, to).await
+        }
+
+        async fn copy_if_not_exists(
+            &self,
+            from: &Path,
+            to: &Path,
+        ) -> object_store::Result<()> {
+            self.inner.copy_if_not_exists(from, to).await
+        }
+    }
+
+    /// Transient per-key conflicts retry inside `put_cas` and the write
+    /// lands; a genuine conflict still answers `Ok(None)` without retrying.
+    #[test]
+    fn put_cas_retries_transient_conflicts_only() {
+        use std::sync::atomic::Ordering;
+        let runtime = crate::asyncrt::shared_test_runtime();
+
+        let store = Arc::new(FlakyConflictStore::new(2));
+        let bucket = Bucket::with_store_for_test(store.clone());
+        let token = runtime
+            .block_on(bucket.put_cas("wake/entry/1", b"body".to_vec(), None))
+            .expect("transient conflicts must retry to success");
+        assert!(
+            token.is_some(),
+            "the retried conditional create must apply"
+        );
+        assert_eq!(
+            store.attempts.load(Ordering::SeqCst),
+            3,
+            "two aborts plus the applying write"
+        );
+
+        let store = Arc::new(FlakyConflictStore::new(u32::MAX));
+        let bucket = Bucket::with_store_for_test(store.clone());
+        let outcome = runtime.block_on(bucket.put_cas("wake/entry/2", b"body".to_vec(), None));
+        assert!(
+            outcome.is_err(),
+            "an endlessly contended key must fail ambiguous for the caller \
+             to reconcile, never report a loss that never happened"
+        );
+
+        // A genuine create conflict is not transient: no retry, clean loss.
+        let bucket = Bucket::with_store_for_test(Arc::new(InMemory::new()));
+        runtime
+            .block_on(bucket.put_cas("wake/entry/3", b"first".to_vec(), None))
+            .expect("first create applies")
+            .expect("first create holds a token");
+        let loss = runtime
+            .block_on(bucket.put_cas("wake/entry/3", b"second".to_vec(), None))
+            .expect("a genuine conflict must not error");
+        assert_eq!(loss, None, "the second create loses cleanly");
     }
 }
