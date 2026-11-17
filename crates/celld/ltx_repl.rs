@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): an eviction skips the visibility LISTs its own uploads already prove and the time-based checkpoint before the handoff; an eviction deletes the per-cell L0/L1 objects its handoff snapshot supersedes; bucket-posture group commit: paged gate judges PAGED_FORMAT (0059); bucket-posture group commit: bucket bundle gate, sync pacing and event-driven bundle flush (0060); the eviction guard proves a journaled epoch with a HEAD on the newest journaled key, falling back to the listing on a miss, an error, or an empty journal (0061); bucket-posture group commit: bundled-cell eviction guard, graceful-close per-cell drain, bundle GC without ensemble, linger holds only while the dirty set is shared (0064).; bucket-posture group commit: bucket switch on by default (0070); bucket-posture group commit: a sync worker yields once the bundle loop owns tiering, and a lone-cell round uploads per-cell instead of bundling (0071); bucket-posture group commit: bundle switch defaults off (0075); MergeTree-style lazy handoff: an eviction skips the snapshot for a short chain born in this epoch (0078).
+// Modified by ryuzcorp (ryuzcorp/celld): an eviction skips the visibility LISTs its own uploads already prove and the time-based checkpoint before the handoff; an eviction deletes the per-cell L0/L1 objects its handoff snapshot supersedes; bucket-posture group commit: paged gate judges PAGED_FORMAT (0059); bucket-posture group commit: bucket bundle gate, sync pacing and event-driven bundle flush (0060); the eviction guard proves a journaled epoch with a HEAD on the newest journaled key, falling back to the listing on a miss, an error, or an empty journal (0061); bucket-posture group commit: bundled-cell eviction guard, graceful-close per-cell drain, bundle GC without ensemble, linger holds only while the dirty set is shared (0064).; bucket-posture group commit: bucket switch on by default (0070); bucket-posture group commit: a sync worker yields once the bundle loop owns tiering, and a lone-cell round uploads per-cell instead of bundling (0071); bucket-posture group commit: bundle switch defaults off (0075); MergeTree-style lazy handoff: an eviction skips the snapshot for a short chain born in this epoch (0078); local L0/epoch LTX retention on compaction, activation, and startup (upstream #311).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! In-process replication backend built on `celld-ltx`.
@@ -1713,7 +1713,7 @@ impl LtxRepl {
             DEFAULT_DURABILITY_TIMEOUT_SECS,
         )?
         .saturating_mul(1_000);
-        Ok(Self::assemble(
+        let repl = Self::assemble(
             watch,
             store,
             timestamp_metadata_key,
@@ -1728,7 +1728,13 @@ impl LtxRepl {
             None,
             durability_timeout_ms,
             LtxConfig::from_env(),
-        ))
+        );
+        // Local retention at startup (upstream #311): drop live-named epoch
+        // dirs a newer local epoch supersedes. Clean-reload boots already
+        // pruned to the exact resident set at shutdown, so this is a no-op
+        // there; other boots restore from the bucket.
+        repl.prune_superseded_epochs_all();
+        Ok(repl)
     }
 
     /// The one constructor body for every field and every background loop.
@@ -3093,6 +3099,12 @@ impl LtxRepl {
         if let (Some(name), Some(hydration)) = (&paged_vfs_name, hydration) {
             self.spawn_hydration(cell, epoch, name.clone(), dst.clone(), hydration);
         }
+
+        // Local retention during normal operation (upstream #311): this
+        // activation supersedes older live-named epoch dirs of the same
+        // cell. Best-effort — a prune failure must not fail the activation
+        // it follows — and resident epochs are never touched.
+        self.prune_superseded_epochs(cell, epoch);
 
         Ok(ActivationResult {
             path: dst,
@@ -4831,6 +4843,81 @@ impl LtxRepl {
         Ok(stale.len())
     }
 
+    /// Delete live-named epoch dirs of `cell` below `keep_epoch`.
+    ///
+    /// A newer live epoch supersedes the older ones: the owner has moved
+    /// on, and a future activation restores from the bucket, never from the
+    /// stale local image (upstream #311). Epochs with a resident replica
+    /// are never touched — the activation hook below runs after the new
+    /// handle installs, so a still-draining old epoch keeps its files until
+    /// its own eviction removes them. Best-effort: a failure is logged and
+    /// skipped, a leftover dir costs inodes, never correctness. Returns the
+    /// number of removed epoch dirs.
+    pub fn prune_superseded_epochs(&self, cell: &str, keep_epoch: u64) -> usize {
+        let active: std::collections::BTreeSet<(String, u64)> =
+            self.cells.lock().unwrap().keys().cloned().collect();
+        let mut pruned = 0;
+        for local in self.local_cells() {
+            if local.id != cell || !local.live || local.epoch >= keep_epoch {
+                continue;
+            }
+            if active.contains(&(local.id.clone(), local.epoch)) {
+                continue;
+            }
+            let db = self.db_path(&local.id, local.epoch);
+            let Some(parent) = db.parent() else {
+                continue;
+            };
+            match self.ltx_host.remove_dir_all(parent) {
+                Ok(()) => {
+                    pruned += 1;
+                    let mut preserved = self.preserved.lock().expect("preserved cache poisoned");
+                    preserved.forget(&db.with_extension("evicted"));
+                    preserved.forget(&db.with_extension("hibernated"));
+                }
+                Err(error) => {
+                    warn!(
+                        cell = %local.id,
+                        epoch = local.epoch,
+                        %error,
+                        "superseded epoch prune failed"
+                    );
+                }
+            }
+        }
+        if pruned > 0 {
+            info!(
+                event = "ltx_epoch_prune",
+                cell, keep_epoch, pruned, "removed superseded live-named epoch dirs"
+            );
+        }
+        pruned
+    }
+
+    /// Startup sweep: for every cell with more than one live-named epoch,
+    /// drop the older dirs. Nothing is resident yet, so every older live
+    /// dir is superseded by definition (upstream #311). A clean-reload
+    /// boot is unaffected: its shutdown already pruned to the exact
+    /// resident set, so the sweep is a no-op there; every other boot
+    /// restores from the bucket, so a wrongly-aged dir costs a refetch,
+    /// never data.
+    pub fn prune_superseded_epochs_all(&self) -> usize {
+        let mut newest: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+        for local in self.local_cells() {
+            if !local.live {
+                continue;
+            }
+            newest
+                .entry(local.id)
+                .and_modify(|epoch| *epoch = (*epoch).max(local.epoch))
+                .or_insert(local.epoch);
+        }
+        newest
+            .iter()
+            .map(|(cell, epoch)| self.prune_superseded_epochs(cell, *epoch))
+            .sum()
+    }
+
     /// There is no external process, so the in-process replicator is healthy while celld runs.
     pub fn process_status(&self) -> std::io::Result<Option<std::process::ExitStatus>> {
         Ok(None)
@@ -5166,6 +5253,39 @@ async fn compact_cell(
             // LIST. The trim filter keeps only keys the handoff snapshot
             // supersedes.
             note_epoch_upload(&handle, info.level, info.min_txid.0, info.max_txid.0);
+            // Local L0 retention (upstream #311): the fold just proved
+            // every covered TXID durable in L1, so the local L0 files are
+            // redundant. Best-effort: a leftover file costs inodes, never
+            // correctness.
+            let retain_host = compaction.host.clone();
+            let retain_meta = compaction.local_path.clone();
+            let retain_through = info.max_txid;
+            let retain_cell = compaction.cell.clone();
+            let retain_epoch = compaction.epoch;
+            let _ = asyncrt::blocking(move || {
+                match celld_ltx::Db::retain_l0_through(&retain_host, &retain_meta, retain_through) {
+                    Ok(deleted) if deleted > 0 => {
+                        info!(
+                            event = "ltx_l0_retention",
+                            cell = %retain_cell,
+                            epoch = retain_epoch,
+                            deleted,
+                            max_txid = retain_through.0,
+                            "deleted compacted local L0 files"
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        warn!(
+                            cell = %retain_cell,
+                            epoch = retain_epoch,
+                            %error,
+                            "local L0 retention failed"
+                        );
+                    }
+                }
+            })
+            .await;
             info!(
                 event = "ltx_compaction",
                 trigger,
@@ -8206,6 +8326,60 @@ mod evict_trim_tests {
             );
             activate_epoch(&repl, "c", 2, false).await;
             assert_eq!(row_count(&db_path(&watch, "c", 2)), 1);
+            shutdown(repl).await;
+        });
+    }
+
+    /// A stale live-named dir planted by hand: the retaining dir and the
+    /// database file that make `local_cells` report it live.
+    fn plant_live_epoch(watch: &Path, cell: &str, epoch: u64) {
+        let db = db_path(watch, cell, epoch);
+        std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+        std::fs::write(&db, b"stale").unwrap();
+    }
+
+    /// Upstream #311: live-named epoch dirs a newer local epoch supersedes
+    /// are removed by the startup sweep and by each activation; resident
+    /// epochs are never touched.
+    #[test]
+    fn superseded_live_epochs_pruned_at_startup_and_activation() {
+        let runtime = asyncrt::shared_test_runtime();
+        runtime.block_on(async {
+            let _temp = test_watch();
+            let watch = _temp.path().to_path_buf();
+            let store = Arc::new(InMemory::new());
+            let repl = LtxRepl::start_with_store_for_test(&watch, store);
+            // Two live dirs for c (e2 supersedes e1), one for d.
+            plant_live_epoch(&watch, "c", 1);
+            plant_live_epoch(&watch, "c", 2);
+            plant_live_epoch(&watch, "d", 1);
+            assert_eq!(repl.prune_superseded_epochs_all(), 1);
+            assert!(
+                !db_path(&watch, "c", 1).exists(),
+                "the superseded e1 dir is gone"
+            );
+            assert!(db_path(&watch, "c", 2).exists(), "the newest e2 stays");
+            assert!(db_path(&watch, "d", 1).exists(), "a sole epoch stays");
+            assert_eq!(
+                repl.prune_superseded_epochs_all(),
+                0,
+                "the second sweep is a no-op"
+            );
+            // Activation prunes: a fresh e3 supersedes the planted e2 stub.
+            activate_epoch(&repl, "c", 3, true).await;
+            assert!(
+                !db_path(&watch, "c", 2).exists(),
+                "activation prunes the older live dir"
+            );
+            // Resident epochs are never touched: f/1 stays active while a
+            // prune for the newer f/2 names it.
+            activate_epoch(&repl, "f", 1, true).await;
+            activate_epoch(&repl, "f", 2, true).await;
+            assert_eq!(repl.prune_superseded_epochs("f", 2), 0);
+            assert!(
+                db_path(&watch, "f", 1).exists(),
+                "the resident older epoch stays"
+            );
             shutdown(repl).await;
         });
     }
