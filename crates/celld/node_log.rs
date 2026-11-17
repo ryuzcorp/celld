@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): operator token for the internal listener; list_page resume is a cursor; ported from meln1k/celld: seal a dead lease that never opened a log (01522b3); seal_absent_log regression tests; lone-node repair backoff; bucket-posture group commit: bucket-session record encoding + old-reader interop tests (0059); bucket-posture group commit: bucket executor without ensemble (0060); bucket-posture group commit: successor fold of bucket bundles (0063); bucket-posture group commit: bucket-session drain, per-cell seal, bundle GC without ensemble, linger holds only while the dirty set is shared (0064); bucket-posture group commit: lone-cell-per-cell vs shared-bundle executor tests, and idle bucket sessions skip empty bundle-GC scans (0071); stale-target 409 proves the member gone in recovery (upstream #273); tail reads stream under a progress timeout (upstream #250); deleted sessions with surviving objects declare loss (upstream #245).
+// Modified by ryuzcorp (ryuzcorp/celld): operator token for the internal listener; list_page resume is a cursor; ported from meln1k/celld: seal a dead lease that never opened a log (01522b3); seal_absent_log regression tests; lone-node repair backoff; bucket-posture group commit: bucket-session record encoding + old-reader interop tests (0059); bucket-posture group commit: bucket executor without ensemble (0060); bucket-posture group commit: successor fold of bucket bundles (0063); bucket-posture group commit: bucket-session drain, per-cell seal, bundle GC without ensemble, linger holds only while the dirty set is shared (0064); bucket-posture group commit: lone-cell-per-cell vs shared-bundle executor tests, and idle bucket sessions skip empty bundle-GC scans (0071); stale-target 409 proves the member gone in recovery (upstream #273); tail reads stream under a progress timeout (upstream #250); deleted sessions with surviving objects declare loss (upstream #245); same-ensemble degrade resumes the epoch (upstream #268).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! v0 of the in-fleet replicated log tier (`CELLD_DURABILITY=fleet`).
@@ -4107,6 +4107,10 @@ pub struct NodeLogManager {
     /// The gray-follower ledger: append timings in, eviction verdicts and
     /// the quarantine out. Outlives every shipper swap.
     health: Arc<Mutex<celld_logic::log_evict::FollowerHealth>>,
+    /// Consecutive same-ensemble resumes without an epoch install
+    /// (upstream #268). Past MAX_SAME_ENSEMBLE_RESUMES the loop steps the
+    /// epoch anyway, so a member that lost its fragment can still rejoin.
+    same_ensemble_resumes: std::sync::atomic::AtomicU64,
     policy: Arc<celld_logic::log_evict::EvictionPolicy>,
     /// A correlated member stall latched self-suspicion: every ensemble
     /// member stuck at once means our own connectivity is the suspect,
@@ -4616,6 +4620,37 @@ mod maintain_outcome_tests {
     }
 }
 
+/// How many consecutive same-ensemble resumes one epoch absorbs before
+/// the maintenance loop steps it anyway (upstream #268). A transiently
+/// sick member heals within a resume or two, with zero record churn; a
+/// member that lost its fragment (or sealed) can only rejoin through
+/// adoption at sequence 1, which needs the step.
+const MAX_SAME_ENSEMBLE_RESUMES: u64 = 3;
+
+/// Whether a degraded ensemble whose eligible membership matches its
+/// record resumes its epoch instead of stepping it (upstream #268).
+/// Pure, so the flap guard's boundary is unit-tested where the loop is not.
+fn resume_same_ensemble(resumes: u64) -> bool {
+    resumes < MAX_SAME_ENSEMBLE_RESUMES
+}
+
+#[cfg(test)]
+mod same_ensemble_resume_tests {
+    use super::*;
+
+    /// The flap guard resumes while the budget lasts and steps past it:
+    /// three cheap resumes, then the epoch step that rejoins an amnesiac
+    /// member through adoption.
+    #[test]
+    fn resume_budget_steps_past_three() {
+        assert!(resume_same_ensemble(0));
+        assert!(resume_same_ensemble(2));
+        assert!(!resume_same_ensemble(3));
+        assert!(!resume_same_ensemble(100));
+        assert_eq!(MAX_SAME_ENSEMBLE_RESUMES, 3);
+    }
+}
+
 #[cfg(test)]
 mod seal_gone_tests {
     use super::*;
@@ -4788,6 +4823,7 @@ impl NodeLogManager {
             bundle_gc_clean: std::sync::atomic::AtomicBool::new(false),
             bundle_cache: tokio::sync::Mutex::new(None),
             health: Arc::new(Mutex::new(celld_logic::log_evict::FollowerHealth::default())),
+            same_ensemble_resumes: std::sync::atomic::AtomicU64::new(0),
             policy: Arc::new(policy),
             suspect_self: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             shortfall_logged_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -6269,6 +6305,35 @@ impl NodeLogManager {
                 if current.is_active() && members.len() <= current.members.len() {
                     return Ok(MaintainOutcome::Other);
                 }
+                // The flap guard (upstream #268): a degraded ensemble whose
+                // eligible membership matches its record gains no witness
+                // from an epoch step — the step only churns the record, a
+                // lease write per reopen, and the member's fragment. Resume
+                // the live epoch instead: the failed batch already rode the
+                // bucket, the ledger is intact, and the next batch continues
+                // the sequence. Past MAX_SAME_ENSEMBLE_RESUMES consecutive
+                // resumes, step anyway: a member that lost its fragment (or
+                // sealed) can only rejoin through adoption at sequence 1.
+                if !current.is_active()
+                    && members
+                        .iter()
+                        .map(|member| member.node.clone())
+                        .collect::<BTreeSet<_>>()
+                        == current.record.ensemble
+                    && resume_same_ensemble(
+                        self.same_ensemble_resumes.load(Ordering::SeqCst),
+                    )
+                {
+                    self.same_ensemble_resumes.fetch_add(1, Ordering::SeqCst);
+                    current.degraded.store(false, Ordering::SeqCst);
+                    self.health.lock().unwrap().reset();
+                    info!(
+                        epoch = current.epoch,
+                        members = ?current.record.ensemble,
+                        "log ensemble resumed; fleet acks enabled"
+                    );
+                    return Ok(MaintainOutcome::Other);
+                }
                 // Deactivate first: acks fall to the bucket and pacing
                 // stops, so the drain below converges.
                 current.degraded.store(true, Ordering::SeqCst);
@@ -6423,6 +6488,9 @@ impl NodeLogManager {
             );
             lanes.push(send);
         }
+        // An epoch install settles the resume budget: the next degrade of
+        // this ensemble resumes cheaply again (upstream #268).
+        self.same_ensemble_resumes.store(0, Ordering::SeqCst);
         *installed = Some(Arc::new(FleetShipper {
             // The wire leader identity IS the session string: followers key
             // fragments and seal marks by it, so a restarted process's
@@ -9632,6 +9700,76 @@ mod bucket_recovery_tests {
                 .recover_self()
                 .await
                 .expect("the clean latch makes recovery done-once");
+        });
+    }
+
+    /// Upstream #268: a degraded ensemble whose eligible membership matches
+    /// its record resumes its epoch instead of stepping it — no record
+    /// churn, no lease write, no fragment wipe. A single-member ensemble
+    /// whose member is only transiently sick flapped through a
+    /// degrade/reopen/lease-write cycle per batch; the resume keeps the
+    /// live ledger and continues the sequence. Fail-before: maintain
+    /// stepped the epoch (and stalled on the lease write the renewal loop
+    /// would have carried) on every degraded pass.
+    #[test]
+    fn degraded_same_ensemble_resumes_without_an_epoch_step() {
+        let runtime = crate::asyncrt::shared_test_runtime();
+        runtime.block_on(async {
+            let shared = tempfile::tempdir().expect("test dir");
+            let bucket = bucket_in(shared.path());
+            let local = tempfile::tempdir().expect("test dir");
+            let manager = manager_for(&bucket, local.path(), "n0/gen1", "n0");
+            // One live peer: the single-member ensemble.
+            publish_lease(
+                &bucket,
+                "n1",
+                "gen9",
+                crate::ownership_store::now_ms() + 3_600_000,
+                None,
+            )
+            .await;
+            let ensemble: BTreeSet<String> = BTreeSet::from(["n1".to_string()]);
+            let record = log_tier::create_record(ensemble, 0).expect("nonempty ensemble");
+            let shipper = FleetShipper {
+                node: "n0/gen1".to_string(),
+                transport: manager.transport.clone(),
+                live_log: manager.live_log.clone(),
+                record: record.clone(),
+                activated: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+                epoch: record.epoch,
+                members: vec![Member {
+                    node: "n1".to_string(),
+                    addr: String::new(),
+                }],
+                lanes: Vec::new(),
+                pipeline: 4,
+                seq: std::sync::atomic::AtomicU64::new(359),
+                degraded: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+                outstanding: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                policy: manager.policy.clone(),
+                stream: None,
+            };
+            *manager.inner.lock().unwrap() = Some(Arc::new(shipper));
+            let outcome = manager.maintain().await.expect("maintain runs");
+            assert_eq!(outcome, MaintainOutcome::Other);
+            let inner = manager
+                .inner
+                .lock()
+                .unwrap()
+                .clone()
+                .expect("the shipper stays installed");
+            assert_eq!(inner.epoch, 1, "same ensemble: no epoch step");
+            assert!(inner.is_active(), "the epoch resumes");
+            assert_eq!(
+                inner.seq.load(Ordering::SeqCst),
+                359,
+                "the ledger is intact: the next batch continues the sequence"
+            );
+            assert_eq!(
+                manager.same_ensemble_resumes.load(Ordering::SeqCst),
+                1,
+                "the resume spends the budget"
+            );
         });
     }
 
