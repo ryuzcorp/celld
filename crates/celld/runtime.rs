@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): cross-isolate RPC stubs and streams; D1 export operator-ingress marker; ported from meln1k/celld: report wake coverage after maintenance (e6cb9a3); wake coverage follow-ups: startup observation ordering, installation comparison; trusted cell RPC; deployment cache scope purge on generation free; staged invoke joins the driver past the reply.; answered drivers poll while waitUntil background is outstanding (upstream #300); drivers take the mailbox once more before retiring (upstream #309); post-response background budget ends orphaned drives (upstream #275); storage-poisoned cells restart on a fresh isolate (upstream #291); restore fails a vanished class before touching disk (upstream #276); incoming spans carry HTTP method/status and 5xx without exception marks error (upstream #285).
+// Modified by ryuzcorp (ryuzcorp/celld): cross-isolate RPC stubs and streams; D1 export operator-ingress marker; ported from meln1k/celld: report wake coverage after maintenance (e6cb9a3); wake coverage follow-ups: startup observation ordering, installation comparison; trusted cell RPC; deployment cache scope purge on generation free; staged invoke joins the driver past the reply.; answered drivers poll while waitUntil background is outstanding (upstream #300); drivers take the mailbox once more before retiring (upstream #309); post-response background budget ends orphaned drives (upstream #275); storage-poisoned cells restart on a fresh isolate (upstream #291); restore fails a vanished class before touching disk (upstream #276); incoming spans carry HTTP method/status and 5xx without exception marks error (upstream #285); CELLD_MAX_CELLS_PER_ISOLATE knob (upstream #278).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 // RuntimeManager is the V8 cell-host arm, so its executor and observability
@@ -443,6 +443,36 @@ impl Drop for AlarmRequestGuard {
     }
 }
 
+/// The isolate pool's limits for an explicit environment lookup. Production
+/// passes the process environment; tests pass a scripted map, so the
+/// configurable-knob test never mutates process-wide state that the parallel
+/// test runner would leak into unrelated readers.
+fn pool_limits_from(lookup: &dyn Fn(&str) -> Option<String>) -> celld_logic::isolate::PoolLimits {
+    const GROW_AT: usize = 2;
+    const SHRINK_UNDER: usize = 1;
+    const DEFAULT_CELLS_PER_ISOLATE: usize = 32;
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    let positive = |name: &str| {
+        crate::env_vars::parse_positive::<usize>(name, lookup(name))
+            .expect("validated positive runtime limit")
+    };
+    celld_logic::isolate::PoolLimits {
+        // These thresholds form one hysteresis policy, so they are constants
+        // rather than two independently configurable values.
+        grow_at: GROW_AT,
+        shrink_under: SHRINK_UNDER,
+        max_stateless: positive("CELLD_MAX_STATELESS_ISOLATES").unwrap_or(cores),
+        max_requests: positive("CELLD_MAX_REQUESTS"),
+        // This is an engine blast-radius policy. The resident-cell and RSS
+        // limits are the operator controls for node memory. Heavy-weight
+        // cells (agents being the reported case) can lower the per-isolate
+        // packing so one heap holds fewer of them (denoland/celld#278).
+        max_cells: positive("CELLD_MAX_CELLS_PER_ISOLATE").unwrap_or(DEFAULT_CELLS_PER_ISOLATE),
+    }
+}
+
 /// The isolate pool's limits, built from the environment here because the
 /// decision core never reads it.
 ///
@@ -452,27 +482,7 @@ impl Drop for AlarmRequestGuard {
 /// means unbounded, not unwired — `engine/load-under-pressure.md` measures
 /// `CELLD_MAX_REQUESTS=32` admitting 641 rps against a theoretical 640.
 pub fn pool_limits() -> celld_logic::isolate::PoolLimits {
-    const GROW_AT: usize = 2;
-    const SHRINK_UNDER: usize = 1;
-    const MAX_CELLS_PER_ISOLATE: usize = 32;
-    let cores = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4);
-    celld_logic::isolate::PoolLimits {
-        // These thresholds form one hysteresis policy, so they are constants
-        // rather than two independently configurable values.
-        grow_at: GROW_AT,
-        shrink_under: SHRINK_UNDER,
-        max_stateless: env_usize("CELLD_MAX_STATELESS_ISOLATES").unwrap_or(cores),
-        max_requests: env_usize("CELLD_MAX_REQUESTS"),
-        // This is an engine blast-radius policy. The resident-cell and RSS
-        // limits are the operator controls for node memory.
-        max_cells: MAX_CELLS_PER_ISOLATE,
-    }
-}
-
-fn env_usize(name: &str) -> Option<usize> {
-    crate::env_vars::positive(name).expect("validated positive runtime limit")
+    pool_limits_from(&|name| crate::env_vars::value(name).expect("readable runtime limit"))
 }
 
 #[derive(Clone)]
@@ -4331,6 +4341,31 @@ export default { fetch() { return new Response('ok'); } };
             observed.lock().expect("observation log poisoned").len(),
             1,
             "an uncovered installation stays silent"
+        );
+    }
+}
+
+#[cfg(test)]
+mod pool_limit_tests {
+    use super::*;
+
+    /// `CELLD_MAX_CELLS_PER_ISOLATE` overrides the per-isolate cell packing;
+    /// unset restores the historical 32 (denoland/celld#278). The lookup is
+    /// injected so the test never touches process-wide environment state,
+    /// which the parallel runner would leak into unrelated pool readers.
+    #[test]
+    fn max_cells_per_isolate_is_configurable() {
+        let configured =
+            |name: &str| (name == "CELLD_MAX_CELLS_PER_ISOLATE").then(|| "4".to_string());
+        assert_eq!(
+            pool_limits_from(&configured).max_cells,
+            4,
+            "the knob must reach the pool limits"
+        );
+        assert_eq!(
+            pool_limits_from(&|_| None).max_cells,
+            32,
+            "unset must restore the historical default"
         );
     }
 }
