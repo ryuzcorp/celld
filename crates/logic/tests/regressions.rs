@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): ported from meln1k/celld: scripted core-bug reproductions (ea471ee, e46a685, 6d61462, 18d3bf9, 9d4c163, 468b456, 01522b3, 65fdb13); shared bucket-posture ownership reads (0056); round-level fence settlement (0062); bucket-posture group commit: live-lease routing pin (0063); renewal readback authority bound (upstream #264); alarm deadline waits for the running copy (upstream #256); same-guard lease conflict retry (upstream #239); storage-poison restart pump (upstream #291); failed start disarms the restored alarm (upstream #276).
+// Modified by ryuzcorp (ryuzcorp/celld): ported from meln1k/celld: scripted core-bug reproductions (ea471ee, e46a685, 6d61462, 18d3bf9, 9d4c163, 468b456, 01522b3, 65fdb13); shared bucket-posture ownership reads (0056); round-level fence settlement (0062); bucket-posture group commit: live-lease routing pin (0063); renewal readback authority bound (upstream #264); alarm deadline waits for the running copy (upstream #256); same-guard lease conflict retry (upstream #239); storage-poison restart pump (upstream #291); failed start disarms the restored alarm (upstream #276); zero-capacity dead-owner handoff (upstream #263).
 //! Scripted reproductions of core bugs the deterministic simulator
 //! (`crates/sim`) found. Each drives the core through a minimal shell that
 //! answers every effect at once, except the ones a test holds back to
@@ -1871,6 +1871,106 @@ fn a_renewal_readback_carries_the_authority_bound() {
         "the readback carries the prior expiry so the shell can bound it"
     );
     shell.state.validate().expect("state invariant");
+}
+
+/// An ingress-only node (`max_resident = 0`) that receives demand for a
+/// cell whose owner died must look for fleet capacity instead of taking the
+/// cell over itself. It used to park the request behind a residency slot it
+/// could never free and fail `CapacityExhausted` at the deadline, even with
+/// a healthy peer idle (denoland/celld#263).
+#[test]
+fn a_zero_capacity_node_hands_a_dead_owners_cell_to_a_peer() {
+    let mut shell = Shell::new(0, |effect| {
+        matches!(
+            effect,
+            Effect::ReadNodeLease { .. } | Effect::ReadCapacityPeers { .. }
+        )
+    });
+    shell.start();
+    shell.owners.insert(
+        "c".into(),
+        OwnerRecord {
+            node: Some("n1".into()),
+            epoch: 3,
+            etag: "owned".into(),
+        },
+    );
+    shell.send(Event::RequestAt {
+        request: 1,
+        cell: "c".into(),
+        now_mono_ms: MONO_MS,
+    });
+    // The owner is dead and its log is already sealed, so there is no
+    // recovery detour: the core must ask the fleet for room.
+    let Some(Effect::ReadNodeLease { op, .. }) = shell.held.pop() else {
+        panic!("expected a lease read: {:?}", shell.held);
+    };
+    let effects = shell.send(Event::NodeLeaseRead {
+        op,
+        now_ms: NOW_MS,
+        result: Ok(Some(NodeLeaseRecord {
+            node: "n1".into(),
+            addr: "n1".into(),
+            expires_ms: NOW_MS - 1,
+            peer_protocol: 1,
+            generation: "g1".into(),
+            log_state: Some(celld_logic::log_tier::LogState::Sealed),
+            etag: "lease-n1".into(),
+        })),
+    });
+    assert!(
+        effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::ReadCapacityPeers { .. })),
+        "no capacity lookup for a takeover with no local room: {effects:?}"
+    );
+    assert!(
+        !effects.iter().any(|effect| matches!(
+            effect,
+            Effect::ScheduleTimer {
+                timer: Timer::QueuedActivation { .. },
+                ..
+            }
+        )),
+        "the request must not park behind a slot that never frees: {effects:?}"
+    );
+    let Some(Effect::ReadCapacityPeers { op, .. }) = shell.held.pop() else {
+        panic!("expected a capacity lookup: {:?}", shell.held);
+    };
+    let effects = shell.send(Event::CapacityPeersRead {
+        op,
+        now_ms: NOW_MS,
+        result: Ok(vec![celld_logic::CapacityPeer {
+            node: "n2".into(),
+            addr: "n2".into(),
+            expires_ms: NOW_MS + TTL_MS,
+            peer_protocol: 1,
+            sampled_ms: NOW_MS,
+            owned_cells: Some(0),
+            placement_weight: None,
+            bucket_format: None,
+            resident_cells: 0,
+            host_websockets: 0,
+            rss_bytes: 0,
+            in_use_bytes: None,
+            pressured: false,
+            memory_headroom: Some(true),
+            restoring: 0,
+            paced_handoff: false,
+            rebalance_paused: false,
+            draining: false,
+        }]),
+    });
+    assert!(
+        effects.iter().any(|effect| matches!(
+            effect,
+            Effect::Complete {
+                request: 1,
+                result: Ok(celld_logic::Route::Remote { node, .. }),
+            } if node == "n2"
+        )),
+        "the request must route to the peer with room: {effects:?}"
+    );
 }
 
 /// A restored overdue alarm must not hot-loop a cell whose runtime will not
