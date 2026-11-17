@@ -1,3 +1,4 @@
+// Modified by ryuzcorp (ryuzcorp/celld): AES-KW import/generate/wrap/unwrap + symmetric JWK import/export (upstream #295).
 // Web Crypto implementation for the embedded runtime.
 //
 // The common WebCrypto paths use typed-array host ops.
@@ -18,8 +19,46 @@
     "SHA-1", "SHA-256", "SHA-384", "SHA-512", "MD5",
   ]);
   const _SECRET_KEY_ALGS = new Set(
-    ["HMAC", "AES-GCM", "AES-CBC", "AES-CTR"],
+    ["HMAC", "AES-GCM", "AES-CBC", "AES-CTR", "AES-KW"],
   );
+  // base64url without padding, the JWK encoding. `atob`/`btoa` are the
+  // binary-string pair from the prelude; the alphabet swap keeps padding
+  // out, because a padded `k` still decodes but no writer emits one. The
+  // binary string builds in 32 KiB chunks: spreading a large key into one
+  // `fromCharCode` call would blow the engine's argument-count limit.
+  function _b64urlEncode(bytes) {
+    let bin = "";
+    for (let i = 0; i < bytes.length; i += 0x8000) {
+      bin += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+    }
+    return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  }
+  function _b64urlDecode(text) {
+    const padded = String(text).replace(/-/g, "+").replace(/_/g, "/");
+    const bin = atob(padded);
+    const out = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+    return out;
+  }
+  // The JWK `alg` for a symmetric key: HMAC by hash, AES by length. Any
+  // other length has no JOSE name, so it exports without one rather than
+  // with a wrong one.
+  function _secretJwkAlg(name, bytes, hash) {
+    if (name === "HMAC") {
+      // Every hash has a JOSE name, SHA-1 included (W3C WebCrypto).
+      return { "SHA-1": "HS1", "SHA-256": "HS256", "SHA-384": "HS384", "SHA-512": "HS512" }[hash];
+    }
+    const bits = bytes.byteLength * 8;
+    if (name === "AES-GCM")
+      return { 128: "A128GCM", 192: "A192GCM", 256: "A256GCM" }[bits];
+    if (name === "AES-CBC")
+      return { 128: "A128CBC", 192: "A192CBC", 256: "A256CBC" }[bits];
+    if (name === "AES-CTR")
+      return { 128: "A128CTR", 192: "A192CTR", 256: "A256CTR" }[bits];
+    if (name === "AES-KW")
+      return { 128: "A128KW", 192: "A192KW", 256: "A256KW" }[bits];
+    return undefined;
+  }
   // Cloudflare accepts its own pre-standard curve spellings beside the
   // standard ones.
   const _curveName = (curve) =>
@@ -249,6 +288,62 @@
           "secret", normalized, extractable, usages, { bytes: raw },
         );
       }
+      // A symmetric key's JWK is `{"kty":"oct","k":...}`. `k` carries the
+      // bytes, so the import is the raw arm above once decoded; a missing or
+      // non-oct `kty` is not a symmetric key at all.
+      if (format === "jwk" && _SECRET_KEY_ALGS.has(name)) {
+        if (keyData?.kty !== undefined && keyData.kty !== "oct") {
+          throw _notSupported("unsupported JWK kty: " + keyData.kty);
+        }
+        let raw;
+        try {
+          raw = _b64urlDecode(keyData?.k ?? "");
+        } catch {
+          throw new DOMException("Invalid JWK oct key", "DataError");
+        }
+        if (raw.byteLength === 0) {
+          throw new DOMException("Invalid JWK oct key", "DataError");
+        }
+        // AES keys are 128, 192, or 256 bits: any other length has no
+        // algorithm to run (W3C WebCrypto). HMAC keys stay unrestricted.
+        if (name !== "HMAC" &&
+            raw.byteLength !== 16 && raw.byteLength !== 24 && raw.byteLength !== 32) {
+          throw new DOMException("Invalid JWK oct key length", "DataError");
+        }
+        // A present `use` must name this key's operation class: a `sig`
+        // JWK is not an AES key that can encrypt (W3C WebCrypto).
+        // HMAC keys carry no such restriction here.
+        if (name !== "HMAC" && keyData?.use !== undefined && keyData.use !== "enc") {
+          throw new DOMException("JWK use mismatch: " + keyData.use, "DataError");
+        }
+        // `ext: false` marks a non-extractable key: importing it as
+        // extractable would mint an exportable key the JWK forbids. Absent
+        // `ext` carries no such promise, so only an explicit `false`
+        // conflicts.
+        if (keyData?.ext === false && extractable) {
+          throw new DOMException(
+            "JWK ext false conflicts with extractable true", "DataError");
+        }
+        // A present `alg` must name this algorithm: an `A128KW` JWK is not
+        // an AES-GCM key that can encrypt. `_secretJwkAlg` is the same
+        // table export uses, so an absent `alg` stays valid and a matching
+        // one imports; anything else (including an `alg` for a length with
+        // no JOSE name) is a mismatch.
+        if (keyData?.alg !== undefined) {
+          const expected = _secretJwkAlg(
+            name, raw, _hashName(algorithm?.hash));
+          if (keyData.alg !== expected) {
+            throw new DOMException(
+              "JWK alg mismatch: " + keyData.alg, "DataError");
+          }
+        }
+        const normalized = name === "HMAC"
+          ? { name, hash: { name: _hashName(algorithm?.hash) }, length: raw.byteLength * 8 }
+          : { name, length: raw.byteLength * 8 };
+        return _makeKey(
+          "secret", normalized, extractable, usages, { bytes: raw },
+        );
+      }
       // A Secure Curves public key has a `raw` form: the 32-byte point on
       // its own. It is checked before the asymmetric block below, because
       // that block reads `raw` bytes as a DER document and can only report a
@@ -342,6 +437,29 @@
         }
         const raw = key.__celldMaterial.bytes;
         return raw.buffer.slice(raw.byteOffset, raw.byteOffset + raw.byteLength);
+      }
+      // A symmetric key exports as `{"kty":"oct",...}` from its bytes, with
+      // the JOSE `alg` for its algorithm and length. Lengths with no JOSE
+      // name export without one rather than with a wrong one.
+      if (format === "jwk" && key?.type === "secret" &&
+          key?.__celldMaterial?.bytes !== undefined &&
+          key?.__celldMaterial?.keyType === undefined) {
+        if (!key.extractable) {
+          throw new DOMException("key is not extractable", "InvalidAccessError");
+        }
+        const bytes = key.__celldMaterial.bytes;
+        const name = key.algorithm?.name;
+        const jwk = {
+          kty: "oct",
+          k: _b64urlEncode(bytes),
+          key_ops: Array.from(key.usages),
+          ext: true,
+        };
+        const alg = _secretJwkAlg(
+          String(name ?? "").toUpperCase(), bytes,
+          _hashName(key.algorithm?.hash));
+        if (alg !== undefined) jwk.alg = alg;
+        return jwk;
       }
       if (format === "jwk" && key?.__celldMaterial?.jwk) {
         if (!key.extractable) {
@@ -450,7 +568,8 @@
       // An HMAC key with no stated length defaults to its hash's block
       // size, which is what the spec's getKeyLength returns.
       const length = derived?.length ??
-        (name === "AES-GCM" || name === "AES-CBC" || name === "AES-CTR"
+        (name === "AES-GCM" || name === "AES-CBC" || name === "AES-CTR" ||
+          name === "AES-KW"
           ? 256
           : name === "HMAC"
             ? ({ "SHA-384": 1024, "SHA-512": 1024 }[
@@ -488,7 +607,12 @@
           );
         }
         byteLength = Number(algorithm?.length || 256) / 8;
-        if (byteLength !== 16 && byteLength !== 32) {
+        if (name === "AES-KW") {
+          if (byteLength !== 16 && byteLength !== 24 && byteLength !== 32) {
+            throw new DOMException(
+              "AES-KW length must be 128, 192 or 256", "OperationError");
+          }
+        } else if (byteLength !== 16 && byteLength !== 32) {
           throw new DOMException("AES-GCM length must be 128 or 256", "OperationError");
         }
         const raw = new Uint8Array(byteLength);
@@ -688,11 +812,32 @@
     // wrapKey and unwrapKey compose the primitives exactly the way the
     // spec defines them: export + encrypt, and decrypt + import. A
     // jwk-format key crosses as its JSON bytes.
+    //
+    // AES-KW wraps rather than encrypts: the primitive is RFC 3394 through
+    // the host op, not one of the `_AES_MODES`. A host failure is the
+    // `OperationError` the spec names - a short KEK or corrupt input - not
+    // the host's own error shape.
     async wrapKey(format, key, wrappingKey, wrapAlgorithm) {
       const exported = await this.exportKey(format, key);
       const raw = format === "jwk"
         ? new TextEncoder().encode(JSON.stringify(exported))
         : exported;
+      if (_algorithmName(wrapAlgorithm) === "AES-KW") {
+        if (wrappingKey?.type !== "secret" ||
+            wrappingKey?.algorithm?.name !== "AES-KW") {
+          throw new DOMException(
+            "AES-KW wrapping key must be an AES-KW key", "InvalidAccessError");
+        }
+        try {
+          const out = _extra("aes-kw-wrap", {
+            key: Array.from(wrappingKey.__celldMaterial.bytes),
+            data: Array.from(_toBuf(raw)),
+          });
+          return Uint8Array.from(out.bytes).buffer;
+        } catch {
+          throw _operationError("AES-KW wrapKey failed");
+        }
+      }
       return this.encrypt(wrapAlgorithm, wrappingKey, raw);
     }
 
@@ -700,6 +845,28 @@
       format, wrapped, unwrappingKey, unwrapAlgorithm,
       algorithm, extractable, usages,
     ) {
+      if (_algorithmName(unwrapAlgorithm) === "AES-KW") {
+        if (unwrappingKey?.type !== "secret" ||
+            unwrappingKey?.algorithm?.name !== "AES-KW") {
+          throw new DOMException(
+            "AES-KW unwrapping key must be an AES-KW key",
+            "InvalidAccessError");
+        }
+        let raw;
+        try {
+          const out = _extra("aes-kw-unwrap", {
+            key: Array.from(unwrappingKey.__celldMaterial.bytes),
+            data: Array.from(_toBuf(wrapped)),
+          });
+          raw = Uint8Array.from(out.bytes);
+        } catch {
+          throw _operationError("AES-KW unwrapKey failed");
+        }
+        const keyData = format === "jwk"
+          ? JSON.parse(new TextDecoder().decode(raw))
+          : raw.buffer.slice(raw.byteOffset, raw.byteOffset + raw.byteLength);
+        return this.importKey(format, keyData, algorithm, extractable, usages);
+      }
       const raw = await this.decrypt(unwrapAlgorithm, unwrappingKey, wrapped);
       const keyData = format === "jwk"
         ? JSON.parse(new TextDecoder().decode(raw))

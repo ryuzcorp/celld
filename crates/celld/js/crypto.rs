@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): node:crypto scrypt.
+// Modified by ryuzcorp (ryuzcorp/celld): node:crypto scrypt; AES-KW key wrap/unwrap (upstream #295).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! Web Crypto and node:crypto: the key formats and the primitives.
@@ -965,6 +965,21 @@ fn crypto_operation(operation: &str, args: &serde_json::Value) -> Result<serde_j
             )?;
             Ok(serde_json::json!({ "bytes": bytes }))
         }
+        // AES key wrap (RFC 3394) for Web Crypto's AES-KW `wrapKey` and
+        // `unwrapKey`. One AES block at a time through the `aes` crate's
+        // block API, exactly the primitive the RFC is written against; the
+        // IV check on unwrap is the integrity signal `wrapKey` round-trips
+        // must fail with.
+        "aes-kw-wrap" => {
+            let key = crypto_bytes(args, "key")?;
+            let data = crypto_bytes(args, "data")?;
+            Ok(serde_json::json!({ "bytes": aes_kw_wrap(&key, &data)? }))
+        }
+        "aes-kw-unwrap" => {
+            let key = crypto_bytes(args, "key")?;
+            let data = crypto_bytes(args, "data")?;
+            Ok(serde_json::json!({ "bytes": aes_kw_unwrap(&key, &data)? }))
+        }
         // `createPublicKey` / `createPrivateKey`. Accepts every input shape
         // Node does — PEM, bare DER with a stated structure, or a JWK — and
         // answers with one normalized DER plus what Node reports as
@@ -1869,6 +1884,58 @@ mod scrypt_tests {
     }
 }
 
+#[cfg(test)]
+mod aes_kw_tests {
+    use super::*;
+
+    const KEK: [u8; 16] = [
+        0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
+        0x0f,
+    ];
+
+    /// RFC 3394 section 4.1, both directions: the guards must keep the
+    /// valid vectors working.
+    #[test]
+    fn section_4_1_round_trip() {
+        let key_data = [
+            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
+            0xee, 0xff,
+        ];
+        let wrapped = aes_kw_wrap(&KEK, &key_data).expect("wrap 4.1");
+        assert_eq!(
+            wrapped,
+            [
+                0x1f, 0xa6, 0x8b, 0x0a, 0x81, 0x12, 0xb4, 0x47, 0xae, 0xf3, 0x4b, 0xd8, 0xfb, 0x5a,
+                0x7b, 0x82, 0x9d, 0x3e, 0x86, 0x23, 0x71, 0xd2, 0xcf, 0xe5,
+            ]
+        );
+        assert_eq!(aes_kw_unwrap(&KEK, &wrapped).expect("unwrap 4.1"), key_data);
+    }
+
+    /// RFC 3394 needs two plaintext semiblocks: one (8 bytes) is not
+    /// wrappable, and its 16-byte wrap output is not unwrappable.
+    #[test]
+    fn single_semiblock_is_rejected() {
+        let wrap_err = aes_kw_wrap(&KEK, &[0x42; 8]).unwrap_err();
+        assert!(
+            wrap_err.to_string().contains("at least 16"),
+            "wrap 8 bytes: {wrap_err}"
+        );
+        let unwrap_err = aes_kw_unwrap(&KEK, &[0x42; 16]).unwrap_err();
+        assert!(
+            unwrap_err.to_string().contains("at least 24"),
+            "unwrap 16 bytes: {unwrap_err}"
+        );
+    }
+
+    /// Lengths outside the RFC shape stay rejected even past the minimum.
+    #[test]
+    fn non_multiples_stay_rejected() {
+        assert!(aes_kw_wrap(&KEK, &[0x42; 20]).is_err());
+        assert!(aes_kw_unwrap(&KEK, &[0x42; 28]).is_err());
+    }
+}
+
 /// Constant-time equality for equal-length byte views. The JS surfaces own
 /// their distinct argument and length errors; one native primitive owns the
 /// security property both APIs promise.
@@ -2073,6 +2140,112 @@ fn webcrypto_aes_block_mode(
             "AES-CBC requires a 128- or 256-bit key, got {other} bytes"
         )),
     }
+}
+
+/// One AES block under `key`, in the direction named. The `aes` crate's
+/// block API is the RFC 3394 primitive directly; ECB never appears because
+/// no multi-block mode is built here.
+fn aes_kw_block(key: &[u8], block: &mut [u8; 16], encrypt: bool) -> Result<()> {
+    use aes::cipher::{BlockDecrypt, BlockEncrypt, KeyInit};
+    macro_rules! run {
+        ($aes:ty) => {{
+            let cipher = <$aes>::new_from_slice(key)
+                .map_err(|_| anyhow!("AES-KW requires a 128-, 192- or 256-bit key"))?;
+            let block = aes::cipher::generic_array::GenericArray::from_mut_slice(block);
+            if encrypt {
+                cipher.encrypt_block(block);
+            } else {
+                cipher.decrypt_block(block);
+            }
+        }};
+    }
+    match key.len() {
+        16 => run!(aes::Aes128),
+        24 => run!(aes::Aes192),
+        32 => run!(aes::Aes256),
+        other => {
+            return Err(anyhow!(
+                "AES-KW requires a 128-, 192- or 256-bit key, got {} bits",
+                other * 8
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// RFC 3394 section 2.2.1 key wrap. `data` is two or more 64-bit semiblocks
+/// (any wrapped key is at least 16 bytes); the output prepends the
+/// integrity-checked IV the unwrap step verifies.
+fn aes_kw_wrap(key: &[u8], data: &[u8]) -> Result<Vec<u8>> {
+    if data.len() < 16 || !data.len().is_multiple_of(8) {
+        return Err(anyhow!(
+            "AES-KW data must be a multiple of 8 bytes of at least 16"
+        ));
+    }
+    let mut blocks: Vec<[u8; 8]> = data.as_chunks::<8>().0.to_vec();
+    // The default IV of RFC 3394 section 2.2.3.1.
+    let mut a: [u8; 8] = [0xA6; 8];
+    let n = blocks.len() as u64;
+    for j in 0..6u64 {
+        for (i, pi) in blocks.iter_mut().enumerate() {
+            let mut block = [0u8; 16];
+            block[..8].copy_from_slice(&a);
+            block[8..].copy_from_slice(pi);
+            aes_kw_block(key, &mut block, true)?;
+            let t = n * j + i as u64 + 1;
+            for (k, byte) in t.to_be_bytes().iter().enumerate() {
+                block[k] ^= byte;
+            }
+            a.copy_from_slice(&block[..8]);
+            pi.copy_from_slice(&block[8..]);
+        }
+    }
+    let mut out = Vec::with_capacity(8 + data.len());
+    out.extend_from_slice(&a);
+    for pi in &blocks {
+        out.extend_from_slice(pi);
+    }
+    Ok(out)
+}
+
+/// RFC 3394 section 2.2.2 key unwrap. An IV mismatch fails: the wrapped
+/// key was not wrapped with this KEK, or was corrupted. The input is the
+/// wrap output, so the two-semiblock minimum arrives here as three.
+fn aes_kw_unwrap(key: &[u8], data: &[u8]) -> Result<Vec<u8>> {
+    if data.len() < 24 || !data.len().is_multiple_of(8) {
+        return Err(anyhow!(
+            "AES-KW data must be a multiple of 8 bytes of at least 24"
+        ));
+    }
+    let (iv, rest) = data.split_at(8);
+    let mut a: [u8; 8] = iv
+        .try_into()
+        .map_err(|_| anyhow!("AES-KW data is truncated"))?;
+    let mut blocks: Vec<[u8; 8]> = rest.as_chunks::<8>().0.to_vec();
+    let n = blocks.len() as u64;
+    for j in (0..6u64).rev() {
+        for (i, pi) in blocks.iter_mut().enumerate().rev() {
+            let t = n * j + i as u64 + 1;
+            let mut a_xor = a;
+            for (k, byte) in t.to_be_bytes().iter().enumerate() {
+                a_xor[k] ^= byte;
+            }
+            let mut block = [0u8; 16];
+            block[..8].copy_from_slice(&a_xor);
+            block[8..].copy_from_slice(pi);
+            aes_kw_block(key, &mut block, false)?;
+            a.copy_from_slice(&block[..8]);
+            pi.copy_from_slice(&block[8..]);
+        }
+    }
+    if a != [0xA6; 8] {
+        return Err(anyhow!("AES-KW unwrap integrity check failed"));
+    }
+    let mut out = Vec::with_capacity(rest.len());
+    for pi in &blocks {
+        out.extend_from_slice(pi);
+    }
+    Ok(out)
 }
 
 /// `$$aesEncrypt(mode, key, iv, data, additionalData, tagBytes)` and its
