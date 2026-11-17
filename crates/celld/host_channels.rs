@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): cross-isolate RPC stubs and streams; trusted cell RPC.
+// Modified by ryuzcorp (ryuzcorp/celld): cross-isolate RPC stubs and streams; trusted cell RPC; facet open answers the database path only (upstream #292).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! The channels a cell runtime uses to hand work to the host: one request
@@ -43,12 +43,12 @@ pub(crate) static GATE_TX: OnceLock<tokio::sync::mpsc::UnboundedSender<GateReq>>
 /// prove.
 pub enum FacetReq {
     /// Activate the stream of the facet at `names` below `root`, and answer
-    /// its database file and whether replication restored it.
+    /// its database file.
     Open {
         root: String,
         epoch: u64,
         names: Vec<String>,
-        reply: tokio::sync::oneshot::Sender<Result<(std::path::PathBuf, bool)>>,
+        reply: tokio::sync::oneshot::Sender<Result<std::path::PathBuf>>,
     },
     /// Delete the facet's stream and every stream below it.
     Delete {

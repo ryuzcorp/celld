@@ -1,3 +1,4 @@
+// Modified by ryuzcorp (ryuzcorp/celld): facet open answers the database path only (upstream #292).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! The replication streams of Durable Object facets, shared by both engines.
@@ -59,8 +60,8 @@ impl FacetStreams {
     }
 
     /// Activate a facet's stream, once per root activation, and answer its
-    /// database file and whether replication restored it from a replica.
-    /// `db_path` is the engine's own placement of a cell's database.
+    /// database file. `db_path` is the engine's own placement of a cell's
+    /// database.
     pub(crate) async fn open(
         &self,
         replication: Option<&Replication>,
@@ -68,7 +69,7 @@ impl FacetStreams {
         root: &str,
         epoch: u64,
         names: &[String],
-    ) -> anyhow::Result<(PathBuf, bool)> {
+    ) -> anyhow::Result<PathBuf> {
         let facet = crate::engine_api::facet_cell(root, names);
         let path = db_path(&facet, epoch);
         let resident = |roots: &HashMap<String, FacetRoot>| {
@@ -88,7 +89,7 @@ impl FacetStreams {
             let roots = self.0.lock().expect("facet streams poisoned");
             let (open, _, opening) = resident(&roots)?;
             if open {
-                return Ok((path, false));
+                return Ok(path);
             }
             opening
         };
@@ -97,11 +98,11 @@ impl FacetStreams {
             let roots = self.0.lock().expect("facet streams poisoned");
             let (open, spec, _) = resident(&roots)?;
             if open {
-                return Ok((path, false));
+                return Ok(path);
             }
             spec
         };
-        let restored = match (replication, spec) {
+        match (replication, spec) {
             (Some(replication), Some(mut spec)) => {
                 // A clean reload resumes the files it closed. A facet that
                 // was not open then has none, so it restores as any facet
@@ -109,15 +110,13 @@ impl FacetStreams {
                 if spec.resume_local && crate::asyncrt::fs().metadata(&path).is_err() {
                     spec.resume_local = false;
                 }
-                let (restored_path, restored, _) =
-                    replication.restore(&facet, &spec, false).await?;
+                let (restored_path, _, _) = replication.restore(&facet, &spec, false).await?;
                 anyhow::ensure!(
                     restored_path == path,
                     "replication restored {} instead of {}",
                     restored_path.display(),
                     path.display()
                 );
-                restored
             }
             (Some(_), None) => anyhow::bail!("{root} was activated without a restore"),
             (None, _) => {
@@ -125,7 +124,6 @@ impl FacetStreams {
                 crate::asyncrt::fs()
                     .create_dir_all(parent)
                     .with_context(|| format!("create facet directory {}", parent.display()))?;
-                false
             }
         };
         let mut roots = self.0.lock().expect("facet streams poisoned");
@@ -145,7 +143,7 @@ impl FacetStreams {
                 anyhow::bail!("{root} epoch {epoch} stopped while its facet opened");
             }
         }
-        Ok((path, restored))
+        Ok(path)
     }
 
     /// Delete a facet's stream and every stream below it, resident or not,
