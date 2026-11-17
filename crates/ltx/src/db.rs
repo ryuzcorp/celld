@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): a capture before a handoff skips the time-based checkpoint; exact uncaptured-changes probe for the lazy handoff (0078).
+// Modified by ryuzcorp (ryuzcorp/celld): a capture before a handoff skips the time-based checkpoint; exact uncaptured-changes probe for the lazy handoff (0078); local L0 retention after L1 compaction (upstream #311).
 //! db.rs — SQLite database lifecycle: WAL-mode setup, the long-running read-lock
 //! checkpoint takeover, the WAL→LTX capture loop, and manual checkpointing.
 //! Ported from litestream@v0.5.11 `db.go`.
@@ -44,7 +44,9 @@
 //!   FFI): only matters when *all* connections close and SQLite
 //!   would delete the WAL; the capture path keeps its own connection open.
 //! - The background monitor loop, `ensure_exists`, `sync_status`, `sync_and_wait`,
-//!   retention, and retry behavior are not implemented.
+//!   and retry behavior are not implemented. Local L0 retention is
+//!   [`Db::retain_l0_through`], driven by the compaction worker after each
+//!   successful L1 fold (upstream #311).
 //! - A `loom` model of the lock protocol.
 
 use crate::error::{new_ltx_error, Error, Result};
@@ -905,6 +907,53 @@ impl Db {
     /// Ported from `invalidatePosCache` (db.go:430-434).
     fn invalidate_pos_cache(&mut self) {
         self.pos_cache = None;
+    }
+
+    /// Delete the local L0 files a successful L1 compaction has covered.
+    ///
+    /// Without retention every committed transaction leaves one
+    /// `<min>-<max>.ltx` file in the epoch's L0 directory until the cell is
+    /// evicted, so a write-hot cell exhausts inodes (upstream #311). Once a
+    /// compaction fold proves the covered range durable in L1, those locals
+    /// are redundant: remove every L0 file whose max TXID is at or below
+    /// `compacted_max`, except the newest file, which `pos()` and `verify`
+    /// read back.
+    ///
+    /// Files that fail to parse, subdirectories, and files that fail to
+    /// delete are left in place: retention is best-effort garbage
+    /// collection, so a leftover file costs inodes, never correctness. A
+    /// concurrent capture can only append newer TXIDs (single-writer epoch,
+    /// atomic tmp-then-rename), so it is either above `compacted_max` or the
+    /// newest file — never deleted.
+    pub fn retain_l0_through(
+        host: &crate::LtxHost,
+        meta_path: &Path,
+        compacted_max: TXID,
+    ) -> Result<usize> {
+        let dir = ltx_level_dir(&meta_path.to_string_lossy(), 0);
+        let entries = match host.read_dir(Path::new(&dir)) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(error) => return Err(error.into()),
+        };
+        let mut newest = TXID(0);
+        let mut files = Vec::new();
+        for entry in &entries {
+            if entry.is_dir {
+                continue;
+            }
+            if let Ok((_, max)) = ltx::parse_filename(&entry.file_name.to_string_lossy()) {
+                newest = newest.max(max);
+                files.push((entry.path.clone(), max));
+            }
+        }
+        let mut deleted = 0;
+        for (path, max) in &files {
+            if *max <= compacted_max && *max < newest && host.remove_file(path).is_ok() {
+                deleted += 1;
+            }
+        }
+        Ok(deleted)
     }
 
     /// Removes local LTX files, forcing a fresh snapshot on the next sync.
@@ -2749,6 +2798,41 @@ mod tests {
             db.has_uncaptured_changes().unwrap(),
             "a WAL-only commit is invisible to the L0 position"
         );
+    }
+
+    #[test]
+    fn retain_l0_through_keeps_newest_covered_file() {
+        let (_dir, mut db) = open_test_db();
+        for _ in 0..3 {
+            write_row(&db);
+            db.sync().unwrap();
+        }
+        let host = crate::LtxHost::default();
+        let meta = db.meta_path().to_path_buf();
+        let l0_dir = ltx_level_dir(&meta.to_string_lossy(), 0);
+        let pos = db.pos().unwrap();
+        let before = host.read_dir(Path::new(&l0_dir)).unwrap().len();
+        assert!(before >= 3, "each sync leaves one L0 file: {before}");
+        // Covering everything but the newest deletes exactly the older files.
+        let deleted = Db::retain_l0_through(&host, &meta, TXID(pos.txid.0 - 1)).unwrap();
+        assert_eq!(deleted, before - 1, "covered L0 files are redundant");
+        assert_eq!(
+            host.read_dir(Path::new(&l0_dir)).unwrap().len(),
+            1,
+            "the newest file stays for pos() and verify"
+        );
+        assert_eq!(db.pos().unwrap(), pos);
+        assert!(!db.has_uncaptured_changes().unwrap());
+        // Captures keep working after retention, and covering the newest
+        // file still keeps it.
+        write_row(&db);
+        db.sync().unwrap();
+        let newest = db.pos().unwrap().txid;
+        assert!(newest.0 > pos.txid.0);
+        let count = host.read_dir(Path::new(&l0_dir)).unwrap().len();
+        let deleted = Db::retain_l0_through(&host, &meta, newest).unwrap();
+        assert_eq!(deleted, count - 1);
+        assert_eq!(host.read_dir(Path::new(&l0_dir)).unwrap().len(), 1);
     }
 
     #[test]
