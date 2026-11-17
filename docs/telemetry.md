@@ -59,6 +59,11 @@ celld reads the W3C `traceparent` header on incoming requests and sends it on
 outbound `fetch()`. A malformed header starts a new trace. A Worker call to a
 Durable Object stays in one trace.
 
+A handler reads the traceparent of the span it runs in through
+`getCurrentTraceparent()` from `cloudflare:workers`, so it can return the
+trace id to the caller or record it with the data it writes. The answer is
+`undefined` when telemetry is off or the request is unsampled.
+
 The sampler decides at the start of a request, and an unsampled request
 records nothing. A ratio of `0` records no traces and `1` records all. An
 intermediate ratio makes the same trace-id decision on each node. celld keeps

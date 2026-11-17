@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): node:crypto scrypt; container exec resize op; cross-isolate RPC stubs and streams; test-only fake exec ops; fake kill completion op; exec reads survive their subscribing event; per-node Workers Cache API ops; tenant egress policy; D1 export operator-ingress marker; stateless attribution tokens; reaction-aware request resources; fake close/signal completion ops; binding-forgery enforcement; trusted cell RPC; Queue DLQ forward host op; DLQ forward caller identity; WebSocket and TCP socket ownership; receiver-held stream lifetime; deployment cache scope key; share the /bundle tree per deployment generation.; cancelled requests reject pending ops so co-awaiters settle (upstream #317); answered drivers poll while waitUntil background is outstanding (upstream #300); refused handoffs reject instead of dropping resolvers (upstream #309); facet adoption drops the restored flag (upstream #292); background expiry for orphaned drives (upstream #275); unrefed AbortSignal.timeout timer (upstream #306); loader-fetch 101 webSocket join (upstream #305); nodejs process.env population (upstream #296); writable request /tmp files (upstream #280); synchronous loader abort publish (upstream #281); tenant fetch trusts the shared TLS roots (upstream #230).
+// Modified by ryuzcorp (ryuzcorp/celld): node:crypto scrypt; container exec resize op; cross-isolate RPC stubs and streams; test-only fake exec ops; fake kill completion op; exec reads survive their subscribing event; per-node Workers Cache API ops; tenant egress policy; D1 export operator-ingress marker; stateless attribution tokens; reaction-aware request resources; fake close/signal completion ops; binding-forgery enforcement; trusted cell RPC; Queue DLQ forward host op; DLQ forward caller identity; WebSocket and TCP socket ownership; receiver-held stream lifetime; deployment cache scope key; share the /bundle tree per deployment generation.; cancelled requests reject pending ops so co-awaiters settle (upstream #317); answered drivers poll while waitUntil background is outstanding (upstream #300); refused handoffs reject instead of dropping resolvers (upstream #309); facet adoption drops the restored flag (upstream #292); background expiry for orphaned drives (upstream #275); unrefed AbortSignal.timeout timer (upstream #306); loader-fetch 101 webSocket join (upstream #305); nodejs process.env population (upstream #296); writable request /tmp files (upstream #280); synchronous loader abort publish (upstream #281); tenant fetch trusts the shared TLS roots (upstream #230); __traceparent op for handler-visible trace context (upstream #313).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 // The raw V8 adapter and its child modules remain outside the Actor execution
@@ -4471,6 +4471,28 @@ fn current_reaction_or_untracked_io_context(scope: &mut v8::PinScope) -> Option<
     current_reaction_io_context(scope)
 }
 
+/// `__traceparent()` — the W3C traceparent of the span the running handler
+/// executes in, backing `cloudflare:workers`' `getCurrentTraceparent`
+/// (denoland/celld#313). A handler that can read its own span can return the
+/// trace id to the caller or record it with the data it writes; without this
+/// the only recourse was inventing ids celld never exports, which joins the
+/// downstream span to a trace the collector never sees and breaks the trace
+/// at the outbound call. `undefined` when telemetry is off or the entry is
+/// not sampled: there is no exported span to name.
+fn op_traceparent(
+    scope: &mut v8::PinScope,
+    _args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let Some(context) = current_trace_context(scope).filter(|context| context.sampled) else {
+        return;
+    };
+    let Some(value) = v8::String::new(scope, &crate::telemetry::traceparent(&context)) else {
+        return;
+    };
+    rv.set(value.into());
+}
+
 /// The trace context current at this exact point of JS execution, read
 /// from CPED — the running turn's, or the running continuation's if V8
 /// restored one. `None` when telemetry is off or execution is outside an
@@ -7183,6 +7205,7 @@ ops! { OP_NAMES, install_op_functions,
         "__heap_limit_excessively_exceeded" =>
             op_heap_limit_excessively_exceeded,
         "__heap_over_admission_share" => op_heap_over_admission_share,
+        "__traceparent" => op_traceparent,
         "__ws_send" => websocket::op_ws_send,
         "__ws_send_binary" => websocket::op_ws_send_binary,
         "__ws_close" => websocket::op_ws_close,
