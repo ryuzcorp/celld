@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): CELLD_MEMORY_SCOPE help; operator token for the internal listener; staged activation; staged invoke command; CELLD_DEPLOY_AWS_* help; non-dumpable serving process. bucket-posture group commit: bundle switch help (0070); bundle switch defaults off (0075); CELLD_NODE pinning help (upstream #249); background budget help (upstream #275); celld versions command (upstream #181); CELLD_SQL_STATEMENT_MS help (upstream #274).
+// Modified by ryuzcorp (ryuzcorp/celld): CELLD_MEMORY_SCOPE help; operator token for the internal listener; staged activation; staged invoke command; CELLD_DEPLOY_AWS_* help; non-dumpable serving process. bucket-posture group commit: bundle switch help (0070); bundle switch defaults off (0075); CELLD_NODE pinning help (upstream #249); background budget help (upstream #275); celld versions command (upstream #181); CELLD_SQL_STATEMENT_MS help (upstream #274); CELLD_MAX_CELLS_PER_ISOLATE help (upstream #278).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! The command line: what the process was asked to do, and the help text
@@ -402,6 +402,8 @@ TUNING:
   CELLD_ALARM_RESIDENT_MS         Near-alarm residency window
   CELLD_WAKER_TICK_MS             Orphan-alarm scan interval
   CELLD_V8_HEAP_LIMIT_MB          Per-isolate V8 heap limit
+  CELLD_MAX_CELLS_PER_ISOLATE     Cells per isolate (default: 32; lower it
+                                  for heavyweight cells such as agents)
   CELLD_SQL_STATEMENT_MS          Per-statement SQL time bound (unset means
                                   unbounded; timed-out statements fail and
                                   roll back)

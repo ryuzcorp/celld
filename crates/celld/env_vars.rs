@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): validate CELLD_MEMORY_SCOPE; CELLD_CACHE_MAX_BYTES validation; tenant egress policy; CELLD_CACHE_SCOPE validation; CELLD_DEPLOY_AWS_* validation; CELLD_SQLITE_CACHE_KB validation; CELLD_C_TRIM_MB validation; CELLD_BUCKET_BUNDLES startup validation (0070); CELLD_BUCKET_BUNDLES defaults off (0075); CELLD_SQL_STATEMENT_MS validation (upstream #274)
+// Modified by ryuzcorp (ryuzcorp/celld): validate CELLD_MEMORY_SCOPE; CELLD_CACHE_MAX_BYTES validation; tenant egress policy; CELLD_CACHE_SCOPE validation; CELLD_DEPLOY_AWS_* validation; CELLD_SQLITE_CACHE_KB validation; CELLD_C_TRIM_MB validation; CELLD_BUCKET_BUNDLES startup validation (0070); CELLD_BUCKET_BUNDLES defaults off (0075); CELLD_SQL_STATEMENT_MS validation (upstream #274); CELLD_MAX_CELLS_PER_ISOLATE validation (upstream #278).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! Strict runtime environment parsing.
@@ -299,6 +299,7 @@ pub fn validate() -> anyhow::Result<()> {
     shutdown_timing()?;
 
     positive::<usize>("CELLD_MAX_DYNAMIC_WORKER_CODE_BYTES")?;
+    positive::<usize>("CELLD_MAX_CELLS_PER_ISOLATE")?;
 
     if let Some(value) = optional::<u64>("CELLD_PRESENCE_HEARTBEAT_MS")? {
         if !(50..=30_000).contains(&value) {
