@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): operator token for the internal listener; list_page resume is a cursor; ported from meln1k/celld: seal a dead lease that never opened a log (01522b3); seal_absent_log regression tests; lone-node repair backoff; bucket-posture group commit: bucket-session record encoding + old-reader interop tests (0059); bucket-posture group commit: bucket executor without ensemble (0060); bucket-posture group commit: successor fold of bucket bundles (0063); bucket-posture group commit: bucket-session drain, per-cell seal, bundle GC without ensemble, linger holds only while the dirty set is shared (0064); bucket-posture group commit: lone-cell-per-cell vs shared-bundle executor tests, and idle bucket sessions skip empty bundle-GC scans (0071).
+// Modified by ryuzcorp (ryuzcorp/celld): operator token for the internal listener; list_page resume is a cursor; ported from meln1k/celld: seal a dead lease that never opened a log (01522b3); seal_absent_log regression tests; lone-node repair backoff; bucket-posture group commit: bucket-session record encoding + old-reader interop tests (0059); bucket-posture group commit: bucket executor without ensemble (0060); bucket-posture group commit: successor fold of bucket bundles (0063); bucket-posture group commit: bucket-session drain, per-cell seal, bundle GC without ensemble, linger holds only while the dirty set is shared (0064); bucket-posture group commit: lone-cell-per-cell vs shared-bundle executor tests, and idle bucket sessions skip empty bundle-GC scans (0071); stale-target 409 proves the member gone in recovery (upstream #273).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! v0 of the in-fleet replicated log tier (`CELLD_DURABILITY=fleet`).
@@ -2519,8 +2519,15 @@ impl LogTransport for SignedPeerTransport {
             // a protocol-incapable member separately from transport failure.
             if !response.status().is_success() {
                 let status = response.status();
-                return Err(anyhow::Error::new(PeerHttpError { status })
-                    .context(format!("peer {node} answered {status}")));
+                let stale_route = response
+                    .headers()
+                    .get(crate::peer_auth::STALE_ROUTE_HEADER)
+                    .is_some_and(|value| value == crate::peer_auth::STALE_ROUTE_VALUE);
+                return Err(anyhow::Error::new(PeerHttpError {
+                    status,
+                    stale_route,
+                })
+                .context(format!("peer {node} answered {status}")));
             }
             crate::peer_auth::validate_response(response.headers())?;
             Ok(response.bytes().await?)
@@ -2554,8 +2561,15 @@ impl LogTransport for SignedPeerTransport {
             let response = request.send().await?;
             if response.status() != reqwest::StatusCode::SWITCHING_PROTOCOLS {
                 let status = response.status();
-                return Err(anyhow::Error::new(PeerHttpError { status })
-                    .context(format!("peer {node} refused the stream: {status}")));
+                let stale_route = response
+                    .headers()
+                    .get(crate::peer_auth::STALE_ROUTE_HEADER)
+                    .is_some_and(|value| value == crate::peer_auth::STALE_ROUTE_VALUE);
+                return Err(anyhow::Error::new(PeerHttpError {
+                    status,
+                    stale_route,
+                })
+                .context(format!("peer {node} refused the stream: {status}")));
             }
             crate::peer_auth::validate_response(response.headers())?;
             Ok(Box::new(response.upgrade().await?) as LogStreamIo)
@@ -2568,6 +2582,29 @@ impl LogTransport for SignedPeerTransport {
 #[derive(Debug)]
 struct PeerHttpError {
     status: reqwest::StatusCode,
+    /// The peer auth gate's stale-route marker. Only a 409 `WrongTarget` —
+    /// a different node session answering at the dialed address — carries
+    /// it, so it separates "the old member is gone" from transport noise.
+    stale_route: bool,
+}
+
+impl PeerHttpError {
+    /// Whether this answer proves the dialed member session is gone: a
+    /// conflict that carries the stale-route marker. Downgrade-safe: older
+    /// peers never send the marker, so their answers classify as before.
+    fn stale_target(&self) -> bool {
+        self.status == reqwest::StatusCode::CONFLICT && self.stale_route
+    }
+}
+
+/// Whether a failed seal POST proves the old member is gone rather than
+/// merely unreachable: only the stale-target 409 does. Every other failure
+/// — transport errors, other statuses, undecodable bodies — stays
+/// inconclusive, so a flaky link can never seal away intact rows.
+fn seal_proves_member_gone(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<PeerHttpError>()
+        .is_some_and(PeerHttpError::stale_target)
 }
 
 impl std::fmt::Display for PeerHttpError {
@@ -4499,6 +4536,57 @@ mod maintain_outcome_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod seal_gone_tests {
+    use super::*;
+
+    fn http_error(status: reqwest::StatusCode, stale_route: bool) -> anyhow::Error {
+        anyhow::Error::new(PeerHttpError {
+            status,
+            stale_route,
+        })
+    }
+
+    /// The upstream #273 wedge: a 409 carrying the stale-route marker proves
+    /// a different session is live at the member's address, so the old
+    /// member is conclusively gone and the pass can proceed past the grace.
+    /// Fail-before: every HTTP answer forced inconclusive, and recovery
+    /// wedged on "refusing to seal" while new sessions answered at the old
+    /// addresses.
+    #[test]
+    fn stale_target_409_proves_member_gone() {
+        assert!(seal_proves_member_gone(&http_error(
+            reqwest::StatusCode::CONFLICT,
+            true
+        )));
+    }
+
+    /// Every other seal failure stays inconclusive: a marker-less 409 (an
+    /// older peer, or a replay rejection), any other status, a transport
+    /// error, and an undecodable body must never seal away intact rows.
+    #[test]
+    fn other_seal_failures_stay_inconclusive() {
+        assert!(!seal_proves_member_gone(&http_error(
+            reqwest::StatusCode::CONFLICT,
+            false
+        )));
+        assert!(!seal_proves_member_gone(&http_error(
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            true
+        )));
+        assert!(!seal_proves_member_gone(&http_error(
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            false
+        )));
+        assert!(!seal_proves_member_gone(&anyhow::anyhow!(
+            "connection refused"
+        )));
+        assert!(!seal_proves_member_gone(&anyhow::Error::new(
+            serde_json::from_str::<u8>("x").unwrap_err()
+        )));
+    }
+}
 impl NodeLogManager {
     #[cfg(all(test, celld_internal_tests))]
     pub fn reset_shipper_injection_calls_for_world(&self) {
@@ -5212,10 +5300,29 @@ impl NodeLogManager {
                 {
                     Ok(sealed) => sealed,
                     Err(error) => {
-                        // Startup serves follower requests before it renews
-                        // the lease. An HTTP error proves a response, not a
-                        // missing fragment: a transient scan failure on an
-                        // expired member must not seal away its intact rows.
+                        // A stale-target 409 proves a DIFFERENT session is
+                        // live at the member's address (upstream #273): the
+                        // old member is gone, not merely unreachable, so the
+                        // answer is conclusive by itself. Every other HTTP
+                        // answer still counts: startup serves follower
+                        // requests before it renews the lease, so a
+                        // transient scan failure on an expired member must
+                        // not seal away its intact rows.
+                        if seal_proves_member_gone(&error) {
+                            warn!(
+                                member,
+                                dead,
+                                addr = addr.as_str(),
+                                epoch = record.epoch,
+                                "recovery seal reached a different node session at the member's address; \
+                                 the old member is gone — restart that address with its old id on the \
+                                 same disk to serve the tail, or recovery declares bounded loss past the grace"
+                            );
+                            if lease_live || !lease_long_dead {
+                                inconclusive += 1;
+                            }
+                            continue;
+                        }
                         let answered = error.downcast_ref::<PeerHttpError>().is_some()
                             || error.downcast_ref::<serde_json::Error>().is_some();
                         if answered || lease_live || !lease_long_dead {
