@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): cross-isolate RPC stubs and streams; D1 export operator-ingress marker; ported from meln1k/celld: report wake coverage after maintenance (e6cb9a3); wake coverage follow-ups: startup observation ordering, installation comparison; trusted cell RPC; deployment cache scope purge on generation free; staged invoke joins the driver past the reply.; answered drivers poll while waitUntil background is outstanding (upstream #300); drivers take the mailbox once more before retiring (upstream #309); answered waitUntil with no ops polls for settlement (upstream #289); post-response background budget ends orphaned drives (upstream #275); storage-poisoned cells restart on a fresh isolate (upstream #291).
+// Modified by ryuzcorp (ryuzcorp/celld): cross-isolate RPC stubs and streams; D1 export operator-ingress marker; ported from meln1k/celld: report wake coverage after maintenance (e6cb9a3); wake coverage follow-ups: startup observation ordering, installation comparison; trusted cell RPC; deployment cache scope purge on generation free; staged invoke joins the driver past the reply.; answered drivers poll while waitUntil background is outstanding (upstream #300); drivers take the mailbox once more before retiring (upstream #309); answered waitUntil with no ops polls for settlement (upstream #289); post-response background budget ends orphaned drives (upstream #275); storage-poisoned cells restart on a fresh isolate (upstream #291); restore fails a vanished class before touching disk (upstream #276).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 // RuntimeManager is the V8 cell-host arm, so its executor and observability
@@ -1100,6 +1100,18 @@ impl RuntimeManager {
         cell: &str,
         spec: &celld_logic::RestoreSpec,
     ) -> anyhow::Result<celld_logic::RestoreOutcome> {
+        // Fail a vanished class before touching the disk, with the same
+        // verdict `start_cell` would reach after restoring (denoland/celld#276).
+        // Restoring first downloads the replica and seeds the restored alarm's
+        // in-process timer; the start then fails, the timer fires, and the
+        // cell hot-loops overdue alarms without application traffic.
+        let class = cell
+            .split_once(':')
+            .map(|(class, _)| class)
+            .ok_or_else(|| anyhow!("cell scope has no class: {cell}"))?;
+        if self.generation().cell_config(class).is_none() {
+            return Err(anyhow!("no Worker exports Durable Object class {class}"));
+        }
         let path = self.db_path(cell, spec.epoch);
         self.facets.register(cell, spec);
         if let Some(replication) = &self.replication {
