@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): validate CELLD_MEMORY_SCOPE; CELLD_CACHE_MAX_BYTES validation; tenant egress policy; CELLD_CACHE_SCOPE validation; CELLD_DEPLOY_AWS_* validation; CELLD_SQLITE_CACHE_KB validation; CELLD_C_TRIM_MB validation; CELLD_BUCKET_BUNDLES startup validation (0070); CELLD_BUCKET_BUNDLES defaults off (0075).
+// Modified by ryuzcorp (ryuzcorp/celld): validate CELLD_MEMORY_SCOPE; CELLD_CACHE_MAX_BYTES validation; tenant egress policy; CELLD_CACHE_SCOPE validation; CELLD_DEPLOY_AWS_* validation; CELLD_SQLITE_CACHE_KB validation; CELLD_C_TRIM_MB validation; CELLD_BUCKET_BUNDLES startup validation (0070); CELLD_BUCKET_BUNDLES defaults off (0075); CELLD_TMP_MAX_BYTES validation (upstream #280).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! Strict runtime environment parsing.
@@ -270,6 +270,7 @@ pub fn validate() -> anyhow::Result<()> {
         "CELLD_SQLITE_CACHE_KB",
         "CELLD_TOKIO_THREADS",
         "CELLD_TTL_MS",
+        "CELLD_TMP_MAX_BYTES",
         "CELLD_WAKER_TICK_MS",
     ] {
         positive::<u64>(name)?;

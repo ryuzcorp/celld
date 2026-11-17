@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): CELLD_MEMORY_SCOPE help; operator token for the internal listener; staged activation; staged invoke command; CELLD_DEPLOY_AWS_* help; non-dumpable serving process. bucket-posture group commit: bundle switch help (0070); bundle switch defaults off (0075); CELLD_NODE pinning help (upstream #249); background budget help (upstream #275).
+// Modified by ryuzcorp (ryuzcorp/celld): CELLD_MEMORY_SCOPE help; operator token for the internal listener; staged activation; staged invoke command; CELLD_DEPLOY_AWS_* help; non-dumpable serving process. bucket-posture group commit: bundle switch help (0070); bundle switch defaults off (0075); CELLD_NODE pinning help (upstream #249); background budget help (upstream #275); CELLD_TMP_MAX_BYTES help (upstream #280).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! The command line: what the process was asked to do, and the help text
@@ -394,6 +394,7 @@ TUNING:
   CELLD_MAX_REQUEST_BODY_BYTES    Ingress request body limit (default: 1 GiB)
   CELLD_MAX_ASSET_FILE_BYTES      Per-file asset limit (default: 25 MiB)
   CELLD_MAX_DYNAMIC_WORKER_CODE_BYTES  Loaded module total (default: 64 MiB)
+  CELLD_TMP_MAX_BYTES             Per-request /tmp size limit (default: 64 MiB)
   CELLD_PRESSURE_OWNERSHIP        release to rebalance, sticky to cache locally
   CELLD_MAX_RSS_MB                Active-memory shed threshold (default: 80%; 0 disables)
   CELLD_MEMORY_SCOPE              Which cgroup memory pressure reads: the

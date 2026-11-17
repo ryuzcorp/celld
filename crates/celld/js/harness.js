@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): ctx.container.images; clone() of streaming and disturbed bodies; __celld$do on the service-binding RPC path; container exec pty/resize; cross-isolate RPC stubs and streams; container exec AbortSignal; test-only fake kill completion; exec reads survive their subscribing event; context end aborts finished uploads; tenant egress policy; D1 export; D1 export operator gate; D1 batch; test-only fake close/signal completion; binding-forgery enforcement; Queue/KV operator fetch gate; Queue/KV stub-RPC allowlists; Queue DLQ host-op forward; Queue send/DLQ cell-side validation; trusted-RPC target pin; Queue operator internal re-checks; receiver-held RPC streams.; dropped timer ops fire their callback early so sleepers settle (upstream #317); unrefed AbortSignal.timeout timer (upstream #306); loader-fetch 101 webSocket join (upstream #305); nodejs process.env population (upstream #296).
+// Modified by ryuzcorp (ryuzcorp/celld): ctx.container.images; clone() of streaming and disturbed bodies; __celld$do on the service-binding RPC path; container exec pty/resize; cross-isolate RPC stubs and streams; container exec AbortSignal; test-only fake kill completion; exec reads survive their subscribing event; context end aborts finished uploads; tenant egress policy; D1 export; D1 export operator gate; D1 batch; test-only fake close/signal completion; binding-forgery enforcement; Queue/KV operator fetch gate; Queue/KV stub-RPC allowlists; Queue DLQ host-op forward; Queue send/DLQ cell-side validation; trusted-RPC target pin; Queue operator internal re-checks; receiver-held RPC streams.; dropped timer ops fire their callback early so sleepers settle (upstream #317); unrefed AbortSignal.timeout timer (upstream #306); loader-fetch 101 webSocket join (upstream #305); nodejs process.env population (upstream #296); writable request /tmp files (upstream #280).
 // The DO object model and the Cloudflare-compatible runtime surface, run
 // once per isolate by `js.rs::install_harness` after the Web-API prelude.
 // Lived as a 4,000-line raw string inside js.rs until 2026-07-29; it is a
@@ -12958,7 +12958,7 @@ const __fsPath = (value) => {
 };
 const __fsError = (code, syscall, path) => {
   const e = new Error(`${code}: ${syscall} '${path}'`);
-  e.errno = { EPERM: -1, ENOENT: -2, EEXIST: -17, ENOTDIR: -20 }[code];
+  e.errno = { EPERM: -1, ENOENT: -2, ENOSPC: -28, EEXIST: -17, ENOTDIR: -20 }[code];
   e.code = code;
   e.syscall = syscall;
   e.path = path;
@@ -12969,12 +12969,13 @@ const __fsStatsBadge = Symbol("fs.Stats");
 class __FsStats {
   constructor(badge, kind, size, bigint) {
     if (badge !== __fsStatsBadge) throw new TypeError("Illegal constructor");
-    const file = kind === 3;
+    const file = kind === 3 || kind === 4;
     this.dev = 0;
     this.ino = 0;
-    // A bundle file is 0o100444 and a writable temporary directory is 0o40666,
-    // matching the mode values workerd's fs-stat-test.js asserts.
-    this.mode = (file ? 0o100000 : 0o40000) | 0o444 | (kind === 2 ? 0o222 : 0);
+    // A bundle file is 0o100444, a request `/tmp` file 0o100666, and a
+    // writable temporary directory 0o40666, matching the mode values
+    // workerd's fs-stat-test.js asserts.
+    this.mode = (file ? 0o100000 : 0o40000) | 0o444 | (kind === 2 || kind === 4 ? 0o222 : 0);
     this.nlink = 1;
     this.uid = 0;
     this.gid = 0;
@@ -13067,6 +13068,256 @@ const __fsReadFileSync = (value, options) => {
   const buffer = Buffer.from(bytes);
   return encoding ? buffer.toString(encoding) : buffer;
 };
+// `writeFile` data is a string or a binary view, as Node accepts. Anything
+// else is an argument error, thrown synchronously by every form.
+const __fsWriteData = (data, encoding) => {
+  if (typeof data === "string") return Buffer.from(data, encoding);
+  if (data instanceof ArrayBuffer) return new Uint8Array(data);
+  if (ArrayBuffer.isView(data)) {
+    return new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+  }
+  const error = new TypeError(
+    "The \"data\" argument must be of type string or an instance of " +
+    "Buffer, TypedArray, or DataView",
+  );
+  error.code = "ERR_INVALID_ARG_TYPE";
+  throw error;
+};
+// Only `/tmp` is writable; the host answers `""` on success and a Node
+// error code otherwise, so the syscall name is the only thing added here.
+// A write that would push the request past `CELLD_TMP_MAX_BYTES` fails with
+// `ENOSPC`. `writeFile` truncates (`"w"`) unless an append flag (`"a"`)
+// appends like `appendFile`; an exclusive flag (`"x"`) fails with `EEXIST`
+// when the path already exists, as Node's `O_EXCL` does. The tree has no
+// read handles, so a read-mode flag (`"r"`) would write through a
+// descriptor Node opened read-only: it is refused loudly instead of
+// silently truncating.
+const __fsParseFlag = (options, fallback) => {
+  const flag = options?.flag ?? fallback;
+  if (typeof flag !== "string") {
+    const error = new TypeError(
+      `The "flag" option must be of type string. Received ${flag}`);
+    error.code = "ERR_INVALID_ARG_TYPE";
+    throw error;
+  }
+  if (flag[0] !== "w" && flag[0] !== "a") {
+    const error = new TypeError(
+      `The flag "${flag}" is not supported for /tmp files`);
+    error.code = "ERR_INVALID_ARG_VALUE";
+    throw error;
+  }
+  return { append: flag[0] === "a", exclusive: flag.includes("x") };
+};
+// The exclusive half of the flag: fail before any mutation when the path
+// already exists. Pure validation lives in `__fsParseFlag`, so callback
+// forms can throw argument errors synchronously while this filesystem
+// error reaches the callback.
+const __fsCheckExclusive = (path, exclusive, syscall) => {
+  if (exclusive && __vfs_stat(path)[0]) throw __fsError("EEXIST", syscall, path);
+};
+const __fsWriteFileSync = (value, data, options = {}) => {
+  const path = __fsPath(value);
+  const encoding = typeof options === "string" ? options : options?.encoding ?? "utf8";
+  const bytes = __fsWriteData(data, encoding);
+  const { append, exclusive } = __fsParseFlag(options, "w");
+  __fsCheckExclusive(path, exclusive, "open");
+  const result = __vfs_write_file(path, bytes, append);
+  if (result && !result.startsWith("/")) throw __fsError(result, "open", path);
+};
+const __fsAppendFileSync = (value, data, options = {}) => {
+  const path = __fsPath(value);
+  const encoding = typeof options === "string" ? options : options?.encoding ?? "utf8";
+  const bytes = __fsWriteData(data, encoding);
+  const { append, exclusive } = __fsParseFlag(options, "a");
+  __fsCheckExclusive(path, exclusive, "open");
+  const result = __vfs_write_file(path, bytes, append);
+  if (result && !result.startsWith("/")) throw __fsError(result, "open", path);
+};
+const __fsWriteFile = (value, data, options, callback) => {
+  [options, callback] = __fsCallbackArgs(options, callback);
+  __fsCallback(
+    () => {
+      __fsPath(value);
+      __fsWriteData(data, typeof options === "string" ? options : options?.encoding);
+      __fsParseFlag(options, "w");
+    },
+    () => __fsWriteFileSync(value, data, options),
+    callback,
+  );
+};
+const __fsAppendFile = (value, data, options, callback) => {
+  [options, callback] = __fsCallbackArgs(options, callback);
+  __fsCallback(
+    () => {
+      __fsPath(value);
+      __fsWriteData(data, typeof options === "string" ? options : options?.encoding);
+      __fsParseFlag(options, "a");
+    },
+    () => __fsAppendFileSync(value, data, options),
+    callback,
+  );
+};
+// `node:stream` classes for the file streams below, loaded on first use:
+// the fs surface is eager but an isolate that never opens a file stream
+// must not pay for the stream bundle.
+const __fsStreamClasses = () => globalThis.process.getBuiltinModule("node:stream");
+// A writable `/tmp` file. Chunks reach the host as they arrive: the first
+// truncates unless the flags ask to append, every later chunk appends, so
+// the per-request cap applies as data arrives instead of at `final`. `mode`
+// is accepted and ignored, as the tree has no modes. `start` throws: the
+// tree has no positioned writes, so silently writing at offset 0 would be
+// silently wrong bytes rather than a loud failure.
+const __fsCreateWriteStream = (value, options = {}) => {
+  const path = __fsPath(value);
+  if (options !== undefined && (options === null || typeof options !== "object")) {
+    const error = new TypeError("The \"options\" argument must be of type object");
+    error.code = "ERR_INVALID_ARG_TYPE";
+    throw error;
+  }
+  if (options.start !== undefined) {
+    const error = new TypeError("The \"start\" option is not supported for /tmp streams");
+    error.code = "ERR_INVALID_ARG_VALUE";
+    throw error;
+  }
+  const { append: appendFlag, exclusive } = __fsParseFlag(
+    { flag: options.flags ?? options.flag ?? "w" }, "w");
+  // A string chunk decodes with this encoding; the Writable validates it
+  // here, so `end("4142", ...)` under `"hex"` is two bytes, not four.
+  const encoding = options.encoding ?? "utf8";
+  if (!Buffer.isEncoding(encoding)) {
+    const error = new TypeError(`Unknown encoding: ${encoding}`);
+    error.code = "ERR_UNKNOWN_ENCODING";
+    throw error;
+  }
+  const { Writable } = __fsStreamClasses();
+  let opened = false;
+  let openFailed = false;
+  // Chunks that arrive before `open`, as a synchronous `end("data")` does:
+  // Node holds them until the async open completes, so an `open` listener
+  // still reads the just-created (or just-truncated) file. Each entry keeps
+  // its callback, so a failed open fails the buffered writes too instead of
+  // confirming bytes that never landed.
+  let pendingChunks = [];
+  const failPending = (error) => {
+    const queued = pendingChunks;
+    pendingChunks = [];
+    for (const { cb } of queued) cb(error);
+  };
+  const onWrite = (chunk, chunkEncoding, cb) => {
+    try {
+      // An exclusive stream never mutates a file it did not create.
+      // Buffered chunks have landed nothing yet, so any file present
+      // before `open` is someone else's.
+      if (exclusive && !opened && __vfs_stat(path)[0]) {
+        throw __fsError("EEXIST", "open", path);
+      }
+      const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk, chunkEncoding);
+      if (!opened) {
+        pendingChunks.push({ bytes, cb });
+        return;
+      }
+      // Past `open` the file is the stream's own: every chunk appends.
+      const result = __vfs_write_file(path, bytes, true);
+      if (result && !result.startsWith("/")) throw __fsError(result, "write", path);
+      cb();
+    } catch (error) { cb(error); }
+  };
+  const onFinal = (cb) => {
+    // `final` can run before the queued open did (a synchronous `end`),
+    // so it waits its turn behind it: the open microtask was queued at
+    // construction and therefore runs first. The open microtask already
+    // created (or truncated) the file, so there is nothing left to do
+    // here: an untouched stream keeps the open-time file, and a written
+    // one keeps its appended chunks.
+    if (!opened && !openFailed) {
+      queueMicrotask(() => onFinal(cb));
+      return;
+    }
+    cb();
+  };
+  const stream = new Writable({
+    defaultEncoding: encoding,
+    write: onWrite,
+    final: onFinal,
+  });
+  stream.path = path;
+  stream.pending = true;
+  queueMicrotask(() => {
+    stream.pending = false;
+    // The file is created (or truncated) before `open`, as Node's async
+    // open does: an `open` listener that reads the path must see the new
+    // file, not `ENOENT` or the pre-truncate bytes. Initialization errors
+    // destroy the stream instead of emitting `open`, and fail the chunks
+    // buffered above. `open` fires before the buffered chunks flush, so
+    // the listener never observes them.
+    if (exclusive && __vfs_stat(path)[0]) {
+      openFailed = true;
+      const error = __fsError("EEXIST", "open", path);
+      failPending(error);
+      stream.destroy(error);
+      return;
+    }
+    const result = __vfs_write_file(path, new Uint8Array(0), appendFlag);
+    if (result && !result.startsWith("/")) {
+      openFailed = true;
+      const error = __fsError(result, "open", path);
+      failPending(error);
+      stream.destroy(error);
+      return;
+    }
+    opened = true;
+    stream.emit("open");
+    const queued = pendingChunks;
+    pendingChunks = [];
+    for (const { bytes, cb } of queued) {
+      try {
+        const flushed = __vfs_write_file(path, bytes, true);
+        if (flushed && !flushed.startsWith("/")) throw __fsError(flushed, "write", path);
+        cb();
+      } catch (error) { cb(error); }
+    }
+  });
+  return stream;
+};
+// A readable `/tmp` (or `/bundle`) file. The whole file is read up front
+// and pushed in 64 KiB chunks; `start`/`end` ranges and `encoding` throw,
+// because serving the whole file under a range request would be silently
+// wrong bytes rather than a loud failure. A missing path destroys the
+// stream with `ENOENT` (or `EISDIR` for a directory), asynchronously like Node.
+const __fsCreateReadStream = (value, options = {}) => {
+  const path = __fsPath(value);
+  if (options !== undefined && (options === null || typeof options !== "object")) {
+    const error = new TypeError("The \"options\" argument must be of type object");
+    error.code = "ERR_INVALID_ARG_TYPE";
+    throw error;
+  }
+  if (options.start !== undefined || options.end !== undefined ||
+      typeof options.encoding === "string") {
+    const error = new TypeError("The \"start\", \"end\" and \"encoding\" options are not supported for /tmp streams");
+    error.code = "ERR_INVALID_ARG_VALUE";
+    throw error;
+  }
+  const { Readable } = __fsStreamClasses();
+  const stream = new Readable({ read() {} });
+  stream.path = path;
+  stream.pending = true;
+  queueMicrotask(() => {
+    stream.pending = false;
+    const data = __vfs_read_file(path);
+    if (data === undefined) {
+      const [kind] = __vfs_stat(path);
+      stream.destroy(kind ? __fsError("EISDIR", "read", path) : __fsError("ENOENT", "open", path));
+      return;
+    }
+    stream.emit("open");
+    const bytes = new Uint8Array(data);
+    for (let offset = 0; offset < bytes.byteLength; offset += 65536) {
+      stream.push(bytes.subarray(offset, offset + 65536));
+    }
+    stream.push(null);
+  });
+  return stream;
+};
 // `fs.constants`, with the four access modes from workerd's
 // `src/node/internal/internal_fs_constants.ts`. The table carries only the
 // modes `access` reads. Every other constant belongs to an operation the
@@ -13096,15 +13347,15 @@ const __fsMode = (mode) => {
 // `access` reports what the virtual filesystem can do and not a POSIX
 // permission, so it follows workerd's `accessSyncImpl`: no file is executable,
 // therefore `X_OK` always fails, and an unwritable path fails exactly like a
-// missing one, so a caller cannot tell the two apart. Kind 2 is the writable
-// tree; see `op_vfs_stat`.
+// missing one, so a caller cannot tell the two apart. Kinds 2 and 4 are the
+// writable tree (directory and file); see `op_vfs_stat`.
 const __fsAccessSync = (value, mode) => {
   const path = __fsPath(value);
   mode = __fsMode(mode);
   const [kind] = __vfs_stat(path);
   const denied = mode & __fsConstants.X_OK
     || !kind
-    || (mode & __fsConstants.W_OK && kind !== 2);
+    || (mode & __fsConstants.W_OK && kind !== 2 && kind !== 4);
   if (denied) throw __fsError("ENOENT", "access", path);
 };
 // The callback forms run the same synchronous core as `fs.promises`.
@@ -13210,6 +13461,8 @@ const __fsPromisesSurface = {
   async lstat(...args) { return __fsLstatSync(...args); },
   async realpath(...args) { return __fsRealpathSync(...args); },
   async readFile(...args) { return __fsReadFileSync(...args); },
+  async writeFile(...args) { return __fsWriteFileSync(...args); },
+  async appendFile(...args) { return __fsAppendFileSync(...args); },
 };
 // A namespace import gets a fixed export set when V8 links the module, so a
 // partial module must enumerate unsupported Node exports too. A get trap alone
@@ -13249,10 +13502,10 @@ const __fsPromises = __celld.__fsPromises = __fsNamespaceProxy(
   __fsPromisesSurface,
   "node:fs/promises",
   [
-    "appendFile", "chmod", "chown", "copyFile", "cp", "lchmod", "lchown",
+    "chmod", "chown", "copyFile", "cp", "lchmod", "lchown",
     "link", "lutimes", "mkdtemp", "open", "opendir", "readdir", "readlink",
     "rename", "rm", "rmdir", "statfs", "symlink", "truncate", "unlink",
-    "utimes", "watch", "writeFile",
+    "utimes", "watch",
   ],
 );
 const __fsSurface = {
@@ -13267,17 +13520,23 @@ const __fsSurface = {
   lstatSync: __fsLstatSync,
   realpathSync: __fsRealpathSync,
   readFileSync: __fsReadFileSync,
+  writeFileSync: __fsWriteFileSync,
+  appendFileSync: __fsAppendFileSync,
   stat: __fsStat,
   lstat: __fsLstat,
   realpath: __fsRealpath,
   readFile: __fsReadFile,
   mkdir: __fsMkdir,
+  writeFile: __fsWriteFile,
+  appendFile: __fsAppendFile,
+  createWriteStream: __fsCreateWriteStream,
+  createReadStream: __fsCreateReadStream,
 };
 const __fsNamespaceNames = [
   "Dir", "Dirent", "ReadStream", "WriteStream", "_toUnixTimestamp",
-  "appendFile", "appendFileSync", "chmod", "chmodSync", "chown", "chownSync",
+  "chmod", "chmodSync", "chown", "chownSync",
   "close", "closeSync", "copyFile", "copyFileSync", "cp", "cpSync",
-  "createReadStream", "createWriteStream", "exists", "fchmod", "fchmodSync",
+  "exists", "fchmod", "fchmodSync",
   "fchown", "fchownSync", "fdatasync", "fdatasyncSync", "fstat", "fstatSync",
   "fsync", "fsyncSync", "ftruncate", "ftruncateSync", "futimes", "futimesSync",
   "lchmod", "lchmodSync", "lchown", "lchownSync", "link", "linkSync",
@@ -13287,7 +13546,7 @@ const __fsNamespaceNames = [
   "rm", "rmSync", "rmdir", "rmdirSync", "statfs", "statfsSync", "symlink",
   "symlinkSync", "truncate", "truncateSync", "unlink", "unlinkSync",
   "unwatchFile", "utimes", "utimesSync", "watch", "watchFile", "write",
-  "writeFile", "writeFileSync", "writeSync", "writev", "writevSync",
+  "writeSync", "writev", "writevSync",
 ];
 // Writable file contents and every mutation remain explicit unsupported
 // surfaces until a failing application seam requires them. These two reads
