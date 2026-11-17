@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): round-level fence settlement (0062); renewal lease readback carries the authority bound (upstream #264); first alarm-deadline expiry only marks the firing (upstream #256); same-guard retry on lease conflicts (upstream #239); storage-poisoned runtimes restart on their own generation (upstream #291); failed start disarms the restored alarm (upstream #276).
+// Modified by ryuzcorp (ryuzcorp/celld): round-level fence settlement (0062); renewal lease readback carries the authority bound (upstream #264); first alarm-deadline expiry only marks the firing (upstream #256); same-guard retry on lease conflicts (upstream #239); storage-poisoned runtimes restart on their own generation (upstream #291); failed start disarms the restored alarm (upstream #276); dead-owner takeovers look up fleet capacity when full (upstream #263).
 // Modified by ryuzcorp (ryuzcorp/celld): ported from meln1k/celld: coordination-core fixes (ea471ee, e46a685, 6d61462, 18d3bf9, 9d4c163, 468b456, 01522b3, b026226, 65fdb13); shared bucket-posture ownership reads across concurrent gates (0056).
 // Modified by ryuzcorp (ryuzcorp/celld): MergeTree-style lazy handoff policy (0078).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
@@ -4310,6 +4310,69 @@ impl State {
         }
     }
 
+    /// Place a dead owner's cell after the takeover interlock cleared it.
+    /// This mirrors `place_unowned`'s capacity routing for a claim that is
+    /// already known to be a takeover: a node with room activates locally,
+    /// and a node without room for live demand looks for fleet capacity
+    /// instead of parking the requests behind a residency slot it will never
+    /// free. An ingress-only node (`CELLD_MAX_RESIDENT_CELLS=0`) used to take
+    /// the dead owner's cell over itself and fail `CapacityExhausted`
+    /// forever, even with a healthy peer idle (denoland/celld#263). The
+    /// claim keeps its takeover mark and prior owner either way, so the
+    /// node-log interlock still sees exactly the decision it approved.
+    fn place_takeover(
+        &mut self,
+        id: &str,
+        cell: &mut Cell,
+        claim: Claim,
+        effects: &mut Vec<Effect>,
+    ) {
+        if self.has_capacity() {
+            self.activate_or_wait(
+                id,
+                cell,
+                Activation::Claim(claim),
+                WhenFull::ShedToAdmit,
+                effects,
+            );
+            return;
+        }
+        // An ownership-only handoff parks dormant after its claim and holds
+        // no residency slot, so the cap is no reason to refuse it — the same
+        // exception `place_unowned` carries.
+        if !cell.requests.is_empty()
+            && cell
+                .requests
+                .iter()
+                .all(|request| self.handoff_requests.contains(request))
+        {
+            self.begin_activation(id, cell, Activation::Claim(claim), effects);
+            return;
+        }
+        let handoffs: Vec<RequestId> = cell
+            .requests
+            .iter()
+            .copied()
+            .filter(|request| self.capacity_requests.contains(request))
+            .collect();
+        for request in handoffs {
+            cell.requests.remove(&request);
+            self.request_cells.remove(&request);
+            self.complete_request(id, request, Err(RequestError::CapacityExhausted), effects);
+        }
+        if cell.requests.is_empty() || !self.config.require_node_lease {
+            self.activate_or_wait(
+                id,
+                cell,
+                Activation::Claim(claim),
+                WhenFull::ShedToAdmit,
+                effects,
+            );
+        } else {
+            self.begin_capacity_lookup(id, cell, claim, effects);
+        }
+    }
+
     fn owner_read(
         &mut self,
         op: OpId,
@@ -4787,17 +4850,21 @@ impl State {
                     return;
                 };
                 let prior = record.node.clone();
-                self.activate_or_wait(
+                // Route through the takeover placement, not straight at a
+                // local activation: a node with no room (an ingress-only node
+                // most sharply) must hand live demand to a peer with room
+                // rather than park it behind a slot it will never free
+                // (denoland/celld#263).
+                self.place_takeover(
                     id,
                     cell,
-                    Activation::Claim(Claim {
+                    Claim {
                         guard: CasGuard::Match(record.etag),
                         epoch,
                         takeover: true,
                         prior,
                         reconciles: 0,
-                    }),
-                    WhenFull::ShedToAdmit,
+                    },
                     effects,
                 );
             }
@@ -4837,17 +4904,19 @@ impl State {
                     return;
                 };
                 let prior = owner.node.clone();
-                self.activate_or_wait(
+                // Same routing as the direct dead-owner path above: no room
+                // locally means a capacity lookup, not a parked waiter
+                // (denoland/celld#263).
+                self.place_takeover(
                     &id,
                     &mut cell,
-                    Activation::Claim(Claim {
+                    Claim {
                         guard: CasGuard::Match(owner.etag),
                         epoch,
                         takeover: true,
                         prior,
                         reconciles: 0,
-                    }),
-                    WhenFull::ShedToAdmit,
+                    },
                     effects,
                 );
                 cell.owner_log_recovery_attempts = 0;
