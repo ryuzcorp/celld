@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): cross-isolate RPC stubs and streams; D1 export operator-ingress marker; ported from meln1k/celld: report wake coverage after maintenance (e6cb9a3); wake coverage follow-ups: startup observation ordering, installation comparison; trusted cell RPC; deployment cache scope purge on generation free; staged invoke joins the driver past the reply.; answered drivers poll while waitUntil background is outstanding (upstream #300); drivers take the mailbox once more before retiring (upstream #309); answered waitUntil with no ops polls for settlement (upstream #289)
+// Modified by ryuzcorp (ryuzcorp/celld): cross-isolate RPC stubs and streams; D1 export operator-ingress marker; ported from meln1k/celld: report wake coverage after maintenance (e6cb9a3); wake coverage follow-ups: startup observation ordering, installation comparison; trusted cell RPC; deployment cache scope purge on generation free; staged invoke joins the driver past the reply.; answered drivers poll while waitUntil background is outstanding (upstream #300); drivers take the mailbox once more before retiring (upstream #309); answered waitUntil with no ops polls for settlement (upstream #289); post-response background budget ends orphaned drives (upstream #275).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 // RuntimeManager is the V8 cell-host arm, so its executor and observability
@@ -2414,6 +2414,23 @@ async fn drive_worker(
                     entry.time_out(budget);
                     Vec::new()
                 }
+                Wake::BackgroundExpired => {
+                    let background_budget = crate::engine_api::background_budget();
+                    entry.expire_background();
+                    if entry.keeps_native_ops() {
+                        tracing::warn!(
+                            budget_s = background_budget.as_secs(),
+                            "background work outlived its budget but keeps native ops; not ending it"
+                        );
+                    } else {
+                        tracing::info!(
+                            event = "cell_background_expired",
+                            budget_s = background_budget.as_secs(),
+                            "post-response work outlived its budget; ending it"
+                        );
+                    }
+                    Vec::new()
+                }
                 Wake::Idle => {
                     entry.stuck();
                     Vec::new()
@@ -2472,6 +2489,10 @@ enum Wake {
     Cancelled { shutdown: bool },
     /// It ran past the handler budget without answering.
     Expired,
+    /// Its post-response work outlived the background budget (upstream
+    /// #275). The driver ends the background work so a retiring generation
+    /// can drain, rather than pinning the isolate until the process exits.
+    BackgroundExpired,
     /// Nothing outstanding could ever move it.
     Idle,
     /// A nested Worker entrypoint is pending without native work. Reject that
@@ -2499,6 +2520,18 @@ async fn wake_with_cross_entry_gate(
     budget: Duration,
 ) -> Wake {
     let wait = entry.prepare_cross_entry_gate_wait();
+    // Bound post-response work (upstream #275): once the handler has
+    // settled, leftover timers and `waitUntil` keep the affiliation — and
+    // the isolate — only until the background budget. Past it the driver
+    // ends the background work, so a retiring generation drains instead of
+    // pinning a heap per deploy. The clock starts when the response is
+    // fully released (past the output gate), not when the handler settles.
+    if entry.remaining(budget).is_none()
+        && entry.gated_reply_and_io_context().0.is_none()
+        && entry.background_expired(crate::engine_api::background_budget())
+    {
+        return Wake::BackgroundExpired;
+    }
     match wait
         .wait(wake(ops, entry, budget), |wake| matches!(wake, Wake::Idle))
         .await
@@ -3764,6 +3797,31 @@ async fn drive_cell_inner(
                     .await;
                 #[cfg(celld_internal_tests)]
                 notify_gated_failure_for_test(&mut entry, &mut test_observers.gated_failure);
+                (Vec::new(), Vec::new())
+            }
+            Wake::BackgroundExpired => {
+                // The response already went out, so this records no
+                // failure: it seals further `waitUntil`, drops the
+                // background claim, and lets the abort pass below release
+                // the isolate. An event still holding the cell's input
+                // gate or running another event's critical section keeps
+                // its ops by design, and stays loud about it.
+                let background_budget = crate::engine_api::background_budget();
+                entry.expire_background();
+                if entry.keeps_native_ops() {
+                    tracing::warn!(
+                        scope = %scope,
+                        budget_s = background_budget.as_secs(),
+                        "background work outlived its budget but keeps native ops; not ending it"
+                    );
+                } else {
+                    tracing::info!(
+                        event = "cell_background_expired",
+                        scope = %scope,
+                        budget_s = background_budget.as_secs(),
+                        "post-response work outlived its budget; ending it"
+                    );
+                }
                 (Vec::new(), Vec::new())
             }
             Wake::Idle => {

@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): node:crypto scrypt; container exec resize op; cross-isolate RPC stubs and streams; test-only fake exec ops; fake kill completion op; exec reads survive their subscribing event; per-node Workers Cache API ops; tenant egress policy; D1 export operator-ingress marker; stateless attribution tokens; reaction-aware request resources; fake close/signal completion ops; binding-forgery enforcement; trusted cell RPC; Queue DLQ forward host op; DLQ forward caller identity; WebSocket and TCP socket ownership; receiver-held stream lifetime; deployment cache scope key; share the /bundle tree per deployment generation.; cancelled requests reject pending ops so co-awaiters settle (upstream #317); answered drivers poll while waitUntil background is outstanding (upstream #300); refused handoffs reject instead of dropping resolvers (upstream #309); facet adoption drops the restored flag (upstream #292).
+// Modified by ryuzcorp (ryuzcorp/celld): node:crypto scrypt; container exec resize op; cross-isolate RPC stubs and streams; test-only fake exec ops; fake kill completion op; exec reads survive their subscribing event; per-node Workers Cache API ops; tenant egress policy; D1 export operator-ingress marker; stateless attribution tokens; reaction-aware request resources; fake close/signal completion ops; binding-forgery enforcement; trusted cell RPC; Queue DLQ forward host op; DLQ forward caller identity; WebSocket and TCP socket ownership; receiver-held stream lifetime; deployment cache scope key; share the /bundle tree per deployment generation.; cancelled requests reject pending ops so co-awaiters settle (upstream #317); answered drivers poll while waitUntil background is outstanding (upstream #300); refused handoffs reject instead of dropping resolvers (upstream #309); facet adoption drops the restored flag (upstream #292); background expiry for orphaned drives (upstream #275).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 // The raw V8 adapter and its child modules remain outside the Actor execution
@@ -3546,6 +3546,10 @@ pub struct InFlight {
     /// The alarm bookkeeping this entry still owes, if it is one.
     alarm: Option<AlarmClaim>,
     started: Instant,
+    /// When the post-response background phase began, once the handler has
+    /// settled (upstream #275). Stamped on first observation so the budget
+    /// bounds leftover work even when no wake ever fires again.
+    background_since: Option<Instant>,
     /// The propagation context for this entry. A rejected foreign context
     /// stays here with `sampled` clear, so continuations can forward it
     /// without treating it as permission to record spans or logs.
@@ -3958,6 +3962,28 @@ impl InFlight {
     /// Give up on a handler that will not settle.
     pub fn time_out(&mut self, budget: Duration) {
         self.fail(anyhow!("handler exceeded {}s budget", budget.as_secs()));
+    }
+
+    /// Whether post-response work has outlived its budget (upstream #275).
+    /// Stamps the background phase on first observation, so the budget
+    /// bounds leftover work even when no wake ever fires again. The caller
+    /// checks this only once the handler has settled, so the stamp is the
+    /// background phase's start, not the event's.
+    pub fn background_expired(&mut self, budget: Duration) -> bool {
+        let since = *self.background_since.get_or_insert_with(Instant::now);
+        since.elapsed() >= budget
+    }
+
+    /// End background work that outlived its budget (upstream #275): seal
+    /// off further `waitUntil` and drop the background claim, without
+    /// failing the already-answered request. The driver's abort pass then
+    /// drops the pending operations and the entry finishes, releasing the
+    /// isolate — unless the event still holds the cell's input gate or runs
+    /// another event's critical section, which keep it alive by design.
+    pub fn expire_background(&mut self) {
+        self.background = None;
+        self.completed_cell_event = false;
+        self.context.seal_wait_until();
     }
 
     /// Nothing this request awaits can move it, so it will never settle on
@@ -4934,6 +4960,7 @@ fn begin<'s>(
                 unrefed_ops: std::collections::HashSet::new(),
                 alarm: None,
                 started: Instant::now(),
+                background_since: None,
                 trace: None,
                 failure: None,
                 tail_report,
@@ -5033,6 +5060,7 @@ fn begin_entrypoint_rpc(
                 unrefed_ops: std::collections::HashSet::new(),
                 alarm: None,
                 started: event_started,
+                background_since: None,
                 trace: None,
                 failure: None,
                 tail_report: None,
@@ -5277,6 +5305,7 @@ fn begin_queue(
                 unrefed_ops: std::collections::HashSet::new(),
                 alarm: None,
                 started: Instant::now(),
+                background_since: None,
                 trace: None,
                 failure: None,
                 tail_report: None,
@@ -5462,6 +5491,7 @@ fn start_cell_event<'s>(
                 unrefed_ops: std::collections::HashSet::new(),
                 alarm: None,
                 started: event_started,
+                background_since: None,
                 trace: None,
                 failure: None,
                 tail_report: None,
@@ -5517,6 +5547,7 @@ fn start_cell_event<'s>(
                     unrefed_ops: std::collections::HashSet::new(),
                     alarm: None,
                     started: event_started,
+                    background_since: None,
                     trace: None,
                     failure: Some(failure),
                     tail_report: None,

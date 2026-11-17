@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): D1 export operator-ingress marker; ported from meln1k/celld: report wake coverage after maintenance (e6cb9a3); shared-cell compat union; WebSocket join tokens.
+// Modified by ryuzcorp (ryuzcorp/celld): D1 export operator-ingress marker; ported from meln1k/celld: report wake coverage after maintenance (e6cb9a3); shared-cell compat union; WebSocket join tokens; post-response background budget (upstream #275).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! Engine-neutral types and helpers that the cell runtimes and the host
@@ -954,4 +954,95 @@ pub fn handler_budget() -> std::time::Duration {
                 .expect("validated CELLD_HANDLER_BUDGET_S"),
         )
     })
+}
+
+/// How long post-response work may keep its isolate (upstream #275):
+/// `CELLD_BACKGROUND_BUDGET_S`, 30 seconds by default, the Cloudflare
+/// `waitUntil` limit. A handler that settles but leaves timers or
+/// `waitUntil` pending keeps its affiliation — and its isolate — until they
+/// finish; past this budget the driver ends the background work so a
+/// retiring generation can drain. Applies to cell and stateless drives
+/// alike. The clock starts when the response is fully released (past the
+/// output gate), not when the handler settles.
+pub fn background_budget() -> std::time::Duration {
+    #[cfg(any(test, celld_internal_tests))]
+    if let Some(budget) = background_budget_for_test() {
+        return budget;
+    }
+    static BUDGET: OnceLock<std::time::Duration> = OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        std::time::Duration::from_secs(
+            crate::env_vars::positive_or("CELLD_BACKGROUND_BUDGET_S", 30)
+                .expect("validated CELLD_BACKGROUND_BUDGET_S"),
+        )
+    })
+}
+
+/// A test's background budget override, if one is armed. Process-wide
+/// rather than thread-local: drives run on runtime worker threads, not the
+/// test's thread.
+#[cfg(any(test, celld_internal_tests))]
+static BACKGROUND_BUDGET_OVERRIDE: std::sync::Mutex<Option<std::time::Duration>> =
+    std::sync::Mutex::new(None);
+
+/// Read a test's background budget override, if one is armed.
+#[cfg(any(test, celld_internal_tests))]
+fn background_budget_for_test() -> Option<std::time::Duration> {
+    *BACKGROUND_BUDGET_OVERRIDE
+        .lock()
+        .expect("background budget override poisoned")
+}
+
+/// Arm a background budget for the scope's duration, restoring the prior
+/// policy on unwind so one scenario cannot alter another.
+#[cfg(any(test, celld_internal_tests))]
+pub fn with_background_budget_for_test<T>(
+    budget: std::time::Duration,
+    build: impl FnOnce() -> T,
+) -> T {
+    struct Reset(Option<std::time::Duration>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            *BACKGROUND_BUDGET_OVERRIDE
+                .lock()
+                .expect("background budget override poisoned") = self.0;
+        }
+    }
+    let previous = BACKGROUND_BUDGET_OVERRIDE
+        .lock()
+        .expect("background budget override poisoned")
+        .replace(budget);
+    let _reset = Reset(previous);
+    build()
+}
+
+#[cfg(test)]
+mod background_budget_tests {
+    use super::*;
+
+    #[test]
+    fn default_matches_cloudflare_waituntil_limit() {
+        // No override armed: the production default applies. (The suite
+        // never sets CELLD_BACKGROUND_BUDGET_S, so this pins the default.)
+        assert_eq!(
+            background_budget(),
+            std::time::Duration::from_secs(30),
+            "post-response work gets the waitUntil limit by default"
+        );
+    }
+
+    #[test]
+    fn override_applies_and_restores() {
+        with_background_budget_for_test(std::time::Duration::from_millis(200), || {
+            assert_eq!(
+                background_budget(),
+                std::time::Duration::from_millis(200)
+            );
+        });
+        assert_eq!(
+            background_budget(),
+            std::time::Duration::from_secs(30),
+            "the override restores after its scope"
+        );
+    }
 }
