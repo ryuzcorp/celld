@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): reaction-aware request resources; unrefed websocket bind wait; binding-forgery enforcement; WebSocket ownership.
+// Modified by ryuzcorp (ryuzcorp/celld): reaction-aware request resources; unrefed websocket bind wait; binding-forgery enforcement; WebSocket ownership; post-response DO dial keeps its cell scope (upstream #254).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! WebSockets inside the isolate: the registry, the ops JS calls, and the
@@ -502,6 +502,24 @@ pub(super) fn op_ws_upgrade(
     // a retired owner throws with no queue and no push.
     let Some(owner) = reaction_or_current_context(scope) else {
         return retired_event_throw(scope);
+    };
+    // A continuation running after its dispatch answered lost its actor
+    // scope on the harness side -- the actor event pops when the response
+    // goes out -- but the request's egress frame still names its cell. A
+    // Durable Object's I/O belongs to the object, not to the one request,
+    // so route the dial by that cell: without this the dial leaves as a
+    // Worker isolate socket of an already-retired event, and the turn-end
+    // cleanup closes it before the connector opens it (upstream #254). A
+    // Worker dispatch pushes no frame, so workers keep the isolate path;
+    // facets keep theirs too, since their join needs the facet record only
+    // a live dispatch can supply.
+    let cell = if cell.is_empty() {
+        match current_cell_event(&owner) {
+            Some(frame) if frame.root.is_none() && !frame.storage.is_empty() => frame.storage,
+            _ => cell,
+        }
+    } else {
+        cell
     };
     if ws_claim_id(scope, "WebSocket upgrade", id, &owner).is_err() {
         return;
