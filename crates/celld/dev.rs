@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): operator token for the internal listener; `celld dev --port 0` assigns an ephemeral port; staged activation; deploy --read-root option; non-dumpable serving process.
+// Modified by ryuzcorp (ryuzcorp/celld): operator token for the internal listener; `celld dev --port 0` assigns an ephemeral port; staged activation; deploy --read-root option; non-dumpable serving process; local state path helper for d1 --local (upstream #272).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 // Modified by ryuzcorp (ryuzcorp/celld): deploy --sourcemap writes the bundle's external map.
 
@@ -51,7 +51,7 @@ struct Options {
 /// `PathBuf` field would let a later caller pass any path and lose nothing at
 /// compile time.
 #[derive(Debug)]
-struct DevState {
+pub(crate) struct DevState {
     path: PathBuf,
 }
 
@@ -64,6 +64,13 @@ impl DevState {
         Self {
             path: project.join(Self::DIRECTORY),
         }
+    }
+
+    /// The SQLite file behind one project's local state, for operator
+    /// commands that reach the `celld dev` node through it (`d1 --local`).
+    /// Pure path math: the caller decides what a missing file means.
+    pub(crate) fn database_for_project(project: &Path) -> PathBuf {
+        Self::for_project(project).path.join("objects.sqlite3")
     }
 
     fn path(&self) -> &Path {
