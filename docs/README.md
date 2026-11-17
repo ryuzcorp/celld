@@ -413,6 +413,13 @@ operator can invoke: the internal-listener route requires the fleet
 signature plus the operator token when one is set. See
 [Invoke a staged version](staged-invoke.md).
 
+`celld versions [SCRIPT]` lists the deployed versions from one LIST of the
+deployment manifests, marking the serving generation current from the
+fleet-wide pointer (top-level version plus staged components); an optional
+`SCRIPT` narrows the rows. Rollback and prune stay `celld activate` and
+`celld discard`. Serving an old version against live cell state is out of
+scope: there is no preview.
+
 ## Start a node
 
 For local development, the default listener is sufficient:

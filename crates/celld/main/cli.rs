@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): CELLD_MEMORY_SCOPE help; operator token for the internal listener; staged activation; staged invoke command; CELLD_DEPLOY_AWS_* help; non-dumpable serving process. bucket-posture group commit: bundle switch help (0070); bundle switch defaults off (0075); CELLD_NODE pinning help (upstream #249); background budget help (upstream #275); CELLD_TMP_MAX_BYTES help (upstream #280).
+// Modified by ryuzcorp (ryuzcorp/celld): CELLD_MEMORY_SCOPE help; operator token for the internal listener; staged activation; staged invoke command; CELLD_DEPLOY_AWS_* help; non-dumpable serving process. bucket-posture group commit: bundle switch help (0070); bundle switch defaults off (0075); CELLD_NODE pinning help (upstream #249); background budget help (upstream #275); CELLD_TMP_MAX_BYTES help (upstream #280); celld versions command (upstream #181).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! The command line: what the process was asked to do, and the help text
@@ -39,6 +39,7 @@ pub(crate) enum Action {
     Deploy(Vec<String>),
     Activate(Vec<String>),
     Discard(Vec<String>),
+    Versions(Vec<String>),
     Invoke(Vec<String>),
     Dev(Vec<String>),
     Cell(Vec<String>),
@@ -89,6 +90,7 @@ pub(crate) fn action_from_process() -> anyhow::Result<Action> {
             "deploy" => return Ok(Action::Deploy(arguments)),
             "activate" => return Ok(Action::Activate(arguments)),
             "discard" => return Ok(Action::Discard(arguments)),
+            "versions" => return Ok(Action::Versions(arguments)),
             "invoke" => return Ok(Action::Invoke(arguments)),
             "dev" => return Ok(Action::Dev(arguments)),
             "cell" => return Ok(Action::Cell(arguments)),
@@ -287,6 +289,7 @@ USAGE:
   celld deploy [PROJECT] --bucket [s3://|gs://|az://]NAME[/PREFIX] [OPTIONS]
   celld activate SCRIPT=VERSION... --bucket [s3://|gs://|az://]NAME[/PREFIX] [OPTIONS]
   celld discard SCRIPT=VERSION... --bucket [s3://|gs://|az://]NAME[/PREFIX] [OPTIONS]
+  celld versions [SCRIPT] --bucket [s3://|gs://|az://]NAME[/PREFIX] [OPTIONS]
   celld invoke SCRIPT=VERSION... --path PATH --bucket [s3://|gs://|az://]NAME[/PREFIX]
   celld dev [PROJECT] [--host IP] [--port PORT] [--logs]
   celld cell list [CLASS] --bucket [s3://|gs://|az://]NAME[/PREFIX] [OPTIONS]
@@ -464,6 +467,7 @@ mod action_serving_tests {
             Action::Deploy(Vec::new()),
             Action::Activate(Vec::new()),
             Action::Discard(Vec::new()),
+            Action::Versions(Vec::new()),
             Action::Invoke(Vec::new()),
             Action::Cell(Vec::new()),
             Action::D1(Vec::new()),

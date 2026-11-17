@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): idempotent content-tagged image create; tag-race tests run the fake engine through sh; deploy --sourcemap writes the bundle's external map; service binding targets validated at deploy; staged activation; deploy --sourcemap collects the no_bundle sibling map; staged invoke shares the version-ref parsing; deploy reads stay inside the project; deploy --read-root bounds bundling and container builds; durable object bindings with a foreign script_name are refused (upstream #312); image tars upload multipart (upstream #307).
+// Modified by ryuzcorp (ryuzcorp/celld): idempotent content-tagged image create; tag-race tests run the fake engine through sh; deploy --sourcemap writes the bundle's external map; service binding targets validated at deploy; staged activation; deploy --sourcemap collects the no_bundle sibling map; staged invoke shares the version-ref parsing; deploy reads stay inside the project; deploy --read-root bounds bundling and container builds; durable object bindings with a foreign script_name are refused (upstream #312); image tars upload multipart (upstream #307); celld versions lists deployed versions (upstream #181).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 // Deployment is an operator control-plane path outside the Actor execution
@@ -457,6 +457,145 @@ pub fn discard_options_from_arguments(
         bail!("`celld discard` names at least one SCRIPT=VERSION");
     }
     Ok(Some(options))
+}
+
+#[derive(Debug)]
+pub struct VersionsOptions {
+    pub bucket: Option<String>,
+    pub endpoint: Option<String>,
+    pub region: Option<String>,
+    pub json: bool,
+    pub script: Option<String>,
+}
+
+pub fn print_versions_help() {
+    let text = "celld versions — list the immutable deployments the fleet bucket holds\n\n\
+USAGE:\n  celld versions [SCRIPT] --bucket [s3://|gs://|az://]NAME[/PREFIX] [OPTIONS]\n\n\
+Each `celld deploy` writes one immutable version directory per script. The\n\
+fleet-wide pointer names the serving generation; `celld activate SCRIPT=VERSION`\n\
+moves back to an earlier version for rollback, and `celld discard\n\
+SCRIPT=VERSION` deletes a version no pointer names. This command lists what\n\
+is there, marking the serving versions `current`.\n\n\
+OPTIONS:\n  --bucket [s3://|gs://|az://]NAME[/PREFIX]\n                         Fleet bucket and prefix; defaults to CELLD_BUCKET\n  --endpoint URL         S3-compatible endpoint; defaults to S3_ENDPOINT\n  --region REGION        Storage region; defaults to AWS_REGION\n  --json                 Print one JSON object per version\n  -h, --help             Show this help"
+    ;
+    let _ = crate::cli_output::Output::new(crate::cli_output::Format::Text).help(text);
+}
+
+pub fn versions_options_from_arguments(
+    arguments: impl IntoIterator<Item = String>,
+) -> anyhow::Result<Option<VersionsOptions>> {
+    let mut options = VersionsOptions {
+        bucket: None,
+        endpoint: None,
+        region: None,
+        json: false,
+        script: None,
+    };
+    let mut arguments = arguments.into_iter();
+    while let Some(argument) = arguments.next() {
+        match argument.as_str() {
+            "--help" | "-h" => return Ok(None),
+            "--json" => options.json = true,
+            "--bucket" => {
+                let value = arguments.next().context("--bucket requires a value")?;
+                options.bucket = Some(value);
+            }
+            "--endpoint" => {
+                options.endpoint = Some(arguments.next().context("--endpoint requires a value")?);
+            }
+            "--region" => {
+                options.region = Some(arguments.next().context("--region requires a value")?);
+            }
+            other if other.starts_with('-') => {
+                bail!("unknown argument for `celld versions`: {other}")
+            }
+            other if options.script.is_none() => options.script = Some(other.to_string()),
+            other => bail!("`celld versions` takes one script, and already has one: {other}"),
+        }
+    }
+    Ok(Some(options))
+}
+
+/// One immutable deployment the bucket still holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VersionEntry {
+    pub script: String,
+    pub version: String,
+    /// The serving generation's top-level version, one of its components,
+    /// or — under a fleet-wide pointer without a components map — the
+    /// version a named pointer names. Serving loads service bindings
+    /// through the named pointers there, so a current version is a
+    /// rollback target `celld activate` accepts and a version `celld
+    /// discard` refuses.
+    pub current: bool,
+}
+
+/// Every `deploy/<script>/<version>/manifest.json` in the bucket, by
+/// script then version. The serving versions come from the fleet-wide
+/// pointer — its primary and, under an activated generation, its
+/// components — plus, under a pointer without a components map (a plain
+/// `celld deploy`), every named pointer, through which serving resolves
+/// service bindings there. A bucket without a fleet pointer (no deploy
+/// yet) marks nothing current. Pointer reads fail when they name a
+/// version, because a rollback target must resolve.
+pub async fn list_versions(
+    bucket: &Bucket,
+    script: Option<&str>,
+) -> anyhow::Result<Vec<VersionEntry>> {
+    let mut current = std::collections::BTreeSet::new();
+    if let Some((body, _)) = bucket.get(crate::fleet::CURRENT_POINTER_KEY).await? {
+        let pointer: DeployPointer = serde_json::from_slice(&body)
+            .with_context(|| format!("decode {}", crate::fleet::CURRENT_POINTER_KEY))?;
+        // The primary serves under every pointer shape, so it is always
+        // current. An activated generation names the rest of the serving
+        // set in its components map; under a plain pointer serving
+        // resolves service bindings through the named pointers instead,
+        // so those name the serving versions there.
+        let primary = pointer.script_name.map(|script| (script, pointer.version));
+        current.extend(primary);
+        match pointer.components {
+            Some(generation) => {
+                for (script_name, component) in generation {
+                    current.insert((script_name, component.version));
+                }
+            }
+            None => {
+                for (script_name, component) in legacy_components(bucket)
+                    .await
+                    .context("list the named deployment pointers")?
+                {
+                    current.insert((script_name, component.version));
+                }
+            }
+        }
+    }
+    let mut entries = Vec::new();
+    for object in bucket.list("deploy/").await? {
+        let key: &str = object.location.as_ref();
+        let Some(rest) = key.strip_prefix("deploy/") else {
+            continue;
+        };
+        let mut parts = rest.split('/');
+        let (Some(script_name), Some(version), Some("manifest.json")) =
+            (parts.next(), parts.next(), parts.next())
+        else {
+            continue;
+        };
+        if parts.next().is_some() {
+            continue;
+        }
+        if script.is_some_and(|want| want != script_name) {
+            continue;
+        }
+        entries.push(VersionEntry {
+            current: current.contains(&(script_name.to_string(), version.to_string())),
+            script: script_name.to_string(),
+            version: version.to_string(),
+        });
+    }
+    entries
+        .sort_by(|left, right| (&left.script, &left.version).cmp(&(&right.script, &right.version)));
+    Ok(entries)
 }
 
 /// What a config resolves to once the allowlist has been applied.
@@ -5486,6 +5625,193 @@ fi
                 "unexpected error: {error:#}"
             );
         }
+    }
+
+    #[test]
+    fn versions_options_parse_script_and_flags() {
+        let options = versions_options_from_arguments([
+            "app".to_string(),
+            "--json".to_string(),
+            "--bucket".to_string(),
+            "s3://fleet".to_string(),
+        ])
+        .expect("parse")
+        .expect("options");
+        assert_eq!(options.script.as_deref(), Some("app"));
+        assert!(options.json);
+        assert_eq!(options.bucket.as_deref(), Some("s3://fleet"));
+        let error = versions_options_from_arguments(["app".to_string(), "other".to_string()])
+            .expect_err("two scripts must be refused");
+        assert!(
+            format!("{error:?}").contains("one script"),
+            "the refusal must name the limit: {error:?}"
+        );
+        versions_options_from_arguments(["--nope".to_string()])
+            .expect_err("an unknown flag must be refused");
+    }
+
+    /// Listing reads one LIST and the fleet-wide pointer: the serving
+    /// version is `current`, everything else is not, and a script filter
+    /// narrows the rows.
+    #[tokio::test]
+    async fn versions_list_marks_the_serving_version_current() {
+        let bucket = crate::bucket::Bucket::for_test();
+        for (script, version) in [
+            ("app", "aaaaaaaaaaaaaaaa"),
+            ("app", "bbbbbbbbbbbbbbbb"),
+            ("other", "cccccccccccccccc"),
+        ] {
+            bucket
+                .put(
+                    &format!("deploy/{script}/{version}/manifest.json"),
+                    "{}".to_string(),
+                )
+                .await
+                .unwrap();
+        }
+        // Pointer-adjacent keys are not versions. The named pointer is a
+        // real one: the listing reads it, so its body must decode.
+        bucket
+            .put(
+                "deploy/app/current.json",
+                serde_json::to_vec(&DeployPointer {
+                    script_name: Some("app".to_string()),
+                    version: "bbbbbbbbbbbbbbbb".to_string(),
+                    prefix: "deploy/app/bbbbbbbbbbbbbbbb".to_string(),
+                    rollout: Rollout { percent: 100 },
+                    components: None,
+                })
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let pointer = DeployPointer {
+            script_name: Some("app".to_string()),
+            version: "bbbbbbbbbbbbbbbb".to_string(),
+            prefix: "deploy/app/bbbbbbbbbbbbbbbb".to_string(),
+            rollout: Rollout { percent: 100 },
+            components: None,
+        };
+        bucket
+            .put(
+                crate::fleet::CURRENT_POINTER_KEY,
+                serde_json::to_vec(&pointer).unwrap(),
+            )
+            .await
+            .unwrap();
+        let entries = list_versions(&bucket, None).await.unwrap();
+        assert_eq!(
+            entries,
+            [
+                ("app", "aaaaaaaaaaaaaaaa", false),
+                ("app", "bbbbbbbbbbbbbbbb", true),
+                ("other", "cccccccccccccccc", false),
+            ]
+            .into_iter()
+            .map(|(script, version, current)| VersionEntry {
+                script: script.to_string(),
+                version: version.to_string(),
+                current,
+            })
+            .collect::<Vec<_>>()
+        );
+        let entries = list_versions(&bucket, Some("other")).await.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].script, "other");
+        assert!(!entries[0].current);
+    }
+
+    #[tokio::test]
+    async fn versions_list_without_a_pointer_marks_nothing_current() {
+        let bucket = crate::bucket::Bucket::for_test();
+        bucket
+            .put(
+                "deploy/app/aaaaaaaaaaaaaaaa/manifest.json",
+                "{}".to_string(),
+            )
+            .await
+            .unwrap();
+        let entries = list_versions(&bucket, None).await.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(!entries[0].current);
+    }
+
+    /// A plain `celld deploy` leaves the fleet-wide pointer without a
+    /// components map while service versions stay on their named pointers:
+    /// serving loads the service binding through `deploy/<service>/
+    /// current.json`, and `celld discard` refuses that version, so the
+    /// listing must mark it current beside the primary.
+    #[tokio::test]
+    async fn versions_list_marks_named_pointer_versions_current_without_a_generation() {
+        let bucket = crate::bucket::Bucket::for_test();
+        for (script, version) in [
+            ("app", "aaaaaaaaaaaaaaaa"),
+            ("app", "bbbbbbbbbbbbbbbb"),
+            ("other", "cccccccccccccccc"),
+        ] {
+            bucket
+                .put(
+                    &format!("deploy/{script}/{version}/manifest.json"),
+                    "{}".to_string(),
+                )
+                .await
+                .unwrap();
+        }
+        // What a plain `celld deploy` of each script leaves behind: a
+        // primary-only fleet pointer and one named pointer per script.
+        let plain = |script: &str, version: &str| DeployPointer {
+            script_name: Some(script.to_string()),
+            version: version.to_string(),
+            prefix: format!("deploy/{script}/{version}"),
+            rollout: Rollout { percent: 100 },
+            components: None,
+        };
+        bucket
+            .put(
+                crate::fleet::CURRENT_POINTER_KEY,
+                serde_json::to_vec(&plain("app", "bbbbbbbbbbbbbbbb")).unwrap(),
+            )
+            .await
+            .unwrap();
+        bucket
+            .put(
+                "deploy/other/current.json",
+                serde_json::to_vec(&plain("other", "cccccccccccccccc")).unwrap(),
+            )
+            .await
+            .unwrap();
+        let entries = list_versions(&bucket, None).await.unwrap();
+        assert_eq!(
+            entries,
+            [
+                ("app", "aaaaaaaaaaaaaaaa", false),
+                ("app", "bbbbbbbbbbbbbbbb", true),
+                ("other", "cccccccccccccccc", true),
+            ]
+            .into_iter()
+            .map(|(script, version, current)| VersionEntry {
+                script: script.to_string(),
+                version: version.to_string(),
+                current,
+            })
+            .collect::<Vec<_>>()
+        );
+        // The listing agrees with `discard`: the named version is
+        // protected, so discarding it is refused as the activated version
+        // of its script.
+        let error = discard(
+            &bucket,
+            &[VersionRef {
+                script: "other".to_string(),
+                version: "cccccccccccccccc".to_string(),
+            }],
+        )
+        .await
+        .expect_err("a named-pointer version must be discard-protected");
+        assert!(
+            format!("{error:?}").contains("activated version of that script"),
+            "the refusal must name the named pointer: {error:?}"
+        );
     }
 
     #[test]
