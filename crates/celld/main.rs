@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): cross-isolate RPC stubs and streams; operator token for the internal listener; D1 export operator-ingress marker; ported from meln1k/celld: report wake coverage after maintenance (e6cb9a3); staged activation; trusted cell RPC; WebSocket join tokens; --version reports the full build version; staged invoke operator route; non-dumpable serving process; bucket-posture group commit: paged gate judges PAGED_FORMAT (0059); bucket-posture group commit: bucket bundle gate plumbing (0060); bucket-posture group commit: bundle switch defaults off (0075).
+// Modified by ryuzcorp (ryuzcorp/celld): cross-isolate RPC stubs and streams; operator token for the internal listener; D1 export operator-ingress marker; ported from meln1k/celld: report wake coverage after maintenance (e6cb9a3); staged activation; trusted cell RPC; WebSocket join tokens; --version reports the full build version; staged invoke operator route; non-dumpable serving process; bucket-posture group commit: paged gate judges PAGED_FORMAT (0059); bucket-posture group commit: bucket bundle gate plumbing (0060); bucket-posture group commit: bundle switch defaults off (0075); stale-route marker import from peer_auth (upstream #273).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 // The binary contains connection, startup, shutdown, and V8 shell code. The
@@ -248,8 +248,7 @@ fn clean_reload_is_eligible(
 
 type HttpReply = Response<UnsyncBoxBody<Bytes, std::io::Error>>;
 
-const STALE_ROUTE_HEADER: &str = "x-cells-route-error";
-const STALE_ROUTE_VALUE: &str = "stale-owner";
+use celld::peer_auth::{STALE_ROUTE_HEADER, STALE_ROUTE_VALUE};
 /// Marks a forwarded fetch whose handler failed on the owner, so the caller's
 /// `stub.fetch()` rejects as it does for a local owner. Without the marker a
 /// remote handler failure looks like an application 500 response.
