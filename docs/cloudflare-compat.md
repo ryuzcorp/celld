@@ -1,4 +1,4 @@
-<!-- Modified by ryuzcorp (ryuzcorp/celld): node:crypto scrypt; cloned streaming bodies; cross-isolate RPC stubs and streams; per-node Workers Cache API; receiver-held RPC streams; AbortSignal.timeout is unreferenced (upstream #306); loader 101 webSocket target (upstream #305); loader sibling cloudflare:workers imports (upstream #304). -->
+<!-- Modified by ryuzcorp (ryuzcorp/celld): node:crypto scrypt; cloned streaming bodies; cross-isolate RPC stubs and streams; per-node Workers Cache API; receiver-held RPC streams; AbortSignal.timeout is unreferenced (upstream #306); loader 101 webSocket target (upstream #305); loader sibling cloudflare:workers imports (upstream #304); AES-KW and symmetric JWK (upstream #295). -->
 # Cloudflare compatibility
 
 This page lists only the differences from the linked Cloudflare APIs. An entry
@@ -192,7 +192,9 @@ The `tail` and `email` handlers are unavailable.
 - AES-GCM accepts authentication tags from 96 through 128 bits in 8-bit steps.
 - RSA-OAEP accepts SHA-1, SHA-256, SHA-384, and SHA-512. A nonempty label must
   contain valid UTF-8.
-- A secret key cannot use `jwk` with `exportKey()` or `wrapKey()`.
+- AES-KW wraps and unwraps (RFC 3394; an IV mismatch fails the unwrap). A
+  symmetric key imports and exports as `raw` bytes and as `jwk` with
+  `kty: "oct"`.
 - Ed25519 signs and verifies, and `NODE-ED25519` names the same algorithm. A
   signature from one spelling verifies under the other.
 - X25519 derives bits and keys. A peer key of a low order gives a shared secret
