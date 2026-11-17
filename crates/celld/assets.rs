@@ -1023,54 +1023,6 @@ mod internal_tests {
     include!(env!("CELLD_INTERNAL_ASSETS_TESTS"));
 }
 
-#[cfg(test)]
-mod route_tests {
-    use super::*;
-    use crate::protocol::{AssetConfig, AssetEntry, AssetIndex};
-
-    fn test_index() -> AssetIndex {
-        let mut entries = std::collections::BTreeMap::new();
-        for path in ["/index.html", "/sub/index.html", "/about.html"] {
-            entries.insert(
-                path.to_string(),
-                AssetEntry {
-                    sha256: "abc".into(),
-                    bytes: 10,
-                    content_type: Some("text/html".into()),
-                },
-            );
-        }
-        AssetIndex {
-            schema_version: 1,
-            entries,
-            config: AssetConfig::default(),
-        }
-    }
-
-    #[test]
-    fn dir_index_served_at_dir() {
-        // `auto-trailing-slash` (the default): `/sub` redirects to `/sub/`,
-        // and `/sub/` serves `sub/index.html` with a 200.
-        assert_eq!(decode_path("/sub/"), Some("/sub/".to_string()));
-        let index = test_index();
-        match route(&index, "/sub", false) {
-            Route::Redirect { location, .. } => assert_eq!(location, "/sub/"),
-            other => panic!("expected a redirect, got {other:?}"),
-        }
-        match route(&index, "/sub/", false) {
-            Route::Asset { path, status, .. } => {
-                assert_eq!(path, "/sub/index.html");
-                assert_eq!(status, StatusCode::OK);
-            }
-            other => panic!("expected the directory index, got {other:?}"),
-        }
-        // Doubled slashes still reject, as do dot segments.
-        assert_eq!(decode_path("/sub//"), None);
-        assert_eq!(decode_path("//"), None);
-        assert_eq!(decode_path("/sub/../index.html"), None);
-    }
-}
-
 fn route(index: &AssetIndex, path: &str, include_not_found: bool) -> Route {
     let entries = &index.entries;
     let html = index
@@ -1503,4 +1455,52 @@ fn route_pattern_matches(pattern: &str, path: &str) -> bool {
         expression.push('$');
     }
     regex::Regex::new(&expression).is_ok_and(|pattern| pattern.is_match(path))
+}
+
+#[cfg(test)]
+mod route_tests {
+    use super::*;
+    use crate::protocol::{AssetConfig, AssetEntry, AssetIndex};
+
+    fn test_index() -> AssetIndex {
+        let mut entries = std::collections::BTreeMap::new();
+        for path in ["/index.html", "/sub/index.html", "/about.html"] {
+            entries.insert(
+                path.to_string(),
+                AssetEntry {
+                    sha256: "abc".into(),
+                    bytes: 10,
+                    content_type: Some("text/html".into()),
+                },
+            );
+        }
+        AssetIndex {
+            schema_version: 1,
+            entries,
+            config: AssetConfig::default(),
+        }
+    }
+
+    #[test]
+    fn dir_index_served_at_dir() {
+        // `auto-trailing-slash` (the default): `/sub` redirects to `/sub/`,
+        // and `/sub/` serves `sub/index.html` with a 200.
+        assert_eq!(decode_path("/sub/"), Some("/sub/".to_string()));
+        let index = test_index();
+        match route(&index, "/sub", false) {
+            Route::Redirect { location, .. } => assert_eq!(location, "/sub/"),
+            other => panic!("expected a redirect, got {other:?}"),
+        }
+        match route(&index, "/sub/", false) {
+            Route::Asset { path, status, .. } => {
+                assert_eq!(path, "/sub/index.html");
+                assert_eq!(status, StatusCode::OK);
+            }
+            other => panic!("expected the directory index, got {other:?}"),
+        }
+        // Doubled slashes still reject, as do dot segments.
+        assert_eq!(decode_path("/sub//"), None);
+        assert_eq!(decode_path("//"), None);
+        assert_eq!(decode_path("/sub/../index.html"), None);
+    }
 }

@@ -493,18 +493,7 @@ pub struct FetchRequest<'a> {
 /// the abort dies with the entry (upstream #281). Publishing synchronously
 /// from `__do_call_cancel` closes that race; the select stays for settling
 /// the caller-side promise.
-static DO_CALL_CANCELS: OnceLock<
-    std::sync::Mutex<
-        HashMap<
-            RequestId,
-            (
-                tokio::sync::oneshot::Sender<()>,
-                Option<Arc<crate::runtime::RequestCancellationLifetime>>,
-            ),
-        >,
-    >,
-> = OnceLock::new();
-fn do_call_cancels() -> &'static std::sync::Mutex<
+type DoCallCancels = std::sync::Mutex<
     HashMap<
         RequestId,
         (
@@ -512,7 +501,9 @@ fn do_call_cancels() -> &'static std::sync::Mutex<
             Option<Arc<crate::runtime::RequestCancellationLifetime>>,
         ),
     >,
-> {
+>;
+static DO_CALL_CANCELS: OnceLock<DoCallCancels> = OnceLock::new();
+fn do_call_cancels() -> &'static DoCallCancels {
     DO_CALL_CANCELS.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
 }
 

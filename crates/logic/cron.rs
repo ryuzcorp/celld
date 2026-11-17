@@ -200,11 +200,11 @@ pub fn parse(expression: &str) -> Result<Cron, CronError> {
             fields.len()
         )));
     }
-    let minute = parse_field(fields[0], &MINUTE).map_err(&fail)?;
-    let hour = parse_field(fields[1], &HOUR).map_err(&fail)?;
-    let day_of_month = parse_day_of_month(fields[2]).map_err(&fail)?;
-    let month = parse_field(fields[3], &MONTH).map_err(&fail)?;
-    let day_of_week = parse_day_of_week(fields[4]).map_err(&fail)?;
+    let minute = parse_field(fields[0], &MINUTE).map_err(fail)?;
+    let hour = parse_field(fields[1], &HOUR).map_err(fail)?;
+    let day_of_month = parse_day_of_month(fields[2]).map_err(fail)?;
+    let month = parse_field(fields[3], &MONTH).map_err(fail)?;
+    let day_of_week = parse_day_of_week(fields[4]).map_err(fail)?;
     Ok(Cron {
         text: expression.trim().to_string(),
         minute,

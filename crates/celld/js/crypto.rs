@@ -2163,19 +2163,12 @@ fn aes_kw_block(key: &[u8], block: &mut [u8; 16], encrypt: bool) -> Result<()> {
 /// (any wrapped key is a multiple of 8 bytes); the output prepends the
 /// integrity-checked IV the unwrap step verifies.
 fn aes_kw_wrap(key: &[u8], data: &[u8]) -> Result<Vec<u8>> {
-    if data.len() < 8 || data.len() % 8 != 0 {
+    if data.len() < 8 || !data.len().is_multiple_of(8) {
         return Err(anyhow!(
             "AES-KW data must be a non-empty multiple of 8 bytes"
         ));
     }
-    let mut blocks: Vec<[u8; 8]> = data
-        .chunks_exact(8)
-        .map(|chunk| {
-            let mut block = [0u8; 8];
-            block.copy_from_slice(chunk);
-            block
-        })
-        .collect();
+    let mut blocks: Vec<[u8; 8]> = data.as_chunks::<8>().0.to_vec();
     // The default IV of RFC 3394 section 2.2.3.1.
     let mut a: [u8; 8] = [0xA6; 8];
     let n = blocks.len() as u64;
@@ -2204,7 +2197,7 @@ fn aes_kw_wrap(key: &[u8], data: &[u8]) -> Result<Vec<u8>> {
 /// RFC 3394 section 2.2.2 key unwrap. An IV mismatch fails: the wrapped
 /// key was not wrapped with this KEK, or was corrupted.
 fn aes_kw_unwrap(key: &[u8], data: &[u8]) -> Result<Vec<u8>> {
-    if data.len() < 16 || data.len() % 8 != 0 {
+    if data.len() < 16 || !data.len().is_multiple_of(8) {
         return Err(anyhow!(
             "AES-KW data must be a multiple of 8 bytes of at least 16"
         ));
@@ -2213,14 +2206,7 @@ fn aes_kw_unwrap(key: &[u8], data: &[u8]) -> Result<Vec<u8>> {
     let mut a: [u8; 8] = iv
         .try_into()
         .map_err(|_| anyhow!("AES-KW data is truncated"))?;
-    let mut blocks: Vec<[u8; 8]> = rest
-        .chunks_exact(8)
-        .map(|chunk| {
-            let mut block = [0u8; 8];
-            block.copy_from_slice(chunk);
-            block
-        })
-        .collect();
+    let mut blocks: Vec<[u8; 8]> = rest.as_chunks::<8>().0.to_vec();
     let n = blocks.len() as u64;
     for j in (0..6u64).rev() {
         for (i, pi) in blocks.iter_mut().enumerate().rev() {

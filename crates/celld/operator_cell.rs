@@ -138,7 +138,7 @@ impl Reachable {
         let nodes = live_nodes(bucket, unsafe_public_advertise, subject.source).await?;
         // The same secret and the same source shape `celld diagnose` uses.
         let auth = crate::peer_auth::PeerAuth::new(
-            crate::peer_auth::load_existing(&bucket).await?,
+            crate::peer_auth::load_existing(bucket).await?,
             subject.source,
         )?;
         let http = reqwest::Client::builder()

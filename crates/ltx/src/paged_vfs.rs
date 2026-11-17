@@ -123,16 +123,6 @@ impl HydratedSet {
         });
         self.counted -= uncounted;
     }
-
-    /// The full walk `hydration()` used to do: the regression test asserts
-    /// the count matches this oracle after every mutation shape.
-    #[cfg(test)]
-    fn oracle_count(&self, commit: u32, lock: u32) -> u32 {
-        self.pages
-            .iter()
-            .filter(|pgno| Self::in_cut(**pgno, commit, lock))
-            .count() as u32
-    }
 }
 
 /// Per-registration state, hung off the VFS `pAppData`.
@@ -756,6 +746,7 @@ pub fn unregister_paged_vfs(name: &str) -> crate::error::Result<()> {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)] // Test tempfiles live outside the injected filesystem.
 mod tests {
     use super::*;
     use crate::error::Result;
