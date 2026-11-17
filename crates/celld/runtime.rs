@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): cross-isolate RPC stubs and streams; D1 export operator-ingress marker; ported from meln1k/celld: report wake coverage after maintenance (e6cb9a3); wake coverage follow-ups: startup observation ordering, installation comparison; trusted cell RPC; deployment cache scope purge on generation free; staged invoke joins the driver past the reply.; answered drivers poll while waitUntil background is outstanding (upstream #300); drivers take the mailbox once more before retiring (upstream #309)
+// Modified by ryuzcorp (ryuzcorp/celld): cross-isolate RPC stubs and streams; D1 export operator-ingress marker; ported from meln1k/celld: report wake coverage after maintenance (e6cb9a3); wake coverage follow-ups: startup observation ordering, installation comparison; trusted cell RPC; deployment cache scope purge on generation free; staged invoke joins the driver past the reply.; answered drivers poll while waitUntil background is outstanding (upstream #300); drivers take the mailbox once more before retiring (upstream #309); answered waitUntil with no ops polls for settlement (upstream #289)
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 // RuntimeManager is the V8 cell-host arm, so its executor and observability
@@ -4190,6 +4190,150 @@ export default { fetch() { return new Response('ok'); } };
             observed.lock().expect("observation log poisoned").len(),
             1,
             "an uncovered installation stays silent"
+        );
+    }
+
+    /// An answered stateless entry driving `waitUntil` work with no native
+    /// op of its own must poll for the background's settlement instead of
+    /// spinning past it (denoland/celld#289). Two requests share one timer
+    /// through `waitUntil`; the second holds no op, so no turn would
+    /// otherwise observe the aggregate settle and the entry would never
+    /// retire. The driver used to sleep-loop here until the budget gave
+    /// out; now it looks in.
+    /// NOTE: ignored in the normal suite. Driving V8 turns directly in
+    /// this process destabilizes a later manager test (SIGSEGV in the V8
+    /// dispatch-table write during a later cell adoption); the mechanism is
+    /// still under investigation. Run standalone to verify:
+    /// `cargo test -p celld --lib -- --ignored answered_waituntil`.
+    /// The driver fix it guards is also covered black-box by the
+    /// waituntil-tx conformance test (upstream #300, same branch family).
+    #[test]
+    #[ignore = "in-process V8 turns destabilize a later manager test; run standalone"]
+    fn answered_waituntil_without_ops_polls_for_settlement() {
+        ensure_v8();
+        let shared = crate::asyncrt::shared_test_runtime();
+
+        const SCRIPT: &str = r#"
+let shared = null;
+export default {
+  async fetch(request, env, ctx) {
+    const url = new URL(request.url);
+    if (url.pathname === "/start") {
+      shared = new Promise((resolve) => setTimeout(() => resolve("v"), 20));
+      ctx.waitUntil(shared);
+      const value = await shared;
+      return Response.json({ value });
+    }
+    if (url.pathname === "/join") {
+      // Answer at once, leaving only the shared waitUntil behind: no op
+      // of its own, background outstanding.
+      ctx.waitUntil(shared);
+      return Response.json({ ok: true });
+    }
+    return new Response("not found", { status: 404 });
+  },
+};
+"#;
+        let config = std::sync::Arc::new(WorkerConfig::new(WorkerConfigOptions {
+            src: SCRIPT.into(),
+            script_name: "waituntil-retire-test".into(),
+            do_classes: Vec::new(),
+            bindings: Vec::new(),
+            r2_bindings: Vec::new(),
+            d1_bindings: Vec::new(),
+            kv_bindings: Vec::new(),
+            queue_bindings: Vec::new(),
+            queue_consumers: Vec::new(),
+            workflow_bindings: Vec::new(),
+            vars: Vec::new(),
+            node: "n0".into(),
+            modules: Vec::new(),
+            compat: Compat::default(),
+        }));
+        let mut worker = Worker::load_config(config).expect("load worker");
+
+        fn begin(
+            worker: &mut Worker,
+            url: &str,
+            request_id: u128,
+        ) -> (
+            js::InFlight,
+            tokio::sync::oneshot::Receiver<Result<HttpResponse, anyhow::Error>>,
+            Vec<js::Op>,
+        ) {
+            let (reply, receive) = tokio::sync::oneshot::channel();
+            let job = crate::WorkerJob::Fetch {
+                queued_at: std::time::Instant::now(),
+                entrypoint: None,
+                invocation_limits: None,
+                url: url.into(),
+                method: "GET".into(),
+                body: js::RequestBody::Bytes(bytes::Bytes::new()),
+                headers: Vec::new(),
+                request_id: Some(request_id),
+                tail_report: None,
+                reply,
+            };
+            let (entry, started) = worker.turn_begin(job, None);
+            (entry.expect("request starts"), receive, started)
+        }
+
+        // A starts shared work and suspends on it; B answers at once with
+        // only the shared waitUntil behind it, holding no op of its own.
+        let (mut entry_a, mut reply_a, started_a) =
+            begin(&mut worker, "http://test/start", 28901);
+        assert_eq!(started_a.len(), 1, "A waits on its timer op");
+        let (mut entry_b, mut reply_b, started_b) =
+            begin(&mut worker, "http://test/join", 28902);
+        assert!(started_b.is_empty(), "B holds no op of its own");
+        drop(started_b);
+        let response = reply_b
+            .try_recv()
+            .expect("B answered at once")
+            .unwrap_or_else(|error| panic!("B must answer: {error:#}"));
+        assert_eq!(response.status, 200);
+
+        // Fire the shared timer and deliver it to A. A resumes and answers;
+        // B's background aggregate settles with no turn observing it.
+        let (id_a, fut_a) = started_a.into_iter().next().unwrap();
+        let settle = shared.block_on(fut_a);
+        let started = worker.turn_deliver(&mut entry_a, id_a, settle);
+        drop(started);
+        let response = reply_a
+            .try_recv()
+            .expect("A answered")
+            .unwrap_or_else(|error| panic!("A must answer: {error:#}"));
+        assert_eq!(response.status, 200);
+        drop(entry_a);
+        assert!(
+            !entry_b.finished(),
+            "B still drives its unobserved background"
+        );
+
+        // No native op of its own remains, but the background is
+        // outstanding. The wake must poll so settle() observes the
+        // aggregate, not spin past it: pre-fix this never returned.
+        let mut ops: Ops = Default::default();
+        let woken = shared
+            .block_on(async {
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    wake(&mut ops, &mut entry_b, std::time::Duration::from_secs(300)),
+                )
+                .await
+            })
+            .expect("answered waitUntil with no ops polls instead of spinning");
+        assert!(
+            matches!(woken, Wake::Poll),
+            "expected a look-in turn, got another wake"
+        );
+
+        // The look-in observes the settled aggregate and the entry retires.
+        let started = worker.turn_poll(&mut entry_b);
+        drop(started);
+        assert!(
+            entry_b.finished(),
+            "the settled background retires the entry"
         );
     }
 }
