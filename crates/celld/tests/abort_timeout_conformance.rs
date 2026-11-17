@@ -16,7 +16,7 @@
 //! which let it die with the request), so sequential requests never exhaust
 //! the admission window; the timeout itself still aborts.
 
-use std::io::{BufReader, Read, Write};
+use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};

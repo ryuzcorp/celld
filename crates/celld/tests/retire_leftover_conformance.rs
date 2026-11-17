@@ -238,7 +238,7 @@ fn retiring_generation_frees_its_isolates() {
     // Stage a second version of the same app and adopt it: the cell moves
     // to a new generation, stranding the first request's background work
     // on the old isolate.
-    let _version = {
+    {
         let index = app_project.join("index.js");
         let mut src = std::fs::read_to_string(&index).expect("read worker");
         src.push_str("\n// v2: identical behavior, new version.\n");

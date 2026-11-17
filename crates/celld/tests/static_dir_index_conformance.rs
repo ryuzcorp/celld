@@ -130,7 +130,9 @@ impl Drop for TestNode {
     }
 }
 
-fn raw_get(addr: &str, path: &str) -> Result<(u16, Vec<(String, String)>, String), String> {
+type RawResponse = (u16, Vec<(String, String)>, String);
+
+fn raw_get(addr: &str, path: &str) -> Result<RawResponse, String> {
     let mut stream = TcpStream::connect(addr).map_err(|error| format!("connect: {error}"))?;
     stream
         .set_read_timeout(Some(Duration::from_secs(60)))

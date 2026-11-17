@@ -9936,6 +9936,7 @@ mod bucket_recovery_tests {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)] // Test tempdirs live outside the injected filesystem.
 mod fragment_gc_tests {
     use super::*;
 

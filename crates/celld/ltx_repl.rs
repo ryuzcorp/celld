@@ -6639,6 +6639,7 @@ impl Drop for LtxRepl {
     }
 }
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)] // Test tempdirs live outside the injected filesystem.
 mod evict_trim_tests {
     use super::*;
     use celld_ltx::object_store::memory::InMemory;

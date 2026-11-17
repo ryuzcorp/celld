@@ -801,6 +801,7 @@ fn precondition(path: &str) -> Error {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)] // Test tempdirs spawn burst writers outside the execution boundary.
 mod tests {
     use super::*;
     use object_store::UpdateVersion;
