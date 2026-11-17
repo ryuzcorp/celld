@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): round-level fence settlement (0062).
+// Modified by ryuzcorp (ryuzcorp/celld): round-level fence settlement (0062); failed start disarms the restored alarm (upstream #276).
 // Modified by ryuzcorp (ryuzcorp/celld): ported from meln1k/celld: 51 code probes on the core's rare branches (b026226); keep-the-unfolded-tail probe (65fdb13); shared bucket-posture ownership reads across concurrent gates (0056).
 //! Code probes: rare branches of the core, named and counted when taken.
 //!
@@ -113,6 +113,18 @@ probes! {
     // Activation.
     /// A restore failed: the cell parks dormant.
     RestoreFailed,
+    /// A runtime start failed after a restore armed a covered alarm: the
+    /// start drops the in-process timer it restored with, so the overdue
+    /// alarm cannot hot-loop the activation (denoland/celld#276). The alarm
+    /// stays discoverable through its wake entry, which the scan finds at
+    /// scan pace.
+    StartFailedDisarmsAlarm,
+    /// A runtime start failed after a restore armed an uncovered alarm: no
+    /// wake entry exists for the scan to find, so the start re-arms the
+    /// timer at scan pace instead of dropping it. The bumped generation
+    /// retires the restore's immediate timer, and the new one reactivates
+    /// the cell once per backoff.
+    StartFailedRearmsAlarm,
     /// A restore failed for a cell a clean reload was resuming.
     ResumeFailed,
     /// A runtime start outlived its deadline.
