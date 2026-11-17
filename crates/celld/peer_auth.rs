@@ -1,7 +1,15 @@
+// Modified by ryuzcorp (ryuzcorp/celld): stale-route marker shared with the node-log recovery classifier (upstream #273).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 // Authentication entropy and signature timestamps belong to the real peer wire.
+
 #![allow(clippy::disallowed_methods, clippy::disallowed_types)]
+
+/// The response marker the peer auth gate sets beside a 409 `WrongTarget`:
+/// the process at the dialed address answers for a different node session.
+/// Recovery uses it to tell "the old member is gone" from transport noise.
+pub const STALE_ROUTE_HEADER: &str = "x-cells-route-error";
+pub const STALE_ROUTE_VALUE: &str = "stale-owner";
 
 use crate::bucket::Bucket;
 use anyhow::{anyhow, Context};

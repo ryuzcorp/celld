@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): cross-isolate RPC stubs and streams; operator token for the internal listener; D1 export operator-ingress marker; ported from meln1k/celld: report wake coverage after maintenance (e6cb9a3); staged activation; trusted cell RPC; WebSocket join tokens; --version reports the full build version; staged invoke operator route; non-dumpable serving process; bucket-posture group commit: paged gate judges PAGED_FORMAT (0059); bucket-posture group commit: bucket bundle gate plumbing (0060); bucket-posture group commit: bundle switch defaults off (0075).
+// Modified by ryuzcorp (ryuzcorp/celld): cross-isolate RPC stubs and streams; operator token for the internal listener; D1 export operator-ingress marker; ported from meln1k/celld: report wake coverage after maintenance (e6cb9a3); staged activation; trusted cell RPC; WebSocket join tokens; --version reports the full build version; staged invoke operator route; non-dumpable serving process; bucket-posture group commit: paged gate judges PAGED_FORMAT (0059); bucket-posture group commit: bucket bundle gate plumbing (0060); bucket-posture group commit: bundle switch defaults off (0075); stale-route marker import from peer_auth (upstream #273).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 // The binary contains connection, startup, shutdown, and V8 shell code. The
@@ -248,8 +248,7 @@ fn clean_reload_is_eligible(
 
 type HttpReply = Response<UnsyncBoxBody<Bytes, std::io::Error>>;
 
-const STALE_ROUTE_HEADER: &str = "x-cells-route-error";
-const STALE_ROUTE_VALUE: &str = "stale-owner";
+use celld::peer_auth::{STALE_ROUTE_HEADER, STALE_ROUTE_VALUE};
 /// Marks a forwarded fetch whose handler failed on the owner, so the caller's
 /// `stub.fetch()` rejects as it does for a local owner. Without the marker a
 /// remote handler failure looks like an application 500 response.
@@ -321,6 +320,25 @@ fn peer_response(mut response: HttpReply) -> HttpReply {
         hyper::header::HeaderValue::from_static(peer_auth::PROTOCOL_VERSION_TEXT),
     );
     response
+}
+
+/// The auth gate's denial for an internal peer route (upstream #273). A
+/// `WrongTarget` 409 carries the stale-route marker: a different node
+/// session answers at the dialed address, so the old member is gone rather
+/// than merely unreachable, and recovery may treat the seal as conclusive.
+/// `Replay` is also a 409 and must NOT carry the marker: a replay proves
+/// nothing about the member, and marking it would let a replayed request
+/// seal away intact rows. Every internal route with a peer-auth gate shares
+/// this helper so the seal/tail route cannot drift from the abort route.
+fn peer_auth_denied(error: &peer_auth::VerifyError) -> HttpReply {
+    let mut denied = response(error.status(), error.message());
+    if matches!(error, peer_auth::VerifyError::WrongTarget) {
+        denied.headers_mut().insert(
+            hyper::header::HeaderName::from_static(STALE_ROUTE_HEADER),
+            hyper::header::HeaderValue::from_static(STALE_ROUTE_VALUE),
+        );
+    }
+    denied
 }
 
 /// The operator-token gate for the internal listener. `None` is an open
@@ -2532,14 +2550,7 @@ async fn internal_abort(request: Request<Incoming>, app: AppHandle, path: String
         &body,
         app.peer_auth.source(),
     ) {
-        let mut denied = response(error.status(), error.message());
-        if matches!(error, peer_auth::VerifyError::WrongTarget) {
-            denied.headers_mut().insert(
-                hyper::header::HeaderName::from_static(STALE_ROUTE_HEADER),
-                hyper::header::HeaderValue::from_static(STALE_ROUTE_VALUE),
-            );
-        }
-        return peer_response(denied);
+        return peer_response(peer_auth_denied(&error));
     }
     if parts.method != hyper::Method::POST {
         return peer_response(response(
@@ -3067,7 +3078,7 @@ async fn internal_log(request: Request<Incoming>, app: AppHandle, path: String) 
         &body,
         app.peer_auth.source(),
     ) {
-        return peer_response(response(error.status(), error.message()));
+        return peer_response(peer_auth_denied(&error));
     }
     if parts.method != hyper::Method::POST {
         return peer_response(response(
@@ -6190,4 +6201,221 @@ fn forwarder_response_stream(
 #[cfg(all(test, celld_internal_tests))]
 mod durability_lifecycle_private {
     include!(env!("CELLD_CONFORMANCE_MAIN_DURABILITY_TESTS"));
+}
+
+/// Wire-level proof that the seal/tail route marks a stale-target 409
+/// (upstream #273): the classifier in `celld::node_log` can only conclude
+/// "the old member is gone" when this route emits the marker, and the unit
+/// tests there construct the marker directly — so this module serves real
+/// seal requests through `internal_log` over a socket and asserts on the
+/// bytes back.
+#[cfg(test)]
+mod internal_log_wire_tests {
+    use super::*;
+
+    /// The process-wide Tokio runtime these tests boot node state on, with
+    /// the asyncrt host handle installed exactly once (mirrors
+    /// `celld::asyncrt::shared_test_runtime`, which the binary cannot name
+    /// because it is `pub(crate)` to the library). A `#[tokio::test]`
+    /// runtime dies with its test, so sharing one runtime keeps the
+    /// installed handle alive for the whole test process.
+    fn test_runtime() -> &'static tokio::runtime::Runtime {
+        static RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+        RUNTIME.get_or_init(|| {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(4)
+                .enable_all()
+                .build()
+                .expect("test runtime builds");
+            celld::asyncrt::set_host_handle(runtime.handle().clone());
+            runtime
+        })
+    }
+
+    fn test_app(follower: Arc<celld::node_log::FollowerStore>, peer_auth: Arc<PeerAuth>) -> AppHandle {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let (websockets, _websocket_rx) = mpsc::unbounded_channel();
+        AppHandle {
+            tx,
+            runtime: None,
+            reload: celld::generation::reload_channel().0,
+            peer_http: reqwest::Client::new(),
+            peer_auth,
+            advertise: "n0".to_string(),
+            websockets,
+            max_outbound_websockets: 8,
+            draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            fleet_ready: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            public_in_flight: Arc::new(AtomicUsize::new(0)),
+            drain_pins: DrainPinRegistry::default(),
+            follower: Some(follower),
+            trust_forwarded_headers: false,
+            max_request_body_bytes: 10 * 1024 * 1024,
+            operation_deadline_ms: 30_000,
+            operator_token: None,
+            deploy_bucket: None,
+            invoke_permits: Arc::new(tokio::sync::Semaphore::new(4)),
+        }
+    }
+
+    async fn serve_internal_log(app: AppHandle) -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test listener binds");
+        let addr = listener.local_addr().expect("listener has an address");
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let app = app.clone();
+                tokio::spawn(async move {
+                    let service = service_fn(move |request: Request<Incoming>| {
+                        let app = app.clone();
+                        async move {
+                            let path = request.uri().path().to_string();
+                            Ok::<_, Infallible>(internal_log(request, app, path).await)
+                        }
+                    });
+                    let _ = http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), service)
+                        .await;
+                });
+            }
+        });
+        addr
+    }
+
+    /// One raw HTTP exchange: byte-exact headers so a byte-identical second
+    /// send is a true replay, which a client library would not reproduce.
+    async fn post_raw(
+        addr: std::net::SocketAddr,
+        path: &str,
+        headers: &axum::http::HeaderMap,
+        body: &[u8],
+    ) -> (u16, Vec<(String, String)>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut stream = tokio::net::TcpStream::connect(addr)
+            .await
+            .expect("test server accepts");
+        let mut head = format!(
+            "POST {path} HTTP/1.1\r\nhost: 127.0.0.1\r\ncontent-length: {}\r\nconnection: close\r\n",
+            body.len()
+        );
+        for (name, value) in headers.iter() {
+            head.push_str(&format!(
+                "{name}: {}\r\n",
+                value.to_str().expect("peer header value is ASCII")
+            ));
+        }
+        head.push_str("\r\n");
+        stream.write_all(head.as_bytes()).await.expect("head writes");
+        stream.write_all(body).await.expect("body writes");
+        let mut raw = Vec::new();
+        stream.read_to_end(&mut raw).await.expect("response reads");
+        let text = String::from_utf8(raw).expect("response is ASCII");
+        let (head, _) = text.split_once("\r\n\r\n").expect("response has a head");
+        let mut lines = head.lines();
+        let status = lines
+            .next()
+            .expect("response has a status line")
+            .split_whitespace()
+            .nth(1)
+            .expect("status line carries a code")
+            .parse::<u16>()
+            .expect("status code parses");
+        let headers = lines
+            .filter_map(|line| line.split_once(':'))
+            .map(|(name, value)| (name.trim().to_lowercase(), value.trim().to_string()))
+            .collect();
+        (status, headers)
+    }
+
+    fn has_stale_marker(headers: &[(String, String)]) -> bool {
+        headers
+            .iter()
+            .any(|(name, value)| name == STALE_ROUTE_HEADER && value == STALE_ROUTE_VALUE)
+    }
+
+    fn test_server() -> (Arc<PeerAuth>, PeerAuth, Arc<celld::node_log::FollowerStore>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("test dir");
+        let key = [7u8; 32];
+        let server_auth = Arc::new(PeerAuth::new(key, "n0").expect("server auth"));
+        let client_auth = PeerAuth::new(key, "n1").expect("client auth");
+        let follower = Arc::new(celld::node_log::FollowerStore::new(
+            dir.path(),
+            None,
+            "n0",
+        ));
+        (server_auth, client_auth, follower, dir)
+    }
+
+    /// A seal request signed for a different session answers 409 carrying
+    /// the stale-route marker — the exact signal `seal_proves_member_gone`
+    /// needs. Fail-before: the route answered a bare 409 with no marker.
+    #[test]
+    fn seal_with_mismatched_session_answers_marked_409() {
+        test_runtime().block_on(async {
+            let (server_auth, client_auth, follower, _dir) = test_server();
+            let addr = serve_internal_log(test_app(follower, server_auth)).await;
+            let body = br#"{"leader":"n9/gen1","epoch":1}"#.as_slice();
+            let headers = client_auth
+                .signed_headers("POST", "/peer/log/seal", body, "n9")
+                .expect("wrong-target request signs");
+            let (status, headers) = post_raw(addr, "/peer/log/seal", &headers, body).await;
+            assert_eq!(status, 409, "a mismatched session is a conflict");
+            assert!(
+                has_stale_marker(&headers),
+                "the seal-route 409 carries the stale-route marker: {headers:?}"
+            );
+        });
+    }
+
+    /// The control: a seal request for this node's own session passes the
+    /// auth gate and reaches the handler (an unknown fragment then fails
+    /// the seal itself, not the authentication).
+    #[test]
+    fn seal_with_matching_session_reaches_the_handler() {
+        test_runtime().block_on(async {
+            let (server_auth, client_auth, follower, _dir) = test_server();
+            let addr = serve_internal_log(test_app(follower, server_auth)).await;
+            let body = br#"{"leader":"n9/gen1","epoch":1}"#.as_slice();
+            let headers = client_auth
+                .signed_headers("POST", "/peer/log/seal", body, "n0")
+                .expect("matching-target request signs");
+            let (status, _) = post_raw(addr, "/peer/log/seal", &headers, body).await;
+            assert!(
+                status != 409 && status != 401,
+                "a matching session passes the auth gate, handler answers: {status}"
+            );
+        });
+    }
+
+    /// A byte-identical replay of an authenticated tail request answers 409
+    /// WITHOUT the marker: `Replay` is also a conflict but proves nothing
+    /// about the member, so it must never read as member-gone. The first
+    /// send passes the gate (an empty body then fails the tail decode, not
+    /// the authentication).
+    #[test]
+    fn replayed_tail_request_answers_unmarked_409() {
+        test_runtime().block_on(async {
+            let (server_auth, client_auth, follower, _dir) = test_server();
+            let addr = serve_internal_log(test_app(follower, server_auth)).await;
+            let body = b"{}".as_slice();
+            let headers = client_auth
+                .signed_headers("POST", "/peer/log/tail", body, "n0")
+                .expect("tail request signs");
+            let (first, _) = post_raw(addr, "/peer/log/tail", &headers, body).await;
+            assert!(
+                first != 409 && first != 401,
+                "the first send passes the auth gate: {first}"
+            );
+            let (status, headers) = post_raw(addr, "/peer/log/tail", &headers, body).await;
+            assert_eq!(status, 409, "the replay is a conflict");
+            assert!(
+                !has_stale_marker(&headers),
+                "a replay 409 carries no stale-route marker: {headers:?}"
+            );
+        });
+    }
 }
