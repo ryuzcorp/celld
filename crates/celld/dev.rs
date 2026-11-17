@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): operator token for the internal listener; `celld dev --port 0` assigns an ephemeral port; staged activation; deploy --read-root option; non-dumpable serving process.
+// Modified by ryuzcorp (ryuzcorp/celld): operator token for the internal listener; `celld dev --port 0` assigns an ephemeral port; staged activation; deploy --read-root option; non-dumpable serving process; local state path helper for d1 --local (upstream #272).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 // Modified by ryuzcorp (ryuzcorp/celld): deploy --sourcemap writes the bundle's external map.
 
@@ -51,7 +51,7 @@ struct Options {
 /// `PathBuf` field would let a later caller pass any path and lose nothing at
 /// compile time.
 #[derive(Debug)]
-struct DevState {
+pub(crate) struct DevState {
     path: PathBuf,
 }
 
@@ -64,6 +64,30 @@ impl DevState {
         Self {
             path: project.join(Self::DIRECTORY),
         }
+    }
+
+    /// The SQLite file behind one project's local state, for operator
+    /// commands that reach the `celld dev` node through it (`d1 --local`).
+    /// Pure path math: the caller decides what a missing file means.
+    pub(crate) fn database_for_project(project: &Path) -> PathBuf {
+        Self::for_project(project).path.join("objects.sqlite3")
+    }
+
+    /// The project directory a Wrangler config belongs to: the parent of the
+    /// canonicalized config path, so a symlinked config resolves to the same
+    /// project — and the same `.celld/dev` — that `celld dev` runs in. Both
+    /// `celld dev` and `d1 --local` resolve through this, so the state
+    /// directory never depends on which spelling of the config path named it.
+    /// Pure path math beside the canonicalization: the caller decides what a
+    /// missing directory means.
+    #[allow(clippy::disallowed_methods)] // Project resolution uses the operator's host filesystem.
+    pub(crate) fn project_dir(config: &Path) -> anyhow::Result<PathBuf> {
+        let config = std::fs::canonicalize(config)
+            .with_context(|| format!("resolve Wrangler config {}", config.display()))?;
+        config
+            .parent()
+            .map(Path::to_path_buf)
+            .context("the Wrangler config has no project directory")
     }
 
     fn path(&self) -> &Path {
@@ -419,10 +443,8 @@ pub async fn run(arguments: Vec<String>) -> anyhow::Result<()> {
     let config = deploy::resolve_config(options.project)?;
     let config = std::fs::canonicalize(&config)
         .with_context(|| format!("resolve Wrangler config {}", config.display()))?;
-    let project = config
-        .parent()
-        .context("the Wrangler config has no project directory")?;
-    let state = DevState::for_project(project);
+    let project = DevState::project_dir(&config)?;
+    let state = DevState::for_project(&project);
     let console = Console::new();
     console.header();
     console.detail("Project", &config.display().to_string());

@@ -71,9 +71,19 @@ impl FleetFlags {
     }
 
     /// Fill anything the flags left unset from the environment.
-    pub fn with_environment(mut self) -> Self {
+    pub fn with_environment(self) -> Self {
+        self.with_environment_from(|name| std::env::var(name).ok())
+    }
+
+    /// `with_environment` with the environment lookup under test control,
+    /// so tests pass their own instead of inheriting the developer's shell
+    /// — and never mutate the process environment parallel tests share.
+    pub fn with_environment_from(mut self, environment: impl Fn(&str) -> Option<String>) -> Self {
+        // An empty variable is how a shell spells "unset" in a script that
+        // always exports, so it must not beat a flag or a default.
+        let env = |name: &str| environment(name).filter(|value| !value.trim().is_empty());
         if self.bucket.is_none() {
-            self.bucket = bucket_from_environment();
+            self.bucket = env("CELLD_BUCKET").map(|value| value.trim().to_string());
         }
         if self.endpoint.is_none() {
             self.endpoint = env("S3_ENDPOINT");
