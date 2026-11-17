@@ -1,3 +1,4 @@
+// Modified by ryuzcorp (ryuzcorp/celld): allow the canonical trailing slash in asset request paths (upstream #318).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 // Asset download and cache maintenance execute outside the Actor execution
@@ -93,6 +94,7 @@ struct AssetResolverInner {
     redirect_rules: Vec<RedirectRule>,
 }
 
+#[derive(Debug)]
 enum Route {
     Asset {
         path: String,
@@ -1021,6 +1023,54 @@ mod internal_tests {
     include!(env!("CELLD_INTERNAL_ASSETS_TESTS"));
 }
 
+#[cfg(test)]
+mod route_tests {
+    use super::*;
+    use crate::protocol::{AssetConfig, AssetEntry, AssetIndex};
+
+    fn test_index() -> AssetIndex {
+        let mut entries = std::collections::BTreeMap::new();
+        for path in ["/index.html", "/sub/index.html", "/about.html"] {
+            entries.insert(
+                path.to_string(),
+                AssetEntry {
+                    sha256: "abc".into(),
+                    bytes: 10,
+                    content_type: Some("text/html".into()),
+                },
+            );
+        }
+        AssetIndex {
+            schema_version: 1,
+            entries,
+            config: AssetConfig::default(),
+        }
+    }
+
+    #[test]
+    fn dir_index_served_at_dir() {
+        // `auto-trailing-slash` (the default): `/sub` redirects to `/sub/`,
+        // and `/sub/` serves `sub/index.html` with a 200.
+        assert_eq!(decode_path("/sub/"), Some("/sub/".to_string()));
+        let index = test_index();
+        match route(&index, "/sub", false) {
+            Route::Redirect { location, .. } => assert_eq!(location, "/sub/"),
+            other => panic!("expected a redirect, got {other:?}"),
+        }
+        match route(&index, "/sub/", false) {
+            Route::Asset { path, status, .. } => {
+                assert_eq!(path, "/sub/index.html");
+                assert_eq!(status, StatusCode::OK);
+            }
+            other => panic!("expected the directory index, got {other:?}"),
+        }
+        // Doubled slashes still reject, as do dot segments.
+        assert_eq!(decode_path("/sub//"), None);
+        assert_eq!(decode_path("//"), None);
+        assert_eq!(decode_path("/sub/../index.html"), None);
+    }
+}
+
 fn route(index: &AssetIndex, path: &str, include_not_found: bool) -> Route {
     let entries = &index.entries;
     let html = index
@@ -1415,13 +1465,22 @@ fn decode_path(path: &str) -> Option<String> {
         return None;
     }
     let decoded = percent_decode_str(path).decode_utf8().ok()?.into_owned();
-    if decoded.contains('\\')
-        || decoded.contains('\0')
-        || decoded.split('/').skip(1).any(|segment| {
-            segment.is_empty() && decoded != "/" || segment == "." || segment == ".."
-        })
-    {
+    if decoded.contains('\\') || decoded.contains('\0') {
         return None;
+    }
+    // A single trailing slash is the canonical directory form -- it is what
+    // `auto-trailing-slash` redirects to, so rejecting it made every
+    // `dir/index.html` unreachable at its `dir/` URL (upstream #318).
+    // Anything else empty (a doubled slash, here or inside) still rejects,
+    // as do `.` and `..`.
+    let mut segments = decoded.split('/').skip(1).peekable();
+    while let Some(segment) = segments.next() {
+        if segment == "." || segment == ".." {
+            return None;
+        }
+        if segment.is_empty() && segments.peek().is_some() {
+            return None;
+        }
     }
     Some(decoded)
 }
