@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): ctx.container.images; clone() of streaming and disturbed bodies; __celld$do on the service-binding RPC path; container exec pty/resize; cross-isolate RPC stubs and streams; container exec AbortSignal; test-only fake kill completion; exec reads survive their subscribing event; context end aborts finished uploads; tenant egress policy; D1 export; D1 export operator gate; D1 batch; test-only fake close/signal completion; binding-forgery enforcement; Queue/KV operator fetch gate; Queue/KV stub-RPC allowlists; Queue DLQ host-op forward; Queue send/DLQ cell-side validation; trusted-RPC target pin; Queue operator internal re-checks; receiver-held RPC streams.; dropped timer ops fire their callback early so sleepers settle (upstream #317); unrefed AbortSignal.timeout timer (upstream #306); loader-fetch 101 webSocket join (upstream #305); nodejs process.env population (upstream #296); writable request /tmp files (upstream #280); Worker WebSocket close codes (upstream #279).
+// Modified by ryuzcorp (ryuzcorp/celld): ctx.container.images; clone() of streaming and disturbed bodies; __celld$do on the service-binding RPC path; container exec pty/resize; cross-isolate RPC stubs and streams; container exec AbortSignal; test-only fake kill completion; exec reads survive their subscribing event; context end aborts finished uploads; tenant egress policy; D1 export; D1 export operator gate; D1 batch; test-only fake close/signal completion; binding-forgery enforcement; Queue/KV operator fetch gate; Queue/KV stub-RPC allowlists; Queue DLQ host-op forward; Queue send/DLQ cell-side validation; trusted-RPC target pin; Queue operator internal re-checks; receiver-held RPC streams.; dropped timer ops fire their callback early so sleepers settle (upstream #317); unrefed AbortSignal.timeout timer (upstream #306); loader-fetch 101 webSocket join (upstream #305); nodejs process.env population (upstream #296); writable request /tmp files (upstream #280); Worker WebSocket close codes (upstream #279); Symbol.dispose on plain RPC results (upstream #260).
 // The DO object model and the Cloudflare-compatible runtime surface, run
 // once per isolate by `js.rs::install_harness` after the Web-API prelude.
 // Lived as a 4,000-line raw string inside js.rs until 2026-07-29; it is a
@@ -6363,6 +6363,17 @@ const __rpcDesArgs = (bytes) => {
 // properties, `.remote`, and a local (caller-side) stack. The tag is
 // checked and sliced host-side; legacy 3/4 arrive as the tree with no
 // table and grant nothing.
+// A plain object or array RPC result is disposable even when it carries no
+// stubs: `using result = await service.method()` must work for pure data,
+// as in workerd (upstream #260). Anything else that revives as an object --
+// a stub, a Response, a stream -- keeps exactly the disposal it already had,
+// so only the plain-data shapes matched here gain one. Attaching at the top
+// result alone is enough: nested stubs are still collected into this
+// result's handles and released together.
+const __isPlainRpcResult = (v) =>
+  __primArrayIsArray(v) ||
+  ((proto) => proto === Object.prototype || proto === null)(
+    __primGetProto(v));
 const __rpcDes = (bytes) => {
   const [tag, decoded] = __rpc_decode_bytes(bytes);
   if (tag === 0) {
@@ -6377,14 +6388,27 @@ const __rpcDes = (bytes) => {
     throw error;
   }
   {
-    if (tag === 0xff) return decoded;
+    // A pure-data reply crosses as a bare clone with no table to revive:
+    // the value is fresh, so a no-op dispose makes it `using`-compatible
+    // without touching the callee's object.
+    if (tag === 0xff) {
+      if (decoded !== null && typeof decoded === "object" &&
+          __isPlainRpcResult(decoded)) {
+        __primDefineProp(decoded, Symbol.dispose, {
+          configurable: true,
+          value: () => {},
+        });
+      }
+      return decoded;
+    }
     const { value, handles, disposers } =
       (tag === 5 || tag === 6)
         ? __stubRevive(decoded[0], decoded[1])
         : __stubRevive(decoded);
     if (value !== null && typeof value === "object" &&
         !__weakHas(__stubMeta, value) &&
-        (handles.length > 0 || disposers.length > 0)) {
+        (handles.length > 0 || disposers.length > 0 ||
+          __isPlainRpcResult(value))) {
       __primDefineProp(value, Symbol.dispose, {
         configurable: true,
         value: () => {

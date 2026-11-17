@@ -1,4 +1,4 @@
-<!-- Modified by ryuzcorp (ryuzcorp/celld): node:crypto scrypt; cloned streaming bodies; cross-isolate RPC stubs and streams; per-node Workers Cache API; receiver-held RPC streams; AbortSignal.timeout is unreferenced (upstream #306); loader 101 webSocket target (upstream #305); loader sibling cloudflare:workers imports (upstream #304); AES-KW and symmetric JWK (upstream #295); EC raw point format (upstream #271); writable request /tmp, node:url file helpers, and the CELLD_TMP_MAX_BYTES /tmp cap (upstream #280).; workerd close codes (upstream #279).; fetch gzip/deflate decoding (upstream #238). -->
+<!-- Modified by ryuzcorp (ryuzcorp/celld): node:crypto scrypt; cloned streaming bodies; cross-isolate RPC stubs and streams; per-node Workers Cache API; receiver-held RPC streams; AbortSignal.timeout is unreferenced (upstream #306); loader 101 webSocket target (upstream #305); loader sibling cloudflare:workers imports (upstream #304); AES-KW and symmetric JWK (upstream #295); EC raw point format (upstream #271); writable request /tmp, node:url file helpers, and the CELLD_TMP_MAX_BYTES /tmp cap (upstream #280); workerd close codes (upstream #279); fetch gzip/deflate decoding (upstream #238); Symbol.dispose on RPC results (upstream #260). -->
 # Cloudflare compatibility
 
 This page lists only the differences from the linked Cloudflare APIs. An entry
@@ -139,6 +139,9 @@ The `tail` and `email` handlers are unavailable.
   not cross a node boundary.
 - A remote RPC retries only when the failed peer attempt did not start the
   method. Use a stable operation ID for an application retry.
+- A plain object or array returned over RPC carries a no-op `Symbol.dispose`,
+  so a `using` declaration typechecks; only results that revive stubs or
+  disposers release anything.
 - Deviations from workerd stub lifetime: a stub used only from `waitUntil`
   work after the handler settles is already disposed; a stub a Durable
   Object stores on its instance does not survive into a later invocation;
