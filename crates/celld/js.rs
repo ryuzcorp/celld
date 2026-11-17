@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): node:crypto scrypt; container exec resize op; cross-isolate RPC stubs and streams; test-only fake exec ops; fake kill completion op; exec reads survive their subscribing event; per-node Workers Cache API ops; tenant egress policy; D1 export operator-ingress marker; stateless attribution tokens; reaction-aware request resources; fake close/signal completion ops; binding-forgery enforcement; trusted cell RPC; Queue DLQ forward host op; DLQ forward caller identity; WebSocket and TCP socket ownership; receiver-held stream lifetime; deployment cache scope key; share the /bundle tree per deployment generation.; cancelled requests reject pending ops so co-awaiters settle (upstream #317); answered drivers poll while waitUntil background is outstanding (upstream #300); refused handoffs reject instead of dropping resolvers (upstream #309); facet adoption drops the restored flag (upstream #292); background expiry for orphaned drives (upstream #275); unrefed AbortSignal.timeout timer (upstream #306); loader-fetch 101 webSocket join (upstream #305); nodejs process.env population (upstream #296); writable request /tmp files (upstream #280).
+// Modified by ryuzcorp (ryuzcorp/celld): node:crypto scrypt; container exec resize op; cross-isolate RPC stubs and streams; test-only fake exec ops; fake kill completion op; exec reads survive their subscribing event; per-node Workers Cache API ops; tenant egress policy; D1 export operator-ingress marker; stateless attribution tokens; reaction-aware request resources; fake close/signal completion ops; binding-forgery enforcement; trusted cell RPC; Queue DLQ forward host op; DLQ forward caller identity; WebSocket and TCP socket ownership; receiver-held stream lifetime; deployment cache scope key; share the /bundle tree per deployment generation.; cancelled requests reject pending ops so co-awaiters settle (upstream #317); answered drivers poll while waitUntil background is outstanding (upstream #300); refused handoffs reject instead of dropping resolvers (upstream #309); facet adoption drops the restored flag (upstream #292); background expiry for orphaned drives (upstream #275); unrefed AbortSignal.timeout timer (upstream #306); loader-fetch 101 webSocket join (upstream #305); nodejs process.env population (upstream #296); writable request /tmp files (upstream #280); synchronous loader abort publish (upstream #281).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 // The raw V8 adapter and its child modules remain outside the Actor execution
@@ -486,11 +486,24 @@ pub struct FetchRequest<'a> {
     pub request_id: Option<RequestId>,
 }
 
-static DO_CALL_CANCELS: OnceLock<
-    std::sync::Mutex<HashMap<RequestId, tokio::sync::oneshot::Sender<()>>>,
-> = OnceLock::new();
-fn do_call_cancels(
-) -> &'static std::sync::Mutex<HashMap<RequestId, tokio::sync::oneshot::Sender<()>>> {
+/// A cancellable call's abort sender, plus the request-cancellation lifetime
+/// a caller-side abort must publish to. The sender alone cannot reach a
+/// callee isolate: once the caller's entry retires, its driver stops polling
+/// the call's future, so a select waiting on the receiver never fires and
+/// the abort dies with the entry (upstream #281). Publishing synchronously
+/// from `__do_call_cancel` closes that race; the select stays for settling
+/// the caller-side promise.
+type DoCallCancels = std::sync::Mutex<
+    HashMap<
+        RequestId,
+        (
+            tokio::sync::oneshot::Sender<()>,
+            Option<Arc<crate::runtime::RequestCancellationLifetime>>,
+        ),
+    >,
+>;
+static DO_CALL_CANCELS: OnceLock<DoCallCancels> = OnceLock::new();
+fn do_call_cancels() -> &'static DoCallCancels {
     DO_CALL_CANCELS.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
 }
 
@@ -592,9 +605,97 @@ impl Drop for DoCallCancelGuard {
         let Some(request) = self.0.take() else {
             return;
         };
-        if let Some(cancel) = do_call_cancels().lock().unwrap().remove(&request) {
+        if let Some((cancel, _)) = do_call_cancels().lock().unwrap().remove(&request) {
             let _ = cancel.send(());
         }
+    }
+}
+
+/// Finish a loaded-fetch cancellation lifetime when its driver never starts.
+///
+/// An abort that lands while the call waits for the egress gate or the
+/// loaded worker slot is published to `pending_aborts`; if the caller
+/// retires during that wait, `drive_fetch_job` never runs, so no driver
+/// guard finishes the lifetime and the entry (and `PENDING_ABORT_COUNT`)
+/// leaks. Holding this guard across the dispatch awaits retires the
+/// lifetime on that retire-before-dispatch path out.
+///
+/// The guard must be disarmed once the driver spawns: from there the
+/// driver's own guard owns retirement, and this block finishing first
+/// would clear a published abort before the driver task polls it — the
+/// abort would never reach the child. `drive_fetch_job` installs its
+/// guard before it returns, so disarming right after the spawn leaves
+/// no path without an owner.
+struct LoaderFetchCancellationGuard(
+    Option<std::sync::Arc<crate::runtime::RequestCancellationLifetime>>,
+);
+
+impl LoaderFetchCancellationGuard {
+    fn armed(
+        lifetime: &Option<std::sync::Arc<crate::runtime::RequestCancellationLifetime>>,
+    ) -> Self {
+        Self(lifetime.clone())
+    }
+
+    fn disarm(&mut self) {
+        self.0.take();
+    }
+}
+
+impl Drop for LoaderFetchCancellationGuard {
+    fn drop(&mut self) {
+        if let Some(lifetime) = self.0.take() {
+            lifetime.finish();
+        }
+    }
+}
+
+#[cfg(test)]
+mod loader_fetch_cancellation_tests {
+    use super::take_request_cancellation;
+    use super::LoaderFetchCancellationGuard;
+
+    /// A dispatch retired before its driver starts must not leak the abort
+    /// the cancel path already published. Without a finish-on-drop owner
+    /// the `pending_aborts` entry (and `PENDING_ABORT_COUNT`) survives the
+    /// call, so every such retire leaves one entry behind.
+    #[test]
+    fn retired_dispatch_clears_a_published_abort() {
+        let lifetime = crate::runtime::RequestCancellationLifetime::stateless();
+        let id = lifetime.request_id();
+        // The cancel path publishes synchronously once the caller's entry
+        // retires: the entry is observable until something finishes it.
+        lifetime.publish_abort();
+        assert!(
+            take_request_cancellation(Some(id)),
+            "a published abort must be observable",
+        );
+        // The dispatch future is dropped before `drive_fetch_job` starts,
+        // as on caller retire; the guard it holds retires the lifetime.
+        lifetime.publish_abort();
+        drop(LoaderFetchCancellationGuard::armed(&Some(lifetime)));
+        assert!(
+            !take_request_cancellation(Some(id)),
+            "a retired dispatch leaked its cancellation state",
+        );
+    }
+
+    /// Once the driver spawns, the dispatch guard is disarmed: a published
+    /// abort must survive this block's end so the driver task still
+    /// observes it. Finishing here first would clear the entry before the
+    /// driver polls, and the abort would never reach the child.
+    #[test]
+    fn disarmed_dispatch_leaves_a_published_abort_for_the_driver() {
+        let lifetime = crate::runtime::RequestCancellationLifetime::stateless();
+        let id = lifetime.request_id();
+        lifetime.publish_abort();
+        let mut guard = LoaderFetchCancellationGuard::armed(&Some(lifetime));
+        guard.disarm();
+        drop(guard);
+        assert!(
+            take_request_cancellation(Some(id)),
+            "the driver must still observe the abort",
+        );
     }
 }
 
@@ -7853,7 +7954,7 @@ fn op_svc_call_impl(
         do_call_cancels()
             .lock()
             .unwrap()
-            .insert(request_id, cancel_sender);
+            .insert(request_id, (cancel_sender, None));
         (
             Some(request_id),
             Some(cancel_receiver),
@@ -8455,20 +8556,26 @@ fn op_loader_fetch(
     // `__do_call_cancel` already reads, as a service-binding call does. Only a
     // call with a signal registers, because nothing else can name the id.
     let cancellable = args.get(10).boolean_value(scope);
-    let (cancel_id, cancel, cancel_guard) = if cancellable {
+    let (cancel_id, cancel, cancel_guard, cancellation) = if cancellable {
         let request_id = next_do_request_id();
         let (cancel_sender, cancel_receiver) = tokio::sync::oneshot::channel();
+        // Minted here so the registry entry carries the lifetime the abort
+        // must publish to: `op_do_call_cancel` publishes synchronously
+        // instead of relying on the call's select being polled after the
+        // caller's entry retires (upstream #281).
+        let cancellation = crate::runtime::RequestCancellationLifetime::stateless();
         do_call_cancels()
             .lock()
             .unwrap()
-            .insert(request_id, cancel_sender);
+            .insert(request_id, (cancel_sender, Some(cancellation.clone())));
         (
             Some(request_id),
             Some(cancel_receiver),
             Some(DoCallCancelGuard::new(request_id)),
+            Some(cancellation),
         )
     } else {
-        (None, None, None)
+        (None, None, None, None)
     };
     let (tail_report, tail_receive) = if want_tail_report {
         let (send, receive) = tokio::sync::oneshot::channel();
@@ -8491,6 +8598,14 @@ fn op_loader_fetch(
     let stream_service = http_stream_service();
     let async_id = asyncrt::enqueue(async move {
         let mut cancel_guard = cancel_guard;
+        // Own the lifetime's retirement until the driver takes it: an abort
+        // published while awaiting the gate or the slot below lands in
+        // `pending_aborts`, and retiring the call before `drive_fetch_job`
+        // starts would otherwise leave that entry with no driver to finish
+        // it. Disarmed at the spawn below; from there the driver's own
+        // guard owns retirement, and finishing here first would clear a
+        // published abort before the driver task polls it.
+        let mut dispatch_guard = LoaderFetchCancellationGuard::armed(&cancellation);
         // The child's own `IoContext` has an empty egress stack, so nothing
         // inside it gates what it sends onward. Holding the call until the
         // caller's writes are proven makes every effect of the loaded worker
@@ -8518,8 +8633,15 @@ fn op_loader_fetch(
         // Without this shared lifetime, a caller's abort rejected only the
         // caller's promise and the child ran to completion with a live
         // `request.signal` (denoland/celld#257).
-        let cancellation = crate::runtime::RequestCancellationLifetime::stateless();
+        let cancellation =
+            cancellation.unwrap_or_else(crate::runtime::RequestCancellationLifetime::stateless);
         let driving = tokio::spawn(cancellation.clone().drive_fetch_job(slot, job));
+        // The driver owns retirement from here: `drive_fetch_job` installs
+        // its own finish-on-drop guard before it returns, so a retire after
+        // this point still retires through the driver. Disarming keeps this
+        // block from clearing a published abort the driver task has not
+        // polled yet.
+        dispatch_guard.disarm();
         let response = async {
             match receive.await {
                 Ok(response) => response,
@@ -9469,7 +9591,7 @@ fn op_do_call_impl(
     do_call_cancels()
         .lock()
         .unwrap()
-        .insert(request_id, cancel_sender);
+        .insert(request_id, (cancel_sender, None));
     let mut cancel_guard = DoCallCancelGuard::new(request_id);
     let Some(event) = event_context(scope) else {
         return retired_event_throw(scope);
@@ -9520,8 +9642,18 @@ fn op_do_call_cancel(
     let Some(request_id) = parse_request_id(&request_id) else {
         return;
     };
-    if let Some(cancel) = do_call_cancels().lock().unwrap().remove(&request_id) {
+    let hit = do_call_cancels().lock().unwrap().remove(&request_id);
+    if let Some((cancel, lifetime)) = hit {
         let _ = cancel.send(());
+        // Publish here, not only in the call's select: once the caller's
+        // entry retires, its driver stops polling the call's future, so a
+        // select waiting on the receiver never fires and the abort dies
+        // with the entry. Publishing synchronously hands the abort to the
+        // callee's driver, which samples it on its next turn (upstream
+        // #281). A finished lifetime suppresses its own publish.
+        if let Some(lifetime) = lifetime {
+            lifetime.publish_abort();
+        }
     }
 }
 
@@ -10448,7 +10580,7 @@ fn op_fetch(
             do_call_cancels()
                 .lock()
                 .unwrap()
-                .insert(request_id, cancel_sender);
+                .insert(request_id, (cancel_sender, None));
             (
                 Some(request_id),
                 Some(cancel_receiver),
@@ -10560,7 +10692,7 @@ fn op_fetch(
         do_call_cancels()
             .lock()
             .unwrap()
-            .insert(request_id, cancel_sender);
+            .insert(request_id, (cancel_sender, None));
         (
             Some(request_id),
             Some(cancel_receiver),
