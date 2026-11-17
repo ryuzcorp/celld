@@ -1,6 +1,6 @@
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 //
-// Modified by ryuzcorp (ryuzcorp/celld): retired-event attribution test; cancelled-request shared-work regression tests (upstream #317). Apache-2.0.
+// Modified by ryuzcorp (ryuzcorp/celld): retired-event attribution test; cancelled-request shared-work regression tests (upstream #317); shared-promise attribution regression test (upstream #316). Apache-2.0.
 
 // A white-box driver test, not node code: it builds a Worker in-process and
 // runs its turns directly, so the execution boundary's injected
@@ -398,6 +398,74 @@ fn cancelled_request_rejects_shared_fetch_so_co_awaiters_fail_loudly() {
         Ok(_) => panic!("cancelled A must fail"),
         Err(error) => assert!(format!("{error:#}").contains("disconnected"), "{error:#}"),
     }
+}
+
+const SHARED_THEN_TIMER: &str = r#"
+const flights = new Map();
+export default {
+  async fetch(request) {
+    const url = new URL(request.url);
+    const key = url.searchParams.get("key");
+    const then = url.searchParams.get("then");
+    if (url.pathname === "/start") {
+      const flight = new Promise((resolve) => setTimeout(() => resolve("v"), 20));
+      flights.set(key, flight);
+      const value = await flight;
+      return Response.json({ value });
+    }
+    if (url.pathname === "/join") {
+      const flight = flights.get(key);
+      if (!flight) return Response.json({ error: "no-flight" });
+      const value = await flight;
+      if (then === "timer") await new Promise((resolve) => setTimeout(resolve, 20));
+      return Response.json({ value });
+    }
+    return new Response("not found", { status: 404 });
+  },
+};
+"#;
+
+/// After awaiting a promise another request settled, a request's next timer
+/// must belong to that request's driver — not to the entry whose checkpoint
+/// resumed it (denoland/celld#316). Adopted by the wrong driver, the timer
+/// died with that entry's answer and the waiter hung to its budget.
+#[test]
+fn shared_promise_waiter_owns_its_next_op() {
+    ensure_engine();
+    let mut worker = load_worker(SHARED_THEN_TIMER, "shared-then-timer");
+
+    // A starts shared work; B awaits the same promise and holds no op.
+    let (mut entry_a, mut reply_a, started_a) =
+        begin_suspended(&mut worker, "http://test/start?key=x", 31601);
+    assert_eq!(started_a.len(), 1, "A waits on its timer op");
+    let (entry_b, reply_b, started_b) =
+        begin_suspended(&mut worker, "http://test/join?key=x&then=timer", 31602);
+    assert!(started_b.is_empty(), "B waits on A's promise");
+    drop(started_b);
+    drop(reply_b);
+
+    // Fire the shared timer by driving its future, then deliver to A. One
+    // checkpoint resumes A (which answers) and B (which arms its own timer).
+    let (id_a, fut_a) = started_a.into_iter().next().unwrap();
+    let settle = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("settle runtime")
+        .block_on(fut_a);
+    let started = worker.turn_deliver(&mut entry_a, id_a, settle);
+    assert!(
+        started.is_empty(),
+        "B's timer must not be adopted by A's driver"
+    );
+    drop(entry_a);
+    drop(entry_b);
+
+    // A answered normally once the shared work finished.
+    let response = reply_a
+        .try_recv()
+        .expect("A answered")
+        .unwrap_or_else(|error| panic!("A must answer: {error:#}"));
+    assert_eq!(response.status, 200);
 }
 
 #[test]
