@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): idempotent content-tagged image create; tag-race tests run the fake engine through sh; deploy --sourcemap writes the bundle's external map; service binding targets validated at deploy; staged activation; deploy --sourcemap collects the no_bundle sibling map; staged invoke shares the version-ref parsing; deploy reads stay inside the project; deploy --read-root bounds bundling and container builds; durable object bindings with a foreign script_name are refused (upstream #312).
+// Modified by ryuzcorp (ryuzcorp/celld): idempotent content-tagged image create; tag-race tests run the fake engine through sh; deploy --sourcemap writes the bundle's external map; service binding targets validated at deploy; staged activation; deploy --sourcemap collects the no_bundle sibling map; staged invoke shares the version-ref parsing; deploy reads stay inside the project; deploy --read-root bounds bundling and container builds; durable object bindings with a foreign script_name are refused (upstream #312); image tars upload multipart (upstream #307).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 // Deployment is an operator control-plane path outside the Actor execution
@@ -1218,7 +1218,10 @@ async fn ensure_image_tar(bucket: &Bucket, image: &str) -> anyhow::Result<()> {
             String::from_utf8_lossy(&output.stderr).trim_end()
         );
     }
-    bucket.put(&key, output.stdout).await
+    // One PUT carries the whole tar under the client's single-try timeout,
+    // so a GB image fails deterministically; each multipart part rides its
+    // own request, well under that cap.
+    bucket.put_multipart_bytes(&key, &output.stdout).await
 }
 
 pub async fn write(bucket: &Bucket, built: &Built) -> anyhow::Result<()> {

@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): R2 startAfter compares decoded keys; listing pages carry walk-ordered rows; staged activation; separate CELLD_DEPLOY_AWS_* credentials for deployment-artifact reads; bucket-posture group commit: inject a store for GC-quiet tests (0071); conditional-write verdict keeps the 409 conflict kind (upstream #239).
+// Modified by ryuzcorp (ryuzcorp/celld): R2 startAfter compares decoded keys; listing pages carry walk-ordered rows; staged activation; separate CELLD_DEPLOY_AWS_* credentials for deployment-artifact reads; bucket-posture group commit: inject a store for GC-quiet tests (0071); conditional-write verdict keeps the 409 conflict kind (upstream #239); multipart byte upload for GB image tars (upstream #307).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! The engine's single object-store client: the `object_store` crate
@@ -69,6 +69,11 @@ mod internal_tests {
 
 /// The stored form of an empty blob key segment. See [`Bucket::blob_path`].
 const EMPTY_SEGMENT: &str = "%";
+
+/// The [`Bucket::put_multipart_bytes`] part size. Every part but the last
+/// must clear the object stores' 5 MiB floor, and each part rides its own
+/// request under the client's single-try timeout.
+pub(crate) const MULTIPART_PART_BYTES: usize = 8 * 1024 * 1024;
 
 /// Explicit credentials for a managed installation; everything else comes
 /// from the standard `AWS_*` environment.
@@ -1179,6 +1184,51 @@ impl Bucket {
             .put(&Path::from(key.as_str()), body.into())
             .await
             .with_context(|| format!("write {}://{}/{key}", this.scheme(), this.name))?;
+        Ok(())
+    }
+
+    /// Upload `body` in fixed-size multipart parts instead of one PUT. One
+    /// PUT carries the whole body under the client's single-try timeout, so
+    /// a slow GB body (a container image tar) fails deterministically; each
+    /// part rides its own request, well under that cap. Every part but the
+    /// last clears the stores' 5 MiB floor.
+    pub async fn put_multipart_bytes(&self, key: &str, body: &[u8]) -> anyhow::Result<()> {
+        if body.is_empty() {
+            return self.put(key, Vec::new()).await;
+        }
+        let this = self.keyed(key);
+        let key = this.key(key);
+        let mut upload = this
+            .store
+            .put_multipart_opts(
+                &Path::from(key.as_str()),
+                PutMultipartOptions::default(),
+            )
+            .await
+            .with_context(|| {
+                format!(
+                    "begin multipart upload {}://{}/{key}",
+                    this.scheme(),
+                    this.name
+                )
+            })?;
+        for chunk in body.chunks(MULTIPART_PART_BYTES) {
+            if let Err(error) = upload.put_part(chunk.to_vec().into()).await {
+                let _ = upload.abort().await;
+                return Err(anyhow!(error).context(format!(
+                    "write part {}://{}/{key}",
+                    this.scheme(),
+                    this.name
+                )));
+            }
+        }
+        upload.complete().await.with_context(|| {
+            format!(
+                "complete multipart upload {}://{}/{key}",
+                this.scheme(),
+                this.name
+            )
+        })?;
         Ok(())
     }
 
@@ -2534,6 +2584,150 @@ impl Bucket {
             prefix: String::new(),
             read_deploy: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod multipart_upload_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A store whose single PUTs fail past a byte cap, the way the fleet
+    /// client's single-try timeout fails a slow GB tar: a large upload must
+    /// ride multipart parts instead, each far under that cap. Multipart
+    /// sessions delegate to an in-memory store, so the bytes still round-trip.
+    #[derive(Debug)]
+    struct CappedSinglePut {
+        inner: object_store::memory::InMemory,
+        cap: usize,
+        single_puts: AtomicUsize,
+        part_sessions: AtomicUsize,
+    }
+
+    impl std::fmt::Display for CappedSinglePut {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(formatter, "CappedSinglePut")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for CappedSinglePut {
+        async fn put_opts(
+            &self,
+            location: &Path,
+            payload: PutPayload,
+            opts: PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            self.single_puts.fetch_add(1, Ordering::SeqCst);
+            if payload.content_length() > self.cap {
+                return Err(Error::Generic {
+                    store: "CappedSinglePut",
+                    source: "single PUT over the fleet try timeout".into(),
+                });
+            }
+            self.inner.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &Path,
+            opts: PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn MultipartUpload>> {
+            self.part_sessions.fetch_add(1, Ordering::SeqCst);
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &Path,
+            options: GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+
+        async fn head(&self, location: &Path) -> object_store::Result<ObjectMeta> {
+            self.inner.head(location).await
+        }
+
+        async fn delete(&self, location: &Path) -> object_store::Result<()> {
+            self.inner.delete(location).await
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&Path>,
+        ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&Path>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy(&self, from: &Path, to: &Path) -> object_store::Result<()> {
+            self.inner.copy(from, to).await
+        }
+
+        async fn copy_if_not_exists(
+            &self,
+            from: &Path,
+            to: &Path,
+        ) -> object_store::Result<()> {
+            self.inner.copy_if_not_exists(from, to).await
+        }
+    }
+
+    /// Two full parts and one byte: the single PUT this body used to ride
+    /// fails under the cap, while the multipart upload reassembles it.
+    #[tokio::test]
+    async fn large_upload_rides_multipart_parts() {
+        let store = Arc::new(CappedSinglePut {
+            inner: object_store::memory::InMemory::new(),
+            cap: 64 * 1024,
+            single_puts: AtomicUsize::new(0),
+            part_sessions: AtomicUsize::new(0),
+        });
+        let bucket = Bucket::with_store_for_test(store.clone());
+        let body: Vec<u8> = (0..2 * MULTIPART_PART_BYTES + 1)
+            .map(|index| (index % 251) as u8)
+            .collect();
+        bucket
+            .put("deploy/images/big.tar", body.clone())
+            .await
+            .expect_err("a single PUT past the try cap must fail");
+        bucket
+            .put_multipart_bytes("deploy/images/big.tar", &body)
+            .await
+            .expect("the multipart upload reassembles the body");
+        let (got, _) = bucket
+            .get("deploy/images/big.tar")
+            .await
+            .expect("read the uploaded body")
+            .expect("the upload left an object");
+        assert_eq!(got.as_ref(), body.as_slice());
+        assert_eq!(
+            store.part_sessions.load(Ordering::SeqCst),
+            1,
+            "the body uploads in one multipart session"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_upload_stays_a_single_put() {
+        let bucket = Bucket::for_test();
+        bucket
+            .put_multipart_bytes("deploy/images/empty.tar", &[])
+            .await
+            .expect("an empty body still uploads");
+        let (got, _) = bucket
+            .get("deploy/images/empty.tar")
+            .await
+            .expect("read the uploaded body")
+            .expect("the upload left an object");
+        assert!(got.is_empty());
     }
 }
 
