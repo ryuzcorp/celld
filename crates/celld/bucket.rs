@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): R2 startAfter compares decoded keys; listing pages carry walk-ordered rows; staged activation; separate CELLD_DEPLOY_AWS_* credentials for deployment-artifact reads; bucket-posture group commit: inject a store for GC-quiet tests (0071).
+// Modified by ryuzcorp (ryuzcorp/celld): R2 startAfter compares decoded keys; listing pages carry walk-ordered rows; staged activation; separate CELLD_DEPLOY_AWS_* credentials for deployment-artifact reads; bucket-posture group commit: inject a store for GC-quiet tests (0071); conditional-write verdict keeps the 409 conflict kind (upstream #239).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! The engine's single object-store client: the `object_store` crate
@@ -220,6 +220,29 @@ pub struct CommonPrefixPage {
 pub(crate) struct ObjectPage {
     pub objects: Vec<ObjectMeta>,
     pub page_token: Option<String>,
+}
+
+/// A conditional write's verdict with its rejection kind attached.
+/// `Rejected.conflict` is a transient store conflict (HTTP 409,
+/// `AlreadyExists`): AWS documents a same-guard retry for it. A
+/// non-conflict rejection is a lost race (HTTP 412, `Precondition`)
+/// that needs a fresh read (upstream #239). The mapping is the shared
+/// HTTP-status one, so it holds for every backend.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CasPut {
+    Applied(String),
+    Rejected { conflict: bool },
+}
+
+impl CasPut {
+    /// The pre-#239 `put_cas` shape: every other caller treats both
+    /// rejection kinds as one lost race.
+    pub fn into_token(self) -> Option<String> {
+        match self {
+            CasPut::Applied(token) => Some(token),
+            CasPut::Rejected { .. } => None,
+        }
+    }
 }
 
 /// Whether a conditional write reached a provider-enforced conflict.
@@ -1232,6 +1255,21 @@ impl Bucket {
         body: impl Into<PutPayload>,
         token: Option<&str>,
     ) -> anyhow::Result<Option<String>> {
+        self.put_cas_verdict(key, body, token)
+            .await
+            .map(CasPut::into_token)
+    }
+
+    /// The conditional-write primitive with its rejection kind attached:
+    /// a 409-style transient conflict is not a lost race, and the lease
+    /// path retries it with the same guard instead of spending a readback
+    /// (upstream #239).
+    pub async fn put_cas_verdict(
+        &self,
+        key: &str,
+        body: impl Into<PutPayload>,
+        token: Option<&str>,
+    ) -> anyhow::Result<CasPut> {
         let this = self.keyed(key);
         let key = this.key(key);
         let mode = match token {
@@ -1261,9 +1299,22 @@ impl Bucket {
                             this.name
                         )
                     })?;
-                Ok(Some(token))
+                Ok(CasPut::Applied(token))
             }
-            Err(error) if is_clean_cas_rejection(&error) => Ok(None),
+            Err(error) if is_clean_cas_rejection(&error) => {
+                // Log the kind, not just the fact: a 409 `AlreadyExists`
+                // is a transient conflict a same-guard retry may clear,
+                // while a 412 `Precondition` is a lost race that needs a
+                // fresh read (upstream #239).
+                let conflict = matches!(error, Error::AlreadyExists { .. });
+                tracing::debug!(
+                    key = key.as_str(),
+                    scheme = this.scheme(),
+                    conflict,
+                    "conditional write rejected"
+                );
+                Ok(CasPut::Rejected { conflict })
+            }
             Err(error) => Err(anyhow!(error).context(format!(
                 "conditional write {}://{}/{key} may have committed",
                 this.scheme(),
