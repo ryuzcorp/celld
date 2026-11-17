@@ -1,4 +1,4 @@
-<!-- Modified by ryuzcorp (ryuzcorp/celld): node:crypto scrypt; cloned streaming bodies; cross-isolate RPC stubs and streams; per-node Workers Cache API; receiver-held RPC streams. -->
+<!-- Modified by ryuzcorp (ryuzcorp/celld): node:crypto scrypt; cloned streaming bodies; cross-isolate RPC stubs and streams; per-node Workers Cache API; receiver-held RPC streams; AbortSignal.timeout is unreferenced (upstream #306). -->
 # Cloudflare compatibility
 
 This page lists only the differences from the linked Cloudflare APIs. An entry
@@ -194,6 +194,9 @@ The `tail` and `email` handlers are unavailable.
   so `importKey()` and `exportKey()` both carry the point alone.
 
 ### [Web standards](https://developers.cloudflare.com/workers/runtime-apis/web-standards/)
+`AbortSignal.timeout()` never keeps its event (or its admission slot) alive:
+the timer is unreferenced, so it fires or dies with the request, whichever
+comes first, and carries no timer id or cancellation.
 
 ### [Performance and timers](https://developers.cloudflare.com/workers/runtime-apis/performance/)
 
