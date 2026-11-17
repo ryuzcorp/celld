@@ -248,9 +248,11 @@ async fn run_with(
     let database = if command.local {
         open_dev_database(
             command.project.clone(),
+            command.state.clone(),
             command.unsafe_public_advertise,
             subject,
             scope,
+            &environment,
         )
         .await?
     } else {
@@ -428,16 +430,19 @@ struct Migration {
 /// state at all.
 async fn open_dev_database(
     project: Option<PathBuf>,
+    state: Option<PathBuf>,
     unsafe_public_advertise: bool,
     subject: Subject,
     scope: String,
+    environment: impl Fn(&str) -> Option<std::ffi::OsString>,
 ) -> anyhow::Result<Reachable> {
     let config = crate::deploy::resolve_config(project)?;
     let project = crate::dev::DevState::project_dir(&config)?;
-    let database = crate::dev::DevState::database_for_project(&project);
+    let database = crate::dev::DevState::database_for_project(&project, state, environment);
     if !database.exists() {
         bail!(
-            "no celld dev state at {}; run `celld dev` in {} first",
+            "no celld dev state at {}; run `celld dev` in {} first, with the same `--state DIR` \
+             (or `CELLD_DEV_STATE`) when the node uses one",
             database.display(),
             project.display()
         );
@@ -704,6 +709,10 @@ struct Command {
     /// Target the `celld dev` node through the project's local state
     /// instead of a fleet bucket.
     local: bool,
+    /// The dev state directory for the local path: the `--state` flag,
+    /// resolving the same way as `celld dev` (flag, `CELLD_DEV_STATE`,
+    /// project).
+    state: Option<PathBuf>,
 }
 
 impl Command {
@@ -760,6 +769,7 @@ impl Command {
         let mut json = false;
         let mut unsafe_public_advertise = false;
         let mut local = false;
+        let mut state = None;
         while let Some(argument) = arguments.next() {
             let mut value = |flag: &str| {
                 arguments
@@ -777,6 +787,7 @@ impl Command {
                 "--json" => json = true,
                 "--unsafe-public-advertise" => unsafe_public_advertise = true,
                 "--local" => local = true,
+                "--state" => state = Some(PathBuf::from(value("--state")?)),
                 "--help" | "-h" => return Ok(None),
                 other => {
                     // The fleet flags are shared, so `--bucket gs://name`
@@ -869,6 +880,9 @@ impl Command {
                  not a fleet bucket; drop --bucket/--endpoint (and CELLD_BUCKET/S3_ENDPOINT)"
             );
         }
+        if !local && state.is_some() {
+            bail!("`--state DIR` names the `celld dev` state directory; it needs `--local`");
+        }
         Ok(Some(Self {
             action,
             database,
@@ -879,6 +893,7 @@ impl Command {
             json,
             unsafe_public_advertise,
             local,
+            state,
         }))
     }
 }
@@ -909,10 +924,12 @@ needs.
 
 `--local` runs the subcommand against the `celld dev` node instead of the
 fleet: it reads the database identity from PROJECT as usual, then reaches
-the running dev node through PROJECT/.celld/dev — the local store carries
-that node's leases and secret, so execute, export, and migrations work
-unchanged. The dev node must be running. `--local` takes no --bucket,
---endpoint, CELLD_BUCKET, or S3_ENDPOINT.
+the running dev node through the project's local state (PROJECT/.celld/dev,
+or the `--state`/`CELLD_DEV_STATE` directory when one is set) — the local
+store carries that node's leases and secret, so execute, export, and
+migrations work unchanged. Pass `--state DIR` when the node runs with
+`celld dev --state DIR` (or `CELLD_DEV_STATE`). The dev node must be running.
+`--local` takes no --bucket, --endpoint, CELLD_BUCKET, or S3_ENDPOINT.
 
 Migration files are `NNNN_description.sql` in `migrations/`. The `sql`
 extension is ASCII case-insensitive. celld applies the files in the order of
@@ -943,6 +960,9 @@ OPTIONS:
                       as one transactional batch (requires --json)
   --local             Target the `celld dev` local database through the
                       running dev node instead of the fleet
+  --state DIR         With --local, use DIR as the `celld dev` state
+                      directory instead of PROJECT/.celld/dev
+                      (CELLD_DEV_STATE sets the same)
   --json              Print one JSON object per row instead of a table
   --output PATH       Write the export to a file instead of stdout
   --table NAME        Export only this table, its indexes, and its triggers;
@@ -1089,6 +1109,42 @@ mod d1_export_cli_tests {
     }
 
     #[test]
+    fn local_state_flag_parses() {
+        let command = parse(&[
+            "execute",
+            "mydb",
+            "--command",
+            "SELECT 1",
+            "--local",
+            "--state",
+            "/tmp/dev-state",
+        ])
+        .expect("parse")
+        .expect("command");
+        assert!(command.local);
+        assert_eq!(command.state, Some(PathBuf::from("/tmp/dev-state")));
+    }
+
+    #[test]
+    fn state_without_local_is_refused() {
+        let error = match parse(&[
+            "execute",
+            "db",
+            "--command",
+            "SELECT 1",
+            "--state",
+            "/tmp/x",
+        ]) {
+            Err(error) => error.to_string(),
+            Ok(_) => panic!("--state without --local must be refused"),
+        };
+        assert!(
+            error.contains("--local"),
+            "the refusal must point at `--local`: {error}"
+        );
+    }
+
+    #[test]
     fn local_refuses_fleet_flags() {
         for arguments in [
             [
@@ -1146,7 +1202,40 @@ mod d1_export_cli_tests {
             message.contains("celld dev"),
             "the refusal must name `celld dev`: {message}"
         );
+        assert!(
+            message.contains("CELLD_DEV_STATE"),
+            "the refusal must name `CELLD_DEV_STATE`: {message}"
+        );
+    }
 
+    /// `--state DIR` points the local path at that state directory, the
+    /// same way `celld dev --state DIR` does: a directory without state
+    /// refuses naming that directory.
+    #[tokio::test]
+    async fn local_state_flag_selects_the_state_directory() {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(
+            project.path().join("wrangler.json"),
+            r#"{"name": "app", "d1_databases": [{"binding": "DB", "database_name": "mydb"}]}"#,
+        )
+        .unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let error = run_isolated(vec![
+            "migrations".to_string(),
+            "apply".to_string(),
+            "mydb".to_string(),
+            "--local".to_string(),
+            "--state".to_string(),
+            elsewhere.path().to_str().unwrap().to_string(),
+            project.path().to_str().unwrap().to_string(),
+        ])
+        .await
+        .expect_err("--state pointing at no dev state must refuse");
+        let message = format!("{error:?}");
+        assert!(
+            message.contains(elsewhere.path().to_str().unwrap()),
+            "the refusal must name the `--state` directory: {message}"
+        );
     }
 
     /// A symlinked `wrangler.json` resolves to the config's own directory,

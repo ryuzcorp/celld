@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): operator token for the internal listener; `celld dev --port 0` assigns an ephemeral port; staged activation; deploy --read-root option; non-dumpable serving process; local state path helper for d1 --local (upstream #272).
+// Modified by ryuzcorp (ryuzcorp/celld): operator token for the internal listener; `celld dev --port 0` assigns an ephemeral port; staged activation; deploy --read-root option; non-dumpable serving process; local state path helper for d1 --local (upstream #272); dev --state with marker-guarded clean (upstream #302).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 // Modified by ryuzcorp (ryuzcorp/celld): deploy --sourcemap writes the bundle's external map.
 
@@ -39,38 +39,103 @@ pub fn open_local_bucket(database: &Path) -> anyhow::Result<Bucket> {
 struct Options {
     project: Option<PathBuf>,
     clean: bool,
+    state: Option<PathBuf>,
     stack: StackOptions,
 }
 
 /// The local state directory of one project.
 ///
-/// `--clean` deletes this directory and everything below it. The path is
-/// private and the only constructor takes the project directory that `run`
-/// resolved, so a command-line value can never become the target of the
-/// delete. A newtype carries that rule instead of a comment, because a
-/// `PathBuf` field would let a later caller pass any path and lose nothing at
-/// compile time.
+/// `--clean` deletes this directory and everything below it. The
+/// project-relative path is private and the only constructor takes the
+/// project directory that `run` resolved, so a command-line value can
+/// never become the target of the delete — except through `--state`,
+/// which names the directory outright and is therefore guarded by the
+/// marker file instead. A newtype carries that rule instead of a comment,
+/// because a `PathBuf` field would let a later caller pass any path and
+/// lose nothing at compile time.
 #[derive(Debug)]
 pub(crate) struct DevState {
     path: PathBuf,
+    explicit: bool,
 }
 
 impl DevState {
     /// The project-relative location of the local state, and also the suffix
-    /// that `discard` requires before it deletes.
+    /// that `discard` requires before it deletes a directory it did not
+    /// create.
     const DIRECTORY: &'static str = ".celld/dev";
+
+    /// The marker `prepare_state` writes into every state directory it
+    /// creates. `--clean` over an explicit `--state` directory deletes
+    /// only when the marker proves celld created it: the directory is
+    /// arbitrary, so the `.celld/dev` suffix cannot prove that.
+    const MARKER: &'static str = ".celld-dev-state";
 
     fn for_project(project: &Path) -> Self {
         Self {
             path: project.join(Self::DIRECTORY),
+            explicit: false,
+        }
+    }
+
+    /// An explicit state directory, from `--state` or `CELLD_DEV_STATE`.
+    /// Unlike `for_project` this names an arbitrary directory, so only
+    /// the marker authorizes a delete — even when the path happens to end
+    /// in `.celld/dev`.
+    fn for_state(dir: PathBuf) -> Self {
+        Self {
+            path: dir,
+            explicit: true,
+        }
+    }
+
+    /// The state directory for one project: the `--state` flag wins, then
+    /// `CELLD_DEV_STATE`, then `PROJECT/.celld/dev`. Operator commands
+    /// (`d1 --local`) take the same `--state` flag and resolve through this
+    /// too, so they follow the override.
+    pub(crate) fn resolve(project: &Path, flag: Option<PathBuf>) -> Self {
+        Self::resolve_with(
+            project,
+            flag,
+            std::env::var_os("CELLD_DEV_STATE").map(PathBuf::from),
+        )
+    }
+
+    fn resolve_with(project: &Path, flag: Option<PathBuf>, env: Option<PathBuf>) -> Self {
+        // An empty or whitespace-only flag or variable is unset, not a
+        // directory — mirroring the fleet resolver's `trim().is_empty()`
+        // check, so `CELLD_DEV_STATE=" "` cannot adopt a directory named
+        // `" "`.
+        let is_unset = |dir: &PathBuf| dir.to_string_lossy().trim().is_empty();
+        match flag
+            .filter(|dir| !is_unset(dir))
+            .or_else(|| env.filter(|dir| !is_unset(dir)))
+        {
+            Some(dir) => Self::for_state(dir),
+            None => Self::for_project(project),
         }
     }
 
     /// The SQLite file behind one project's local state, for operator
     /// commands that reach the `celld dev` node through it (`d1 --local`).
     /// Pure path math: the caller decides what a missing file means.
-    pub(crate) fn database_for_project(project: &Path) -> PathBuf {
-        Self::for_project(project).path.join("objects.sqlite3")
+    /// `state` is the command's `--state` flag, so the operator command
+    /// resolves exactly like `celld dev`: the flag, then `CELLD_DEV_STATE`,
+    /// then `PROJECT/.celld/dev`. `environment` is the lookup
+    /// `CELLD_DEV_STATE` resolves through, so tests pass an empty one
+    /// instead of inheriting the developer's shell.
+    pub(crate) fn database_for_project(
+        project: &Path,
+        state: Option<PathBuf>,
+        environment: impl Fn(&str) -> Option<std::ffi::OsString>,
+    ) -> PathBuf {
+        Self::resolve_with(
+            project,
+            state,
+            environment("CELLD_DEV_STATE").map(PathBuf::from),
+        )
+        .path
+        .join("objects.sqlite3")
     }
 
     /// The project directory a Wrangler config belongs to: the parent of the
@@ -94,6 +159,14 @@ impl DevState {
         &self.path
     }
 
+    /// Only project-relative state proves itself by suffix. An explicit
+    /// `--state` path never does, even when it happens to end in
+    /// `.celld/dev`: only the marker authorizes a delete or an adoption
+    /// there.
+    fn is_project_state(&self) -> bool {
+        !self.explicit && self.path.ends_with(Self::DIRECTORY)
+    }
+
     /// Delete the local state so the next run starts from nothing. The answer
     /// reports whether a directory was present, because the console line for
     /// an empty project must not claim that data was removed.
@@ -102,20 +175,31 @@ impl DevState {
     /// an error.
     #[allow(clippy::disallowed_methods)] // Local development state is an operator-owned host path.
     fn discard(&self) -> anyhow::Result<bool> {
-        // The constructor already guarantees this. The check stays because it
-        // is the tripwire for a future constructor that takes a path: a
-        // recursive delete must never widen by accident.
-        anyhow::ensure!(
-            self.path.ends_with(Self::DIRECTORY),
-            "refusing to discard {}, which is not a celld dev state directory",
-            self.path.display()
-        );
+        // A project-relative state directory proves itself by suffix. An
+        // explicit `--state` directory is arbitrary, so only the marker
+        // that `prepare_state` writes proves celld created it: `--clean`
+        // must never delete a directory the operator pointed at by
+        // mistake. The check stays a refusal rather than a fallback,
+        // because a recursive delete must never widen by accident.
+        if !self.is_project_state() && !self.marker().exists() {
+            if !self.path.exists() {
+                return Ok(false);
+            }
+            anyhow::bail!(
+                "refusing to discard {}, which is not a celld dev state directory",
+                self.path.display()
+            );
+        }
         match std::fs::remove_dir_all(&self.path) {
             Ok(()) => Ok(true),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
             Err(error) => Err(error)
                 .with_context(|| format!("discard local state directory {}", self.path.display())),
         }
+    }
+
+    fn marker(&self) -> PathBuf {
+        self.path.join(Self::MARKER)
     }
 }
 
@@ -193,23 +277,75 @@ impl Console {
 
 struct ProjectWatcher {
     project: PathBuf,
+    state: PathBuf,
+    /// The lexical spelling of the state directory, made absolute against
+    /// the canonical watch root, when it names the same directory as
+    /// `state` through a symlink (e.g. `--state /app/dev-state` where that
+    /// link points at `/scratch/state`). notify follows directory symlinks
+    /// and can report event paths in the traversed spelling, which misses
+    /// the canonical prefix — excluding both spellings keeps state writes
+    /// from requesting a rebuild either way.
+    state_alias: Option<PathBuf>,
     ignored: Vec<Pattern>,
     _watcher: notify::RecommendedWatcher,
     changes: mpsc::UnboundedReceiver<notify::Result<notify::Event>>,
 }
 
 impl ProjectWatcher {
-    fn new(project: &Path, ignored: Vec<Pattern>) -> anyhow::Result<Self> {
+    /// Watch `project` recursively, ignoring the resolved state directory
+    /// beside the usual build-output directories. `state` is the
+    /// canonicalized state directory the run prepared: deployment writes
+    /// land there as SQLite WAL writes, and without the exclusion each of
+    /// them requests another rebuild, which writes state again — the
+    /// supervisor rebuilds in a loop without a source change.
+    ///
+    /// The watch root is canonicalized first: event paths carry the
+    /// spelling of the watched root, so a project reached through a
+    /// symlink would otherwise report uncanonicalized event paths that
+    /// miss the canonical state prefix and revive the loop. Watching the
+    /// resolved root keeps both sides canonical; sources keep reporting
+    /// under it either way.
+    ///
+    /// `state` is the lexical state path: it is canonicalized here, and
+    /// its spelling made absolute against the canonical watch root is
+    /// kept as an alias when it names the same directory through a
+    /// symlink below the project. A spelling that resolves elsewhere (a
+    /// relative `--state` run from another directory) is not the watched
+    /// state and gains no exclusion, so sources there stay relevant.
+    fn new(project: &Path, state: &Path, ignored: Vec<Pattern>) -> anyhow::Result<Self> {
+        #[allow(clippy::disallowed_methods)]
+        // Project resolution uses the operator's host filesystem.
+        let project = std::fs::canonicalize(project)
+            .with_context(|| format!("resolve the project directory {}", project.display()))?;
+        #[allow(clippy::disallowed_methods)]
+        // Local development state is an operator-owned host path.
+        let canonical_state = std::fs::canonicalize(state)
+            .with_context(|| format!("resolve the local state directory {}", state.display()))?;
+        // `Path::join` with an absolute `state` keeps it; a relative one
+        // is made absolute against the watch root. Only a spelling that
+        // resolves back to the canonical state becomes an alias.
+        let lexical_state = project.join(state);
+        #[allow(clippy::disallowed_methods)]
+        // Local development state is an operator-owned host path.
+        let resolved_lexical = std::fs::canonicalize(&lexical_state);
+        let state_alias = match resolved_lexical {
+            Ok(resolved) if resolved == canonical_state && lexical_state != canonical_state => {
+                Some(lexical_state)
+            }
+            _ => None,
+        };
         let (sender, changes) = mpsc::unbounded_channel();
         let mut watcher = notify::recommended_watcher(move |event| {
             let _ = sender.send(event);
         })
         .context("create the project watcher")?;
         watcher
-            .watch(project, RecursiveMode::Recursive)
+            .watch(&project, RecursiveMode::Recursive)
             .with_context(|| format!("watch the project directory {}", project.display()))?;
         Ok(Self {
-            project: project.to_path_buf(),
+            project,
+            state: canonical_state,
+            state_alias,
             ignored,
             _watcher: watcher,
             changes,
@@ -240,7 +376,15 @@ impl ProjectWatcher {
                 .await
                 .context("the project watcher stopped")?
             {
-                Ok(event) if relevant_project_event(&self.project, &event, &self.ignored) => {
+                Ok(event)
+                    if relevant_project_event(
+                        &self.project,
+                        &self.state,
+                        self.state_alias.as_deref(),
+                        &event,
+                        &self.ignored,
+                    ) =>
+                {
                     return Ok(())
                 }
                 Ok(_) => {}
@@ -250,7 +394,13 @@ impl ProjectWatcher {
     }
 }
 
-fn relevant_project_event(project: &Path, event: &notify::Event, ignored: &[Pattern]) -> bool {
+fn relevant_project_event(
+    project: &Path,
+    state: &Path,
+    state_alias: Option<&Path>,
+    event: &notify::Event,
+    ignored: &[Pattern],
+) -> bool {
     // A read is not a change. The inotify backend reports `Access(Open(Any))`
     // for every file that the bundler and the deploy step read, so a rebuild
     // produces the events that request the next rebuild and the supervisor
@@ -264,10 +414,31 @@ fn relevant_project_event(project: &Path, event: &notify::Event, ignored: &[Patt
     event
         .paths
         .iter()
-        .any(|path| !ignored_project_path(project, path, ignored))
+        .any(|path| !ignored_project_path(project, state, state_alias, path, ignored))
 }
 
-fn ignored_project_path(project: &Path, path: &Path, ignored: &[Pattern]) -> bool {
+fn ignored_project_path(
+    project: &Path,
+    state: &Path,
+    state_alias: Option<&Path>,
+    path: &Path,
+    ignored: &[Pattern],
+) -> bool {
+    // The state directory holds the deployment the rebuild writes: SQLite
+    // and WAL writes under an in-project `--state` directory would
+    // otherwise request another rebuild, which writes state again, so the
+    // supervisor loops without a source change. Both the canonicalized
+    // directory and its lexical spelling below the project are excluded:
+    // notify follows a symlinked state directory and can report either
+    // spelling. An external state directory never shares either prefix
+    // and keeps working; the default `.celld/dev` stays ignored through
+    // the `.celld` rule below too.
+    if !state.as_os_str().is_empty() && path.starts_with(state) {
+        return true;
+    }
+    if state_alias.is_some_and(|alias| !alias.as_os_str().is_empty() && path.starts_with(alias)) {
+        return true;
+    }
     const IGNORED_DIRECTORIES: &[&str] = &[
         ".cache",
         ".celld",
@@ -359,17 +530,19 @@ impl ShutdownSignals {
 pub fn print_help() -> anyhow::Result<()> {
     crate::cli_output::Output::new(crate::cli_output::Format::Text).help(
         &format!("celld dev — run an application with persistent local storage\n\n\
-USAGE:\n  celld dev [PROJECT] [--host IP] [--port PORT] [--logs] [--no-watch] [--clean]\n\n\
+USAGE:\n  celld dev [PROJECT] [--host IP] [--port PORT] [--logs] [--no-watch] [--clean] [--state DIR]\n\n\
 PROJECT is a directory or a Wrangler config. It defaults to the current\n\
-directory. celld stores all local state in PROJECT/.celld/dev, and it keeps\n\
-that state across a restart. A configuration change does not migrate the\n\
-state, so a cell can keep a value that the new configuration rejects. Use\n\
---clean to start from an empty local state.\n\n\
+directory. celld stores all local state in PROJECT/.celld/dev — or in DIR\n\
+when --state (or CELLD_DEV_STATE) names one, keeping the state outside the\n\
+source tree — and it keeps that state across a restart. A configuration\n\
+change does not migrate the state, so a cell can keep a value that the new\n\
+configuration rejects. Use --clean to start from an empty local state;\n\
+over an explicit state directory --clean deletes only what celld created.\n\n\
 A .dev.vars file beside the config supplies Worker variables in dotenv form,\n\
 as for wrangler dev. Without one, .env and then .env.local supply them, and\n\
 an entry of these files that cannot be a binding is skipped with a warning.\n\
 The entries override the vars of the config.\n\n\
-OPTIONS:\n  --host IP              Worker listener host (default: 127.0.0.1)\n  --port PORT            Worker listener port (default: {DEFAULT_PORT}; 0 assigns an ephemeral port)\n  --clean                Delete PROJECT/.celld/dev before the server starts\n  --logs                 Show the node warning and information logs\n  --no-watch             Do not rebuild when a project file changes\n  --watch-ignore PATTERN Ignore a project-relative glob; repeat as needed\n  -h, --help             Show this help"
+OPTIONS:\n  --host IP              Worker listener host (default: 127.0.0.1)\n  --port PORT            Worker listener port (default: {DEFAULT_PORT}; 0 assigns an ephemeral port)\n  --clean                Delete the local state before the server starts\n  --state DIR            Keep local state in DIR instead of PROJECT/.celld/dev\n                         (CELLD_DEV_STATE sets the same); --clean removes DIR\n                         only when celld created it\n  --logs                 Show the node warning and information logs\n  --no-watch             Do not rebuild when a project file changes\n  --watch-ignore PATTERN Ignore a project-relative glob; repeat as needed\n  -h, --help             Show this help"
         ),
     )
 }
@@ -379,6 +552,7 @@ fn options_from_arguments(arguments: Vec<String>) -> anyhow::Result<Option<Optio
     let mut host = IpAddr::V4(Ipv4Addr::LOCALHOST);
     let mut port = DEFAULT_PORT;
     let mut clean = false;
+    let mut state = None;
     let mut logs = false;
     let mut watch = true;
     let mut watch_ignores = Vec::new();
@@ -387,6 +561,11 @@ fn options_from_arguments(arguments: Vec<String>) -> anyhow::Result<Option<Optio
         match argument.as_str() {
             "--help" | "-h" => return Ok(None),
             "--clean" => clean = true,
+            "--state" => {
+                state = Some(PathBuf::from(
+                    arguments.next().context("--state requires a value")?,
+                ));
+            }
             "--logs" => logs = true,
             "--no-watch" => watch = false,
             "--watch-ignore" => {
@@ -425,6 +604,7 @@ fn options_from_arguments(arguments: Vec<String>) -> anyhow::Result<Option<Optio
     Ok(Some(Options {
         project,
         clean,
+        state,
         stack: StackOptions {
             listener: SocketAddr::new(host, port),
             logs,
@@ -444,7 +624,7 @@ pub async fn run(arguments: Vec<String>) -> anyhow::Result<()> {
     let config = std::fs::canonicalize(&config)
         .with_context(|| format!("resolve Wrangler config {}", config.display()))?;
     let project = DevState::project_dir(&config)?;
-    let state = DevState::for_project(&project);
+    let state = DevState::resolve(&project, options.state);
     let console = Console::new();
     console.header();
     console.detail("Project", &config.display().to_string());
@@ -463,7 +643,7 @@ pub async fn run(arguments: Vec<String>) -> anyhow::Result<()> {
             },
         );
     }
-    prepare_state(state.path())?;
+    prepare_state(&state)?;
     if !options.stack.logs {
         console.detail("Logs", "hidden (use --logs)");
     }
@@ -488,11 +668,42 @@ pub async fn run(arguments: Vec<String>) -> anyhow::Result<()> {
 }
 
 #[allow(clippy::disallowed_methods)] // Local development state is an operator-owned host path.
-fn prepare_state(state: &Path) -> anyhow::Result<()> {
-    for directory in [state.to_path_buf(), state.join("runtime")] {
-        std::fs::create_dir_all(&directory)
+fn prepare_state(state: &DevState) -> anyhow::Result<()> {
+    // Fail closed on adoption: an explicit `--state` directory is arbitrary,
+    // so one that already exists non-empty without the marker is foreign —
+    // refusing here keeps a later `--clean` from ever seeing a marker in a
+    // directory celld did not create. A missing directory is fresh and
+    // proceeds; any other read error propagates. Project-relative state
+    // proves itself by suffix and gains the marker on first start, and a
+    // new or empty explicit directory is adopted. The check runs before
+    // anything is created, so a refusal leaves no marker behind.
+    if !state.is_project_state() && !state.marker().exists() {
+        match std::fs::read_dir(&state.path) {
+            Ok(mut entries) => {
+                if entries.next().is_some() {
+                    anyhow::bail!(
+                        "refusing to adopt {}, which is not a celld dev state directory",
+                        state.path.display()
+                    );
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("read local state directory {}", state.path.display())
+                });
+            }
+        }
+    }
+    for directory in [&state.path, &state.path.join("runtime")] {
+        std::fs::create_dir_all(directory)
             .with_context(|| format!("create local state directory {}", directory.display()))?;
     }
+    // The proof of authorship `--clean` requires before it deletes an
+    // explicit `--state` directory. Written on every start, so a state
+    // directory made by an older celld gains it on first use.
+    std::fs::write(state.marker(), "celld dev state\n")
+        .with_context(|| format!("mark local state directory {}", state.path.display()))?;
     Ok(())
 }
 
@@ -646,9 +857,13 @@ async fn run_stack(
     let project = config
         .parent()
         .context("the Wrangler config has no project directory")?;
+    // The watcher canonicalizes the watch root and both spellings of the
+    // state directory itself; `prepare_state` created it before
+    // `run_stack`, so it always exists here. An external directory never
+    // shares either prefix and needs no special case.
     let mut watcher = options
         .watch
-        .then(|| ProjectWatcher::new(project, options.watch_ignores))
+        .then(|| ProjectWatcher::new(project, state, options.watch_ignores))
         .transpose()?;
 
     console.progress("building the application");
@@ -997,6 +1212,7 @@ async fn stop_child(child: &mut Child, internal: Option<&str>) {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)] // Operator-side tests use real tempdirs, not node storage.
 mod dev_tests {
     use super::*;
 
@@ -1012,6 +1228,275 @@ mod dev_tests {
         assert_eq!(options.stack.listener.port(), 0);
         let options = options_of(&["--port", "8484"]);
         assert_eq!(options.stack.listener.port(), 8484);
+    }
+
+    #[test]
+    fn state_flag_reaches_options() {
+        let options = options_of(&["--state", "/tmp/elsewhere"]);
+        assert_eq!(
+            options.state.as_deref(),
+            Some(std::path::Path::new("/tmp/elsewhere"))
+        );
+        assert_eq!(options_of(&[]).state, None);
+    }
+
+    #[test]
+    fn state_resolution_prefers_flag_then_environment_then_project() {
+        let project = std::path::Path::new("/proj");
+        let resolve = |flag: Option<&str>, env: Option<&str>| {
+            DevState::resolve_with(project, flag.map(PathBuf::from), env.map(PathBuf::from)).path
+        };
+        assert_eq!(resolve(None, None), project.join(".celld/dev"));
+        assert_eq!(
+            resolve(None, Some("/env/state")),
+            std::path::PathBuf::from("/env/state")
+        );
+        assert_eq!(
+            resolve(Some("/flag/state"), Some("/env/state")),
+            std::path::PathBuf::from("/flag/state")
+        );
+        // An empty or whitespace-only flag or variable is unset, not a
+        // directory.
+        assert_eq!(
+            resolve(Some(""), Some("/env/state")),
+            std::path::PathBuf::from("/env/state")
+        );
+        assert_eq!(resolve(Some(""), None), project.join(".celld/dev"));
+        assert_eq!(
+            resolve(Some("   "), Some("/env/state")),
+            std::path::PathBuf::from("/env/state")
+        );
+        assert_eq!(resolve(None, Some(" \t ")), project.join(".celld/dev"));
+        assert_eq!(resolve(Some("  "), None), project.join(".celld/dev"));
+    }
+
+    /// The watcher excludes the resolved state directory: SQLite and WAL
+    /// writes under an in-project `--state` directory must not request a
+    /// rebuild — each rebuild writes state again, so the supervisor would
+    /// loop without a source change — while source files still rebuild,
+    /// the default `.celld/dev` stays ignored, and an external state
+    /// directory changes nothing.
+    #[test]
+    fn watcher_excludes_the_resolved_state_directory() {
+        use notify::event::{DataChange, ModifyKind};
+        let project = tempfile::tempdir().unwrap();
+        let state = project.path().join("dev-state");
+        std::fs::create_dir_all(&state).unwrap();
+        let ignored: Vec<Pattern> = Vec::new();
+        let relevant = |state: &Path, path: &Path| {
+            relevant_project_event(
+                project.path(),
+                state,
+                None,
+                &notify::Event {
+                    kind: notify::EventKind::Modify(ModifyKind::Data(DataChange::Any)),
+                    paths: vec![path.to_path_buf()],
+                    ..Default::default()
+                },
+                &ignored,
+            )
+        };
+        // State writes never rebuild, including the state directory event
+        // itself.
+        assert!(!relevant(&state, &state.join("objects.sqlite3")));
+        assert!(!relevant(&state, &state.join("objects.sqlite3-wal")));
+        assert!(!relevant(&state, &state));
+        // Sources beside the state directory still rebuild.
+        assert!(relevant(&state, &project.path().join("worker.js")));
+        // The default state stays ignored through the `.celld` rule too.
+        let default_state = project.path().join(".celld").join("dev");
+        assert!(!relevant(
+            &default_state,
+            &default_state.join("objects.sqlite3")
+        ));
+        // An external state directory never matches a project event, so it
+        // changes nothing: sources still rebuild.
+        let elsewhere = tempfile::tempdir().unwrap();
+        assert!(relevant(
+            elsewhere.path(),
+            &project.path().join("worker.js")
+        ));
+    }
+
+    /// A project reached through a symlinked root still excludes its
+    /// state: the watcher canonicalizes the watch root, so event paths
+    /// carry the canonical spelling and match the canonical state
+    /// prefix. Without the canonicalization the state writes look like
+    /// source changes and the supervisor rebuilds in a loop.
+    #[test]
+    fn watcher_canonicalizes_a_symlinked_watch_root() {
+        let real = tempfile::tempdir().unwrap();
+        let state = real.path().join("dev-state");
+        std::fs::create_dir_all(&state).unwrap();
+
+        let link = real.path().join("linked");
+        std::os::unix::fs::symlink(real.path(), &link).unwrap();
+        let watcher = ProjectWatcher::new(&link, &state, Vec::new()).expect("watch");
+        // The watch root is resolved, so it matches the canonical state
+        // directory even though the project was reached through a symlink.
+        assert_eq!(watcher.project, std::fs::canonicalize(&link).unwrap(),);
+        // Event paths carry the watch root's spelling: a state write under
+        // it must be ignored, while a source beside it still rebuilds.
+        let ignored: Vec<Pattern> = Vec::new();
+        let event = |path: &std::path::Path| notify::Event {
+            kind: notify::EventKind::Modify(notify::event::ModifyKind::Data(
+                notify::event::DataChange::Any,
+            )),
+            paths: vec![path.to_path_buf()],
+            ..Default::default()
+        };
+        assert!(
+            !relevant_project_event(
+                &watcher.project,
+                &watcher.state,
+                watcher.state_alias.as_deref(),
+                &event(
+                    &watcher
+                        .project
+                        .join("dev-state")
+                        .join("objects.sqlite3-wal")
+                ),
+                &ignored,
+            ),
+            "a state write through the symlinked root must be ignored",
+        );
+        assert!(relevant_project_event(
+            &watcher.project,
+            &watcher.state,
+            watcher.state_alias.as_deref(),
+            &event(&watcher.project.join("worker.js")),
+            &ignored,
+        ));
+    }
+
+    /// A symlinked state directory inside the project excludes both
+    /// spellings: notify follows the link and can report a WAL event
+    /// under the traversed link path, which misses the canonical prefix.
+    /// Sources outside the state dir stay relevant either way.
+    #[test]
+    fn watcher_excludes_a_symlinked_state_directory_spelling() {
+        use notify::event::{DataChange, ModifyKind};
+        let project = tempfile::tempdir().unwrap();
+        let target = tempfile::tempdir().unwrap();
+        let link = project.path().join("dev-state");
+        std::os::unix::fs::symlink(target.path(), &link).unwrap();
+        let canonical_project = std::fs::canonicalize(project.path()).unwrap();
+        let watcher = ProjectWatcher::new(&canonical_project, &link, Vec::new()).expect("watch");
+        // The canonical prefix covers the resolved spelling; the alias
+        // covers the traversed link spelling.
+        assert_eq!(watcher.state, std::fs::canonicalize(&link).unwrap(),);
+        assert_eq!(watcher.state_alias.as_deref(), Some(link.as_path()));
+        let ignored: Vec<Pattern> = Vec::new();
+        let event = |path: &std::path::Path| notify::Event {
+            kind: notify::EventKind::Modify(ModifyKind::Data(DataChange::Any)),
+            paths: vec![path.to_path_buf()],
+            ..Default::default()
+        };
+        let relevant = |path: &std::path::Path| {
+            relevant_project_event(
+                &watcher.project,
+                &watcher.state,
+                watcher.state_alias.as_deref(),
+                &event(path),
+                &ignored,
+            )
+        };
+        // Either spelling of a state write is ignored ...
+        assert!(
+            !relevant(&link.join("objects.sqlite3-wal")),
+            "a state write under the link spelling must be ignored",
+        );
+        assert!(
+            !relevant(&watcher.state.join("objects.sqlite3-wal")),
+            "a state write under the canonical spelling must be ignored",
+        );
+        // ... while a source beside the state dir still rebuilds.
+        assert!(relevant(&watcher.project.join("worker.js")));
+    }
+
+    /// `prepare_state` fails closed on adoption and `--clean` deletes only
+    /// what celld created: a marked directory goes away, a non-empty foreign
+    /// one is refused by both with its contents intact and no marker left
+    /// behind — even when it happens to end in `.celld/dev`, since the
+    /// suffix only exempts project-relative state — and a missing one is
+    /// already clean.
+    #[test]
+    fn discard_guards_explicit_state_directories() {
+        let marked = tempfile::tempdir().unwrap();
+        let state = DevState::for_state(marked.path().to_path_buf());
+        prepare_state(&state).unwrap();
+        assert!(state.marker().exists());
+        assert!(state.discard().unwrap());
+        assert!(!marked.path().exists());
+
+        let foreign = tempfile::tempdir().unwrap();
+        std::fs::write(foreign.path().join("precious.txt"), "keep\n").unwrap();
+        let foreign_state = DevState::for_state(foreign.path().to_path_buf());
+        // The start itself must refuse before it writes anything, so a
+        // later `--clean` never finds a marker celld planted in a
+        // directory it did not create.
+        let error = prepare_state(&foreign_state)
+            .expect_err("adopting a foreign directory must be refused");
+        assert!(
+            format!("{error:?}").contains("refusing to adopt"),
+            "the refusal must say so: {error:?}"
+        );
+        assert!(!foreign_state.marker().exists());
+        let error = foreign_state
+            .discard()
+            .expect_err("a foreign directory must be refused");
+        assert!(
+            format!("{error:?}").contains("refusing to discard"),
+            "the refusal must say so: {error:?}"
+        );
+        assert!(foreign.path().join("precious.txt").exists());
+        // A foreign directory that happens to end in `.celld/dev` is still
+        // foreign: the suffix only exempts project-relative state, never an
+        // explicit `--state` path.
+        let shaped = tempfile::tempdir().unwrap();
+        let shaped_dir = shaped.path().join(".celld/dev");
+        std::fs::create_dir_all(&shaped_dir).unwrap();
+        std::fs::write(shaped_dir.join("precious.txt"), "keep\n").unwrap();
+        let shaped_state = DevState::for_state(shaped_dir.clone());
+        let error = prepare_state(&shaped_state)
+            .expect_err("adopting a suffix-shaped foreign directory must be refused");
+        assert!(
+            format!("{error:?}").contains("refusing to adopt"),
+            "the refusal must say so: {error:?}"
+        );
+        assert!(!shaped_state.marker().exists());
+        let error = shaped_state
+            .discard()
+            .expect_err("a suffix-shaped foreign directory must be refused");
+        assert!(
+            format!("{error:?}").contains("refusing to discard"),
+            "the refusal must say so: {error:?}"
+        );
+        assert!(shaped_dir.join("precious.txt").exists());
+
+        let missing = DevState::for_state(foreign.path().join("no-such-dir"));
+        assert!(!missing.discard().unwrap());
+    }
+
+    /// Back-compat: project-relative state is suffix-exempt, so a non-empty
+    /// directory from an older celld gains the marker on first start; a new
+    /// or empty explicit directory is adopted the same way.
+    #[test]
+    fn prepare_state_adopts_project_and_empty_explicit_directories() {
+        let project = tempfile::tempdir().unwrap();
+        let legacy = project.path().join(".celld/dev");
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(legacy.join("objects.sqlite3"), "old\n").unwrap();
+        let state = DevState::for_project(project.path());
+        prepare_state(&state).unwrap();
+        assert!(state.marker().exists());
+        assert!(legacy.join("objects.sqlite3").exists());
+
+        let empty = tempfile::tempdir().unwrap();
+        let fresh = DevState::for_state(empty.path().join("no-such-dir"));
+        prepare_state(&fresh).unwrap();
+        assert!(fresh.marker().exists());
+        assert!(fresh.discard().unwrap());
     }
 
     #[test]

@@ -319,6 +319,7 @@ is `http://127.0.0.1:9876` by default.
 | `--host ADDR` | The Worker listener interface. The operator listener stays on loopback |
 | `--logs` | Show the node warning and information logs |
 | `--clean` | Delete `.celld/dev` before the start |
+| `--state DIR` | Keep local state in DIR instead of `PROJECT/.celld/dev` (`CELLD_DEV_STATE` sets the same) |
 | `--watch-ignore GLOB` | Ignore one more project-relative glob. Repeatable. Not valid with `--no-watch` |
 | `--no-watch` | Disable automatic builds and restarts |
 
@@ -336,11 +337,17 @@ or that collides with another binding; in `.dev.vars` such an entry stops
 the build. `celld deploy` does not read these files. Add `.dev.vars`,
 `.env`, `.env.local`, and `.celld/` to `.gitignore`.
 
-The command keeps the local state in `.celld/dev`, across restarts and
-configuration changes. celld does not migrate stored state, so a stored
-value from an earlier configuration can make the application fail with an
-error that looks unrelated. Use `--clean` to start from an empty state.
-`--clean` deletes nothing else under `.celld`.
+The command keeps the local state in `PROJECT/.celld/dev` (`--state DIR` or
+`CELLD_DEV_STATE` moves it elsewhere, so backups and search tools skip it),
+across restarts and configuration changes. celld does not migrate stored
+state, so a stored value from an earlier configuration can make the
+application fail with an error that looks unrelated. Use `--clean` to start
+from an empty state. `--clean` deletes nothing else under `.celld`, and over
+an explicit `--state` directory it deletes only what celld created: a missing
+directory is already clean, and a foreign one is refused with its contents
+intact. `celld d1 --local` resolves the same directory, so it follows the
+override; pass the same `--state DIR` (or `CELLD_DEV_STATE`) when the node
+runs with an explicit state directory.
 
 The command watches the project directory and rebuilds on a source,
 configuration, or dotenv change. The current application serves during the
