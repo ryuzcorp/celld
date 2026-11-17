@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): operator token for the internal listener; list_page resume is a cursor; ported from meln1k/celld: seal a dead lease that never opened a log (01522b3); seal_absent_log regression tests; lone-node repair backoff; bucket-posture group commit: bucket-session record encoding + old-reader interop tests (0059); bucket-posture group commit: bucket executor without ensemble (0060); bucket-posture group commit: successor fold of bucket bundles (0063); bucket-posture group commit: bucket-session drain, per-cell seal, bundle GC without ensemble, linger holds only while the dirty set is shared (0064); bucket-posture group commit: lone-cell-per-cell vs shared-bundle executor tests, and idle bucket sessions skip empty bundle-GC scans (0071); stale-target 409 proves the member gone in recovery (upstream #273); tail reads stream under a progress timeout (upstream #250); deleted sessions with surviving objects declare loss (upstream #245); same-ensemble degrade resumes the epoch (upstream #268).
+// Modified by ryuzcorp (ryuzcorp/celld): operator token for the internal listener; list_page resume is a cursor; ported from meln1k/celld: seal a dead lease that never opened a log (01522b3); seal_absent_log regression tests; lone-node repair backoff; bucket-posture group commit: bucket-session record encoding + old-reader interop tests (0059); bucket-posture group commit: bucket executor without ensemble (0060); bucket-posture group commit: successor fold of bucket bundles (0063); bucket-posture group commit: bucket-session drain, per-cell seal, bundle GC without ensemble, linger holds only while the dirty set is shared (0064); bucket-posture group commit: lone-cell-per-cell vs shared-bundle executor tests, and idle bucket sessions skip empty bundle-GC scans (0071); stale-target 409 proves the member gone in recovery (upstream #273); tail reads stream under a progress timeout (upstream #250); deleted sessions with surviving objects declare loss (upstream #245); same-ensemble degrade resumes the epoch (upstream #268); fragment GC collects record-less sessions (upstream #259).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! v0 of the in-fleet replicated log tier (`CELLD_DURABILITY=fleet`).
@@ -615,26 +615,68 @@ pub(crate) async fn read_record(
     bucket: &Bucket,
     session: &str,
 ) -> anyhow::Result<Option<FoldedRead>> {
+    Ok(read_record_full(bucket, session).await?.present())
+}
+
+/// What `read_record_full` found: either the folded log, or WHY there is
+/// none. Callers that act on the absence (fragment GC) must tell the
+/// terminal cases from a session that may still publish its log.
+pub(crate) enum RecordRead {
+    Present(Box<FoldedRead>),
+    Absent(RecordAbsence),
+}
+
+impl RecordRead {
+    fn present(self) -> Option<FoldedRead> {
+        match self {
+            RecordRead::Present(folded) => Some(*folded),
+            RecordRead::Absent(_) => None,
+        }
+    }
+}
+
+/// Why a session has no folded log (upstream #259). Only the first two are
+/// terminal — no new epoch will ever adopt the leftovers. A lease that
+/// names the session but carries no log is a session that may still open
+/// one (a live lease before its first publication, a slow first-open
+/// racing fragment arrival), so its fragments are not garbage.
+pub(crate) enum RecordAbsence {
+    /// No lease object at all: the node never opened a session here, or
+    /// its lease record is gone (a decommissioned node, a deleted lease).
+    NoLease,
+    /// The lease carries a different generation: this session was
+    /// superseded by a restart, so no new epoch will ever adopt the
+    /// leftovers.
+    SupersededGeneration,
+    /// The lease names this session but carries no folded log: the session
+    /// may still open one, so the absence is not terminal.
+    LeaseWithoutLog,
+}
+
+pub(crate) async fn read_record_full(
+    bucket: &Bucket,
+    session: &str,
+) -> anyhow::Result<RecordRead> {
     let (node, generation) = session.split_once('/').unwrap_or((session, ""));
     let Some((bytes, token)) = bucket.get(&lease_key(node)).await? else {
-        return Ok(None);
+        return Ok(RecordRead::Absent(RecordAbsence::NoLease));
     };
     let wire: crate::ownership_store::NodeLeaseWire = serde_json::from_slice(&bytes)?;
     // A bare node name reads whatever session the record carries; a full
     // <node>/<generation> pins it, and a superseded generation is a
     // recovered-then-replaced session whose absence means complete.
     if !generation.is_empty() && wire.generation != generation {
-        return Ok(None);
+        return Ok(RecordRead::Absent(RecordAbsence::SupersededGeneration));
     }
     let Some(log) = wire.log.as_ref() else {
-        return Ok(None);
+        return Ok(RecordRead::Absent(RecordAbsence::LeaseWithoutLog));
     };
-    Ok(Some(FoldedRead {
+    Ok(RecordRead::Present(Box::new(FoldedRead {
         record: log_from_wire(log)?,
         may_have_fleet_acks: log.may_have_fleet_acks,
         token,
         wire,
-    }))
+    })))
 }
 
 /// CAS a DEAD session's folded log fields. Authority fields ride through
@@ -2179,19 +2221,34 @@ impl FollowerStore {
     /// One fragment-GC pass over every leader this node follows. A
     /// fragment is garbage when its epoch is closed: the record moved past
     /// it (reconfiguration or a reopened incarnation force-tiered or
-    /// recovered it away), or the record at its epoch is Sealed (recovery
+    /// recovered it away), the record at its epoch is Sealed (recovery
     /// certified and uploaded the tail, so this copy is redundant by
-    /// write-all). The deletion runs under the per-leader guard, keeps the
-    /// state file, and extends the seal mark over the closed epoch, so a
-    /// straggling append at it is refused rather than resurrected.
+    /// write-all), or there is no record at all (a superseded generation,
+    /// a deleted lease — no new epoch will ever adopt the leftovers). A
+    /// lease that names the session but carries no folded log yet is the
+    /// exception: the session may still open one, so its fragments stay.
+    /// The deletion runs under the per-leader guard, keeps the state file,
+    /// and extends the seal mark over the closed epoch, so a straggling
+    /// append at it is refused rather than resurrected.
     pub async fn gc_fragments(&self) {
         let Some(bucket) = &self.bucket else { return };
         let leaders = self.followed_sessions();
         for leader in leaders {
-            let Ok(Some(folded)) = read_record(bucket, &leader).await else {
-                continue;
+            // A read error retries next pass. A missing record is not an
+            // error: the session is gone (a superseded generation, a
+            // deleted lease), so its fragments are garbage no new epoch
+            // will ever adopt — upstream #259. But a lease that names the
+            // session and simply carries no folded log yet is not gone: the
+            // session may still open its log and adopt these fragments, so
+            // the sweep skips it instead of collecting live data. The seal
+            // mark below still extends in the terminal cases, so a
+            // straggling append is refused rather than resurrected.
+            let record = match read_record_full(bucket, &leader).await {
+                Err(_) => continue,
+                Ok(RecordRead::Absent(RecordAbsence::LeaseWithoutLog)) => continue,
+                Ok(RecordRead::Absent(_)) => None,
+                Ok(RecordRead::Present(folded)) => Some(folded.record),
             };
-            let record = folded.record;
             let guard = self.guard(&leader);
             let _held = guard.lock().await;
             let Ok(state) = self.load(&leader) else {
@@ -2200,7 +2257,10 @@ impl FollowerStore {
             if state.fragment_epoch == 0 {
                 continue;
             }
-            let closed = log_tier::fragment_closed(&record, state.fragment_epoch);
+            let closed = match &record {
+                None => true,
+                Some(record) => log_tier::fragment_closed(record, state.fragment_epoch),
+            };
             if !closed {
                 continue;
             }
@@ -10052,6 +10112,237 @@ mod bucket_recovery_tests {
                 2,
                 "bundle coverage alone restores the rows"
             );
+        });
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::disallowed_methods)] // Test tempdirs live outside the injected filesystem.
+mod fragment_gc_tests {
+    use super::*;
+
+    fn test_bucket(dir: &std::path::Path) -> Arc<Bucket> {
+        let database = dir.join("objects.sqlite3");
+        Arc::new(Bucket::open_dev(&database).expect("dev bucket"))
+    }
+
+    /// A sealed session record for `node`, as recovery leaves it: the epoch
+    /// is closed, so every follower copy is redundant by write-all.
+    async fn write_sealed_record(bucket: &Bucket, node: &str, generation: &str, epoch: u64) {
+        let record = log_tier::LogRecord {
+            epoch,
+            ensemble: ["f1".to_string(), node.to_string()].into_iter().collect(),
+            tiered: 0,
+            state: LogState::Sealed,
+            kind: log_tier::SessionKind::Fleet,
+            claimant: None,
+            claimed_ms: None,
+        };
+        let wire = crate::ownership_store::NodeLeaseWire {
+            node: node.to_string(),
+            expires_ms: crate::ownership_store::now_ms() + 3_600_000,
+            addr: String::new(),
+            probe_public_key: String::new(),
+            peer_protocol: 1,
+            paced_handoff: false,
+            generation: generation.to_string(),
+            log: Some(log_to_wire(&record, false)),
+            load: Default::default(),
+        };
+        bucket
+            .put(
+                &lease_key(node),
+                serde_json::to_vec(&wire).expect("lease encodes"),
+            )
+            .await
+            .expect("lease puts");
+    }
+
+    fn write_fragment(dir: &std::path::Path, epoch: u64, end: u64) {
+        std::fs::create_dir_all(dir).expect("fragment dir");
+        let state = FollowerState {
+            fragment_epoch: epoch,
+            base: 0,
+            end,
+            sealed_to: 0,
+        };
+        std::fs::write(
+            dir.join("state.json"),
+            serde_json::to_vec(&state).expect("state encodes"),
+        )
+        .expect("state writes");
+        for seq in 1..=end {
+            std::fs::write(dir.join(format!("{seq}.entry")), b"x").expect("entry writes");
+        }
+    }
+
+    fn entry_count(dir: &std::path::Path) -> usize {
+        std::fs::read_dir(dir)
+            .expect("read fragment dir")
+            .filter_map(|item| item.ok())
+            .filter(|item| {
+                item.file_name()
+                    .to_str()
+                    .is_some_and(|name| name.ends_with(".entry"))
+            })
+            .count()
+    }
+
+    /// Upstream #259: a follower drops the fragments of a sealed session
+    /// even though the dead session never opens a new epoch. The GC pass
+    /// reads the bucket record (no new epoch involved), deletes every
+    /// entry file, and extends the seal mark so a straggling append is
+    /// refused rather than resurrected.
+    #[test]
+    fn sealed_session_fragments_are_collected_without_a_new_epoch() {
+        let runtime = crate::asyncrt::shared_test_runtime();
+        runtime.block_on(async {
+            let dir = tempfile::tempdir().expect("temp dir");
+            let bucket = test_bucket(dir.path());
+            let store = FollowerStore::new(dir.path(), Some(bucket.clone()), "f1");
+            write_sealed_record(&bucket, "dead", "", 7).await;
+            let fragment = dir.path().join("peerlog/dead");
+            write_fragment(&fragment, 7, 5);
+            store.gc_fragments().await;
+            assert_eq!(entry_count(&fragment), 0, "closed entries are removed");
+            assert!(
+                fragment.join("state.json").is_file(),
+                "the state file stays as the seal-mark carrier"
+            );
+            let state: FollowerState = serde_json::from_slice(
+                &std::fs::read(fragment.join("state.json")).expect("state reads"),
+            )
+            .expect("state decodes");
+            assert_eq!(state.base, 5, "the range collapses to the covered end");
+            assert_eq!(state.end, 5);
+            assert!(
+                state.sealed_to >= 7,
+                "the seal mark covers the collected epoch"
+            );
+        });
+    }
+
+    /// The generation-scoped layout a fleet follower actually uses is
+    /// collected the same way.
+    #[test]
+    fn sealed_generation_scoped_fragments_are_collected() {
+        let runtime = crate::asyncrt::shared_test_runtime();
+        runtime.block_on(async {
+            let dir = tempfile::tempdir().expect("temp dir");
+            let bucket = test_bucket(dir.path());
+            let store = FollowerStore::new(dir.path(), Some(bucket.clone()), "f1");
+            write_sealed_record(&bucket, "dead", "gen2", 9).await;
+            let fragment = dir.path().join("peerlog/dead/gen2");
+            write_fragment(&fragment, 9, 3);
+            store.gc_fragments().await;
+            assert_eq!(entry_count(&fragment), 0, "closed entries are removed");
+            let state: FollowerState = serde_json::from_slice(
+                &std::fs::read(fragment.join("state.json")).expect("state reads"),
+            )
+            .expect("state decodes");
+            assert!(state.sealed_to >= 9);
+        });
+    }
+
+    /// Upstream #259: when a leader restarts, its lease moves to the new
+    /// generation, so the dead generation's record is absent — and the old
+    /// session never opens a new epoch. The sweep still collects the
+    /// orphaned fragments instead of waiting for an epoch that never
+    /// comes, and the seal mark refuses a straggling append.
+    #[test]
+    fn superseded_generation_fragments_are_collected_without_a_record() {
+        let runtime = crate::asyncrt::shared_test_runtime();
+        runtime.block_on(async {
+            let dir = tempfile::tempdir().expect("temp dir");
+            let bucket = test_bucket(dir.path());
+            let store = FollowerStore::new(dir.path(), Some(bucket.clone()), "f1");
+            // The node restarted: its lease now carries the new generation,
+            // so the dead one's record reads back absent.
+            write_sealed_record(&bucket, "dead", "gen9", 4).await;
+            let fragment = dir.path().join("peerlog/dead/gen2");
+            write_fragment(&fragment, 6, 3);
+            store.gc_fragments().await;
+            assert_eq!(entry_count(&fragment), 0, "orphaned entries are removed");
+            let state: FollowerState = serde_json::from_slice(
+                &std::fs::read(fragment.join("state.json")).expect("state reads"),
+            )
+            .expect("state decodes");
+            assert_eq!(state.base, 3, "the range collapses to the covered end");
+            assert_eq!(state.end, 3);
+            assert!(
+                state.sealed_to >= 6,
+                "the seal mark covers the collected epoch"
+            );
+        });
+    }
+
+    /// Same for a flat session whose lease record is gone (a decommissioned
+    /// node, a deleted lease): no record, no new epoch, no leftovers.
+    #[test]
+    fn deleted_lease_fragments_are_collected_without_a_record() {
+        let runtime = crate::asyncrt::shared_test_runtime();
+        runtime.block_on(async {
+            let dir = tempfile::tempdir().expect("temp dir");
+            let bucket = test_bucket(dir.path());
+            let store = FollowerStore::new(dir.path(), Some(bucket.clone()), "f1");
+            let fragment = dir.path().join("peerlog/dead");
+            write_fragment(&fragment, 7, 5);
+            store.gc_fragments().await;
+            assert_eq!(entry_count(&fragment), 0, "orphaned entries are removed");
+            let state: FollowerState = serde_json::from_slice(
+                &std::fs::read(fragment.join("state.json")).expect("state reads"),
+            )
+            .expect("state decodes");
+            assert!(state.sealed_to >= 7);
+        });
+    }
+
+    /// A live lease for the fragment's session, with no folded log yet.
+    async fn write_logless_lease(bucket: &Bucket, node: &str, generation: &str) {
+        let wire = crate::ownership_store::NodeLeaseWire {
+            node: node.to_string(),
+            expires_ms: crate::ownership_store::now_ms() + 3_600_000,
+            addr: String::new(),
+            probe_public_key: String::new(),
+            peer_protocol: 1,
+            paced_handoff: false,
+            generation: generation.to_string(),
+            log: None,
+            load: Default::default(),
+        };
+        bucket
+            .put(
+                &lease_key(node),
+                serde_json::to_vec(&wire).expect("lease encodes"),
+            )
+            .await
+            .expect("lease puts");
+    }
+
+    /// Upstream #259: a lease that names the session but carries no folded
+    /// log yet is not terminal — the session may still open its log and
+    /// adopt these fragments — so the sweep keeps them. Fail-before: the
+    /// sweep lumped this absence with the dead sessions, deleted the
+    /// entries, and extended the seal mark over a live session's epoch.
+    #[test]
+    fn live_logless_lease_fragments_are_kept() {
+        let runtime = crate::asyncrt::shared_test_runtime();
+        runtime.block_on(async {
+            let dir = tempfile::tempdir().expect("temp dir");
+            let bucket = test_bucket(dir.path());
+            let store = FollowerStore::new(dir.path(), Some(bucket.clone()), "f1");
+            write_logless_lease(&bucket, "dead", "gen2").await;
+            let fragment = dir.path().join("peerlog/dead/gen2");
+            write_fragment(&fragment, 6, 3);
+            store.gc_fragments().await;
+            assert_eq!(entry_count(&fragment), 3, "live-session fragments are kept");
+            let state: FollowerState = serde_json::from_slice(
+                &std::fs::read(fragment.join("state.json")).expect("state reads"),
+            )
+            .expect("state decodes");
+            assert_eq!(state.sealed_to, 0, "no seal mark extends over a live session");
+            assert_eq!(state.base, 0, "the retained range is untouched");
+            assert_eq!(state.end, 3);
         });
     }
 }
