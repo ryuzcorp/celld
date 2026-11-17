@@ -35,6 +35,7 @@ pub const NODE_ID_FILE: &str = "node-id";
 /// #249). A missing or unwritable directory degrades to today's ephemeral
 /// id with a loud line, never a boot failure; a corrupt pin warns and
 /// regenerates, naming the discarded id for operator recovery.
+#[allow(clippy::disallowed_methods)] // The pin is read before any injected filesystem exists.
 pub fn resolve_node_session_id(
     explicit: Option<String>,
     data_dir: &std::path::Path,
@@ -64,6 +65,7 @@ pub fn resolve_node_session_id(
 
 /// Reflect the effective node-session id in the data directory's pin. Best
 /// effort: an unwritable directory keeps today's ephemeral behavior, loudly.
+#[allow(clippy::disallowed_methods)] // The pin is written before any injected filesystem exists.
 fn record_node_session_id(data_dir: &std::path::Path, node: &str) {
     if let Err(error) = (|| -> std::io::Result<()> {
         std::fs::create_dir_all(data_dir)?;
@@ -252,6 +254,7 @@ mod internal_tests {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)] // Test tempdirs live outside the injected filesystem.
 mod node_id_tests {
     use super::*;
 

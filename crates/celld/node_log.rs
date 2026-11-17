@@ -4737,12 +4737,12 @@ mod tail_progress_tests {
         runtime.block_on(async {
             let silent =
                 futures_util::stream::pending::<Result<bytes::Bytes, anyhow::Error>>();
-            let started = std::time::Instant::now();
+            let started_ms = crate::asyncrt::mono_ms();
             let error = read_progress_bounded(silent, std::time::Duration::from_millis(50))
                 .await
                 .expect_err("silence fails");
             assert!(
-                started.elapsed() < std::time::Duration::from_secs(5),
+                crate::asyncrt::mono_ms().saturating_sub(started_ms) < 5_000,
                 "the stall fails at the budget, not at the transfer end"
             );
             assert!(
