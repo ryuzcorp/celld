@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): bucket-posture group commit: bundle switch defaults off (0075).
+// Modified by ryuzcorp (ryuzcorp/celld): bucket-posture group commit: bundle switch defaults off (0075); unclean-restart prune of live-named epochs (upstream #290).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! The node's replication engine behind one engine-neutral handle.
@@ -108,6 +108,14 @@ impl Replication {
 
     pub fn prune_stale_live(&self, keep: &BTreeSet<(String, u64)>) -> anyhow::Result<usize> {
         self.ltx.prune_stale_live(keep)
+    }
+
+    pub fn prune_unclean_restart(&self) -> anyhow::Result<usize> {
+        self.ltx.prune_unclean_restart()
+    }
+
+    pub fn take_pruned_at_boot(&self) -> Vec<celld_logic::LocalCell> {
+        self.ltx.take_pruned_at_boot()
     }
 
     /// Copy the exact published epoch into a private read-only snapshot.

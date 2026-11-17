@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): cross-isolate RPC stubs and streams; operator token for the internal listener; D1 export operator-ingress marker; ported from meln1k/celld: report wake coverage after maintenance (e6cb9a3); staged activation; trusted cell RPC; WebSocket join tokens; --version reports the full build version; staged invoke operator route; non-dumpable serving process; bucket-posture group commit: paged gate judges PAGED_FORMAT (0059); bucket-posture group commit: bucket bundle gate plumbing (0060); bucket-posture group commit: bundle switch defaults off (0075); stale-route marker import from peer_auth (upstream #273); resolve the node-session id from the data-dir pin (upstream #249); boot scan takes the due scan's upcoming minute (upstream #308).
+// Modified by ryuzcorp (ryuzcorp/celld): cross-isolate RPC stubs and streams; operator token for the internal listener; D1 export operator-ingress marker; ported from meln1k/celld: report wake coverage after maintenance (e6cb9a3); staged activation; trusted cell RPC; WebSocket join tokens; --version reports the full build version; staged invoke operator route; non-dumpable serving process; bucket-posture group commit: paged gate judges PAGED_FORMAT (0059); bucket-posture group commit: bucket bundle gate plumbing (0060); bucket-posture group commit: bundle switch defaults off (0075); stale-route marker import from peer_auth (upstream #273); resolve the node-session id from the data-dir pin (upstream #249); boot scan takes the due scan's upcoming minute (upstream #308); unclean-restart prune of live-named epochs (upstream #290).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 // The binary contains connection, startup, shutdown, and V8 shell code. The
@@ -4803,6 +4803,23 @@ async fn async_main(
                 })
             })
             .await?;
+            // The predecessor's acked tails are in the bucket now, and the core
+            // has not started, so no runtime holds a local epoch yet. An
+            // unclean predecessor leaves live-named epochs no activation will
+            // ever reopen; delete them now so dead files stop rotting on disk
+            // outside the local-cache budget. The deleted cells stay in the
+            // boot prune list, so ownership confirmation still finds the cells
+            // that were resident when the predecessor died.
+            if !clean_reload_candidate {
+                match replication.prune_unclean_restart() {
+                    Ok(pruned) => tracing::info!(
+                        event = "unclean_restart_pruned",
+                        pruned,
+                        "removed live-named epochs that no activation reopens"
+                    ),
+                    Err(error) => tracing::warn!(%error, "unclean restart prune failed"),
+                }
+            }
             let mut owner = celld::node_log::DurabilityOwner::new(manager, durability == "fleet");
             owner.start_background(follower.clone());
             durability_owner.install_runtime(owner);

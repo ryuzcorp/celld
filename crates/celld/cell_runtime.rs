@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): staged invoke reserves generation ids and parks shadow generations; facet open answers the database path only (upstream #292).
+// Modified by ryuzcorp (ryuzcorp/celld): staged invoke reserves generation ids and parks shadow generations; facet open answers the database path only (upstream #292); local reload replays the boot prune list (upstream #290).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! What a node's cell runtime holds whichever engine runs the cells: the
@@ -304,7 +304,9 @@ impl CellRuntime {
             .replication
             .as_ref()
             .context("local reload requires replication")?;
-        Ok(replication.local_cells())
+        let mut cells = replication.local_cells();
+        cells.extend(replication.take_pruned_at_boot());
+        Ok(cells)
     }
 
     pub fn replication_status(&self) -> std::io::Result<Option<std::process::ExitStatus>> {
