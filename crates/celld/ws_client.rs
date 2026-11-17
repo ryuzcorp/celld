@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): tenant egress policy.
+// Modified by ryuzcorp (ryuzcorp/celld): tenant egress policy; shared TLS roots with fetch (upstream #230).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 // The real peer WebSocket transport is outside the Actor execution domain.
@@ -82,17 +82,15 @@ pub struct Connection {
     pub headers: HeaderMap,
 }
 
-/// Mozilla's roots, the same set the previous client compiled in. Deliberately
-/// not the platform store: a downloaded celld should reach `wss://` on a host
-/// that has no `/etc/ssl/certs`.
+/// The shared tenant roots: Mozilla's plus the OS store and `SSL_CERT_FILE`,
+/// so an outbound WebSocket to a private-CA host verifies exactly where a
+/// socket or `fetch()` to the same host does (denoland/celld#230). A host
+/// with no readable store still verifies public CAs against Mozilla's roots.
 fn tls_config() -> &'static tokio_rustls::TlsConnector {
     static CONFIG: OnceLock<tokio_rustls::TlsConnector> = OnceLock::new();
     CONFIG.get_or_init(|| {
-        let roots = rustls::RootCertStore {
-            roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
-        };
         let config = rustls::ClientConfig::builder()
-            .with_root_certificates(roots)
+            .with_root_certificates(crate::tls_roots::root_store())
             .with_no_client_auth();
         tokio_rustls::TlsConnector::from(std::sync::Arc::new(config))
     })
