@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): cross-isolate RPC stubs and streams; D1 export operator-ingress marker; ported from meln1k/celld: report wake coverage after maintenance (e6cb9a3); wake coverage follow-ups: startup observation ordering, installation comparison; trusted cell RPC; deployment cache scope purge on generation free; staged invoke joins the driver past the reply.; answered drivers poll while waitUntil background is outstanding (upstream #300)
+// Modified by ryuzcorp (ryuzcorp/celld): cross-isolate RPC stubs and streams; D1 export operator-ingress marker; ported from meln1k/celld: report wake coverage after maintenance (e6cb9a3); wake coverage follow-ups: startup observation ordering, installation comparison; trusted cell RPC; deployment cache scope purge on generation free; staged invoke joins the driver past the reply.; answered drivers poll while waitUntil background is outstanding (upstream #300); drivers take the mailbox once more before retiring (upstream #309)
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 // RuntimeManager is the V8 cell-host arm, so its executor and observability
@@ -2378,57 +2378,85 @@ async fn drive_worker(
     }
     after_turn(&entry);
 
-    while !entry.finished() {
-        let started = match wake_with_cross_entry_gate(&mut ops, &mut entry, budget).await {
-            Wake::Op(op, result) => {
-                slot.turn(|worker| worker.turn_deliver(&mut entry, op, result))
-                    .await
+    loop {
+        while !entry.finished() {
+            let started = match wake_with_cross_entry_gate(&mut ops, &mut entry, budget).await {
+                Wake::Op(op, result) => {
+                    slot.turn(|worker| worker.turn_deliver(&mut entry, op, result))
+                        .await
+                }
+                Wake::GatedReply(completion) => {
+                    entry.finish_gated_reply(completion);
+                    Vec::new()
+                }
+                Wake::CancelGatedReply => {
+                    entry.cancel_gated_reply();
+                    Vec::new()
+                }
+                Wake::CrossEntryGateChanged => {
+                    entry.finish_cross_entry_gates();
+                    Vec::new()
+                }
+                Wake::Cancelled { shutdown } => {
+                    let started = slot
+                        .turn(|worker| {
+                            if shutdown {
+                                worker.turn_cancel_for_shutdown(&mut entry)
+                            } else {
+                                worker.turn_cancel(&mut entry)
+                            }
+                        })
+                        .await;
+                    entry.cancel_gated_reply();
+                    started
+                }
+                Wake::Expired => {
+                    entry.time_out(budget);
+                    Vec::new()
+                }
+                Wake::Idle => {
+                    entry.stuck();
+                    Vec::new()
+                }
+                Wake::PendingEventIdle => {
+                    slot.turn(|worker| worker.turn_cancel_pending_events(&mut entry))
+                        .await
+                }
+                Wake::Poll => slot.turn(|worker| worker.turn_poll(&mut entry)).await,
+            };
+            if entry.keeps_native_ops() {
+                adopt(&mut ops, started);
+            } else {
+                drop(started);
+                abort_ops(&mut ops, &mut entry);
             }
-            Wake::GatedReply(completion) => {
-                entry.finish_gated_reply(completion);
-                Vec::new()
-            }
-            Wake::CancelGatedReply => {
-                entry.cancel_gated_reply();
-                Vec::new()
-            }
-            Wake::CrossEntryGateChanged => {
-                entry.finish_cross_entry_gates();
-                Vec::new()
-            }
-            Wake::Cancelled { shutdown } => {
-                let started = slot
-                    .turn(|worker| {
-                        if shutdown {
-                            worker.turn_cancel_for_shutdown(&mut entry)
-                        } else {
-                            worker.turn_cancel(&mut entry)
-                        }
-                    })
-                    .await;
-                entry.cancel_gated_reply();
-                started
-            }
-            Wake::Expired => {
-                entry.time_out(budget);
-                Vec::new()
-            }
-            Wake::Idle => {
-                entry.stuck();
-                Vec::new()
-            }
-            Wake::PendingEventIdle => {
-                slot.turn(|worker| worker.turn_cancel_pending_events(&mut entry))
-                    .await
-            }
-            Wake::Poll => slot.turn(|worker| worker.turn_poll(&mut entry)).await,
-        };
-        if entry.keeps_native_ops() {
-            adopt(&mut ops, started);
-        } else {
-            drop(started);
-            abort_ops(&mut ops, &mut entry);
+            after_turn(&entry);
         }
+        // A handoff can land after the last take but before retirement:
+        // another event's turn enqueues an op while this driver is between
+        // its wake take and its exit check. Retiring with it still queued
+        // discards accepted work with nothing logged (denoland/celld#207).
+        // Take once more before leaving; anything found rejoins the drive.
+        if entry.keeps_native_ops() {
+            let trailing = entry.take_handed_ops();
+            if trailing.is_empty() {
+                break;
+            }
+            adopt(&mut ops, trailing);
+            after_turn(&entry);
+            continue;
+        }
+        // Finished with nothing keeping its native ops: nobody will poll
+        // whatever the last take finds, so reject it inside the turn
+        // instead of dropping it silently (denoland/celld#207). Same
+        // message as the refused-handoff path.
+        let rejected = slot
+            .turn(|worker| worker.turn_reject_trailing_handed_ops(&mut entry))
+            .await;
+        if !rejected {
+            break;
+        }
+        abort_ops(&mut ops, &mut entry);
         after_turn(&entry);
     }
 
@@ -3799,6 +3827,38 @@ async fn drive_cell_inner(
         // waiting on, so the host hears about it now rather than when the
         // request ends.
         report_alarm_moves(&report, moves);
+        // A handoff can land after the last take but before retirement:
+        // another event's turn enqueues an op while this driver is between
+        // its wake take and its exit check. Retiring with it still queued
+        // discards accepted work with nothing logged (denoland/celld#207)
+        // or wedges a background loop whose next timer arrived just too
+        // late (denoland/celld#309). Take once more before leaving;
+        // anything found rejoins the drive instead of the mailbox.
+        if entry.finished() {
+            if entry.keeps_native_ops() {
+                let trailing = entry.take_handed_ops();
+                if trailing.is_empty() {
+                    break;
+                }
+                #[cfg(celld_internal_tests)]
+                adopt_cell_ops_for_test(&mut ops, trailing, &mut test_observers.native_op_dropped);
+                #[cfg(not(celld_internal_tests))]
+                adopt(&mut ops, trailing);
+                continue;
+            }
+            // Finished with nothing keeping its native ops: nobody will
+            // poll whatever the last take finds, so reject it inside the
+            // turn instead of dropping it silently (denoland/celld#207).
+            // Same message as the refused-handoff path.
+            let rejected = slot
+                .turn(|worker| worker.turn_reject_trailing_handed_ops(&mut entry))
+                .await;
+            if !rejected {
+                break;
+            }
+            abort_ops(&mut ops, &mut entry);
+            continue;
+        }
     }
 
     // An alarm that ended without running JS again still owes its outcome —
