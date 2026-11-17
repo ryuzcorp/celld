@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): ctx.container.images; clone() of streaming and disturbed bodies; __celld$do on the service-binding RPC path; container exec pty/resize; cross-isolate RPC stubs and streams; container exec AbortSignal; test-only fake kill completion; exec reads survive their subscribing event; context end aborts finished uploads; tenant egress policy; D1 export; D1 export operator gate; D1 batch; test-only fake close/signal completion; binding-forgery enforcement; Queue/KV operator fetch gate; Queue/KV stub-RPC allowlists; Queue DLQ host-op forward; Queue send/DLQ cell-side validation; trusted-RPC target pin; Queue operator internal re-checks; receiver-held RPC streams.; dropped timer ops fire their callback early so sleepers settle (upstream #317); unrefed AbortSignal.timeout timer (upstream #306); loader-fetch 101 webSocket join (upstream #305).
+// Modified by ryuzcorp (ryuzcorp/celld): ctx.container.images; clone() of streaming and disturbed bodies; __celld$do on the service-binding RPC path; container exec pty/resize; cross-isolate RPC stubs and streams; container exec AbortSignal; test-only fake kill completion; exec reads survive their subscribing event; context end aborts finished uploads; tenant egress policy; D1 export; D1 export operator gate; D1 batch; test-only fake close/signal completion; binding-forgery enforcement; Queue/KV operator fetch gate; Queue/KV stub-RPC allowlists; Queue DLQ host-op forward; Queue send/DLQ cell-side validation; trusted-RPC target pin; Queue operator internal re-checks; receiver-held RPC streams.; dropped timer ops fire their callback early so sleepers settle (upstream #317); unrefed AbortSignal.timeout timer (upstream #306); loader-fetch 101 webSocket join (upstream #305); nodejs process.env population (upstream #296).
 // The DO object model and the Cloudflare-compatible runtime surface, run
 // once per isolate by `js.rs::install_harness` after the Web-API prelude.
 // Lived as a 4,000-line raw string inside js.rs until 2026-07-29; it is a
@@ -3877,6 +3877,30 @@ const __makeServiceBinding = __celld.__makeServiceBinding =
   return binding;
 };
 
+// Copy loader-supplied strings into `process.env` without installing the
+// loader env itself. `build_env` runs after the user module evaluates, when
+// `__installLoaderEnv` installs `__cell.env` too; this entry runs before
+// evaluation so module-scope reads agree with the handler's `env`. The copy
+// follows the same compat gate `populate_process_env` checks, carries only
+// string entries, and never carries the reserved host-owned name
+// (denoland/celld#296).
+__celld.__installLoaderProcessEnv = (bytes, reservedName) => {
+  const env = __sc_decode(bytes);
+  if (env === null || typeof env !== "object") return;
+  if (__celld.__cell.compat?.nodejsProcessEnv &&
+      globalThis.process && globalThis.process.env) {
+    for (const key of Object.keys(env)) {
+      if (key === reservedName) continue;
+      // `__proto__` assigns through the prototype setter and would
+      // re-prototype `process.env`; `constructor`/`prototype` would shadow
+      // the inherited members. None of them is a real variable.
+      if (key === "__proto__" || key === "constructor" || key === "prototype") continue;
+      const value = env[key];
+      if (typeof value === "string") globalThis.process.env[key] = value;
+    }
+  }
+};
+
 __celld.__installLoaderEnv = (bytes, routes) => {
   const env = __sc_decode(bytes);
   const seen = new Set();
@@ -7696,7 +7720,7 @@ const __cell = __celld.__cell = {
   namespaceKeys: {},
   node: "",
   deleteAllDeletesAlarm: false,
-  compat: { jsRpc: false, fetcherGetPutDelete: false, queueJsonMessages: false },
+  compat: { jsRpc: false, fetcherGetPutDelete: false, queueJsonMessages: false, nodejsProcessEnv: false },
   makeNamespace,
   release: __cellRelease,
 };
@@ -12866,6 +12890,10 @@ globalThis.process.exit = (code = 0) => {
 };
 globalThis.process.getBuiltinModule =
   (id) => __builtin_module(String(id));
+// `node:process` (and bare `process`) is the global process object itself:
+// the same object, not a copy, so `nodeProcess === globalThis.process` and
+// a named `env` import stays live. Set before any user module links.
+__celld.__processGlobal = globalThis.process;
 if (!globalThis.global) globalThis.global = globalThis;
 // Events belong to the request, and the host owns the request. `__event_*`
 // and `__wait_until` operate on whichever context the host has made current

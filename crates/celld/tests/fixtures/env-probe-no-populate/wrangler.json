@@ -1,0 +1,9 @@
+{
+  "name": "env-probe-no-populate",
+  "main": "worker.js",
+  "compatibility_date": "2026-01-01",
+  "compatibility_flags": ["nodejs_compat", "nodejs_compat_do_not_populate_process_env"],
+  "no_bundle": true,
+  "vars": { "FROM_VARS": "set-in-vars" },
+  "worker_loaders": [{ "binding": "LOADER" }]
+}
