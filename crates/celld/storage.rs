@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): D1 export; D1 export hardening; D1 batch tests; D1 export sequence scoping; binding-forgery enforcement; per-connection SQLite page-cache budget (CELLD_SQLITE_CACHE_KB).
+// Modified by ryuzcorp (ryuzcorp/celld): D1 export; D1 export hardening; D1 batch tests; D1 export sequence scoping; binding-forgery enforcement; per-connection SQLite page-cache budget (CELLD_SQLITE_CACHE_KB); 0.5.1 facet-image import repair (upstream #292).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 // This is V8-thread SQLite plumbing outside the Actor execution domain.
@@ -14,7 +14,7 @@
 //! `scope` column survives from the single-db era and still keys rows, but a
 //! db now holds exactly one cell.
 use anyhow::Context as _;
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, ToSql};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::ffi::{CStr, CString};
@@ -1109,44 +1109,276 @@ fn owned_sqlite_data(bytes: &[u8]) -> anyhow::Result<rusqlite::serialize::OwnedD
     }
 }
 
+/// Tables that never count as facet user data for the 0.5.1 image import:
+/// the replica's own control tables, the storage control tables (whose rows
+/// the import itself brings), and the legacy nested-facet images, which are
+/// migration sources rather than content. Actor names in `_cf_METADATA` do
+/// not count either: `set_actor_name` writes one on every named-stub
+/// construction and re-derives it on the next open, so a named facet that
+/// never stored user data must still repair.
+const LEGACY_IMPORT_CONTROL_TABLES: &[&str] = &[
+    "_litestream_seq",
+    "_litestream_lock",
+    "_cf_KV",
+    "_cf_ALARM",
+    "_cf_METADATA",
+    "_cf_FACETS",
+];
+
+/// The legacy-migration marker in a facet file's `user_version`: 0.5.1 never
+/// set it, so 0 means no fixed-version open has decided yet.
+const LEGACY_IMPORT_UNDECIDED: u32 = 0;
+const LEGACY_IMPORT_DECIDED: u32 = 1;
+
+/// What a facet file holds that its root's 0.5.1 image cannot explain.
+#[derive(Debug, PartialEq, Eq)]
+enum LegacyImportStatus {
+    /// A fixed-version open already decided (imported, or nothing to import).
+    Decided,
+    /// No user data; import when the root still holds the image.
+    Pristine,
+    /// Live file content always wins: 0.5.1 never wrote facet files, so any
+    /// user data in one is post-0.5.1 lineage, and the legacy row stays for
+    /// manual recovery.
+    Live,
+}
+
+/// Quote an identifier read back out of `sqlite_master`.
+fn quote_ident(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+/// Decide whether a facet file needs its root's 0.5.1 image. Reads only,
+/// through the caller's own connection.
+fn legacy_import_status(connection: &Connection) -> anyhow::Result<LegacyImportStatus> {
+    let user_version: u32 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if user_version != LEGACY_IMPORT_UNDECIDED {
+        return Ok(LegacyImportStatus::Decided);
+    }
+    let mut statement = connection.prepare(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
+    )?;
+    let tables = statement
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(statement);
+    for table in &tables {
+        // Control tables never count, but `_cf_KV` and `_cf_ALARM` rows are
+        // application writes, and `sqlite_sequence` rows mean an
+        // AUTOINCREMENT table once held rows (a full wipe leaves the
+        // counters behind, and must still count as a deliberate empty).
+        let counts = table == "sqlite_sequence"
+            || table == "_cf_KV"
+            || table == "_cf_ALARM"
+            || !LEGACY_IMPORT_CONTROL_TABLES.contains(&table.as_str());
+        if !counts {
+            continue;
+        }
+        let rows: i64 = connection.query_row(
+            &format!("SELECT COUNT(*) FROM {}", quote_ident(table)),
+            [],
+            |row| row.get(0),
+        )?;
+        if rows > 0 {
+            return Ok(LegacyImportStatus::Live);
+        }
+    }
+    Ok(LegacyImportStatus::Pristine)
+}
+
+/// Read a 0.5.1 facet image out of its root's `_cf_FACETS`. The root opens
+/// read-only: the import must never create or modify the root file, and a
+/// missing root is a loud error, not an empty facet.
+fn read_legacy_facet_image(
+    root_path: &str,
+    root_scope: &str,
+    facet_path: &[String],
+) -> anyhow::Result<Option<Vec<u8>>> {
+    let path = serde_json::to_string(facet_path)?;
+    let root = Connection::open_with_flags(root_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .with_context(|| format!("open root database {root_path} for the facet image"))?;
+    root.query_row(
+        "SELECT image FROM _cf_FACETS WHERE scope=?1 AND path=?2",
+        rusqlite::params![root_scope, path],
+        |row| row.get::<_, Vec<u8>>(0),
+    )
+    .optional()
+    .context("read the facet's legacy image")
+}
+
+/// Copy a 0.5.1 facet image into its own file with ordinary SQL writes, so
+/// the import never needs EXCLUSIVE: a live replica's read lock refuses a
+/// `Backup` with `SQLITE_BUSY`, while ordinary writes commit beside it, as
+/// the application's own writes do. Everything lands in one transaction, so
+/// a failed import leaves the file untouched for the next open to retry.
+/// Returns the number of copied tables.
+fn replay_legacy_facet_image(connection: &Connection, image: &[u8]) -> anyhow::Result<usize> {
+    let mut source = Connection::open_in_memory()?;
+    source.deserialize(
+        rusqlite::DatabaseName::Main,
+        owned_sqlite_data(image)?,
+        true,
+    )?;
+    let transaction = connection.unchecked_transaction()?;
+    let mut statement = source.prepare(
+        "SELECT type, name, sql FROM sqlite_master
+         WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite_autoindex_%'",
+    )?;
+    let objects = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(statement);
+    let mut tables = 0;
+    for (kind, name, sql) in &objects {
+        // The replica owns its tables, and SQLite owns `sqlite_%`: the
+        // destination maintains those itself (sequences sync below).
+        if name == "_litestream_seq" || name == "_litestream_lock" || name.starts_with("sqlite_") {
+            continue;
+        }
+        let exists: bool = transaction
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type = ?1 AND name = ?2",
+                rusqlite::params![kind, name],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if kind == "table" {
+            if !exists {
+                transaction.execute_batch(sql)?;
+            }
+            let declared: Vec<(String, String, bool)> = source
+                .prepare(&format!(
+                    "SELECT name, type, pk FROM pragma_table_info({})",
+                    quote_ident(name)
+                ))?
+                .query_map([], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get::<_, i64>(2)? > 0))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            {
+                let dest_columns: Vec<String> = transaction
+                    .prepare(&format!(
+                        "SELECT name FROM pragma_table_info({})",
+                        quote_ident(name)
+                    ))?
+                    .query_map([], |row| row.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                let source_columns: Vec<&str> = declared
+                    .iter()
+                    .map(|(column, _, _)| column.as_str())
+                    .collect();
+                anyhow::ensure!(
+                    source_columns == dest_columns,
+                    "legacy table {name} changed shape since 0.5.1"
+                );
+            }
+            // A rowid table without an exact `INTEGER PRIMARY KEY` alias
+            // stores its identity outside `SELECT *`; copy it explicitly so
+            // related tables keep pointing at the same rows.
+            let without_rowid = sql.to_uppercase().contains("WITHOUT ROWID");
+            let alias = declared
+                .iter()
+                .any(|(_, ty, pk)| *pk && ty.trim().eq_ignore_ascii_case("INTEGER"));
+            let mut columns: Vec<String> =
+                declared.into_iter().map(|(column, _, _)| column).collect();
+            if !without_rowid && !alias {
+                columns.insert(0, "rowid".to_string());
+            }
+            let quoted = columns
+                .iter()
+                .map(|column| quote_ident(column))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let placeholders = columns.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+            let mut rows =
+                source.prepare(&format!("SELECT {quoted} FROM {}", quote_ident(name)))?;
+            let rows = rows.query_map([], |row| {
+                (0..columns.len())
+                    .map(|index| row.get::<_, rusqlite::types::Value>(index))
+                    .collect::<rusqlite::Result<Vec<_>>>()
+            })?;
+            for values in rows {
+                let values = values?;
+                let params: Vec<&dyn ToSql> =
+                    values.iter().map(|value| value as &dyn ToSql).collect();
+                transaction.execute(
+                    &format!(
+                        "INSERT INTO {} ({quoted}) VALUES ({placeholders})",
+                        quote_ident(name)
+                    ),
+                    params.as_slice(),
+                )?;
+            }
+            tables += 1;
+        } else if !exists {
+            transaction.execute_batch(sql)?;
+        }
+    }
+    // `AUTOINCREMENT` counters need no sync: the row inserts above advance
+    // `sqlite_sequence` past every copied rowid on their own. A table the
+    // image fully wiped restarts at 1 — part of the documented wipe corner.
+    transaction.commit()?;
+    Ok(tables)
+}
+
 /// Open a facet's own database file, which `crate::facet_streams`
 /// activated at `path`. A facet from before facets had streams of their own
-/// kept its database as an image in a row of its root's `_cf_FACETS`; a
-/// stream replication did not restore takes that image as its first content.
+/// kept its database as an image in a row of its root's `_cf_FACETS`; the
+/// first fixed-version open replays that image as the file's first content
+/// (upstream #292).
+///
+/// The 0.6.0-0.6.2 import tested `page_count == 0`, but under replication
+/// the replica opens the file first and its control tables already push the
+/// count past zero, so the import never ran: silent upgrade data loss. The
+/// check is now "no user data", which also repairs the files those versions
+/// left behind (control tables plus empty application tables). Live file
+/// content always wins over the legacy image — 0.5.1 never wrote facet
+/// files — and the decision is stamped in `user_version`, so a facet the
+/// application later wipes is never resurrected. The legacy row itself is
+/// left in place for manual recovery; deleting the facet removes it.
+///
+/// One deliberate corner remains: an all-content deletion made on 0.6.0-0.6.2
+/// followed by this upgrade replays the 0.5.1 image once, because the wipe
+/// left no trace the import can tell from a never-written facet
+/// (`AUTOINCREMENT` counters aside). Delete again on the fixed version.
 pub(crate) fn open_embedded(
     scope: &str,
     parent: &StorageIdentity,
     name: &str,
     path: &std::path::Path,
-    restored: bool,
     sqlite_vec: bool,
 ) -> anyhow::Result<()> {
     anyhow::ensure!(parent.facet_path.len() < 3, "Facet nesting depth limit exceeded. The maximum depth including the root Durable Object is 4.");
     let mut facet_path = parent.facet_path.clone();
     facet_path.push(name.to_string());
     let stream = crate::engine_api::facet_cell(&parent.root_scope, &facet_path);
-    let mut connection = Connection::open(path)?;
-    let empty = connection.query_row("PRAGMA page_count", [], |row| row.get::<_, u64>(0))? == 0;
-    if !restored && empty {
-        let legacy = serde_json::to_string(&facet_path)?;
-        let root = Connection::open(&parent.root_path)?;
-        let image = root
-            .query_row(
-                "SELECT image FROM _cf_FACETS WHERE scope=?1 AND path=?2",
-                rusqlite::params![parent.root_scope, legacy],
-                |row| row.get::<_, Vec<u8>>(0),
-            )
-            .optional()?;
-        if let Some(image) = image {
-            let mut source = Connection::open_in_memory()?;
-            source.deserialize(
-                rusqlite::DatabaseName::Main,
-                owned_sqlite_data(&image)?,
-                true,
-            )?;
-            rusqlite::backup::Backup::new(&source, &mut connection)?
-                .run_to_completion(i32::MAX, std::time::Duration::ZERO, None)
-                .context("import the facet's legacy image")?;
+    let connection = Connection::open(path)?;
+    // 0.5.1 → 0.6 upgrade repair (upstream #292): the first fixed-version
+    // open replays the root's image as this file's first content, through
+    // ordinary SQL writes, which commit beside a live replica's read lock
+    // (a `Backup` would take EXCLUSIVE and fail with `SQLITE_BUSY`).
+    match legacy_import_status(&connection)? {
+        LegacyImportStatus::Decided => {}
+        LegacyImportStatus::Pristine => {
+            if let Some(image) =
+                read_legacy_facet_image(&parent.root_path, &parent.root_scope, &facet_path)?
+            {
+                let tables = replay_legacy_facet_image(&connection, &image)?;
+                tracing::info!(scope, tables, "imported the facet's 0.5.1 image");
+            }
+            connection
+                .execute_batch(&format!("PRAGMA user_version = {}", LEGACY_IMPORT_DECIDED))?;
+        }
+        LegacyImportStatus::Live => {
+            connection
+                .execute_batch(&format!("PRAGMA user_version = {}", LEGACY_IMPORT_DECIDED))?;
         }
     }
     schema(&connection)?;
@@ -6555,5 +6787,249 @@ mod d1_batch_tests {
                 connection.execute_batch("ROLLBACK").expect("rollback");
             })
         });
+    }
+}
+
+#[cfg(test)]
+mod legacy_import_tests {
+    use super::*;
+
+    fn temp_db(name: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join(name);
+        (dir, path)
+    }
+
+    /// A 0.5.1-shaped facet image: user tables (one with an explicit
+    /// non-sequential rowid, one AUTOINCREMENT), an index, a legacy-named
+    /// control table, and the replica control table the replay must skip.
+    fn legacy_image_bytes() -> Vec<u8> {
+        let (_dir, path) = temp_db("image.sqlite3");
+        let connection = Connection::open(&path).expect("open image");
+        connection
+            .execute_batch(
+                "CREATE TABLE items(id INTEGER PRIMARY KEY, v TEXT NOT NULL);
+                 INSERT INTO items(id, v) VALUES (5, 'a1'), (9, 'a2');
+                 CREATE TABLE log(n TEXT NOT NULL);
+                 INSERT INTO log(n) VALUES ('x');
+                 CREATE INDEX items_v ON items(v);
+                 CREATE TABLE seq_test(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT);
+                 INSERT INTO seq_test(v) VALUES ('s');
+                 CREATE TABLE kv(k TEXT PRIMARY KEY, v TEXT);
+                 INSERT INTO kv(k, v) VALUES ('k', 'v');
+                 CREATE TABLE _litestream_seq(id INTEGER PRIMARY KEY, seq INTEGER);
+                 INSERT INTO _litestream_seq(id, seq) VALUES (1, 42);",
+            )
+            .expect("seed image");
+        drop(connection);
+        std::fs::read(&path).expect("read image")
+    }
+
+    fn table_rows(connection: &Connection, table: &str) -> Vec<(i64, String)> {
+        let mut statement = connection
+            .prepare(&format!("SELECT * FROM {table} ORDER BY 1"))
+            .expect("select");
+        statement
+            .query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })
+            .expect("query")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("collect")
+    }
+
+    #[test]
+    fn status_tracks_marker_then_content() {
+        let (_dir, path) = temp_db("facet.sqlite3");
+        let connection = Connection::open(&path).expect("open");
+        assert_eq!(
+            legacy_import_status(&connection).expect("status"),
+            LegacyImportStatus::Pristine,
+            "a fresh file is pristine"
+        );
+        // The exact 0.6.0-0.6.2 shape: control tables plus empty application
+        // tables push page_count past zero, but there is no user data.
+        connection
+            .execute_batch(
+                "CREATE TABLE _litestream_seq(id INTEGER PRIMARY KEY);
+                 CREATE TABLE _litestream_lock(id INTEGER PRIMARY KEY);
+                 CREATE TABLE _cf_KV(scope TEXT, k TEXT, v TEXT);
+                 CREATE TABLE items(id INTEGER PRIMARY KEY, v TEXT);",
+            )
+            .expect("broken shape");
+        let pages: u64 = connection
+            .query_row("PRAGMA page_count", [], |row| row.get(0))
+            .expect("pages");
+        assert!(pages > 0, "the broken shape is not an empty file");
+        assert_eq!(
+            legacy_import_status(&connection).expect("status"),
+            LegacyImportStatus::Pristine,
+            "page_count must not gate the import (upstream #292)"
+        );
+        connection
+            .execute("INSERT INTO items(id, v) VALUES (1, 'w')", [])
+            .expect("write");
+        assert_eq!(
+            legacy_import_status(&connection).expect("status"),
+            LegacyImportStatus::Live,
+            "a user row always wins over the legacy image"
+        );
+        connection
+            .execute_batch("PRAGMA user_version = 1")
+            .expect("stamp");
+        assert_eq!(
+            legacy_import_status(&connection).expect("status"),
+            LegacyImportStatus::Decided
+        );
+    }
+
+    #[test]
+    fn status_ignores_names_and_sequences_but_counts_writes() {
+        let (_dir, path) = temp_db("facet.sqlite3");
+        let connection = Connection::open(&path).expect("open");
+        // An actor name alone is not user data: it re-derives on next open.
+        connection
+            .execute_batch(
+                "CREATE TABLE _cf_METADATA(scope TEXT PRIMARY KEY, actor_name TEXT);
+                 INSERT INTO _cf_METADATA(scope, actor_name) VALUES ('s', 'n');",
+            )
+            .expect("actor name");
+        assert_eq!(
+            legacy_import_status(&connection).expect("status"),
+            LegacyImportStatus::Pristine
+        );
+        // Control-table application writes are.
+        connection
+            .execute_batch(
+                "CREATE TABLE _cf_KV(scope TEXT, k TEXT, v TEXT);
+                 INSERT INTO _cf_KV(scope, k, v) VALUES ('s', 'k', 'v');",
+            )
+            .expect("kv write");
+        assert_eq!(
+            legacy_import_status(&connection).expect("status"),
+            LegacyImportStatus::Live
+        );
+        connection.execute("DELETE FROM _cf_KV", []).expect("wipe");
+        // A full wipe leaves no trace here, so the file reads pristine; the
+        // upgrade corner this leaves is documented on `open_embedded`.
+        assert_eq!(
+            legacy_import_status(&connection).expect("status"),
+            LegacyImportStatus::Pristine
+        );
+    }
+
+    #[test]
+    fn replay_restores_rows_schema_and_index() {
+        let (_dir, path) = temp_db("facet.sqlite3");
+        let connection = Connection::open(&path).expect("open");
+        // The broken shape: the replica's control tables plus an empty
+        // application table, with a pre-existing row the import must keep.
+        connection
+            .execute_batch(
+                "CREATE TABLE _litestream_seq(id INTEGER PRIMARY KEY, seq INTEGER);
+                 INSERT INTO _litestream_seq(id, seq) VALUES (1, 7);
+                 CREATE TABLE items(id INTEGER PRIMARY KEY, v TEXT NOT NULL);",
+            )
+            .expect("broken shape");
+        let image = legacy_image_bytes();
+        let tables = replay_legacy_facet_image(&connection, &image).expect("replay");
+        assert_eq!(tables, 4, "items, log, seq_test, kv");
+        assert_eq!(
+            table_rows(&connection, "items"),
+            vec![(5, "a1".to_string()), (9, "a2".to_string())],
+            "rowids survive the replay"
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT n FROM log", [], |row| row.get::<_, String>(0))
+                .expect("log row"),
+            "x"
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM kv", [], |row| row.get::<_, i64>(0))
+                .expect("kv count"),
+            1
+        );
+        let index: Option<String> = connection
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'items_v'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("index");
+        assert!(index.is_some(), "the image's index is recreated");
+        let seq: i64 = connection
+            .query_row(
+                "SELECT seq FROM sqlite_sequence WHERE name = 'seq_test'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("sequence");
+        assert_eq!(seq, 1, "AUTOINCREMENT counters continue the image");
+        let own_seq: i64 = connection
+            .query_row("SELECT seq FROM _litestream_seq WHERE id = 1", [], |row| {
+                row.get(0)
+            })
+            .expect("own control row");
+        assert_eq!(own_seq, 7, "the replica's own control table is untouched");
+    }
+
+    #[test]
+    fn replay_refuses_a_reshaped_table() {
+        let (_dir, path) = temp_db("facet.sqlite3");
+        let connection = Connection::open(&path).expect("open");
+        connection
+            .execute_batch("CREATE TABLE items(id INTEGER PRIMARY KEY, v TEXT, extra TEXT);")
+            .expect("reshaped");
+        let image = legacy_image_bytes();
+        let error = replay_legacy_facet_image(&connection, &image).expect_err("must refuse");
+        assert!(
+            error.to_string().contains("changed shape"),
+            "unexpected error: {error:#}"
+        );
+        assert_eq!(
+            legacy_import_status(&connection).expect("status"),
+            LegacyImportStatus::Pristine,
+            "a failed replay leaves the file untouched for the next open"
+        );
+    }
+
+    #[test]
+    fn read_legacy_image_roundtrips() {
+        let (_dir, path) = temp_db("root.sqlite3");
+        let root = Connection::open(&path).expect("open root");
+        root.execute_batch(
+            "CREATE TABLE _cf_FACETS(scope TEXT NOT NULL, path TEXT NOT NULL, image BLOB NOT NULL,
+              PRIMARY KEY(scope, path)) WITHOUT ROWID;",
+        )
+        .expect("table");
+        let image = legacy_image_bytes();
+        root.execute(
+            "INSERT INTO _cf_FACETS(scope, path, image) VALUES (?1, ?2, ?3)",
+            rusqlite::params!["Root:x", "[\"child\"]", image],
+        )
+        .expect("insert");
+        drop(root);
+        let found = read_legacy_facet_image(
+            path.to_str().expect("utf-8"),
+            "Root:x",
+            &["child".to_string()],
+        )
+        .expect("read");
+        assert_eq!(found, Some(image), "the image round-trips byte for byte");
+        let missing = read_legacy_facet_image(
+            path.to_str().expect("utf-8"),
+            "Root:x",
+            &["other".to_string()],
+        )
+        .expect("read");
+        assert_eq!(missing, None);
+        let absent = read_legacy_facet_image(
+            "/nonexistent/root.sqlite3",
+            "Root:x",
+            &["child".to_string()],
+        );
+        assert!(absent.is_err(), "a missing root is loud, never empty");
     }
 }

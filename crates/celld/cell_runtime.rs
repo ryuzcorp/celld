@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): staged invoke reserves generation ids and parks shadow generations.
+// Modified by ryuzcorp (ryuzcorp/celld): staged invoke reserves generation ids and parks shadow generations; facet open answers the database path only (upstream #292).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! What a node's cell runtime holds whichever engine runs the cells: the
@@ -351,7 +351,7 @@ impl CellRuntime {
         root: &str,
         epoch: u64,
         names: &[String],
-    ) -> anyhow::Result<(PathBuf, bool)> {
+    ) -> anyhow::Result<PathBuf> {
         self.facets
             .open(
                 self.replication.as_ref(),
