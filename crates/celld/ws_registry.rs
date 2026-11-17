@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): WebSocket ownership and join tokens. Apache-2.0.
+// Modified by ryuzcorp (ryuzcorp/celld): WebSocket ownership and join tokens; isolate-join senders for loaded-worker 101s (upstream #305). Apache-2.0.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! The WebSocket registry: the sockets an instance holds, the frames waiting
@@ -882,6 +882,38 @@ pub(crate) fn ws_mint_bind_token(id: u64) -> Option<u64> {
     let meta = registry.metadata.get_mut(&id)?;
     meta.bind_token = Some(token);
     Some(token)
+}
+
+/// Join handoffs for a loaded worker's own 101, stashed when its response is
+/// serialized for the caller isolate. Moving the whole `WorkerWebSocket`
+/// here (instead of dropping it at serialization) keeps the loaded socket's
+/// metadata, bind token, and input-queue sender alive for the join: the
+/// handoff's `Drop` would otherwise unregister the socket before the caller
+/// could bind it. The joiner takes it — the caller-side bind pipe, or the
+/// final host response conversion on pass-through — and an unjoined upgrade
+/// fails closed. An upgrade nobody ever joins leaves one handoff behind,
+/// the same bounded cost as a dropped upgrade elsewhere.
+static ISOLATE_JOIN_HANDOFFS: std::sync::OnceLock<std::sync::Mutex<HashMap<u64, WorkerWebSocket>>> =
+    std::sync::OnceLock::new();
+
+fn isolate_join_handoffs() -> &'static std::sync::Mutex<HashMap<u64, WorkerWebSocket>> {
+    ISOLATE_JOIN_HANDOFFS.get_or_init(Default::default)
+}
+
+/// Stash the loaded socket's handoff for a later caller-isolate join.
+/// Replaces any previous stash for the id: a 101 serialization mints a
+/// fresh single-use bind token, so only the newest target can join.
+pub fn ws_stash_join_handoff(worker: WorkerWebSocket) {
+    isolate_join_handoffs()
+        .lock()
+        .unwrap()
+        .insert(worker.id(), worker);
+}
+
+/// Take the stashed join handoff for `id`, if its 101 was serialized for a
+/// caller join and nobody has joined it yet.
+pub fn ws_take_join_handoff(id: u64) -> Option<WorkerWebSocket> {
+    isolate_join_handoffs().lock().unwrap().remove(&id)
 }
 
 /// Consume `token` against `id`: true only when it matches the outstanding
