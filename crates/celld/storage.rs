@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): D1 export; D1 export hardening; D1 batch tests; D1 export sequence scoping; binding-forgery enforcement; per-connection SQLite page-cache budget (CELLD_SQLITE_CACHE_KB); 0.5.1 facet-image import repair (upstream #292); broken-SQL scopes restart the cell (upstream #291).
+// Modified by ryuzcorp (ryuzcorp/celld): D1 export; D1 export hardening; D1 batch tests; D1 export sequence scoping; binding-forgery enforcement; per-connection SQLite page-cache budget (CELLD_SQLITE_CACHE_KB); 0.5.1 facet-image import repair (upstream #292); broken-SQL scopes restart the cell (upstream #291); per-statement SQL time bound (upstream #274).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 // This is V8-thread SQLite plumbing outside the Actor execution domain.
@@ -353,6 +353,13 @@ struct SqlCursor {
     statement: *mut rusqlite::ffi::sqlite3_stmt,
     changes_before: u64,
     cache_query: Option<Arc<str>>,
+    /// The instant the whole scan must abort, when the operator bounded
+    /// application statements. Set at cursor creation; every step arms the
+    /// progress handler with what remains of it.
+    deadline: Option<std::time::Instant>,
+    /// The budget the deadline was armed from, in millis. The timeout error
+    /// names this captured value, never a freshly read knob.
+    timeout_ms: Option<u128>,
 }
 
 #[derive(Default)]
@@ -503,6 +510,135 @@ fn as_user_sql<T>(callback: impl FnOnce() -> T) -> T {
     result
 }
 
+/// The per-statement bound for application SQL, or `None` when the operator
+/// left `CELLD_SQL_STATEMENT_MS` unset (unbounded, the historical behavior).
+/// Read fresh on every statement so tests and operators observe the current
+/// value; startup already rejects non-positive values.
+fn statement_timeout() -> Option<std::time::Duration> {
+    crate::env_vars::optional::<u64>("CELLD_SQL_STATEMENT_MS")
+        .ok()
+        .flatten()
+        .map(std::time::Duration::from_millis)
+}
+
+thread_local! {
+    /// The instant the running application statement must abort, for the
+    /// progress callback below. Thread-local because a SQLite progress
+    /// handler is per connection and every connection here is stepped on
+    /// the thread that opened it; application statements never nest, so one
+    /// slot cannot mix two deadlines.
+    static STATEMENT_DEADLINE: std::cell::Cell<Option<std::time::Instant>> =
+        const { std::cell::Cell::new(None) };
+    /// Whether the progress callback has fired for the running statement.
+    static STATEMENT_TIMED_OUT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Progress callbacks fire every `N` SQLite virtual-machine instructions
+/// with no other context, so the deadline travels thread-locally. Returning
+/// nonzero aborts the statement with `SQLITE_INTERRUPT`, which rolls the
+/// statement back; the error the guard reports names the knob, not the
+/// interrupt, so the handler can catch a timeout it recognizes.
+unsafe extern "C" fn statement_progress(_: *mut std::ffi::c_void) -> std::ffi::c_int {
+    if STATEMENT_DEADLINE
+        .get()
+        .is_some_and(|deadline| std::time::Instant::now() >= deadline)
+    {
+        STATEMENT_TIMED_OUT.set(true);
+        1
+    } else {
+        0
+    }
+}
+
+/// Abort the connection's running application statement past `timeout`
+/// (denoland/celld#274). A recursive CTE from untrusted SQL otherwise burns
+/// the whole handler budget while every other request to the cell waits.
+/// Installing only when the knob is set keeps the default path free of
+/// progress-handler overhead and never disturbs the interrupt fault the
+/// tests inject through the same machinery.
+struct StatementDeadline {
+    database: *mut rusqlite::ffi::sqlite3,
+    armed: bool,
+}
+
+impl StatementDeadline {
+    /// Arm the deadline for one synchronous statement run on `database`.
+    /// The handler is per connection, so callers must not overlap two armed
+    /// guards on one connection — application statements never nest. The
+    /// outcome is read through [`statement_timed_out`] after the run: every
+    /// armed run resets the flag first, so a set flag always belongs to the
+    /// run that just finished on this thread.
+    fn arm(database: *mut rusqlite::ffi::sqlite3, timeout: Option<std::time::Duration>) -> Self {
+        let armed = timeout.is_some_and(|timeout| {
+            STATEMENT_DEADLINE.set(Some(std::time::Instant::now() + timeout));
+            STATEMENT_TIMED_OUT.set(false);
+            // SAFETY: the handle belongs to this live connection, the
+            // callback reads only thread-locals, and `drop` removes the
+            // handler before the guard releases the database.
+            unsafe {
+                rusqlite::ffi::sqlite3_progress_handler(
+                    database,
+                    1000,
+                    Some(statement_progress),
+                    std::ptr::null_mut(),
+                );
+            }
+            true
+        });
+        Self { database, armed }
+    }
+}
+
+impl Drop for StatementDeadline {
+    fn drop(&mut self) {
+        if self.armed {
+            // SAFETY: paired with the install above, on the same live handle.
+            unsafe {
+                rusqlite::ffi::sqlite3_progress_handler(
+                    self.database,
+                    0,
+                    None,
+                    std::ptr::null_mut(),
+                );
+            }
+            STATEMENT_DEADLINE.set(None);
+        }
+    }
+}
+
+/// Whether the application statement that just ran outran its deadline: any
+/// error it reports is the timeout, not the interrupt SQLite raised.
+fn statement_timed_out() -> bool {
+    STATEMENT_TIMED_OUT.get()
+}
+
+/// The catchable error a timed-out statement reports. Names the armed
+/// budget, not a freshly read knob: the value is captured when the run arms
+/// its deadline, so a mid-run knob change (or removal) cannot mislabel the
+/// error. Outside an explicit transaction the interrupted statement rolls
+/// back; inside one, SQLite keeps the transaction open with the earlier
+/// statements intact.
+fn statement_timeout_error(armed_ms: Option<u128>) -> String {
+    format!(
+        "statement exceeded CELLD_SQL_STATEMENT_MS ({}ms); the statement \
+         was interrupted and its effects rolled back",
+        armed_ms.unwrap_or(0)
+    )
+}
+
+/// The error for a write cursor that expires after yielding its first row.
+/// Its write ran during that first step, and expiring only drops the cursor:
+/// SQLite is never interrupted, so nothing rolls the write back. It keeps
+/// the timeout's catchable prefix but never claims a rollback, so a caller
+/// cannot trust it and retry a non-idempotent write.
+fn statement_timeout_error_after_write(armed_ms: Option<u128>) -> String {
+    format!(
+        "statement exceeded CELLD_SQL_STATEMENT_MS ({}ms); the cursor expired \
+         after its write began and its effects were not rolled back",
+        armed_ms.unwrap_or(0)
+    )
+}
+
 fn is_reserved_sql_name(name: &str) -> bool {
     USER_SQL.with(std::cell::Cell::get)
         && (name
@@ -516,6 +652,7 @@ fn is_reserved_sql_name(name: &str) -> bool {
 
 fn valid_sql_boolean(value: &str) -> bool {
     let value = value.trim();
+
     let value = value
         .strip_prefix('\'')
         .and_then(|value| value.strip_suffix('\''))
@@ -1726,7 +1863,13 @@ type SqlExec = (Vec<String>, Vec<Vec<serde_json::Value>>, u64);
 /// use a prepared statement so their cursor rows are returned.
 pub fn sql_exec(scope: &str, query: &str, binds: &[serde_json::Value]) -> Result<SqlExec, String> {
     require_sql_healthy(scope)?;
+    // The armed budget, read once: the rewrite below must name what this run
+    // was bounded by, not whatever the knob reads when the run reports.
+    let timeout = statement_timeout();
     let run = with(scope, |c| {
+        // SAFETY: the handle belongs to this live connection; the guard
+        // removes the handler before the connection steps anything else.
+        let _deadline = unsafe { StatementDeadline::arm(c.handle(), timeout) };
         as_user_sql(|| {
             let changes_before = total_changes(c);
             if binds.is_empty() && query.matches(';').count() > 1 {
@@ -1755,7 +1898,17 @@ pub fn sql_exec(scope: &str, query: &str, binds: &[serde_json::Value]) -> Result
             Ok((cols, out, total_changes(c).saturating_sub(changes_before)))
         })
     });
-    run.unwrap_or_else(|| Err(format!("no db for {scope}")))
+    let mut run = run.unwrap_or_else(|| Err(format!("no db for {scope}")));
+    // The flag is only meaningful when this run armed a deadline: `arm`
+    // leaves a previous run's set flag in place when the knob is unset, so
+    // an unarmed error below must never be rewritten as a timeout. The
+    // message names the captured budget, never a fresh knob read.
+    if timeout.is_some() && statement_timed_out() && run.is_err() {
+        run = Err(statement_timeout_error(
+            timeout.map(|timeout| timeout.as_millis()),
+        ));
+    }
+    run
 }
 
 /// Execute every complete statement at the front of `input`, returning the
@@ -2188,6 +2341,27 @@ pub(crate) fn sql_cursor_start_values(
     query: &str,
     binds: &[rusqlite::types::Value],
 ) -> Result<SqlCursorStart, String> {
+    // One budget for the whole scan: the prefix run below and every later
+    // cursor step share this instant (denoland/celld#274 follow-up). A
+    // second fresh budget at cursor creation would let a slow prefix plus
+    // a slow stream run up to ~2x the knob. The millis travel with the
+    // instant so every later error names the armed budget, not the knob.
+    let timeout = statement_timeout();
+    let deadline = timeout.map(|timeout| std::time::Instant::now() + timeout);
+    let timeout_ms = timeout.map(|timeout| timeout.as_millis());
+    sql_cursor_start_values_with_deadline(scope, query, binds, deadline, timeout_ms)
+}
+
+/// The cursor start with its deadline supplied by the caller: production
+/// passes the single call-wide instant above, tests inject their own so the
+/// sharing is pinned without racing a clock.
+fn sql_cursor_start_values_with_deadline(
+    scope: &str,
+    query: &str,
+    binds: &[rusqlite::types::Value],
+    deadline: Option<std::time::Instant>,
+    timeout_ms: Option<u128>,
+) -> Result<SqlCursorStart, String> {
     require_sql_healthy(scope)?;
     let (cached_statement, cached_query, cache_busy, reused_cached_query) =
         match take_cached_sql_statement(scope, query) {
@@ -2209,6 +2383,32 @@ pub(crate) fn sql_cursor_start_values(
             // SQL cursors first. SQLite receives transient copies of every bind.
             unsafe {
                 let database = connection.handle();
+                // Bound the prefix run with what remains of the call's
+                // single deadline. The guard is already inside the `unsafe`
+                // the handle needs; it drops with the closure, before the
+                // cursor below steps again.
+                let remaining = deadline.and_then(|deadline| {
+                    deadline.checked_duration_since(std::time::Instant::now())
+                });
+                if deadline.is_some() && remaining.is_none() {
+                    // The budget is already spent: reject without stepping, so
+                    // a slow prefix cannot run unarmed past its bound. The
+                    // checkout above may have handed this call a cached
+                    // statement; returning here would leak it and wedge its
+                    // slot busy, so release it and discard the slot first.
+                    // Clear any stale timeout flag too — a later unarmed error
+                    // must not be rewritten as this call's timeout.
+                    STATEMENT_TIMED_OUT.set(false);
+                    if !cached_statement.is_null() {
+                        discard_in_use_sql_statement(
+                            scope,
+                            cached_query.as_deref(),
+                            cached_statement,
+                        );
+                    }
+                    return Err(anyhow::anyhow!(statement_timeout_error(timeout_ms)));
+                }
+                let _deadline = StatementDeadline::arm(database, remaining);
                 let started_in_transaction = rusqlite::ffi::sqlite3_get_autocommit(database) == 0;
                 let changes_before = total_changes_for_handle(database);
                 let start = sql.as_ptr();
@@ -2349,9 +2549,17 @@ pub(crate) fn sql_cursor_start_values(
         })
     })
     .unwrap_or_else(|| Err(anyhow::anyhow!("no db for {scope}")))
-    .map_err(|error| error.to_string())?;
+    .map_err(|error| error.to_string());
+    let mut result = result;
+    // As in `sql_exec`: only a run that armed a deadline may report one.
+    // The deadline is the call's single instant, not a fresh knob read, so
+    // a mid-call knob change cannot arm one run and report another. The
+    // message names the captured budget for the same reason.
+    if deadline.is_some() && statement_timed_out() && result.is_err() {
+        result = Err(statement_timeout_error(timeout_ms));
+    }
+    let (database, statement, changes_before, columns, row, rows_written, cache_query) = result?;
 
-    let (database, statement, changes_before, columns, row, rows_written, cache_query) = result;
     if row.is_none() {
         if let Some(query) = cache_query.as_deref() {
             recycle_sql_statement(scope, query, statement);
@@ -2361,6 +2569,12 @@ pub(crate) fn sql_cursor_start_values(
         return Ok((0, columns, row, rows_written, reused_cached_query));
     }
     let id = NEXT_SQL_CURSOR.fetch_add(1, Ordering::Relaxed);
+    // The cursor inherits the call's single deadline — the same instant the
+    // prefix run above was armed with — so a scan that streams rows across
+    // many steps is still bounded end to end by one budget, not two. Without
+    // the knob the deadline stays empty and stepping is unbounded, as before.
+    // It carries the armed millis alongside, so a later step names the
+    // budget it is bounded by even when the knob has since changed.
     sql_cursors(|cursors| {
         cursors.borrow_mut().insert(
             id,
@@ -2370,6 +2584,8 @@ pub(crate) fn sql_cursor_start_values(
                 statement,
                 changes_before,
                 cache_query,
+                deadline,
+                timeout_ms,
             },
         );
     });
@@ -2394,6 +2610,39 @@ pub fn sql_cursor_next(cursor_id: u64) -> Result<(Option<Vec<SqlValue>>, u64), S
         // live until the cursor is removed.
         let started_in_transaction =
             unsafe { rusqlite::ffi::sqlite3_get_autocommit(cursor.database) == 0 };
+        // The cursor's remaining budget bounds this step; a cursor whose
+        // deadline already passed fails here without stepping again. The
+        // guard drops before the match below returns, so the handler never
+        // outlives the step it bounded.
+        let remaining = cursor
+            .deadline
+            .and_then(|deadline| deadline.checked_duration_since(std::time::Instant::now()));
+        if cursor.deadline.is_some() && remaining.is_none() {
+            let timeout_ms = cursor.timeout_ms;
+            // A live cursor already yielded its first row, and for a write
+            // (INSERT/UPDATE/DELETE ... RETURNING) that first step ran the
+            // write. Expiring only drops the cursor — SQLite is never
+            // interrupted — so the write stands: inside an explicit
+            // transaction it stays in the open transaction, and in autocommit
+            // finalizing the cursor keeps it. Claiming a rollback here would
+            // let a caller retry and duplicate the write, so a write cursor
+            // reports that its effects were not rolled back. A read cursor
+            // keeps the rollback message: it has nothing to duplicate.
+            // SAFETY: the cursor exclusively owns its live statement.
+            let wrote = unsafe { rusqlite::ffi::sqlite3_stmt_readonly(cursor.statement) == 0 };
+            if let Some(query) = cursor.cache_query.take() {
+                let scope = cursor.scope.clone();
+                cursors.remove(&cursor_id);
+                discard_cached_sql_statement(&scope, &query);
+            } else {
+                cursors.remove(&cursor_id);
+            }
+            if wrote {
+                return Err(statement_timeout_error_after_write(timeout_ms));
+            }
+            return Err(statement_timeout_error(timeout_ms));
+        }
+        let _deadline = StatementDeadline::arm(cursor.database, remaining);
         let step = unsafe { rusqlite::ffi::sqlite3_step(cursor.statement) };
         match step {
             rusqlite::ffi::SQLITE_ROW => Ok((Some(unsafe { sql_cursor_row(cursor.statement) }), 0)),
@@ -2405,6 +2654,20 @@ pub fn sql_cursor_next(cursor_id: u64) -> Result<(Option<Vec<SqlValue>>, u64), S
                 Ok((None, rows_written))
             }
             _ => {
+                // Only a cursor carrying a deadline may report a timeout: a
+                // stale flag from an earlier armed run must not rewrite an
+                // unarmed stepping error.
+                if cursor.deadline.is_some() && statement_timed_out() {
+                    let timeout_ms = cursor.timeout_ms;
+                    if let Some(query) = cursor.cache_query.take() {
+                        let scope = cursor.scope.clone();
+                        cursors.remove(&cursor_id);
+                        discard_cached_sql_statement(&scope, &query);
+                    } else {
+                        cursors.remove(&cursor_id);
+                    }
+                    return Err(statement_timeout_error(timeout_ms));
+                }
                 let error = sqlite_operation_failure(
                     &cursor.scope,
                     cursor.database,
@@ -7165,5 +7428,337 @@ mod legacy_import_tests {
             &["child".to_string()],
         );
         assert!(absent.is_err(), "a missing root is loud, never empty");
+    }
+}
+
+#[cfg(test)]
+mod statement_timeout_tests {
+    use super::d1_test_db::TestDb;
+    use super::*;
+    use std::sync::Mutex;
+
+    /// The knob lives in the process environment, so the tests that flip it
+    /// must not overlap: one test's restore would disarm another's run and
+    /// both would misread the result.
+    static ENV_SERIAL: Mutex<()> = Mutex::new(());
+
+    /// A CTE far too slow for any machine to finish inside the test's
+    /// knob: the abort must come from the deadline, not the data.
+    const SLOW_CTE: &str = "WITH RECURSIVE c(x) AS \
+        (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 100000000) \
+        SELECT count(*) FROM c";
+
+    fn with_statement_timeout_ms(ms: &str) -> Option<std::ffi::OsString> {
+        let previous = std::env::var_os("CELLD_SQL_STATEMENT_MS");
+        std::env::set_var("CELLD_SQL_STATEMENT_MS", ms);
+        previous
+    }
+
+    fn restore_statement_timeout(previous: Option<std::ffi::OsString>) {
+        match previous {
+            Some(value) => std::env::set_var("CELLD_SQL_STATEMENT_MS", value),
+            None => std::env::remove_var("CELLD_SQL_STATEMENT_MS"),
+        }
+    }
+
+    /// A statement past `CELLD_SQL_STATEMENT_MS` fails with a catchable
+    /// timeout naming the knob, its effects roll back, and the cell keeps
+    /// serving afterwards (denoland/celld#274).
+    #[test]
+    fn long_statement_fails_catchable_and_rolls_back() {
+        let _env = ENV_SERIAL.lock().expect("env lock");
+        let db = TestDb::open("stmt-timeout");
+        db.exec("CREATE TABLE t(x INTEGER PRIMARY KEY)");
+        // Unset knob: the slow statement is unbounded, so only prove a fast
+        // one passes without the machinery armed.
+        sql_exec(&db.scope, "INSERT INTO t VALUES (1)", &[]).expect("fast insert");
+        let previous = with_statement_timeout_ms("200");
+        // A fast statement still passes with the knob set: no false positive.
+        sql_exec(&db.scope, "INSERT INTO t VALUES (2)", &[]).expect("fast insert under the knob");
+        let error =
+            sql_exec(&db.scope, SLOW_CTE, &[]).expect_err("the CTE must not finish inside 200ms");
+        assert!(
+            error.contains("CELLD_SQL_STATEMENT_MS"),
+            "the timeout must be catchable and name the knob, got: {error}"
+        );
+        // The timed-out statement's effects rolled back and the cell is
+        // still usable: the two fast inserts stand, nothing else does.
+        let count = sql_exec(&db.scope, "SELECT count(*) FROM t", &[]).expect("cell usable");
+        restore_statement_timeout(previous);
+        assert_eq!(
+            count.1,
+            vec![vec![serde_json::json!(2)]],
+            "only the fast inserts stand"
+        );
+    }
+
+    /// A scan that streams rows across many cursor steps is bounded end to
+    /// end by the deadline the cursor inherited at creation.
+    #[test]
+    fn streaming_cursor_is_bounded_end_to_end() {
+        let _env = ENV_SERIAL.lock().expect("env lock");
+        let db = TestDb::open("stmt-timeout-cursor");
+        let previous = with_statement_timeout_ms("200");
+        // No aggregation: the first row arrives immediately and the scan
+        // then streams slower than the budget, so the deadline — not the
+        // start call — is what stops it.
+        let stream = "WITH RECURSIVE c(x) AS \
+            (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 100000000) \
+            SELECT x FROM c";
+        let (cursor, _columns, _row, _written, _reused) =
+            sql_cursor_start(&db.scope, stream, &[]).expect("the first row is fast");
+        // Exhaust the 200ms budget, then step: the cursor must refuse rather
+        // than stream forever. (If the start call itself outran the budget
+        // on a loaded machine, it already reported the same timeout.)
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let mut timed_out = false;
+        for _ in 0..100_000 {
+            match sql_cursor_next(cursor) {
+                Ok((Some(_), _)) => continue,
+                Ok((None, _)) => break,
+                Err(error) => {
+                    assert!(
+                        error.contains("CELLD_SQL_STATEMENT_MS"),
+                        "cursor timeout must name the knob, got: {error}"
+                    );
+                    timed_out = true;
+                    break;
+                }
+            }
+        }
+        sql_cursor_close(cursor);
+        restore_statement_timeout(previous);
+        assert!(timed_out, "the streaming scan must hit the cursor deadline");
+    }
+
+    /// The cursor carries the call's single deadline, not a second fresh
+    /// budget (denoland/celld#274 follow-up). A live injected instant arms the
+    /// scan — the prefix returns its first row and the cursor inherits that
+    /// instant — while an already-spent instant rejects before stepping, so a
+    /// slow prefix cannot run unarmed past its bound.
+    #[test]
+    fn streaming_cursor_shares_the_calls_single_deadline() {
+        let _env = ENV_SERIAL.lock().expect("env lock");
+        let db = TestDb::open("stmt-timeout-shared-deadline");
+        db.exec("CREATE TABLE t(x INTEGER PRIMARY KEY)");
+        db.exec("INSERT INTO t VALUES (1)");
+        let previous = with_statement_timeout_ms("60000");
+        // A live deadline arms the scan: the fast prefix returns its first
+        // row and the cursor carries the call's instant, not a fresh budget.
+        let live = Some(std::time::Instant::now() + std::time::Duration::from_secs(60));
+        let (cursor, _columns, row, _written, _reused) = sql_cursor_start_values_with_deadline(
+            &db.scope,
+            "SELECT x FROM t",
+            &[],
+            live,
+            Some(60_000),
+        )
+        .expect("a live budget still arms the scan");
+        assert!(row.is_some(), "the prefix row must survive a live budget");
+        let stored =
+            sql_cursors(|cursors| cursors.borrow().get(&cursor).map(|cursor| cursor.deadline));
+        assert_eq!(
+            stored,
+            Some(live),
+            "the cursor must inherit the call's deadline, not a fresh full budget"
+        );
+        sql_cursor_close(cursor);
+        // A spent budget rejects at the start, naming the armed budget, and
+        // clears the stale flag so the next unarmed error reports itself.
+        let spent = Some(std::time::Instant::now() - std::time::Duration::from_secs(1));
+        let error = sql_cursor_start_values_with_deadline(
+            &db.scope,
+            "SELECT x FROM t",
+            &[],
+            spent,
+            Some(60_000),
+        )
+        .expect_err("a spent budget rejects without stepping");
+        assert!(
+            error.contains("CELLD_SQL_STATEMENT_MS (60000ms)"),
+            "the rejection must name the armed budget, got: {error}"
+        );
+        // The spent start checked a cached statement out; rejecting must not
+        // leak it or wedge its slot busy. The slot is discarded, so probing
+        // it misses, and the next query prepares fresh.
+        match take_cached_sql_statement(&db.scope, "SELECT x FROM t") {
+            SqlStatementCacheLookup::Busy => {
+                panic!("the spent start left its cached statement checked out");
+            }
+            SqlStatementCacheLookup::Miss => {}
+            SqlStatementCacheLookup::Hit {
+                statement, query, ..
+            } => {
+                let query: &str = &query;
+                discard_in_use_sql_statement(&db.scope, Some(query), statement);
+                panic!("the spent start left a cached statement behind");
+            }
+        }
+        let live = Some(std::time::Instant::now() + std::time::Duration::from_secs(60));
+        let (cursor, _columns, row, _written, _reused) = sql_cursor_start_values_with_deadline(
+            &db.scope,
+            "SELECT x FROM t",
+            &[],
+            live,
+            Some(60_000),
+        )
+        .expect("the next query prepares fresh after the discard");
+        assert!(row.is_some(), "the fresh query still returns its row");
+        sql_cursor_close(cursor);
+        restore_statement_timeout(previous);
+        let error = sql_exec(&db.scope, "SELECT * FROM no_such_table", &[])
+            .expect_err("a missing table must fail");
+        assert!(
+            !error.contains("CELLD_SQL_STATEMENT_MS"),
+            "an unarmed error must not be rewritten as a timeout, got: {error}"
+        );
+    }
+
+    /// The rejection names the armed budget, not the live knob. A start
+    /// whose budget is already spent fails before stepping, and the error
+    /// must still report the budget it was bounded by even after the knob
+    /// changed or vanished — the call never re-reads it.
+    #[test]
+    fn cursor_timeout_names_the_armed_budget_not_the_live_knob() {
+        let _env = ENV_SERIAL.lock().expect("env lock");
+        let db = TestDb::open("stmt-timeout-armed-ms");
+        db.exec("CREATE TABLE t(x INTEGER PRIMARY KEY)");
+        db.exec("INSERT INTO t VALUES (1)");
+        let previous = with_statement_timeout_ms("60000");
+        let spent = Some(std::time::Instant::now() - std::time::Duration::from_secs(1));
+        // The knob changes before the start: the rejection must still name
+        // the 60000ms budget the call was armed with.
+        std::env::set_var("CELLD_SQL_STATEMENT_MS", "200");
+        let error = sql_cursor_start_values_with_deadline(
+            &db.scope,
+            "SELECT x FROM t",
+            &[],
+            spent,
+            Some(60_000),
+        )
+        .expect_err("a spent budget rejects without stepping");
+        assert!(
+            error.contains("CELLD_SQL_STATEMENT_MS (60000ms)"),
+            "the rejection must name the armed 60000ms, got: {error}"
+        );
+        // The knob goes away entirely: same expectation, no fresh read.
+        std::env::remove_var("CELLD_SQL_STATEMENT_MS");
+        let error = sql_cursor_start_values_with_deadline(
+            &db.scope,
+            "SELECT x FROM t",
+            &[],
+            spent,
+            Some(60_000),
+        )
+        .expect_err("a spent budget rejects without stepping");
+        assert!(
+            error.contains("CELLD_SQL_STATEMENT_MS (60000ms)"),
+            "the rejection must name the armed 60000ms, got: {error}"
+        );
+        restore_statement_timeout(previous);
+    }
+
+    /// A timeout flag left set by an armed run must not rewrite a later
+    /// unarmed error: with the knob unset, a failing statement reports its
+    /// own error, not `CELLD_SQL_STATEMENT_MS` (denoland/celld#274).
+    #[test]
+    fn unarmed_error_after_timeout_is_not_retimed() {
+        let _env = ENV_SERIAL.lock().expect("env lock");
+        let db = TestDb::open("stmt-timeout-stale-flag");
+        let previous = with_statement_timeout_ms("200");
+        let error =
+            sql_exec(&db.scope, SLOW_CTE, &[]).expect_err("the CTE must not finish inside 200ms");
+        assert!(
+            error.contains("CELLD_SQL_STATEMENT_MS"),
+            "the armed run must time out, got: {error}"
+        );
+        // The knob goes away mid-process (as the suite itself does): the
+        // armed flag stays set, and the next failing statement must still
+        // report itself.
+        restore_statement_timeout(previous);
+        let error = sql_exec(&db.scope, "SELECT * FROM no_such_table", &[])
+            .expect_err("a missing table must fail");
+        assert!(
+            !error.contains("CELLD_SQL_STATEMENT_MS"),
+            "an unarmed error must not be rewritten as a timeout, got: {error}"
+        );
+        assert!(
+            error.contains("no_such_table"),
+            "the real error must survive, got: {error}"
+        );
+    }
+
+    /// Expire a live cursor's stored deadline without stepping again: the
+    /// only deterministic way to age a deadline past its budget.
+    fn expire_cursor_for_test(cursor: u64) {
+        sql_cursors(|cursors| {
+            cursors
+                .borrow_mut()
+                .get_mut(&cursor)
+                .expect("a live cursor")
+                .deadline = Some(std::time::Instant::now() - std::time::Duration::from_secs(1));
+        });
+    }
+
+    /// A write cursor that expires after its first row must not claim a
+    /// rollback: its write ran during that first step and expiring only
+    /// drops the cursor, so the write stands. A caller that trusted the old
+    /// message would retry and duplicate the row.
+    #[test]
+    fn expired_write_cursor_reports_its_standing_write() {
+        let _env = ENV_SERIAL.lock().expect("env lock");
+        let db = TestDb::open("stmt-timeout-write-cursor-expiry");
+        db.exec("CREATE TABLE t(x INTEGER PRIMARY KEY)");
+        let previous = with_statement_timeout_ms("60000");
+        let (cursor, _columns, row, _written, _reused) =
+            sql_cursor_start(&db.scope, "INSERT INTO t VALUES (1) RETURNING x", &[])
+                .expect("the first row is fast");
+        assert!(row.is_some(), "the write's first row must arrive");
+        expire_cursor_for_test(cursor);
+        let error = sql_cursor_next(cursor).expect_err("the expired budget fails fast");
+        assert!(
+            error.contains("CELLD_SQL_STATEMENT_MS"),
+            "the expiry must name the knob, got: {error}"
+        );
+        assert!(
+            !error.contains("its effects rolled back"),
+            "an expired write must not claim a rollback, got: {error}"
+        );
+        let count = sql_exec(&db.scope, "SELECT count(*) FROM t", &[]).expect("cell usable");
+        assert_eq!(
+            count.1,
+            vec![vec![serde_json::json!(1)]],
+            "the expired cursor's write stands"
+        );
+        // A cursor whose budget never expires still completes normally.
+        let (cursor, _columns, first, _written, _reused) =
+            sql_cursor_start(&db.scope, "INSERT INTO t VALUES (2) RETURNING x", &[])
+                .expect("the first row is fast");
+        assert!(first.is_some(), "the write's first row must arrive");
+        let (row, written) = sql_cursor_next(cursor).expect("a live cursor finishes");
+        assert!(row.is_none(), "the cursor is done after its single row");
+        assert_eq!(written, 1, "one row written");
+        restore_statement_timeout(previous);
+    }
+
+    /// A read cursor that expires has nothing to duplicate, so it keeps the
+    /// plain rollback message.
+    #[test]
+    fn expired_read_cursor_keeps_the_rollback_message() {
+        let _env = ENV_SERIAL.lock().expect("env lock");
+        let db = TestDb::open("stmt-timeout-read-cursor-expiry");
+        db.exec("CREATE TABLE t(x INTEGER PRIMARY KEY)");
+        db.exec("INSERT INTO t VALUES (1)");
+        let previous = with_statement_timeout_ms("60000");
+        let (cursor, _columns, row, _written, _reused) =
+            sql_cursor_start(&db.scope, "SELECT x FROM t", &[]).expect("the first row is fast");
+        assert!(row.is_some(), "the first row must arrive");
+        expire_cursor_for_test(cursor);
+        let error = sql_cursor_next(cursor).expect_err("the expired budget fails fast");
+        assert!(
+            error.contains("its effects rolled back"),
+            "an expired read keeps the rollback message, got: {error}"
+        );
+        restore_statement_timeout(previous);
     }
 }
