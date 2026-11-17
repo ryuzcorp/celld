@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): staged activation; the serving bucket constructor.
+// Modified by ryuzcorp (ryuzcorp/celld): staged activation; the serving bucket constructor; celld versions listing (upstream #181).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 // Modified by ryuzcorp (ryuzcorp/celld): deploy --sourcemap writes the bundle's external map.
 
@@ -108,6 +108,32 @@ impl Record for Activated {
                 "adopted at the next pointer poll"
             }
         ))
+    }
+}
+
+/// One listed deployment version: the script and version a rollback or a
+/// prune names, and whether the fleet-wide pointer serves it now.
+pub(crate) struct Versioned {
+    script: String,
+    version: String,
+    current: bool,
+}
+
+impl Record for Versioned {
+    fn json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "script": self.script,
+            "version": self.version,
+            "current": self.current,
+        })
+    }
+
+    fn text(&self) -> Cow<'_, str> {
+        Cow::Owned(if self.current {
+            format!("{} {} (current)", self.script, self.version)
+        } else {
+            format!("{} {}", self.script, self.version)
+        })
     }
 }
 
@@ -871,6 +897,44 @@ pub async fn run_discard(arguments: Vec<String>) -> anyhow::Result<()> {
             .collect(),
         objects: discarded.objects,
     })?;
+    out.finish()
+}
+
+pub async fn run_versions(arguments: Vec<String>) -> anyhow::Result<()> {
+    let Some(mut options) = deploy::versions_options_from_arguments(arguments)? else {
+        deploy::print_versions_help();
+        return Ok(());
+    };
+    let region = resolve_storage_location(
+        &mut options.bucket,
+        &mut options.endpoint,
+        options.region.as_deref(),
+    );
+    if options.bucket.is_none() {
+        bail!(
+            "celld versions requires --bucket s3://NAME, gs://NAME or az://CONTAINER \
+             (or CELLD_BUCKET)"
+        );
+    }
+    let bucket = options.bucket.expect("validated versions bucket");
+    let store = bucket_client(&bucket, options.endpoint.as_deref(), &region)?;
+    validate_bucket(&store).await?;
+    let entries = deploy::list_versions(&store, options.script.as_deref()).await?;
+    let mut out = Output::new(if options.json {
+        Format::Json
+    } else {
+        Format::Text
+    });
+    for entry in &entries {
+        out.row(&Versioned {
+            script: entry.script.clone(),
+            version: entry.version.clone(),
+            current: entry.current,
+        })?;
+    }
+    if entries.is_empty() {
+        note!("No deployed versions.");
+    }
     out.finish()
 }
 
