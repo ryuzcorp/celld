@@ -1,4 +1,4 @@
-<!-- Modified by ryuzcorp (ryuzcorp/celld): bucket-posture group commit docs: bundle switch opt-in (0075). -->
+<!-- Modified by ryuzcorp (ryuzcorp/celld): bucket-posture group commit docs: bundle switch opt-in (0075); fleet ops: stable node ids, witness grace, loss record, lease conflict retries, alarm deadline, wake timing (upstream #244, #273, #264, #256, #250, #249, #245, #239, #268, #308). -->
 # What celld guarantees
 
 celld makes two promises. Exactly one node serves a cell at a time, so two
@@ -283,7 +283,12 @@ recovery requirement.
 Recovery has these limits:
 
 - A follower's HTTP error does not prove its data is absent, even when its
-  lease has expired, so persistent errors can block recovery and startup.
+  lease has expired, so persistent errors can block recovery and startup. The
+  one exception is a member answering as a different session (`409
+  WrongTarget`): that member is gone, and past the witness grace the pass
+  proceeds to the loss record instead of wedging.
+- A missing lease with surviving session objects is not proof of
+  completeness: the seal declares the bounded loss loudly instead.
 - A restarted follower cannot certify a range with a damaged batch or a gap
   until valid data covers it.
 - An older node's entries-only tail (`CLT1`) proves neither completeness nor
@@ -296,8 +301,13 @@ Recovery has these limits:
 
 A restarting node serves authenticated follower seal and tail requests before
 its own predecessor recovery completes, so nodes that restart together can
-recover acknowledged writes from surviving follower disks. It accepts
-application requests and new follower appends only after startup completes.
+recover acknowledged writes from surviving follower disks — but only under
+its own session id. A process that restarted with a fresh id rejects its
+predecessor's requests, which is why the id must be stable per disk (above).
+It accepts application requests and new follower appends only after startup
+completes. Follower tails stream under a progress timeout rather than a
+whole-request one: a large tail on a slow link completes instead of failing
+at ten seconds, while a stalled one still fails so recovery refuses to seal.
 
 Recovery of a large dead node can take minutes. It reads retained bundles in
 windows of at most 512 MiB and uploads and releases each window before the next,
@@ -374,7 +384,22 @@ restores, so no write past the cut can be acknowledged.
 
 Each node holds a lease in the bucket with an expiry, renewed after one third of
 the lifetime (`CELLD_TTL_MS`, default 10000 ms). A failed renewal is retried
-while the published expiry has not passed.
+while the published expiry has not passed. Each attempt is bounded so one hung
+store request cannot eat the whole remaining authority: a renewal CAS, and the
+readback that follows a contested renewal, each run at most half the remaining
+authority (250 ms to 2.5 s), and the core retries on what is left. A timeout is
+therefore never the fence — only the published expiry is. A rejected CAS is
+either a lost race (HTTP 412), which reads back and retries with a fresh ETag,
+or a transient store conflict (HTTP 409), which retries twice with the same
+guard before falling back to the readback. The `store` target logs a
+`rejected` outcome with a `conflict` flag, so the two are distinguishable
+without packet captures.
+
+Fencing is decided by each node alone, so a store stall longer than the TTL
+fences every node in the same window, and every restart rejoins at once. A
+longer TTL narrows that window but slows takeover after a real crash; there is
+no separate blip-decoupling knob. What the restarted fleet does next is
+decided by recovery under the witness grace below.
 
 When the expiry passes, the node fences itself: it stops each active cell and
 fails every incomplete request. It also fences at once when its lease record is
@@ -403,7 +428,64 @@ returns the node, through the normal cold-activation path. The
 event for each store request against the node's own lease record, with an
 `outcome` of `found`, `missing`, `applied`, `rejected`, or `error`. An `error`
 carries the store failure in an `error` field; a `found` carries the record's
-`generation`. The target costs nothing at other filters.
+`generation`; a `rejected` write carries a `conflict` flag distinguishing a
+transient store conflict from a lost race. The target costs nothing at other
+filters.
+
+### Stable node identities
+
+Every process session answers peer requests under its node id, and recovery
+addresses members by the id in their lease. An explicit `CELLD_NODE` is that
+id. Without one, the node pins a generated id to `node-id` in its data
+directory (beside the follower `peerlog`) on first boot and reuses it across
+restarts; an explicit value is recorded there too. The pin and the disks it
+recovers must share a fate: keep the data directory on persistent per-node
+disk. On an ephemeral disk the pin dies with the container and each restart
+is a stranger, which is correct only because there is nothing to recover.
+
+A process that answers a seal request for a different session rejects it with
+`409 WrongTarget` and a stale-route marker. Recovery treats that answer as
+proof the old member is gone: the member stays undecided while its lease is
+live or inside the witness grace, then the pass proceeds — to a witness, or
+to the loss record. The log line names the old id, so an operator can restart
+that address with its old id on the same disk and serve the tail. Never run
+two processes on one data directory: both would claim the pin and split the
+session's fate.
+
+### The witness grace
+
+A member whose lease merely lapsed — a restart, a fleet-wide power cycle — is
+not conclusively gone: its fsync'd fragments boot back in seconds, and
+declaring loss against boot order would discard acknowledged writes sitting
+intact on disk. Recovery therefore applies a grace of three TTLs (at least 20
+seconds) to member fate: a member that is unreachable, or answered by a
+stranger, stays undecided until its lease has been dead past the grace, and
+only then does the pass proceed — to a witness, or to the loss record. While
+any member is undecided, recovery refuses to seal and says so loudly
+(`refusing to seal while member state remains unverified`); a node whose own
+predecessor is that session waits with it instead of starting. Do not
+"resolve" this by deleting lease or log records: a deleted lease with
+surviving session objects declares bounded loss (below); it unblocks nothing
+faster.
+
+### The loss record
+
+When no complete true witness survives for an active log that may hold fleet
+acknowledgements, recovery writes a loss record beside the log and seals:
+`log/<session>.e<epoch>.loss.json`, or `log/<node>.loss.json` when the lease
+and record are gone but session objects survive. "Loss is a record, never a
+prompt": the pass never asks the operator, and it never silently proceeds.
+The record names the dead session, its epoch, who declared it, and what was
+unrecoverable — acknowledged writes in the final flush window may be missing.
+
+After a declared loss the new log epoch restarts the sequence space, so seqs
+of written-off acknowledged writes can reappear carrying different rows. A
+client that stored a seq from an acknowledged write can later read a
+different row under it. Match acknowledged writes by content across a
+declared loss, never by sequence, and treat the loss record as the marker
+that the lineage turned over. A returning follower disk still holds its
+written-off rows, but nothing rejoins them automatically; reconcile them by
+content against the record.
 
 ## Alarm discovery and the wake format
 
@@ -428,7 +510,16 @@ concurrently, continuing the listing on the next pass and restarting after the
 last page. A failed DELETE or a late PUT can need another full scan. The
 interval defaults to 60 seconds; `CELLD_WAKER_TICK_MS` sets it and the due-scan
 interval. A large inventory can take many intervals, and each extra node can
-repeat the same reads and deletes.
+repeat the same reads and deletes. Each due-scan pass also wakes for the next
+not-yet-due alarm minute when it lands before the next tick, so a persisted
+alarm fires on schedule after a restart instead of waiting out the 60 s scan.
+
+A firing alarm that outlives the operation deadline (`CELLD_OPERATION_DEADLINE_MS`,
+default 15000 ms) is still running, not failed: the first expiry only marks
+the firing, and the running copy settles the alarm when it answers, so a slow
+handler never runs twice. A second expiry with the op still outstanding treats
+the op as lost and re-fires, preserving at-least-once. A firing alarm holds
+its cell out of worker routing until the copy settles or is retired.
 
 `wake/format.json` selects format 2; `wake/waker.json` holds the advisory lease
 for the waker role. A new node initializes an empty fleet or upgrades a stopped
