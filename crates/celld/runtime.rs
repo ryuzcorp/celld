@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): cross-isolate RPC stubs and streams; D1 export operator-ingress marker; ported from meln1k/celld: report wake coverage after maintenance (e6cb9a3); wake coverage follow-ups: startup observation ordering, installation comparison; trusted cell RPC; deployment cache scope purge on generation free; staged invoke joins the driver past the reply.
+// Modified by ryuzcorp (ryuzcorp/celld): cross-isolate RPC stubs and streams; D1 export operator-ingress marker; ported from meln1k/celld: report wake coverage after maintenance (e6cb9a3); wake coverage follow-ups: startup observation ordering, installation comparison; trusted cell RPC; deployment cache scope purge on generation free; staged invoke joins the driver past the reply.; answered drivers poll while waitUntil background is outstanding (upstream #300)
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 // RuntimeManager is the V8 cell-host arm, so its executor and observability
@@ -2587,13 +2587,46 @@ async fn wake(ops: &mut Ops, entry: &mut js::InFlight, budget: Duration) -> Wake
                 };
                 match next {
                     Some(Some((op, result))) => return Wake::Op(op, result),
-                    Some(None) => return Wake::Idle,
+                    Some(None) => {
+                        if entry.has_background() {
+                            // Answered, driving `waitUntil` work, with no
+                            // native op of its own: the background can settle
+                            // through another event, so look in instead of
+                            // concluding the entry waits on nothing and
+                            // abandoning the work (denoland/celld#300).
+                            // Throttled like the unanswered empty-ops path.
+                            asyncrt::sleep(CANCELLATION_TICK).await;
+                            return Wake::Poll;
+                        }
+                        return Wake::Idle;
+                    }
                     // Handed over; the next pass takes it.
                     None => continue,
                 }
             };
             let next = if ops.is_empty() {
                 asyncrt::sleep(CANCELLATION_TICK).await;
+                // A lifecycle cancellation must still retire the background
+                // work (denoland/celld#300): sample it before concluding
+                // the entry only needs a look-in, or shutdown spins here
+                // until the background budget gives out. A client disconnect
+                // no longer matters once answered, so only shutdown
+                // interrupts the poll.
+                if let Some(cancelled) = take_cancellation_wake(Some(request_id)) {
+                    if matches!(cancelled, Wake::Cancelled { shutdown: true }) {
+                        return cancelled;
+                    }
+                }
+                if entry.has_background() {
+                    // Answered, driving `waitUntil` work with no native op
+                    // of its own: the background can settle through another
+                    // event (a shared promise it awaited, resolved
+                    // elsewhere), and no turn would otherwise observe that.
+                    // Look in so settle() sees it and the entry retires,
+                    // instead of spinning here past its purpose
+                    // (denoland/celld#289). Already throttled above.
+                    return Wake::Poll;
+                }
                 None
             } else {
                 asyncrt::select_biased! {
