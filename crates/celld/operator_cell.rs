@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): operator token for the internal listener; staged invoke reuses the signed entrance.
+// Modified by ryuzcorp (ryuzcorp/celld): operator token for the internal listener; staged invoke reuses the signed entrance; bucket-backed entrance for d1 --local (upstream #272).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! Reaching a reserved-class cell from outside the fleet.
@@ -64,6 +64,24 @@ pub(crate) struct Reachable {
     subject: Subject,
 }
 
+/// The operator path for one reserved cell: the scope, plus the binding
+/// name that constructs a reserved cell on first request. A later named
+/// binding call cannot repair the identity that the existing JavaScript
+/// instance already cached, so an operator command can be that first
+/// request.
+fn entrance_path(scope: &str, name: Option<&str>) -> String {
+    let mut path = format!("/runtime/{scope}");
+    if let Some(name) = name {
+        path.push('?');
+        path.push_str(
+            &url::form_urlencoded::Serializer::new(String::new())
+                .append_pair("name", name)
+                .finish(),
+        );
+    }
+    path
+}
+
 impl Reachable {
     pub(crate) async fn open(
         fleet: Fleet<'_>,
@@ -71,19 +89,26 @@ impl Reachable {
         scope: String,
         name: Option<&str>,
     ) -> anyhow::Result<Self> {
-        let mut path = format!("/runtime/{scope}");
-        if let Some(name) = name {
-            // An operator command can be the first request to construct a
-            // reserved cell. A later named binding call cannot repair the
-            // identity that the existing JavaScript instance already cached.
-            path.push('?');
-            path.push_str(
-                &url::form_urlencoded::Serializer::new(String::new())
-                    .append_pair("name", name)
-                    .finish(),
-            );
-        }
-        Self::open_path(fleet, subject, path).await
+        let bucket = crate::fleet::bucket_client(fleet.bucket, fleet.endpoint, fleet.region)?;
+        Self::open_local(&bucket, fleet.unsafe_public_advertise, subject, scope, name).await
+    }
+
+    /// The same entrance over an already-open bucket, for commands that
+    /// resolve storage themselves instead of through fleet flags.
+    pub(crate) async fn open_local(
+        bucket: &crate::bucket::Bucket,
+        unsafe_public_advertise: bool,
+        subject: Subject,
+        scope: String,
+        name: Option<&str>,
+    ) -> anyhow::Result<Self> {
+        Self::open_bucket(
+            bucket,
+            unsafe_public_advertise,
+            subject,
+            entrance_path(&scope, name),
+        )
+        .await
     }
 
     /// The same signed entrance behind another operator route: the live
@@ -97,10 +122,23 @@ impl Reachable {
         path: String,
     ) -> anyhow::Result<Self> {
         let bucket = crate::fleet::bucket_client(fleet.bucket, fleet.endpoint, fleet.region)?;
-        let nodes = live_nodes(&bucket, fleet.unsafe_public_advertise, subject.source).await?;
+        Self::open_bucket(&bucket, fleet.unsafe_public_advertise, subject, path).await
+    }
+
+    /// The fleet entrance over an already-open bucket. `celld d1 --local`
+    /// reaches the `celld dev` node through the project's local store,
+    /// which carries that node's leases and secret exactly like a fleet
+    /// bucket carries its fleet's: discovery and signing work unchanged.
+    pub(crate) async fn open_bucket(
+        bucket: &crate::bucket::Bucket,
+        unsafe_public_advertise: bool,
+        subject: Subject,
+        path: String,
+    ) -> anyhow::Result<Self> {
+        let nodes = live_nodes(bucket, unsafe_public_advertise, subject.source).await?;
         // The same secret and the same source shape `celld diagnose` uses.
         let auth = crate::peer_auth::PeerAuth::new(
-            crate::peer_auth::load_existing(&bucket).await?,
+            crate::peer_auth::load_existing(bucket).await?,
             subject.source,
         )?;
         let http = reqwest::Client::builder()

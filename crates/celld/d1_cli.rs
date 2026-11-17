@@ -1,5 +1,5 @@
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
-// Modified by ryuzcorp (ryuzcorp/celld): d1 export; d1 execute --batch; deploy reads stay inside the project.
+// Modified by ryuzcorp (ryuzcorp/celld): d1 export; d1 execute --batch; deploy reads stay inside the project; d1 --local targets the celld dev node (upstream #272).
 
 // The D1 CLI reads operator input and migration files outside node storage.
 #![allow(clippy::disallowed_methods)]
@@ -228,24 +228,30 @@ pub async fn run(arguments: Vec<String>) -> anyhow::Result<()> {
             )
         })?;
     let scope = crate::js::d1_cell_scope(&declaration.database_identity);
-    let storage = command.fleet.clone().resolve("celld d1")?;
-    let database = Reachable::open(
-        Fleet {
-            bucket: &storage.bucket,
-            endpoint: storage.endpoint.as_deref(),
-            region: &storage.region,
-            unsafe_public_advertise: command.unsafe_public_advertise,
-        },
-        Subject {
-            noun: "database",
-            source: "d1",
-            // A migration on a large table is not a diagnostic ping.
-            timeout: std::time::Duration::from_secs(120),
-        },
-        scope,
-        None,
-    )
-    .await?;
+    let subject = Subject {
+        noun: "database",
+        source: "d1",
+        // A migration on a large table is not a diagnostic ping.
+        timeout: std::time::Duration::from_secs(120),
+    };
+    let database = if command.local {
+        open_dev_database(command.project.clone(), command.unsafe_public_advertise, subject, scope)
+            .await?
+    } else {
+        let storage = command.fleet.clone().resolve("celld d1")?;
+        Reachable::open(
+            Fleet {
+                bucket: &storage.bucket,
+                endpoint: storage.endpoint.as_deref(),
+                region: &storage.region,
+                unsafe_public_advertise: command.unsafe_public_advertise,
+            },
+            subject,
+            scope,
+            None,
+        )
+        .await?
+    };
 
     let mut out = Output::new(if command.json {
         Format::Json
@@ -396,6 +402,42 @@ pub async fn run(arguments: Vec<String>) -> anyhow::Result<()> {
 struct Migration {
     name: String,
     sql: String,
+}
+
+/// The `celld dev` node's database, reached through the project's local
+/// store: the store carries that node's leases and secret exactly like a
+/// fleet bucket carries its fleet's, so discovery and signing work
+/// unchanged. The node must be running: a stopped node leaves only
+/// expired leases behind, and a project `celld dev` never ran has no
+/// state at all.
+async fn open_dev_database(
+    project: Option<PathBuf>,
+    unsafe_public_advertise: bool,
+    subject: Subject,
+    scope: String,
+) -> anyhow::Result<Reachable> {
+    let config = crate::deploy::resolve_config(project)?;
+    let project = config
+        .parent()
+        .context("the Wrangler config has no project directory")?;
+    let database = crate::dev::DevState::database_for_project(project);
+    if !database.exists() {
+        bail!(
+            "no celld dev state at {}; run `celld dev` in {} first",
+            database.display(),
+            project.display()
+        );
+    }
+    let bucket = crate::bucket::Bucket::open_dev(&database)?;
+    Reachable::open_local(
+        &bucket,
+        unsafe_public_advertise,
+        subject,
+        scope,
+        None,
+    )
+    .await
+    .context("reach the `celld dev` node; it must be running while this command works")
 }
 
 /// One entrance into the fleet: a node's address and the identity a request
@@ -651,6 +693,9 @@ struct Command {
     fleet: FleetFlags,
     json: bool,
     unsafe_public_advertise: bool,
+    /// Target the `celld dev` node through the project's local state
+    /// instead of a fleet bucket.
+    local: bool,
 }
 
 impl Command {
@@ -697,6 +742,7 @@ impl Command {
         let mut fleet = FleetFlags::default();
         let mut json = false;
         let mut unsafe_public_advertise = false;
+        let mut local = false;
         while let Some(argument) = arguments.next() {
             let mut value = |flag: &str| {
                 arguments
@@ -713,6 +759,7 @@ impl Command {
                 "--batch" => batch = true,
                 "--json" => json = true,
                 "--unsafe-public-advertise" => unsafe_public_advertise = true,
+                "--local" => local = true,
                 "--help" | "-h" => return Ok(None),
                 other => {
                     // The fleet flags are shared, so `--bucket gs://name`
@@ -791,15 +838,26 @@ impl Command {
                 }
             }
         };
+        // The environment fills what the flags left unset, so a fleet bucket
+        // set either way conflicts with `--local`: running migrations against
+        // the wrong database must be a refusal, not a silent bucket choice.
+        let fleet = fleet.with_environment();
+        if local && (fleet.bucket.is_some() || fleet.endpoint.is_some()) {
+            bail!(
+                "`celld d1 --local` reaches the `celld dev` node through the project's local state, \
+                 not a fleet bucket; drop --bucket/--endpoint (and CELLD_BUCKET/S3_ENDPOINT)"
+            );
+        }
         Ok(Some(Self {
             action,
             database,
             project,
             // Resolution is deferred to `run`, so the missing-bucket message
             // is the one every command shares.
-            fleet: fleet.with_environment(),
+            fleet,
             json,
             unsafe_public_advertise,
+            local,
         }))
     }
 }
@@ -814,6 +872,9 @@ USAGE:
   celld d1 migrations apply DATABASE [PROJECT] --bucket NAME
   celld d1 migrations list  DATABASE [PROJECT] --bucket NAME
 
+  Append --local to any of the above to target the `celld dev` node instead
+  of the fleet; --local takes no --bucket.
+
 DATABASE is a `database_name` the project declares in `d1_databases`. PROJECT
 is the directory holding wrangler.jsonc, and defaults to the working directory.
 The `database_id` is the stable database identity when the declaration has one.
@@ -824,6 +885,13 @@ leases and sends the SQL to that node, which forwards it to the node that owns
 the database. It signs each request with the fleet's shared secret, which it
 reads from the bucket, so it needs the same bucket credentials celld deploy
 needs.
+
+`--local` runs the subcommand against the `celld dev` node instead of the
+fleet: it reads the database identity from PROJECT as usual, then reaches
+the running dev node through PROJECT/.celld/dev — the local store carries
+that node's leases and secret, so execute, export, and migrations work
+unchanged. The dev node must be running. `--local` takes no --bucket,
+--endpoint, CELLD_BUCKET, or S3_ENDPOINT.
 
 Migration files are `NNNN_description.sql` in `migrations/`. The `sql`
 extension is ASCII case-insensitive. celld applies the files in the order of
@@ -852,6 +920,8 @@ OPTIONS:
   --file PATH         Read the SQL from a file instead
   --batch             Read a JSON array of statements from stdin and run it
                       as one transactional batch (requires --json)
+  --local             Target the `celld dev` local database through the
+                      running dev node instead of the fleet
   --json              Print one JSON object per row instead of a table
   --output PATH       Write the export to a file instead of stdout
   --table NAME        Export only this table, its indexes, and its triggers;
@@ -967,6 +1037,62 @@ mod d1_export_cli_tests {
             };
             assert!(error.contains(fragment), "arguments {arguments:?}: {error}");
         }
+    }
+
+    #[test]
+    fn local_parses_without_a_bucket() {
+        let command = parse(&["migrations", "apply", "mydb", "--local"])
+            .expect("parse")
+            .expect("command");
+        assert!(command.local);
+        assert!(matches!(command.action, Action::MigrationsApply));
+        let command = parse(&["execute", "mydb", "--command", "SELECT 1", "--local"])
+            .expect("parse")
+            .expect("command");
+        assert!(command.local);
+    }
+
+    #[test]
+    fn local_refuses_fleet_flags() {
+        for arguments in [
+            ["execute", "db", "--command", "SELECT 1", "--local", "--bucket", "s3://fleet"].as_slice(),
+            ["migrations", "apply", "db", "--local", "--endpoint", "http://localhost:9000"].as_slice(),
+        ] {
+            let error = match parse(arguments) {
+                Err(error) => error.to_string(),
+                Ok(_) => panic!("accepted {arguments:?}"),
+            };
+            assert!(
+                error.contains("--local"),
+                "arguments {arguments:?}: {error}"
+            );
+        }
+    }
+
+    /// No fleet, no node: the command must name `celld dev`, not fail
+    /// opening a bucket or dialing an address.
+    #[tokio::test]
+    async fn local_without_dev_state_names_celld_dev() {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(
+            project.path().join("wrangler.json"),
+            r#"{"name": "app", "d1_databases": [{"binding": "DB", "database_name": "mydb"}]}"#,
+        )
+        .unwrap();
+        let error = run(vec![
+            "migrations".to_string(),
+            "apply".to_string(),
+            "mydb".to_string(),
+            "--local".to_string(),
+            project.path().to_str().unwrap().to_string(),
+        ])
+        .await
+        .expect_err("without dev state the command must refuse");
+        let message = format!("{error:?}");
+        assert!(
+            message.contains("celld dev"),
+            "the refusal must name `celld dev`: {message}"
+        );
     }
 }
 
