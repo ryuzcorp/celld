@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): idempotent content-tagged image create; tag-race tests run the fake engine through sh; deploy --sourcemap writes the bundle's external map; service binding targets validated at deploy; staged activation; deploy --sourcemap collects the no_bundle sibling map; staged invoke shares the version-ref parsing; deploy reads stay inside the project; deploy --read-root bounds bundling and container builds; durable object bindings with a foreign script_name are refused (upstream #312); image tars upload multipart (upstream #307).
+// Modified by ryuzcorp (ryuzcorp/celld): idempotent content-tagged image create; tag-race tests run the fake engine through sh; deploy --sourcemap writes the bundle's external map; service binding targets validated at deploy; staged activation; deploy --sourcemap collects the no_bundle sibling map; staged invoke shares the version-ref parsing; deploy reads stay inside the project; deploy --read-root bounds bundling and container builds; durable object bindings with a foreign script_name are refused (upstream #312); image tars upload multipart (upstream #307); celld versions lists deployed versions (upstream #181).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 // Deployment is an operator control-plane path outside the Actor execution
@@ -457,6 +457,125 @@ pub fn discard_options_from_arguments(
         bail!("`celld discard` names at least one SCRIPT=VERSION");
     }
     Ok(Some(options))
+}
+
+#[derive(Debug)]
+pub struct VersionsOptions {
+    pub bucket: Option<String>,
+    pub endpoint: Option<String>,
+    pub region: Option<String>,
+    pub json: bool,
+    pub script: Option<String>,
+}
+
+pub fn print_versions_help() {
+    let text = "celld versions — list the immutable deployments the fleet bucket holds\n\n\
+USAGE:\n  celld versions [SCRIPT] --bucket [s3://|gs://|az://]NAME[/PREFIX] [OPTIONS]\n\n\
+Each `celld deploy` writes one immutable version directory per script. The\n\
+fleet-wide pointer names the serving generation; `celld activate SCRIPT=VERSION`\n\
+moves back to an earlier version for rollback, and `celld discard\n\
+SCRIPT=VERSION` deletes a version no pointer names. This command lists what\n\
+is there, marking the serving versions `current`.\n\n\
+OPTIONS:\n  --bucket [s3://|gs://|az://]NAME[/PREFIX]\n                         Fleet bucket and prefix; defaults to CELLD_BUCKET\n  --endpoint URL         S3-compatible endpoint; defaults to S3_ENDPOINT\n  --region REGION        Storage region; defaults to AWS_REGION\n  --json                 Print one JSON object per version\n  -h, --help             Show this help"
+    ;
+    let _ = crate::cli_output::Output::new(crate::cli_output::Format::Text).help(text);
+}
+
+pub fn versions_options_from_arguments(
+    arguments: impl IntoIterator<Item = String>,
+) -> anyhow::Result<Option<VersionsOptions>> {
+    let mut options = VersionsOptions {
+        bucket: None,
+        endpoint: None,
+        region: None,
+        json: false,
+        script: None,
+    };
+    let mut arguments = arguments.into_iter();
+    while let Some(argument) = arguments.next() {
+        match argument.as_str() {
+            "--help" | "-h" => return Ok(None),
+            "--json" => options.json = true,
+            "--bucket" => {
+                let value = arguments.next().context("--bucket requires a value")?;
+                options.bucket = Some(value);
+            }
+            "--endpoint" => {
+                options.endpoint = Some(arguments.next().context("--endpoint requires a value")?);
+            }
+            "--region" => {
+                options.region = Some(arguments.next().context("--region requires a value")?);
+            }
+            other if other.starts_with('-') => {
+                bail!("unknown argument for `celld versions`: {other}")
+            }
+            other if options.script.is_none() => options.script = Some(other.to_string()),
+            other => bail!("`celld versions` takes one script, and already has one: {other}"),
+        }
+    }
+    Ok(Some(options))
+}
+
+/// One immutable deployment the bucket still holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VersionEntry {
+    pub script: String,
+    pub version: String,
+    /// Named by the fleet-wide pointer: the serving generation's top-level
+    /// version or one of its components. A current version is a rollback
+    /// target `celld activate` accepts and a version `celld discard`
+    /// refuses.
+    pub current: bool,
+}
+
+/// Every `deploy/<script>/<version>/manifest.json` in the bucket, by
+/// script then version. The serving versions come from the fleet-wide
+/// pointer alone: a bucket without one (no deploy yet) simply marks
+/// nothing current. Pointer reads fail only when the pointer names a
+/// version, because a rollback target must resolve.
+pub async fn list_versions(
+    bucket: &Bucket,
+    script: Option<&str>,
+) -> anyhow::Result<Vec<VersionEntry>> {
+    let mut current = std::collections::BTreeSet::new();
+    if let Some((body, _)) = bucket.get(crate::fleet::CURRENT_POINTER_KEY).await? {
+        let pointer: DeployPointer = serde_json::from_slice(&body)
+            .with_context(|| format!("decode {}", crate::fleet::CURRENT_POINTER_KEY))?;
+        if let Some(script_name) = pointer.script_name {
+            current.insert((script_name, pointer.version));
+        }
+        for (script_name, component) in pointer.components.unwrap_or_default() {
+            current.insert((script_name, component.version));
+        }
+    }
+    let mut entries = Vec::new();
+    for object in bucket.list("deploy/").await? {
+        let key: &str = object.location.as_ref();
+        let Some(rest) = key.strip_prefix("deploy/") else {
+            continue;
+        };
+        let mut parts = rest.split('/');
+        let (Some(script_name), Some(version), Some("manifest.json")) =
+            (parts.next(), parts.next(), parts.next())
+        else {
+            continue;
+        };
+        if parts.next().is_some() {
+            continue;
+        }
+        if script.is_some_and(|want| want != script_name) {
+            continue;
+        }
+        entries.push(VersionEntry {
+            current: current.contains(&(script_name.to_string(), version.to_string())),
+            script: script_name.to_string(),
+            version: version.to_string(),
+        });
+    }
+    entries.sort_by(|left, right| {
+        (&left.script, &left.version).cmp(&(&right.script, &right.version))
+    });
+    Ok(entries)
 }
 
 /// What a config resolves to once the allowlist has been applied.
@@ -5483,6 +5602,104 @@ fi
                 "unexpected error: {error:#}"
             );
         }
+    }
+
+    #[test]
+    fn versions_options_parse_script_and_flags() {
+        let options = versions_options_from_arguments([
+            "app".to_string(),
+            "--json".to_string(),
+            "--bucket".to_string(),
+            "s3://fleet".to_string(),
+        ])
+        .expect("parse")
+        .expect("options");
+        assert_eq!(options.script.as_deref(), Some("app"));
+        assert!(options.json);
+        assert_eq!(options.bucket.as_deref(), Some("s3://fleet"));
+        let error = versions_options_from_arguments(["app".to_string(), "other".to_string()])
+            .expect_err("two scripts must be refused");
+        assert!(
+            format!("{error:?}").contains("one script"),
+            "the refusal must name the limit: {error:?}"
+        );
+        versions_options_from_arguments(["--nope".to_string()])
+            .expect_err("an unknown flag must be refused");
+    }
+
+    /// Listing reads one LIST and the fleet-wide pointer: the serving
+    /// version is `current`, everything else is not, and a script filter
+    /// narrows the rows.
+    #[tokio::test]
+    async fn versions_list_marks_the_serving_version_current() {
+        let bucket = crate::bucket::Bucket::for_test();
+        for (script, version) in [
+            ("app", "aaaaaaaaaaaaaaaa"),
+            ("app", "bbbbbbbbbbbbbbbb"),
+            ("other", "cccccccccccccccc"),
+        ] {
+            bucket
+                .put(
+                    &format!("deploy/{script}/{version}/manifest.json"),
+                    "{}".to_string(),
+                )
+                .await
+                .unwrap();
+        }
+        // Pointer-adjacent keys are not versions.
+        bucket
+            .put("deploy/app/current.json", "{}".to_string())
+            .await
+            .unwrap();
+        let pointer = DeployPointer {
+            script_name: Some("app".to_string()),
+            version: "bbbbbbbbbbbbbbbb".to_string(),
+            prefix: "deploy/app/bbbbbbbbbbbbbbbb".to_string(),
+            rollout: Rollout { percent: 100 },
+            components: None,
+        };
+        bucket
+            .put(
+                crate::fleet::CURRENT_POINTER_KEY,
+                serde_json::to_vec(&pointer).unwrap(),
+            )
+            .await
+            .unwrap();
+        let entries = list_versions(&bucket, None).await.unwrap();
+        assert_eq!(
+            entries,
+            [
+                ("app", "aaaaaaaaaaaaaaaa", false),
+                ("app", "bbbbbbbbbbbbbbbb", true),
+                ("other", "cccccccccccccccc", false),
+            ]
+            .into_iter()
+            .map(|(script, version, current)| VersionEntry {
+                script: script.to_string(),
+                version: version.to_string(),
+                current,
+            })
+            .collect::<Vec<_>>()
+        );
+        let entries = list_versions(&bucket, Some("other")).await.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].script, "other");
+        assert!(!entries[0].current);
+    }
+
+    #[tokio::test]
+    async fn versions_list_without_a_pointer_marks_nothing_current() {
+        let bucket = crate::bucket::Bucket::for_test();
+        bucket
+            .put(
+                "deploy/app/aaaaaaaaaaaaaaaa/manifest.json",
+                "{}".to_string(),
+            )
+            .await
+            .unwrap();
+        let entries = list_versions(&bucket, None).await.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(!entries[0].current);
     }
 
     #[test]
