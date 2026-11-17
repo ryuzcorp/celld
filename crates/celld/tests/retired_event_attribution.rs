@@ -1,6 +1,6 @@
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 //
-// Modified by ryuzcorp (ryuzcorp/celld): retired-event attribution test; cancelled-request shared-work regression tests (upstream #317); shared-promise attribution regression test (upstream #316). Apache-2.0.
+// Modified by ryuzcorp (ryuzcorp/celld): retired-event attribution test; cancelled-request shared-work regression tests (upstream #317); shared-promise attribution regression test (upstream #316); trailing-handoff rejection test (upstream #309). Apache-2.0.
 
 // A white-box driver test, not node code: it builds a Worker in-process and
 // runs its turns directly, so the execution boundary's injected
@@ -497,4 +497,180 @@ fn retired_event_resource_accounting_throws_with_nothing_owned() {
         outcome["hr"], "the event that issued this operation already ended",
         "{outcome}"
     );
+}
+
+const TRAILING_HANDOFF: &str = r#"
+let releaseGate;
+const gate = new Promise((resolve) => {
+  releaseGate = resolve;
+});
+let outcome = "unset";
+export default {
+  async fetch(request) {
+    const url = new URL(request.url);
+    if (url.pathname === "/arm") {
+      // Attached, never awaited: runs after this event retires.
+      gate.then(() => {
+        // A timer op, entangled with nothing else. Its owner is this
+        // retired event, so a releasing turn hands it to the owner's
+        // mailbox — still open here, unlike the refused-handoff pin.
+        new Promise((resolve) => setTimeout(resolve, 60000)).then(
+          () => { outcome = "fired"; },
+          (error) => { outcome = "rejected:" + String((error && error.message) || error); },
+        );
+      });
+      return Response.json({ ok: true });
+    }
+    if (url.pathname === "/release") {
+      releaseGate();
+      return Response.json({ ok: true });
+    }
+    if (url.pathname === "/outcome") {
+      return Response.json({ outcome });
+    }
+    return new Response("not found", { status: 404 });
+  },
+};
+"#;
+
+/// A handoff that lands after a finished, non-keeping event's last take
+/// must reject instead of dropping silently (denoland/celld#207). The
+/// trailing take in both drive loops found work for an answered event with
+/// no `waitUntil`, gate, or `io_context` op, and the old branch dropped the
+/// futures while `abandon` purged their resolvers unresolved — byte-for-byte
+/// the #207 hang signature, reachable by any stale continuation landing
+/// during the final wake. The fixed branch rejects each one with the
+/// refused-handoff message, so the harness fires the timer early and its
+/// dependents settle. This drives the same step the driver runs —
+/// `turn_reject_trailing_handed_ops` — through the public API only.
+#[test]
+fn finished_non_keeping_event_rejects_trailing_handoff() {
+    ensure_engine();
+    let mut worker = load_worker(TRAILING_HANDOFF, "trailing-handoff");
+
+    // A answers at once and stays un-abandoned, so its mailbox stays open:
+    // answered, no background, no gate — finished, keeping nothing. That
+    // is the trailing branch's `else` precondition.
+    let (mut entry_a, mut reply_a, started_a) =
+        begin_suspended(&mut worker, "http://test/arm", 30901);
+    assert!(started_a.is_empty(), "A answers without suspending");
+    drop(started_a);
+    let response = reply_a
+        .try_recv()
+        .expect("A answered at once")
+        .unwrap_or_else(|error| panic!("A must answer: {error:#}"));
+    assert_eq!(response.status, 200);
+    assert!(entry_a.finished(), "A is finished with nothing outstanding");
+
+    // B's turn runs the stale continuation, whose timer op names the
+    // retired owner A. A's mailbox is still open, so the handoff is
+    // delivered — landing after the driver's last take, as in the final
+    // wake.
+    let (mut entry_b, mut reply_b, started_b) =
+        begin_suspended(&mut worker, "http://test/release", 30902);
+    assert!(started_b.is_empty(), "B answers without suspending");
+    drop(started_b);
+    let response = reply_b
+        .try_recv()
+        .expect("B answered at once")
+        .unwrap_or_else(|error| panic!("B must answer: {error:#}"));
+    assert_eq!(response.status, 200);
+
+    // The driver's trailing step for an event that keeps nothing: take
+    // once more inside the turn and reject the handoff instead of dropping
+    // it. Without the reject the resolvers are purged unresolved and the
+    // waiter's promise pends forever (denoland/celld#207).
+    assert!(
+        worker.turn_reject_trailing_handed_ops(&mut entry_a),
+        "the handoff landed after A's last take"
+    );
+    entry_a.abandon();
+    drop(entry_a);
+
+    // The rejection settles the waiter instead of vanishing: the harness
+    // fires the dropped timer early, so its dependents run on the next
+    // checkpoint.
+    let started = worker.turn_poll(&mut entry_b);
+    drop(started);
+    drop(entry_b);
+    drop(reply_a);
+    drop(reply_b);
+
+    let (mut entry_c, mut reply_c, started_c) =
+        begin_suspended(&mut worker, "http://test/outcome", 30903);
+    assert!(started_c.is_empty(), "outcome answers without suspending");
+    drop(started_c);
+    let response = reply_c
+        .try_recv()
+        .expect("outcome answered")
+        .unwrap_or_else(|error| panic!("outcome must answer: {error:#}"));
+    assert_eq!(response.status, 200);
+    let body: serde_json::Value = serde_json::from_slice(&response.body).expect("JSON body");
+    assert_eq!(body["outcome"], "fired", "{body}");
+    entry_c.abandon();
+}
+
+/// A handoff racing the trailing take must be refused at the source, not
+/// land after it. The trailing step closes the mailbox inside the turn, so
+/// a refed op handed after the take rejects on the handing path — and its
+/// waiter settles — instead of sitting in the mailbox until `abandon`
+/// purges it unresolved, byte-for-byte the #207 hang signature again.
+/// This drives the same step the driver runs, but with the releasing turn
+/// after the trailing take rather than before it.
+#[test]
+fn trailing_take_closes_mailbox_so_late_handoff_refuses() {
+    ensure_engine();
+    let mut worker = load_worker(TRAILING_HANDOFF, "trailing-handoff-closed");
+
+    // A answers at once and stays un-abandoned, so its mailbox is open:
+    // answered, no background, no gate — finished, keeping nothing. That
+    // is the trailing branch's precondition.
+    let (mut entry_a, mut reply_a, started_a) =
+        begin_suspended(&mut worker, "http://test/arm", 30911);
+    assert!(started_a.is_empty(), "A answers without suspending");
+    drop(started_a);
+    let response = reply_a
+        .try_recv()
+        .expect("A answered at once")
+        .unwrap_or_else(|error| panic!("A must answer: {error:#}"));
+    assert_eq!(response.status, 200);
+    assert!(entry_a.finished(), "A is finished with nothing outstanding");
+
+    // The trailing step with an empty mailbox: nothing to settle, but the
+    // mailbox must close here.
+    assert!(
+        !worker.turn_reject_trailing_handed_ops(&mut entry_a),
+        "nothing handed yet"
+    );
+
+    // B's turn runs the stale continuation, whose timer op names the
+    // retired owner A. The mailbox is closed, so the handoff is refused
+    // and the promise rejects here instead of hanging on a purged
+    // resolver.
+    let (mut entry_b, mut reply_b, started_b) =
+        begin_suspended(&mut worker, "http://test/release", 30912);
+    assert!(started_b.is_empty(), "B answers without suspending");
+    drop(started_b);
+    let response = reply_b
+        .try_recv()
+        .expect("B answered at once")
+        .unwrap_or_else(|error| panic!("B must answer: {error:#}"));
+    assert_eq!(response.status, 200);
+
+    entry_a.abandon();
+    drop(entry_a);
+
+    // The refusal settles the waiter instead of vanishing: the harness
+    // fires the rejected timer early, so its dependents run on the next
+    // checkpoint.
+    let started = worker.turn_poll(&mut entry_b);
+    drop(started);
+    drop(entry_b);
+    drop(reply_a);
+    drop(reply_b);
+
+    let (status, body) = turn_once(&mut worker, "http://test/outcome");
+    assert_eq!(status, 200);
+    let body: serde_json::Value = serde_json::from_slice(&body).expect("JSON body");
+    assert_eq!(body["outcome"], "fired", "{body}");
 }

@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): node:crypto scrypt; container exec resize op; cross-isolate RPC stubs and streams; test-only fake exec ops; fake kill completion op; exec reads survive their subscribing event; per-node Workers Cache API ops; tenant egress policy; D1 export operator-ingress marker; stateless attribution tokens; reaction-aware request resources; fake close/signal completion ops; binding-forgery enforcement; trusted cell RPC; Queue DLQ forward host op; DLQ forward caller identity; WebSocket and TCP socket ownership; receiver-held stream lifetime; deployment cache scope key; share the /bundle tree per deployment generation.; cancelled requests reject pending ops so co-awaiters settle (upstream #317); answered drivers poll while waitUntil background is outstanding (upstream #300)
+// Modified by ryuzcorp (ryuzcorp/celld): node:crypto scrypt; container exec resize op; cross-isolate RPC stubs and streams; test-only fake exec ops; fake kill completion op; exec reads survive their subscribing event; per-node Workers Cache API ops; tenant egress policy; D1 export operator-ingress marker; stateless attribution tokens; reaction-aware request resources; fake close/signal completion ops; binding-forgery enforcement; trusted cell RPC; Queue DLQ forward host op; DLQ forward caller identity; WebSocket and TCP socket ownership; receiver-held stream lifetime; deployment cache scope key; share the /bundle tree per deployment generation.; cancelled requests reject pending ops so co-awaiters settle (upstream #317); answered drivers poll while waitUntil background is outstanding (upstream #300); refused handoffs reject instead of dropping resolvers (upstream #309)
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 // The raw V8 adapter and its child modules remain outside the Actor execution
@@ -4097,13 +4097,33 @@ impl InFlight {
         }
     }
 
-    /// Drop ops that die with their subscribing event.
+    /// Reject handed-over ops a finished event can no longer drive.
     ///
-    /// Unrefed ops (retained reads and waits) are never polled once their
-    /// event is gone, but their awaiters re-subscribe in a later event, so
-    /// rejecting them would settle that record fatally and break the chain.
-    /// Their resolvers are purged instead, and the next event's refresh
-    /// heals them.
+    /// The driver's last mailbox take found work after the event finished
+    /// with nothing keeping its native ops alive (answered, no `waitUntil`,
+    /// no gate — a plain request). Nobody will ever poll those futures, so
+    /// the refed ones' promises reject here with the same message as the
+    /// refused-handoff path instead of being dropped silently and purged
+    /// unresolved, which left whoever awaits them pending forever with
+    /// nothing logged (denoland/celld#207). Unrefed ops are the caller's
+    /// problem instead: see `drop_handed_ops`.
+    pub(crate) fn reject_handed_ops(&mut self, tc: &mut v8::PinScope, ids: &[u64], message: &str) {
+        for id in ids {
+            self.ops.remove(id);
+            self.io_context_ops.remove(id);
+            self.unrefed_ops.remove(id);
+            resolve_res(tc, *id, Err(message.to_string()));
+        }
+    }
+
+    /// Drop handed-over ops that die with their subscribing event.
+    ///
+    /// The unrefed half of a trailing take: nobody will ever poll these
+    /// futures, but their awaiters re-subscribe in a later event (a
+    /// retained exec read re-armed under a retired owner's captured
+    /// slot), so rejecting them would settle that record fatally and
+    /// break the chain. Their resolvers are purged instead — the
+    /// pre-#309 behavior — and the next event's refresh heals them.
     pub(crate) fn drop_handed_ops(&mut self, ids: &[u64]) {
         let mut promises = self.runtime_state.promises.lock().unwrap();
         for id in ids {
@@ -4157,25 +4177,51 @@ impl InFlight {
     ///
     /// The owner's driver polls it, so the owner's retirement decides when it
     /// is cancelled and this event's retirement cannot take it away. An owner
-    /// that is already gone can never run the continuation again, so its
-    /// resolver goes with the op, exactly as `abandon` drops this event's own.
+    /// that is already gone — or whose mailbox closed while this turn ran —
+    /// will never poll the future: a refed promise rejects instead of hanging
+    /// whoever awaits it (silently dropping the resolver wedged the waiter
+    /// with nothing logged, denoland/celld#207, and a timer the harness
+    /// fires early on rejection still settles its dependents,
+    /// denoland/celld#309), while an unrefed one is dropped — its awaiters
+    /// re-subscribe in a later event, and rejecting it would settle that
+    /// record fatally.
     fn hand_op(
         &mut self,
+        tc: &mut v8::PinScope,
         owner: u64,
         id: u64,
         future: asyncrt::OpFuture,
         lifetime: asyncrt::OpLifetime,
     ) {
         // One branch for both refusals — an owner that is already gone, and
-        // one whose mailbox closed while this turn ran. Splitting them let the
-        // second forget to drop the resolver, which is the whole defect.
+        // one whose mailbox closed while this turn ran. Either way nobody
+        // polls the future.
         let delivered = self
             .runtime_state
             .io_context(owner)
             .is_some_and(|context| context.hand_op(id, future, lifetime));
-        if !delivered {
-            self.runtime_state.promises.lock().unwrap().remove(&id);
+        if delivered {
+            return;
         }
+        // An unrefed op dies with its subscribing event by design: the
+        // stable promise re-subscribes in a later event (a retained exec
+        // read re-armed by the streams pull-again microtask, which runs
+        // under the captured slot of the event that started the pull, so
+        // its op names a retired owner), and the next event's refresh
+        // heals it. Rejecting it here would settle that record fatally
+        // and break the chain, so its resolver is dropped instead — the
+        // pre-#309 behavior, which only refed ops outgrew: their awaiters
+        // cannot recover, and silently dropping them wedged the waiter
+        // with nothing logged (denoland/celld#207).
+        if lifetime == asyncrt::OpLifetime::Unrefed {
+            self.runtime_state.promises.lock().unwrap().remove(&id);
+            return;
+        }
+        resolve_res(
+            tc,
+            id,
+            Err("the event that issued this operation already ended".to_string()),
+        );
     }
 
     /// Take the ops another turn enqueued for this event, and record them as
@@ -4186,7 +4232,21 @@ impl InFlight {
         if !self.context.has_handed_ops() {
             return Vec::new();
         }
-        let handed = self.context.take_handed_ops();
+        self.record_handed_ops(self.context.take_handed_ops())
+    }
+
+    /// Take the mailbox once more before retiring, closing it so a handoff
+    /// racing this take is refused at the source instead of landing after
+    /// it: nobody will ever poll what comes back, and `abandon` would purge
+    /// it unresolved. The caller rejects the refed half and drops the
+    /// unrefed half, like `reject_handed_ops` and `drop_handed_ops`.
+    pub(crate) fn take_handed_ops_closed(&mut self) -> Vec<Op> {
+        self.record_handed_ops(self.context.close_handed_ops())
+    }
+
+    /// Record taken handoffs as this event's own ops so that `deliver`
+    /// and `abandon` treat them alike.
+    fn record_handed_ops(&mut self, handed: Vec<HandedOp>) -> Vec<Op> {
         let mut ops = Vec::with_capacity(handed.len());
         for (id, future, lifetime) in handed {
             self.ops.insert(id);
@@ -4590,6 +4650,71 @@ impl Worker {
         self.cancel_turn(entry, true)
     }
 
+    /// Take the mailbox once more before retiring, settling what a
+    /// finished event that keeps no native work can no longer drive.
+    ///
+    /// The caller has already established that the event keeps nothing
+    /// alive (answered, no `waitUntil`, no gate — a plain request), so
+    /// nobody will ever poll whatever this take finds. Refed promises
+    /// reject here with the refused-handoff message instead of dropping
+    /// silently and purging unresolved, which left whoever awaits them
+    /// pending forever with nothing logged (denoland/celld#207). Unrefed
+    /// ones are dropped instead: their awaiters re-subscribe in a later
+    /// event, and rejecting them would settle that record fatally. The
+    /// dropped futures cancel their native work. Reports whether anything
+    /// was taken. Takes no `finish_turn`: nothing new can have been
+    /// adopted, and the entry is already finished.
+    ///
+    /// The take closes the mailbox: a handoff racing it is refused at the
+    /// source (rejecting refed, dropping unrefed, as `hand_op` does)
+    /// instead of landing after the take, where `abandon` would purge it
+    /// unresolved and wedge whoever awaits it.
+    pub fn turn_reject_trailing_handed_ops(&mut self, entry: &mut InFlight) -> bool {
+        let Some(inner) = self.inner.as_mut() else {
+            return false;
+        };
+        let (mut locker, _cells) = inner.lock();
+        v8::scope!(let hs, &mut *locker);
+        let realm = inner.realm(hs);
+        let context = realm.context;
+        let cs = &mut v8::ContextScope::new(hs, context);
+        let tc = std::pin::pin!(v8::TryCatch::new(cs));
+        let tc = &mut tc.init();
+
+        let previous_io_context = install_io_context(tc, &entry.context);
+        let previous = install_trace(tc, entry.trace.as_ref());
+        debug_assert!(
+            !entry.keeps_native_ops(),
+            "trailing rejects are only for events that keep no native work"
+        );
+        let trailing = entry.take_handed_ops_closed();
+        let found = !trailing.is_empty();
+        if found {
+            let mut reject = Vec::new();
+            let mut drop = Vec::new();
+            for (id, _) in &trailing {
+                if entry.unrefed_ops.contains(id) {
+                    drop.push(*id);
+                } else {
+                    reject.push(*id);
+                }
+            }
+            if !reject.is_empty() {
+                entry.reject_handed_ops(
+                    tc,
+                    &reject,
+                    "the event that issued this operation already ended",
+                );
+            }
+            if !drop.is_empty() {
+                entry.drop_handed_ops(&drop);
+            }
+        }
+        restore_trace(tc, previous);
+        restore_io_context(tc, previous_io_context);
+        found
+    }
+
     fn cancel_turn(&mut self, entry: &mut InFlight, shutdown: bool) -> Vec<Op> {
         let Some(inner) = self.inner.as_mut() else {
             return Vec::new();
@@ -4772,7 +4897,7 @@ fn finish_turn(tc: &mut v8::PinScope, entry: &mut InFlight) -> Vec<Op> {
     //    write rather than the turn owner, because the checkpoint can run a
     //    continuation from another event.
     ws_capture_flush_touched(tc, &entry.runtime_state);
-    let ops = adopt(entry);
+    let ops = adopt(tc, entry);
     // 7. **close the request's sockets** — see above.
     if entry.retired() {
         entry.context.close_sockets();
@@ -4800,13 +4925,13 @@ pub type Op = (u64, asyncrt::OpFuture);
 /// so an op with a foreign name goes to that event's driver instead. Critical
 /// sections carry an explicit driver alongside their resource context; the
 /// op wrapper uses that driver so gate retirement and op cancellation agree.
-fn adopt(entry: &mut InFlight) -> Vec<Op> {
+fn adopt(tc: &mut v8::PinScope, entry: &mut InFlight) -> Vec<Op> {
     let spawns = asyncrt::drain_spawns();
     let mine = entry.context.continuation_id();
     let mut ops = Vec::with_capacity(spawns.len());
     for (id, future, lifetime, owner) in spawns {
         if let Some(owner) = owner.filter(|owner| Some(*owner) != mine) {
-            entry.hand_op(owner, id, future, lifetime);
+            entry.hand_op(tc, owner, id, future, lifetime);
             continue;
         }
         entry.ops.insert(id);
