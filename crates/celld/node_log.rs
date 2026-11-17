@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): operator token for the internal listener; list_page resume is a cursor; ported from meln1k/celld: seal a dead lease that never opened a log (01522b3); seal_absent_log regression tests; lone-node repair backoff; bucket-posture group commit: bucket-session record encoding + old-reader interop tests (0059); bucket-posture group commit: bucket executor without ensemble (0060); bucket-posture group commit: successor fold of bucket bundles (0063); bucket-posture group commit: bucket-session drain, per-cell seal, bundle GC without ensemble, linger holds only while the dirty set is shared (0064); bucket-posture group commit: lone-cell-per-cell vs shared-bundle executor tests, and idle bucket sessions skip empty bundle-GC scans (0071); stale-target 409 proves the member gone in recovery (upstream #273); tail reads stream under a progress timeout (upstream #250).
+// Modified by ryuzcorp (ryuzcorp/celld): operator token for the internal listener; list_page resume is a cursor; ported from meln1k/celld: seal a dead lease that never opened a log (01522b3); seal_absent_log regression tests; lone-node repair backoff; bucket-posture group commit: bucket-session record encoding + old-reader interop tests (0059); bucket-posture group commit: bucket executor without ensemble (0060); bucket-posture group commit: successor fold of bucket bundles (0063); bucket-posture group commit: bucket-session drain, per-cell seal, bundle GC without ensemble, linger holds only while the dirty set is shared (0064); bucket-posture group commit: lone-cell-per-cell vs shared-bundle executor tests, and idle bucket sessions skip empty bundle-GC scans (0071); stale-target 409 proves the member gone in recovery (upstream #273); tail reads stream under a progress timeout (upstream #250); deleted sessions with surviving objects declare loss (upstream #245).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! v0 of the in-fleet replicated log tier (`CELLD_DURABILITY=fleet`).
@@ -6132,7 +6132,28 @@ impl NodeLogManager {
     /// still matches. `false` means the lease moved under the CAS: re-read.
     async fn seal_absent_log(&self, node: &str) -> anyhow::Result<bool> {
         let Some((bytes, token)) = self.bucket.get(&lease_key(node)).await? else {
-            return Ok(true);
+            // No lease and no record. A session that never existed leaves
+            // nothing behind; a session an operator deleted leaves its
+            // objects. Sealing "absent" over leftover objects would orphan
+            // acked rows with no record and no line (upstream #245): list
+            // the session prefix, and declare the bounded loss loudly when
+            // anything survives the deletion.
+            if self.bucket.list(&format!("log/{node}/")).await?.is_empty() {
+                return Ok(true);
+            }
+            let loss = serde_json::json!({
+                "leader": node,
+                "declared_at_ms": crate::ownership_store::now_ms(),
+                "declared_by": self.node,
+                "note": "no lease or log record survived for this session, but objects remain \
+                         under its prefix; acked writes in those objects are unrecoverable",
+            });
+            // The record marks the FIRST declaration: its `declared_at_ms` /
+            // `declared_by` are the forensics of when the loss was found, so
+            // every later pass over the still-deleted session keeps them.
+            // A conditional create wins the first write and loses every
+            // later one (upstream #245).
+            return self.declare_absent_loss(node, serde_json::to_vec(&loss)?).await;
         };
         let wire: crate::ownership_store::NodeLeaseWire = serde_json::from_slice(&bytes)?;
         if wire.log.is_some() {
@@ -6150,6 +6171,51 @@ impl NodeLogManager {
                 .await?
                 .is_some(),
         )
+    }
+
+    /// Declare the loss for an operator-deleted session whose objects
+    /// survive (upstream #245). True when the declaration stands — ours or
+    /// a rival pass's. Only a 412 lost race proves another pass declared
+    /// it: a 409-style conflict does not (the same-guard retry may still
+    /// win it, upstream #239), so the create retries with the same guard,
+    /// then reads back. A record no pass can show is a loud error, never a
+    /// silent seal with objects surviving behind it.
+    async fn declare_absent_loss(&self, node: &str, loss: Vec<u8>) -> anyhow::Result<bool> {
+        let key = format!("log/{node}.loss.json");
+        let mut attempt = 0_u32;
+        loop {
+            match self.bucket.put_cas_verdict(&key, loss.clone(), None).await? {
+                crate::bucket::CasPut::Applied(_) => {
+                    warn!(
+                        node,
+                        by = self.node.as_str(),
+                        "declared bounded loss: the session's lease and record are gone but its objects \
+                         survive; acked writes in those objects are unrecoverable"
+                    );
+                    return Ok(true);
+                }
+                crate::bucket::CasPut::Rejected { conflict: false } => {
+                    // A 412 lost race proves another pass already declared
+                    // the loss: the first record's declaration forensics stand.
+                    return Ok(true);
+                }
+                crate::bucket::CasPut::Rejected { conflict: true } if attempt < 3 => {
+                    attempt += 1;
+                    crate::asyncrt::sleep(std::time::Duration::from_millis(20 * u64::from(attempt)))
+                        .await;
+                }
+                crate::bucket::CasPut::Rejected { .. } => {
+                    // Still conflicting: confirm the record before sealing.
+                    if self.bucket.get(&key).await?.is_some() {
+                        return Ok(true);
+                    }
+                    anyhow::bail!(
+                        "loss record {key} still conflicts but reads absent; \
+                         refusing to seal the session absent without it"
+                    );
+                }
+            }
+        }
     }
 
     fn shipper_batch_in_flight(shipper: &FleetShipper) -> bool {
@@ -8252,6 +8318,312 @@ mod seal_absent_log_tests {
             .await
             .expect("cas runs");
             assert!(applied.is_none(), "a stale token loses the CAS race");
+        });
+    }
+
+    /// An operator-deleted session whose objects survive declares its loss
+    /// loudly instead of sealing "absent" (upstream #245): the deletion
+    /// orphans acked rows, and "loss is a record" — the loss object names
+    /// what the deletion orphaned. Fail-before: the seal returned `true`
+    /// with no loss record and no line.
+    #[test]
+    fn deleted_session_with_objects_declares_loss() {
+        let runtime = crate::asyncrt::shared_test_runtime();
+        let dir = tempfile::tempdir().expect("test dir");
+        let (manager, bucket) = test_manager(dir.path());
+        runtime.block_on(async {
+            bucket
+                .put("log/dead/gen9/bundle/e1-1.ltxb", vec![0xA5u8; 64])
+                .await
+                .expect("orphan object");
+            let proved = manager.seal_absent_log("dead").await.expect("seal runs");
+            assert!(proved, "the seal still unblocks activation");
+            let (bytes, _) = bucket
+                .get("log/dead.loss.json")
+                .await
+                .expect("read back")
+                .expect("a deleted session with objects leaves a loss record");
+            let loss: serde_json::Value = serde_json::from_slice(&bytes).expect("loss parses");
+            assert_eq!(loss["leader"], "dead");
+        });
+    }
+
+    /// A later pass over the still-deleted session keeps the first loss
+    /// record (upstream #245): `declared_at_ms` / `declared_by` name the
+    /// first declaration, not the latest pass. Fail-before: the pass
+    /// unconditionally overwrote the record with its own declaration.
+    #[test]
+    fn loss_record_keeps_the_first_declaration() {
+        let runtime = crate::asyncrt::shared_test_runtime();
+        let dir = tempfile::tempdir().expect("test dir");
+        let (manager, bucket) = test_manager(dir.path());
+        runtime.block_on(async {
+            bucket
+                .put("log/dead/gen9/bundle/e1-1.ltxb", vec![0xA5u8; 64])
+                .await
+                .expect("orphan object");
+            manager
+                .seal_absent_log("dead")
+                .await
+                .expect("first seal runs");
+            // An earlier declaration, as the first pass would have left it.
+            let first = serde_json::json!({
+                "leader": "dead",
+                "declared_at_ms": 111,
+                "declared_by": "original",
+                "note": "first declaration",
+            });
+            bucket
+                .put(
+                    "log/dead.loss.json",
+                    serde_json::to_vec(&first).expect("loss encodes"),
+                )
+                .await
+                .expect("first record stands");
+            let proved = manager
+                .seal_absent_log("dead")
+                .await
+                .expect("second seal runs");
+            assert!(proved, "the seal still unblocks activation");
+            let (bytes, _) = bucket
+                .get("log/dead.loss.json")
+                .await
+                .expect("read back")
+                .expect("the loss record survives the second pass");
+            let loss: serde_json::Value = serde_json::from_slice(&bytes).expect("loss parses");
+            assert_eq!(
+                loss["declared_at_ms"], 111,
+                "the first declaration time stands"
+            );
+            assert_eq!(loss["declared_by"], "original", "the first declarer stands");
+        });
+    }
+
+    /// The control: a session that never existed still seals absent with
+    /// no loss record — nothing was orphaned.
+    #[test]
+    fn never_existed_session_seals_absent_quietly() {
+        let runtime = crate::asyncrt::shared_test_runtime();
+        let dir = tempfile::tempdir().expect("test dir");
+        let (manager, bucket) = test_manager(dir.path());
+        runtime.block_on(async {
+            let proved = manager.seal_absent_log("dead").await.expect("seal runs");
+            assert!(proved, "a missing lease proves the bucket complete");
+            assert!(
+                bucket
+                    .get("log/dead.loss.json")
+                    .await
+                    .expect("read back")
+                    .is_none(),
+                "nothing orphaned, no loss record"
+            );
+        });
+    }
+
+    use object_store::memory::InMemory;
+    use object_store::path::Path;
+    use object_store::{Error, ObjectStore, PutMode, PutOptions, PutPayload};
+
+    fn test_manager_with_store(
+        dir: &std::path::Path,
+        store: Arc<dyn ObjectStore>,
+    ) -> (NodeLogManager, Arc<Bucket>) {
+        let bucket = Arc::new(Bucket::with_store_for_test(store));
+        let database = dir.join("objects.sqlite3");
+        let dev = Arc::new(crate::dev::open_local_bucket(&database).expect("dev bucket"));
+        let replication = crate::ltx_replication::Replication::start(
+            dev.as_ref().clone(),
+            &dir.join("watch"),
+            None,
+            "test".into(),
+            None,
+        )
+        .expect("replication starts");
+        let ownership = Arc::new(crate::ownership_store::BucketOwnership::new(
+            bucket.as_ref().clone(),
+            bucket.as_ref().clone(),
+            "n0".into(),
+            "test-probe-key".into(),
+        ));
+        let own_log = Arc::new(OwnLog {
+            ownership,
+            nudge: Box::new(|| {}),
+            write_lock: tokio::sync::Mutex::new(()),
+        });
+        let auth = Arc::new(PeerAuth::new([0u8; 32], "n0").expect("test auth"));
+        let manager = NodeLogManager::new(
+            "n0/gen1",
+            bucket.clone(),
+            own_log,
+            replication.ltx(),
+            auth,
+            celld_logic::log_evict::EvictionPolicy::default(),
+        );
+        (manager, bucket)
+    }
+
+    /// A store that answers the first `conflicts` conditional PUTs with a
+    /// CLEAN 409 (`AlreadyExists` with no `OperationAborted`): the key
+    /// stays absent, the way a racing same-key create looks to the loser.
+    /// Everything else delegates to memory.
+    #[derive(Debug)]
+    struct CleanConflictStore {
+        inner: InMemory,
+        conflicts: std::sync::Mutex<u32>,
+    }
+
+    impl std::fmt::Display for CleanConflictStore {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("clean-conflict-store")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for CleanConflictStore {
+        async fn put_opts(
+            &self,
+            location: &Path,
+            payload: PutPayload,
+            opts: PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            let conditional = !matches!(opts.mode, PutMode::Overwrite);
+            if conditional {
+                let mut conflicts = self.conflicts.lock().expect("conflict lock");
+                if *conflicts > 0 {
+                    *conflicts -= 1;
+                    return Err(Error::AlreadyExists {
+                        path: location.to_string(),
+                        source: "the key already exists".to_string().into(),
+                    });
+                }
+            }
+            self.inner.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart(
+            &self,
+            location: &Path,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart(location).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &Path,
+            opts: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &Path,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+
+        async fn head(&self, location: &Path) -> object_store::Result<object_store::ObjectMeta> {
+            self.inner.head(location).await
+        }
+
+        async fn delete(&self, location: &Path) -> object_store::Result<()> {
+            self.inner.delete(location).await
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&Path>,
+        ) -> futures_util::stream::BoxStream<
+            'static,
+            object_store::Result<object_store::ObjectMeta>,
+        > {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&Path>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy(&self, from: &Path, to: &Path) -> object_store::Result<()> {
+            self.inner.copy(from, to).await
+        }
+
+        async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> object_store::Result<()> {
+            self.inner.copy_if_not_exists(from, to).await
+        }
+    }
+
+    /// A clean 409 conflict on the loss create is NOT proof the record
+    /// exists: the same-guard retry wins it, and the declaration lands.
+    /// Fail-before: the seal returned `true` with no loss record behind
+    /// the surviving objects.
+    #[test]
+    fn loss_create_conflict_retries_and_declares() {
+        let runtime = crate::asyncrt::shared_test_runtime();
+        let dir = tempfile::tempdir().expect("test dir");
+        let store = Arc::new(CleanConflictStore {
+            inner: InMemory::new(),
+            conflicts: std::sync::Mutex::new(1),
+        });
+        let (manager, bucket) = test_manager_with_store(dir.path(), store);
+        runtime.block_on(async {
+            bucket
+                .put("log/dead/gen9/bundle/e1-1.ltxb", vec![0xA5u8; 64])
+                .await
+                .expect("orphan object");
+            let proved = manager.seal_absent_log("dead").await.expect("seal runs");
+            assert!(
+                proved,
+                "the seal still unblocks activation once the retry lands"
+            );
+            assert!(
+                bucket
+                    .get("log/dead.loss.json")
+                    .await
+                    .expect("read back")
+                    .is_some(),
+                "the retried create declares the loss; no silent seal without it"
+            );
+        });
+    }
+
+    /// A loss create that keeps conflicting while the key reads absent is a
+    /// loud error, never a silent `true`. Fail-before: the seal reported
+    /// the session sealed absent with no loss record behind its objects.
+    #[test]
+    fn loss_create_conflict_without_a_record_is_loud() {
+        let runtime = crate::asyncrt::shared_test_runtime();
+        let dir = tempfile::tempdir().expect("test dir");
+        let store = Arc::new(CleanConflictStore {
+            inner: InMemory::new(),
+            conflicts: std::sync::Mutex::new(u32::MAX),
+        });
+        let (manager, bucket) = test_manager_with_store(dir.path(), store);
+        runtime.block_on(async {
+            bucket
+                .put("log/dead/gen9/bundle/e1-1.ltxb", vec![0xA5u8; 64])
+                .await
+                .expect("orphan object");
+            let error = manager
+                .seal_absent_log("dead")
+                .await
+                .expect_err("no record, no seal");
+            assert!(
+                error.to_string().contains("refusing to seal"),
+                "the refusal names the missing record: {error}"
+            );
+            assert!(
+                bucket
+                    .get("log/dead.loss.json")
+                    .await
+                    .expect("read back")
+                    .is_none(),
+                "no record was ever declared"
+            );
         });
     }
 }
