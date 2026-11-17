@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): node:crypto scrypt; container exec resize op; cross-isolate RPC stubs and streams; test-only fake exec ops; fake kill completion op; exec reads survive their subscribing event; per-node Workers Cache API ops; tenant egress policy; D1 export operator-ingress marker; stateless attribution tokens; reaction-aware request resources; fake close/signal completion ops; binding-forgery enforcement; trusted cell RPC; Queue DLQ forward host op; DLQ forward caller identity; WebSocket and TCP socket ownership; receiver-held stream lifetime; deployment cache scope key; share the /bundle tree per deployment generation.
+// Modified by ryuzcorp (ryuzcorp/celld): node:crypto scrypt; container exec resize op; cross-isolate RPC stubs and streams; test-only fake exec ops; fake kill completion op; exec reads survive their subscribing event; per-node Workers Cache API ops; tenant egress policy; D1 export operator-ingress marker; stateless attribution tokens; reaction-aware request resources; fake close/signal completion ops; binding-forgery enforcement; trusted cell RPC; Queue DLQ forward host op; DLQ forward caller identity; WebSocket and TCP socket ownership; receiver-held stream lifetime; deployment cache scope key; share the /bundle tree per deployment generation.; cancelled requests reject pending ops so co-awaiters settle (upstream #317)
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 // The raw V8 adapter and its child modules remain outside the Actor execution
@@ -4044,6 +4044,28 @@ impl InFlight {
         self.request_id
     }
 
+    /// Reject every operation this event still waits on, so a promise another
+    /// event awaits settles instead of hanging to its own budget.
+    ///
+    /// Purging the resolvers with `abandon` left those promises pending
+    /// forever: a co-awaiting stateless request (denoland/celld#317) or a
+    /// later Durable Object request awaiting a lazily started resource
+    /// (denoland/celld#294) never settled and nothing logged why. The entry
+    /// itself already failed with the disconnect, so its own continuations
+    /// observe the same rejection its co-awaiters do.
+    pub(crate) fn reject_pending_ops(&mut self, tc: &mut v8::PinScope, message: &str) {
+        for id in std::mem::take(&mut self.ops) {
+            resolve_res(tc, id, Err(message.to_string()));
+        }
+        self.io_context_ops.clear();
+        self.unrefed_ops.clear();
+        // A handed op never reached `ops`, but its resolver is in the same
+        // map and its awaiters hang the same way, so it rejects alike.
+        for (id, _, _) in self.context.close_handed_ops() {
+            resolve_res(tc, id, Err(message.to_string()));
+        }
+    }
+
     /// The request is over and its remaining ops are being dropped. Purge
     /// their resolvers.
     ///
@@ -5977,6 +5999,15 @@ fn cancel(tc: &mut v8::PinScope, entry: &mut InFlight, shutdown: bool) {
     // cross-entry block can still use an operation started by this event.
     // Not at shutdown: nothing will run the block to its end, so its gate is
     // given up instead.
+    //
+    // Dropped ops reject first: their promises may be awaited by other
+    // events, and purging the resolvers left those promises pending until
+    // the co-awaiters' own budgets (denoland/celld#317, denoland/celld#294).
+    // Not at shutdown: nothing observes the process exit, so the old silent
+    // drop stands and no internal watchdog mistakes it for a timeout.
+    if !shutdown && !entry.keeps_native_ops_after_disconnect() {
+        entry.reject_pending_ops(tc, "The client has disconnected");
+    }
     if shutdown || !entry.keeps_native_ops_after_disconnect() {
         entry.abandon();
     }

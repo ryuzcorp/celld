@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): ctx.container.images; clone() of streaming and disturbed bodies; __celld$do on the service-binding RPC path; container exec pty/resize; cross-isolate RPC stubs and streams; container exec AbortSignal; test-only fake kill completion; exec reads survive their subscribing event; context end aborts finished uploads; tenant egress policy; D1 export; D1 export operator gate; D1 batch; test-only fake close/signal completion; binding-forgery enforcement; Queue/KV operator fetch gate; Queue/KV stub-RPC allowlists; Queue DLQ host-op forward; Queue send/DLQ cell-side validation; trusted-RPC target pin; Queue operator internal re-checks; receiver-held RPC streams.
+// Modified by ryuzcorp (ryuzcorp/celld): ctx.container.images; clone() of streaming and disturbed bodies; __celld$do on the service-binding RPC path; container exec pty/resize; cross-isolate RPC stubs and streams; container exec AbortSignal; test-only fake kill completion; exec reads survive their subscribing event; context end aborts finished uploads; tenant egress policy; D1 export; D1 export operator gate; D1 batch; test-only fake close/signal completion; binding-forgery enforcement; Queue/KV operator fetch gate; Queue/KV stub-RPC allowlists; Queue DLQ host-op forward; Queue send/DLQ cell-side validation; trusted-RPC target pin; Queue operator internal re-checks; receiver-held RPC streams.; dropped timer ops fire their callback early so sleepers settle (upstream #317)
 // The DO object model and the Cloudflare-compatible runtime surface, run
 // once per isolate by `js.rs::install_harness` after the Web-API prelude.
 // Lived as a 4,000-line raw string inside js.rs until 2026-07-29; it is a
@@ -1325,10 +1325,16 @@ const __clearTimer = (id) => {
 globalThis.setTimeout = (cb, ms, ...a) => {
   const id = __timer_alloc();
   __timers.set(id, id);
-  __op_timer(id, ms | 0).then(() => {
+  const fire = () => {
     if (!__timers.delete(id)) return;
     cb(...a);
-  });
+  };
+  // A rejected op died with its event (client disconnect): the deadline will
+  // never arrive, but the callback still runs so promises built on it settle
+  // instead of hanging to their budget (denoland/celld#294). The value the
+  // callback computes is the same one a firing would produce; only the
+  // timing is early, and timing guarantees are already void for a dead event.
+  __op_timer(id, ms | 0).then(fire, fire);
   return id;
 };
 globalThis.setInterval = (cb, ms, ...a) => {
@@ -1346,6 +1352,12 @@ globalThis.setInterval = (cb, ms, ...a) => {
       // inside the callback must end the interval, and arming after the
       // callback would undo it.
       arm(__timer_alloc());
+      cb(...a);
+    }, () => {
+      // The op died with its event (see setTimeout above): fire this round
+      // so waiters settle, then stop without re-arming under a dead event.
+      if (__timers.get(id) !== armed) return;
+      __timers.delete(id);
       cb(...a);
     });
   };
