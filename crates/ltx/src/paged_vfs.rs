@@ -1,3 +1,4 @@
+// Modified by ryuzcorp (ryuzcorp/celld): O(1) hydration count (upstream #270).
 //! paged_vfs.rs — a SQLite VFS that faults main-db pages in from the bucket.
 //!
 //! The fault-in model of paged restore. The main db is a real local file
@@ -72,6 +73,68 @@ impl PageReader for PageSource {
     }
 }
 
+/// The hydration set with an exact cut-relative count, so `hydration()` is
+/// O(1) (upstream #270): a full walk of the cut per faulted read made a
+/// whale's fill quadratic in its size (111 min for 8.9 GB) and stalled
+/// foreground reads behind the walk's mutex hold. The count tracks only
+/// pages inside the cut (`1..=commit`, never the lock page); the commit is
+/// fixed for the registration, so inserts and truncations keep it exact.
+#[derive(Default)]
+struct HydratedSet {
+    pages: HashSet<u32>,
+    counted: u32,
+}
+
+impl HydratedSet {
+    fn contains(&self, pgno: &u32) -> bool {
+        self.pages.contains(pgno)
+    }
+
+    /// Whether a page counts toward the cut's hydration.
+    fn in_cut(pgno: u32, commit: u32, lock: u32) -> bool {
+        (1..=commit).contains(&pgno) && pgno != lock
+    }
+
+    /// Mark one page resolved, counting it when it is inside the cut.
+    /// Past-cut pages (sparse zeros) and the lock page resolve without
+    /// counting, exactly as the set membership always did.
+    fn insert_counted(&mut self, pgno: u32, commit: u32, lock: u32) {
+        if self.pages.insert(pgno) && Self::in_cut(pgno, commit, lock) {
+            self.counted += 1;
+        }
+    }
+
+    /// Mark a written range resolved, counting the pages inside the cut.
+    fn mark_range(&mut self, first: u32, last: u32, commit: u32, lock: u32) {
+        for pgno in first..=last {
+            self.insert_counted(pgno, commit, lock);
+        }
+    }
+
+    /// Forget pages past a truncation, uncounting the ones inside the cut.
+    fn retain_above(&mut self, keep: u32, commit: u32, lock: u32) {
+        let mut uncounted = 0;
+        self.pages.retain(|pgno| {
+            let drop_page = *pgno > keep;
+            if drop_page && Self::in_cut(*pgno, commit, lock) {
+                uncounted += 1;
+            }
+            !drop_page
+        });
+        self.counted -= uncounted;
+    }
+
+    /// The full walk `hydration()` used to do: the regression test asserts
+    /// the count matches this oracle after every mutation shape.
+    #[cfg(test)]
+    fn oracle_count(&self, commit: u32, lock: u32) -> u32 {
+        self.pages
+            .iter()
+            .filter(|pgno| Self::in_cut(**pgno, commit, lock))
+            .count() as u32
+    }
+}
+
 /// Per-registration state, hung off the VFS `pAppData`.
 struct VfsAppData {
     base: *mut ffi::sqlite3_vfs,
@@ -92,7 +155,7 @@ struct VfsAppData {
     /// page another connection already checkpointed — silent data rollback.
     /// One registration serves one database, so registration scope is
     /// database scope.
-    hydrated: Arc<Mutex<HashSet<u32>>>,
+    hydrated: Arc<Mutex<HydratedSet>>,
 }
 
 /// Our `sqlite3_file` subclass: SQLite reads `methods` (first field); the rest is
@@ -110,7 +173,7 @@ struct FileState {
     /// `Some` only for the main db; other files (WAL, journal) forward untouched.
     reader: Option<Arc<dyn PageReader>>,
     /// The registration's shared hydration set (see [`VfsAppData::hydrated`]).
-    hydrated: Arc<Mutex<HashSet<u32>>>,
+    hydrated: Arc<Mutex<HydratedSet>>,
     page_size: u32,
 }
 
@@ -179,11 +242,13 @@ unsafe fn x_read_inner(
             // and a snapshot carries every page — and zeros would go out as
             // data (a 2 GB opener two thirds holes, fleet 2026-09-02): fail
             // the read instead.
+            let commit = reader.commit();
+            let lock = lock_pgno(ps as u32);
             if run.is_empty() {
-                if pgno <= reader.commit() && pgno != lock_pgno(ps as u32) {
+                if pgno <= commit && pgno != lock {
                     return ffi::SQLITE_IOERR_READ;
                 }
-                hydrated.insert(pgno);
+                hydrated.insert_counted(pgno, commit, lock);
                 continue;
             }
             // Hydrate the whole run, except a page that already holds newer
@@ -203,7 +268,7 @@ unsafe fn x_read_inner(
                 if rc != ffi::SQLITE_OK {
                     return rc;
                 }
-                hydrated.insert(pgno_);
+                hydrated.insert_counted(pgno_, commit, lock);
             }
         }
     }
@@ -222,17 +287,19 @@ unsafe extern "C" fn x_write(
     // over them.
     let paged = file as *mut PagedFile;
     let state = &*(*paged).state;
-    if state.reader.is_some() {
+    if let Some(reader) = state.reader.as_ref() {
         let ps = state.page_size.max(1) as i64;
         let first = (ofst / ps) as u32 + 1;
         let last = ((ofst + amt as i64 - 1) / ps) as u32 + 1;
+        let commit = reader.commit();
+        let lock = lock_pgno(state.page_size.max(1));
         let mut hydrated = state.hydrated.lock().unwrap();
         let write = (*base_methods(file)).xWrite.unwrap();
         let rc = write((*paged).base, buf, amt, ofst);
         // Only bytes that landed count: a mark on a failed write would turn
         // the page into a hole the fault path never fills.
         if rc == ffi::SQLITE_OK {
-            hydrated.extend(first..=last);
+            hydrated.mark_range(first, last, commit, lock);
         }
         return rc;
     }
@@ -283,10 +350,16 @@ unsafe extern "C" fn x_truncate(file: *mut ffi::sqlite3_file, size: ffi::sqlite3
     // the base file's zeros as hydrated data.
     let paged = file as *mut PagedFile;
     let state = &*(*paged).state;
-    if state.reader.is_some() {
+    if let Some(reader) = state.reader.as_ref() {
         let ps = state.page_size.max(1) as i64;
         let keep = ((size + ps - 1) / ps).max(0) as u32;
-        state.hydrated.lock().unwrap().retain(|pgno| *pgno <= keep);
+        let commit = reader.commit();
+        let lock = lock_pgno(state.page_size.max(1));
+        state
+            .hydrated
+            .lock()
+            .unwrap()
+            .retain_above(keep, commit, lock);
     }
     let truncate = (*base_methods(file)).xTruncate.unwrap();
     truncate((*paged).base, size)
@@ -491,7 +564,7 @@ pub fn register_paged_vfs(
             base,
             path,
             reader,
-            hydrated: Arc::new(Mutex::new(HashSet::new())),
+            hydrated: Arc::new(Mutex::new(HydratedSet::default())),
             open_files: std::sync::atomic::AtomicUsize::new(0),
             retired: std::sync::atomic::AtomicBool::new(false),
         }));
@@ -557,11 +630,9 @@ pub fn hydration(name: &str) -> Option<Hydration> {
         let app = &*((*vfs).pAppData as *mut VfsAppData);
         let commit = app.reader.commit();
         let lock = lock_pgno(app.reader.page_size());
-        let hydrated = app.hydrated.lock().unwrap();
+        let hydrated = app.hydrated.lock().unwrap().counted;
         Some(Hydration {
-            hydrated: (1..=commit)
-                .filter(|p| *p != lock && hydrated.contains(p))
-                .count() as u32,
+            hydrated,
             total: commit - u32::from(lock <= commit),
             faults: app.reader.faults(),
         })
@@ -626,10 +697,9 @@ impl Hydrator {
         let mut page = vec![0u8; page_size as usize];
         let gone = || crate::error::Error::Other("hydrator: vfs is gone".into());
         let start = hydration(&self.name).ok_or_else(gone)?.hydrated;
-        // The count is recomputed only after a read that faulted: a page the
-        // file already holds costs one set lookup, never a walk of the cut,
-        // or a whale's step would be quadratic in its pages (the fleet's fill
-        // made no progress in ten minutes).
+        // The count is exact and O(1): every mutation keeps it, so a
+        // faulted read costs one set lookup and a whale's step is linear
+        // in its faults, not quadratic in its pages (upstream #270).
         while self.cursor <= commit {
             let pgno = self.cursor;
             self.cursor += 1;
@@ -683,4 +753,293 @@ pub fn unregister_paged_vfs(name: &str) -> crate::error::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::error::Result;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// A synthetic cut: every page holds its own number, served in runs.
+    struct TestReader {
+        page_size: u32,
+        commit: u32,
+        run_len: u32,
+        faults: AtomicU64,
+    }
+
+    impl TestReader {
+        fn new(page_size: u32, commit: u32, run_len: u32) -> Self {
+            Self {
+                page_size,
+                commit,
+                run_len,
+                faults: AtomicU64::new(0),
+            }
+        }
+
+        fn page(&self, pgno: u32) -> Vec<u8> {
+            let mut page = vec![0u8; self.page_size as usize];
+            page[..4].copy_from_slice(&pgno.to_le_bytes());
+            page
+        }
+    }
+
+    impl PageReader for TestReader {
+        fn page_size(&self) -> u32 {
+            self.page_size
+        }
+
+        fn commit(&self) -> u32 {
+            self.commit
+        }
+
+        fn read_run(&self, pgno: u32) -> Result<Vec<(u32, Vec<u8>)>> {
+            self.faults.fetch_add(1, Ordering::Relaxed);
+            if pgno == lock_pgno(self.page_size) {
+                // Served with content like any in-cut page: the write
+                // extends the sparse file, and the mark stays uncounted.
+                return Ok(vec![(pgno, self.page(pgno))]);
+            }
+            if pgno > self.commit {
+                return Ok(Vec::new());
+            }
+            Ok((pgno..(pgno + self.run_len).min(self.commit + 1))
+                .map(|p| (p, self.page(p)))
+                .collect())
+        }
+
+        fn faults(&self) -> u64 {
+            self.faults.load(Ordering::Relaxed)
+        }
+    }
+
+    fn register(name: &str, path: &Path, reader: TestReader) -> Arc<TestReader> {
+        std::fs::write(path, []).expect("empty sparse file");
+        // Grow past the cut the way a checkpoint-grown file would: reads
+        // past the commit resolve from these holes instead of failing.
+        let grown = 2 * u64::from(reader.commit) * u64::from(reader.page_size);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .expect("open sparse file")
+            .set_len(grown)
+            .expect("grow sparse file");
+        let reader = Arc::new(reader);
+        register_paged_vfs(name, None, path, reader.clone()).expect("register");
+        reader
+    }
+
+    /// The full walk `hydration()` used to do, straight from the set.
+    fn oracle(name: &str) -> u32 {
+        let cname = CString::new(name).expect("cname");
+        unsafe {
+            let vfs = ffi::sqlite3_vfs_find(cname.as_ptr());
+            assert!(!vfs.is_null(), "vfs is gone");
+            let app = &*((*vfs).pAppData as *mut VfsAppData);
+            let commit = app.reader.commit();
+            let lock = lock_pgno(app.reader.page_size());
+            let set = app.hydrated.lock().unwrap();
+            (1..=commit)
+                .filter(|p| *p != lock && set.pages.contains(p))
+                .count() as u32
+        }
+    }
+
+    fn counted(name: &str) -> u32 {
+        hydration(name).expect("hydration").hydrated
+    }
+
+    fn assert_counted(name: &str, context: &str) {
+        assert_eq!(
+            counted(name),
+            oracle(name),
+            "count disagrees with the full walk after {context}"
+        );
+    }
+
+    /// Borrow the live main-db file of a connection opened through the VFS.
+    fn main_file(conn: &rusqlite::Connection) -> *mut ffi::sqlite3_file {
+        let mut file: *mut ffi::sqlite3_file = std::ptr::null_mut();
+        let rc = unsafe {
+            ffi::sqlite3_file_control(
+                conn.handle(),
+                c"main".as_ptr(),
+                ffi::SQLITE_FCNTL_FILE_POINTER,
+                (&mut file as *mut *mut ffi::sqlite3_file).cast(),
+            )
+        };
+        assert_eq!(rc, ffi::SQLITE_OK, "file pointer");
+        assert!(!file.is_null());
+        file
+    }
+
+    fn raw_read(file: *mut ffi::sqlite3_file, pgno: u32, page_size: u32) -> Vec<u8> {
+        let mut page = vec![0u8; page_size as usize];
+        let rc = unsafe {
+            let read = (*(*file).pMethods).xRead.expect("xRead");
+            read(
+                file,
+                page.as_mut_ptr().cast(),
+                page_size as c_int,
+                (i64::from(pgno) - 1) * i64::from(page_size),
+            )
+        };
+        assert_eq!(rc, ffi::SQLITE_OK, "raw read of page {pgno}");
+        page
+    }
+
+    fn raw_write(file: *mut ffi::sqlite3_file, pgno: u32, page: &[u8], page_size: u32) {
+        let rc = unsafe {
+            let write = (*(*file).pMethods).xWrite.expect("xWrite");
+            write(
+                file,
+                page.as_ptr().cast(),
+                page.len() as c_int,
+                (i64::from(pgno) - 1) * i64::from(page_size),
+            )
+        };
+        assert_eq!(rc, ffi::SQLITE_OK, "raw write of page {pgno}");
+    }
+
+    fn raw_truncate(file: *mut ffi::sqlite3_file, bytes: i64) {
+        let rc = unsafe {
+            let truncate = (*(*file).pMethods).xTruncate.expect("xTruncate");
+            truncate(file, bytes)
+        };
+        assert_eq!(rc, ffi::SQLITE_OK, "truncate to {bytes}");
+    }
+
+    fn open_conn(path: &Path, vfs: &str) -> rusqlite::Connection {
+        rusqlite::Connection::open_with_flags_and_vfs(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            vfs,
+        )
+        .expect("open through the paged vfs")
+    }
+
+    /// Upstream #270: the count stays exact through foreground faults,
+    /// background faults, writes, lock-page and past-cut marks, duplicates,
+    /// and truncate/regrow — checked against a full walk after each step.
+    /// Read back the first four bytes as the page number the test image
+    /// stamped there, or fail loudly on short content.
+    fn page_no(page: &[u8]) -> u32 {
+        u32::from_le_bytes(page[..4].try_into().expect("four content bytes"))
+    }
+
+    #[test]
+    fn hydration_count_matches_oracle_through_every_mutation() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("oracle.sqlite");
+        let name = "test-paged-oracle";
+        let (page_size, commit, run_len) = (1024, 64, 4);
+        let reader = register(name, &path, TestReader::new(page_size, commit, run_len));
+        let lock = lock_pgno(page_size);
+        assert!(lock > commit, "the lock page sits past this cut");
+
+        let conn = open_conn(&path, name);
+        let file = main_file(&conn);
+        // Opening the database faults page 1 for its header, like any
+        // first read through the VFS.
+        assert_eq!(reader.faults(), 1, "open faults the header run once");
+        assert_counted(name, "registration");
+        assert_eq!(counted(name), 4, "the header run covers pages 1..=4");
+
+        // Foreground faults, one run at a time; the second read of a held
+        // page must not fault or count again.
+        let faults_before = reader.faults();
+        for pgno in [5u32, 6, 7] {
+            let page = raw_read(file, pgno, page_size);
+            assert_eq!(page_no(&page), pgno, "filled from the cut");
+        }
+        assert_eq!(reader.faults(), faults_before + 1, "one run faults once");
+        assert_counted(name, "foreground faults");
+        assert_eq!(counted(name), 8, "two runs of four faulted");
+        raw_read(file, 5, page_size);
+        assert_eq!(reader.faults(), faults_before + 1, "a held page never re-faults");
+        assert_counted(name, "duplicate fault");
+
+        // The lock page resolves with content but without counting, and a
+        // past-cut page resolves from the holes the pre-sized file holds.
+        raw_read(file, lock, page_size);
+        raw_read(file, commit + 9, page_size);
+        assert_counted(name, "lock-page and past-cut marks");
+        assert_eq!(counted(name), 8, "neither mark counts");
+
+        // Foreground writes mark their range.
+        let mut written = reader.page(20);
+        written[4] = 0xA5;
+        raw_write(file, 20, &written, page_size);
+        raw_write(file, 21, &reader.page(21), page_size);
+        assert_counted(name, "foreground writes");
+        assert_eq!(
+            &raw_read(file, 20, page_size)[..5],
+            &[20u8, 0, 0, 0, 0xA5]
+        );
+
+        // A fault run skips pages that already hold newer bytes.
+        let mut written31 = reader.page(31);
+        written31[4] = 0xB7;
+        raw_write(file, 31, &written31, page_size);
+        raw_read(file, 30, page_size);
+        assert_counted(name, "run around a written page");
+        assert_eq!(
+            raw_read(file, 31, page_size)[4], 0xB7,
+            "writes win over fault runs"
+        );
+
+        // Truncation forgets pages past the new size, including counted
+        // ones; regrowth faults and writes them afresh.
+        raw_truncate(file, 16 * i64::from(page_size));
+        assert_counted(name, "truncate");
+        assert_eq!(counted(name), 8, "only the two fault runs survive");
+        raw_write(file, 40, &reader.page(40), page_size);
+        assert_counted(name, "regrow by write");
+        raw_read(file, 50, page_size);
+        assert_counted(name, "regrow by fault");
+
+        // A background hydrator step faults like a foreground read.
+        drop(conn);
+        let mut hydrator = Hydrator::open(name, &path).expect("hydrator");
+        while !hydration(name).expect("hydration").complete() {
+            hydrator.step(8).expect("step");
+            assert_counted(name, "background step");
+        }
+        assert_eq!(counted(name), commit, "the cut fills completely");
+        unregister_paged_vfs(name).expect("unregister");
+    }
+
+    /// Upstream #270: a 256K-page cut with one-page runs fills to
+    /// completion inside a deadline. Before the O(1) count each faulted
+    /// read walked the whole cut, which made this shape quadratic (tens of
+    /// minutes); it now finishes in seconds.
+    #[test]
+    fn hydrator_step_completes_linear_cut() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("whale.sqlite");
+        let name = "test-paged-whale";
+        let (page_size, commit) = (1024, 262_144);
+        let reader = register(name, &path, TestReader::new(page_size, commit, 1));
+        let total = commit - u32::from(lock_pgno(page_size) <= commit);
+        let mut hydrator = Hydrator::open(name, &path).expect("hydrator");
+        let started = std::time::Instant::now();
+        let deadline = std::time::Duration::from_secs(120);
+        loop {
+            if hydration(name).expect("hydration").complete() {
+                break;
+            }
+            assert!(
+                started.elapsed() < deadline,
+                "the fill is not linear: still faulting after {deadline:?}"
+            );
+            hydrator.step(4096).expect("step");
+        }
+        let done = hydration(name).expect("hydration");
+        assert_eq!(done.hydrated, total, "every cut page is held");
+        assert_eq!(done.hydrated, done.total);
+        assert_eq!(reader.faults(), total as u64, "each page faulted once");
+        unregister_paged_vfs(name).expect("unregister");
+    }
 }
