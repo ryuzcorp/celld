@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): staged activation; dev-store single-writer group commit (upstream #310).
+// Modified by ryuzcorp (ryuzcorp/celld): staged activation; dev-store single-writer group commit (upstream #310); covering listing index with prefix-bounded LIST (upstream #265).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! The persistent object store for `celld dev`.
@@ -88,6 +88,34 @@ struct StoredAttribute {
     value: String,
 }
 
+impl StoredObject {
+    /// One row of the listing query: the body is never read, only its
+    /// length, which the covering index answers without the row.
+    fn from_listing_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        Ok(StoredObject {
+            key: row.get(0)?,
+            body: row.get(1)?,
+            size: row.get(5)?,
+            etag: row.get(2)?,
+            modified_ms: row.get(3)?,
+            attributes: row.get(4)?,
+        })
+    }
+}
+
+/// The exclusive upper bound of a byte-prefix range: the prefix with its
+/// last byte incremented, so every string starting with the prefix sorts
+/// below it. `None` for an empty prefix: the range runs to the end of the
+/// table. Byte math, not UTF-8 math — UTF-8 never holds 0xFF, so the last
+/// byte always increments — and the caller CASTs the bytes back to TEXT,
+/// so the bound need not be a valid string.
+fn prefix_upper(prefix: &str) -> Option<Vec<u8>> {
+    let mut bound = prefix.as_bytes().to_vec();
+    let last = bound.last_mut()?;
+    *last = last.wrapping_add(1);
+    Some(bound)
+}
+
 impl LocalStore {
     pub(crate) fn open(database: impl AsRef<FsPath>) -> object_store::Result<Self> {
         let database = database.as_ref().to_path_buf();
@@ -122,7 +150,14 @@ impl LocalStore {
                    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
                    next_etag INTEGER NOT NULL
                  );
-                 INSERT OR IGNORE INTO store_sequence(singleton, next_etag) VALUES (1, 1);",
+                 INSERT OR IGNORE INTO store_sequence(singleton, next_etag) VALUES (1, 1);
+                 -- The listing query below selects exactly these columns, so
+                 -- the store answers a LIST from this index without touching
+                 -- a row's overflow pages. Without it every listing reads
+                 -- the whole file, because `etag` and friends sit behind
+                 -- `body` in the row.
+                 CREATE INDEX IF NOT EXISTS objects_listing
+                   ON objects(key, etag, modified_ms, attributes, length(body));",
             )
             .map_err(db_error)?;
         Ok(store)
@@ -156,26 +191,38 @@ impl LocalStore {
             .ok_or_else(|| not_found(key))
     }
 
-    fn metadata(&self) -> object_store::Result<Vec<StoredObject>> {
+    /// The rows under one byte-prefix, in key order, without reading any
+    /// body. The range bounds the index scan to the prefix: an unprefixable
+    /// full-table scan made every LIST read the whole file. The Rust-side
+    /// prefix check in each caller stays, so the SQL bound only ever
+    /// narrows what the filter would keep anyway.
+    fn metadata(&self, prefix: &str) -> object_store::Result<Vec<StoredObject>> {
         let connection = self.connect()?;
-        let mut statement = connection
-            .prepare(
+        let upper = prefix_upper(prefix);
+        let sql = match upper {
+            Some(_) => {
+                // The upper bound is bytes, not necessarily UTF-8, so it
+                // rides as a BLOB and is CAST back to TEXT: a BLOB bound
+                // would compare by storage class (every TEXT sorts before
+                // any BLOB) and filter nothing, while the CAST text
+                // compares byte-wise under BINARY collation.
                 "SELECT key, CAST(X'' AS BLOB), etag, modified_ms, attributes, length(body)
-                 FROM objects ORDER BY key",
-            )
-            .map_err(db_error)?;
-        let rows = statement
-            .query_map([], |row| {
-                Ok(StoredObject {
-                    key: row.get(0)?,
-                    body: row.get(1)?,
-                    size: row.get(5)?,
-                    etag: row.get(2)?,
-                    modified_ms: row.get(3)?,
-                    attributes: row.get(4)?,
-                })
-            })
-            .map_err(db_error)?;
+                 FROM objects WHERE key >= ?1 AND key < CAST(?2 AS TEXT) ORDER BY key"
+            }
+            None => {
+                "SELECT key, CAST(X'' AS BLOB), etag, modified_ms, attributes, length(body)
+                 FROM objects WHERE key >= ?1 ORDER BY key"
+            }
+        };
+        let mut statement = connection.prepare(sql).map_err(db_error)?;
+        let rows = match upper {
+            Some(upper) => statement.query_map(
+                params![prefix, upper.as_slice()],
+                StoredObject::from_listing_row,
+            ),
+            None => statement.query_map(params![prefix], StoredObject::from_listing_row),
+        }
+        .map_err(db_error)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(db_error)
     }
 
@@ -484,7 +531,7 @@ impl ObjectStore for LocalStore {
         // while every hermetic test stayed green.
         let prefix = prefix.cloned().unwrap_or_default();
         let want: &str = prefix.as_ref();
-        let result = self.metadata().and_then(|objects| {
+        let result = self.metadata(want).and_then(|objects| {
             objects
                 .into_iter()
                 .map(|object| object_meta(&object))
@@ -506,7 +553,7 @@ impl ObjectStore for LocalStore {
         let prefix = prefix.cloned().unwrap_or_default();
         let mut common_prefixes = BTreeSet::new();
         let mut objects = Vec::new();
-        for object in self.metadata()? {
+        for object in self.metadata(prefix.as_ref())? {
             let location = stored_location(&object.key)?;
             let Some(mut remainder) = location.prefix_match(&prefix) else {
                 continue;
@@ -557,7 +604,7 @@ impl PaginatedListStore for LocalStore {
         let delimiter = options.delimiter.as_deref();
         let limit = options.max_keys.unwrap_or(usize::MAX);
         let mut entries: Vec<(String, Option<Path>, Option<ObjectMeta>)> = Vec::new();
-        for object in self.metadata()? {
+        for object in self.metadata(prefix)? {
             let Some(remainder) = object.key.strip_prefix(prefix) else {
                 continue;
             };
@@ -928,5 +975,76 @@ mod tests {
             );
             assert_eq!(body_of(&store, "k").await, b"z");
         });
+    }
+
+    fn put(store: &LocalStore, key: &str, body_len: usize) {
+        store
+            .put_sync(
+                key.to_string(),
+                bytes::Bytes::from(vec![b'x'; body_len]),
+                PutOptions::default(),
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn prefix_upper_bounds_byte_prefixes() {
+        assert_eq!(prefix_upper("a/b"), Some(b"a/c".to_vec()));
+        assert_eq!(prefix_upper("ab"), Some(b"ac".to_vec()));
+        // Byte increment, not char increment: 0x7F becomes 0x80.
+        assert_eq!(prefix_upper("a\x7f"), Some(b"a\x80".to_vec()));
+        // Multi-byte UTF-8 is still byte math: é is C3 A9.
+        assert_eq!(prefix_upper("é"), Some(vec![0xC3, 0xAA]));
+        assert_eq!(prefix_upper(""), None);
+    }
+
+    /// A LIST must see only its prefix's rows, with sizes, without the
+    /// bodies: the covering index answers `length(body)` and the range
+    /// bounds the scan.
+    #[test]
+    fn listing_reads_only_its_prefix() {
+        let (_dir, store) = open_store();
+        put(&store, "a/1", 100_000);
+        put(&store, "a/2", 200_000);
+        put(&store, "b/1", 300_000);
+        put(&store, "é/1", 50_000);
+        let listed = store.metadata("a/").unwrap();
+        let keys: Vec<&str> = listed.iter().map(|object| object.key.as_str()).collect();
+        assert_eq!(keys, ["a/1", "a/2"]);
+        let sizes: Vec<u64> = listed.iter().map(|object| object.size).collect();
+        assert_eq!(sizes, [100_000, 200_000]);
+        for object in &listed {
+            assert!(object.body.is_empty(), "a listing reads no bodies");
+        }
+        // Multi-byte prefixes bound byte-wise too: é/1 is under é/ and
+        // outside the neighboring è/ range.
+        assert_eq!(store.metadata("é/").unwrap().len(), 1);
+        assert!(store.metadata("è/").unwrap().is_empty());
+        assert_eq!(store.metadata("").unwrap().len(), 4);
+        assert!(store.metadata("c/").unwrap().is_empty());
+    }
+
+    /// The listing query rides the covering index, not the table: the
+    /// table's rows hold multi-page bodies behind every listed column.
+    #[test]
+    fn listing_plan_uses_the_covering_index() {
+        let (_dir, store) = open_store();
+        put(&store, "a/1", 100_000);
+        let connection = store.connect().unwrap();
+        let mut statement = connection
+            .prepare(
+                "EXPLAIN QUERY PLAN SELECT key, CAST(X'' AS BLOB), etag, modified_ms, attributes, length(body)
+                 FROM objects WHERE key >= ?1 AND key < CAST(?2 AS TEXT) ORDER BY key",
+            )
+            .unwrap();
+        let plan: Vec<String> = statement
+            .query_map(params!["a/", b"a0".as_slice()], |row| row.get(3))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(
+            plan.iter().any(|step| step.contains("objects_listing")),
+            "the listing must scan the covering index: {plan:?}"
+        );
     }
 }
