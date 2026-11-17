@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): round-level fence settlement (0062); renewal lease readback carries the authority bound (upstream #264).
+// Modified by ryuzcorp (ryuzcorp/celld): round-level fence settlement (0062); renewal lease readback carries the authority bound (upstream #264); lease CAS conflict outcome (upstream #239).
 // Modified by ryuzcorp (ryuzcorp/celld): ported from meln1k/celld: seal a dead lease that never opened a log (01522b3); shared bucket-posture ownership reads across concurrent gates (0056).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
@@ -355,8 +355,13 @@ pub struct RestoredAlarm {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LeaseCasOutcome {
-    Applied { etag: String },
+    Applied {
+        etag: String,
+    },
     Rejected,
+    /// A transient store conflict (HTTP 409) against the attempted guard:
+    /// a same-guard retry may clear it without a readback (upstream #239).
+    Conflict,
 }
 
 /// Deterministic timers are versioned effects, not implicit clock reads. A
