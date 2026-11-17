@@ -1,0 +1,7 @@
+{
+  "name": "waituntil-tx",
+  "main": "worker.js",
+  "compatibility_date": "2026-01-01",
+  "durable_objects": { "bindings": [{ "name": "REPRO", "class_name": "Repro" }] },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Repro"] }]
+}

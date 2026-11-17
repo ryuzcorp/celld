@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): node:crypto scrypt; container exec resize op; cross-isolate RPC stubs and streams; test-only fake exec ops; fake kill completion op; exec reads survive their subscribing event; per-node Workers Cache API ops; tenant egress policy; D1 export operator-ingress marker; stateless attribution tokens; reaction-aware request resources; fake close/signal completion ops; binding-forgery enforcement; trusted cell RPC; Queue DLQ forward host op; DLQ forward caller identity; WebSocket and TCP socket ownership; receiver-held stream lifetime; deployment cache scope key; share the /bundle tree per deployment generation.; cancelled requests reject pending ops so co-awaiters settle (upstream #317)
+// Modified by ryuzcorp (ryuzcorp/celld): node:crypto scrypt; container exec resize op; cross-isolate RPC stubs and streams; test-only fake exec ops; fake kill completion op; exec reads survive their subscribing event; per-node Workers Cache API ops; tenant egress policy; D1 export operator-ingress marker; stateless attribution tokens; reaction-aware request resources; fake close/signal completion ops; binding-forgery enforcement; trusted cell RPC; Queue DLQ forward host op; DLQ forward caller identity; WebSocket and TCP socket ownership; receiver-held stream lifetime; deployment cache scope key; share the /bundle tree per deployment generation.; cancelled requests reject pending ops so co-awaiters settle (upstream #317); answered drivers poll while waitUntil background is outstanding (upstream #300)
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 // The raw V8 adapter and its child modules remain outside the Actor execution
@@ -3981,6 +3981,16 @@ impl InFlight {
     /// Has the client been answered? `waitUntil` work can still be running.
     pub fn answered(&self) -> bool {
         self.reply.is_none() && self.gated_reply.is_none()
+    }
+
+    /// Is `waitUntil` work still outstanding? The driver keeps polling for
+    /// its settlement even when no native op of its own remains: that work
+    /// can settle through another event (a shared promise resolved
+    /// elsewhere, a hibernatable wake), and concluding "waiting on nothing"
+    /// while it is pending abandons it (denoland/celld#300) or never
+    /// retires its entry (denoland/celld#289).
+    pub(crate) fn has_background(&self) -> bool {
+        self.background.is_some()
     }
 
     /// Whether a native operation can still resume JavaScript for this event.
