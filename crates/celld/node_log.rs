@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): operator token for the internal listener; list_page resume is a cursor; ported from meln1k/celld: seal a dead lease that never opened a log (01522b3); seal_absent_log regression tests; lone-node repair backoff; bucket-posture group commit: bucket-session record encoding + old-reader interop tests (0059); bucket-posture group commit: bucket executor without ensemble (0060); bucket-posture group commit: successor fold of bucket bundles (0063); bucket-posture group commit: bucket-session drain, per-cell seal, bundle GC without ensemble, linger holds only while the dirty set is shared (0064); bucket-posture group commit: lone-cell-per-cell vs shared-bundle executor tests, and idle bucket sessions skip empty bundle-GC scans (0071); stale-target 409 proves the member gone in recovery (upstream #273); tail reads stream under a progress timeout (upstream #250).
+// Modified by ryuzcorp (ryuzcorp/celld): operator token for the internal listener; list_page resume is a cursor; ported from meln1k/celld: seal a dead lease that never opened a log (01522b3); seal_absent_log regression tests; lone-node repair backoff; bucket-posture group commit: bucket-session record encoding + old-reader interop tests (0059); bucket-posture group commit: bucket executor without ensemble (0060); bucket-posture group commit: successor fold of bucket bundles (0063); bucket-posture group commit: bucket-session drain, per-cell seal, bundle GC without ensemble, linger holds only while the dirty set is shared (0064); bucket-posture group commit: lone-cell-per-cell vs shared-bundle executor tests, and idle bucket sessions skip empty bundle-GC scans (0071); stale-target 409 proves the member gone in recovery (upstream #273); tail reads stream under a progress timeout (upstream #250); deleted sessions with surviving objects declare loss (upstream #245).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! v0 of the in-fleet replicated log tier (`CELLD_DURABILITY=fleet`).
@@ -5857,6 +5857,34 @@ impl NodeLogManager {
     /// still matches. `false` means the lease moved under the CAS: re-read.
     async fn seal_absent_log(&self, node: &str) -> anyhow::Result<bool> {
         let Some((bytes, token)) = self.bucket.get(&lease_key(node)).await? else {
+            // No lease and no record. A session that never existed leaves
+            // nothing behind; a session an operator deleted leaves its
+            // objects. Sealing "absent" over leftover objects would orphan
+            // acked rows with no record and no line (upstream #245): list
+            // the session prefix, and declare the bounded loss loudly when
+            // anything survives the deletion.
+            if self.bucket.list(&format!("log/{node}/")).await?.is_empty() {
+                return Ok(true);
+            }
+            let loss = serde_json::json!({
+                "leader": node,
+                "declared_at_ms": crate::ownership_store::now_ms(),
+                "declared_by": self.node,
+                "note": "no lease or log record survived for this session, but objects remain \
+                         under its prefix; acked writes in those objects are unrecoverable",
+            });
+            self.bucket
+                .put(
+                    &format!("log/{node}.loss.json"),
+                    serde_json::to_vec(&loss)?,
+                )
+                .await?;
+            warn!(
+                node,
+                by = self.node.as_str(),
+                "declared bounded loss: the session's lease and record are gone but its objects \
+                 survive; acked writes in those objects are unrecoverable"
+            );
             return Ok(true);
         };
         let wire: crate::ownership_store::NodeLeaseWire = serde_json::from_slice(&bytes)?;
@@ -7977,6 +8005,61 @@ mod seal_absent_log_tests {
             .await
             .expect("cas runs");
             assert!(applied.is_none(), "a stale token loses the CAS race");
+        });
+    }
+
+    /// An operator-deleted session whose objects survive declares its loss
+    /// loudly instead of sealing "absent" (upstream #245): the deletion
+    /// orphans acked rows, and "loss is a record" — the loss object names
+    /// what the deletion orphaned. Fail-before: the seal returned `true`
+    /// with no loss record and no line.
+    #[test]
+    fn deleted_session_with_objects_declares_loss() {
+        let runtime = crate::asyncrt::shared_test_runtime();
+        let dir = tempfile::tempdir().expect("test dir");
+        let (manager, bucket) = test_manager(dir.path());
+        runtime.block_on(async {
+            bucket
+                .put("log/dead/gen9/bundle/e1-1.ltxb", vec![0xA5u8; 64])
+                .await
+                .expect("orphan object");
+            let proved = manager
+                .seal_absent_log("dead")
+                .await
+                .expect("seal runs");
+            assert!(proved, "the seal still unblocks activation");
+            let (bytes, _) = bucket
+                .get("log/dead.loss.json")
+                .await
+                .expect("read back")
+                .expect("a deleted session with objects leaves a loss record");
+            let loss: serde_json::Value =
+                serde_json::from_slice(&bytes).expect("loss parses");
+            assert_eq!(loss["leader"], "dead");
+        });
+    }
+
+    /// The control: a session that never existed still seals absent with
+    /// no loss record — nothing was orphaned.
+    #[test]
+    fn never_existed_session_seals_absent_quietly() {
+        let runtime = crate::asyncrt::shared_test_runtime();
+        let dir = tempfile::tempdir().expect("test dir");
+        let (manager, bucket) = test_manager(dir.path());
+        runtime.block_on(async {
+            let proved = manager
+                .seal_absent_log("dead")
+                .await
+                .expect("seal runs");
+            assert!(proved, "a missing lease proves the bucket complete");
+            assert!(
+                bucket
+                    .get("log/dead.loss.json")
+                    .await
+                    .expect("read back")
+                    .is_none(),
+                "nothing orphaned, no loss record"
+            );
         });
     }
 }
