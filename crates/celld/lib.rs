@@ -72,6 +72,7 @@ pub mod host_channels;
 pub mod host_services;
 pub mod http_streams;
 pub mod invoke_cli;
+pub mod isolate_pipe;
 pub mod js;
 pub mod kv_blob;
 pub mod kv_cli;

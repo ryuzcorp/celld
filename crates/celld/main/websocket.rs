@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): WebSocket ownership. Apache-2.0.
+// Modified by ryuzcorp (ryuzcorp/celld): WebSocket ownership; isolate pipe for loaded-worker 101 joins (upstream #305). Apache-2.0.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! WebSockets on the ingress: accepting them, proxying them to the owner,
@@ -9,6 +9,9 @@
 //! socket proxied to the owning peer, and a socket the worker opened
 //! outbound — and they differ only in what sits on the far end.
 use super::*;
+use celld::isolate_pipe::{
+    forward_isolate_direction, IsolateDirectionEnd, ISOLATE_PIPE_MAX_STAGED_BYTES,
+};
 
 /// Where the events of one socket go.
 ///
@@ -477,6 +480,132 @@ impl OutboundWebSocketSink {
 /// which is also why a hibernatable server end needs nothing special here.
 ///
 /// The task ends when either side closes, and it unregisters both.
+/// Carry frames between a loaded worker's socket and a client end another
+/// isolate in this process kept, after a loader-fetch upgrade.
+///
+/// The cell pipe above cannot serve this pair: the worker end is an
+/// isolate-polled socket, not a cell, so there is no cell to dispatch into.
+/// Each direction instead takes the isolate-queue route — the caller's
+/// `WsOut` frames cross into the loaded socket's pull queue, and the loaded
+/// socket's `WsOut` frames cross into the caller's pull queue — which is the
+/// same exchange the top-level upgrade task runs for a Worker socket.
+///
+/// The task ends when either side closes, and it unregisters both. The
+/// stashed handoff is dropped with the task: it owns the only remaining
+/// `WsPullSender` for the loaded socket, and dropping it lets that input
+/// queue drain.
+async fn local_isolate_websocket_pipe(
+    id: u64,
+    target: celld::js::WsTarget,
+    worker: celld::js::WorkerWebSocket,
+    pull: celld::js::WsPullSender,
+    reply: tokio::sync::oneshot::Sender<anyhow::Result<celld::js::OutboundWsOpen>>,
+) -> anyhow::Result<()> {
+    let inbound = worker.inbound();
+    let loaded_id = worker.id();
+    // Both registrations flush whatever each end queued before it had
+    // anywhere to send, as in the cell pipe above. Each direction carries
+    // an admission budget for its output channel, so neither the backlog
+    // flushed here nor live sends can stage more than the cap before the
+    // forwarder runs.
+    let (caller_tx, from_caller) = mpsc::unbounded_channel();
+    let (loaded_tx, from_loaded) = mpsc::unbounded_channel();
+    let caller_budget = celld::js::WsPipeBudget::new(ISOLATE_PIPE_MAX_STAGED_BYTES);
+    let loaded_budget = celld::js::WsPipeBudget::new(ISOLATE_PIPE_MAX_STAGED_BYTES);
+    celld::js::ws_register_budgeted(id, caller_tx, caller_budget.clone());
+    celld::js::ws_register_budgeted(loaded_id, loaded_tx, loaded_budget.clone());
+    let _ = reply.send(Ok(celld::js::OutboundWsOpen {
+        protocol: None,
+        declined: None,
+    }));
+    // One loop per direction: capacity is reserved before a frame moves, so a
+    // single loop awaiting inline could not observe a close from the other
+    // side — or a close queued behind flooded frames on its own side — while
+    // a frame is pending. The first direction to see a close, a failed
+    // reservation, or its socket's retirement shuts the other one down.
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let caller = celld::asyncrt::spawn({
+        let shutdown_tx = shutdown_tx.clone();
+        let inbound = inbound.clone();
+        let shutdown = shutdown_rx.clone();
+        async move {
+            let end =
+                forward_isolate_direction(from_caller, inbound, shutdown, caller_budget).await;
+            let _ = shutdown_tx.send(true);
+            end
+        }
+    });
+    let loaded = celld::asyncrt::spawn({
+        let shutdown_tx = shutdown_tx.clone();
+        let pull = pull.clone();
+        async move {
+            let end =
+                forward_isolate_direction(from_loaded, pull, shutdown_rx, loaded_budget).await;
+            let _ = shutdown_tx.send(true);
+            end
+        }
+    });
+    // Either direction ending shuts the other one down, so both joins
+    // complete: a direction only ever waits on its socket's channel, its
+    // parked reservation, or the shutdown signal. The extra send covers a
+    // task that ended without sending one. A panicked task reports
+    // retirement, so the teardown below just unregisters: fail-closed.
+    let caller_end = caller.await.unwrap_or(IsolateDirectionEnd::Retired);
+    let _ = shutdown_tx.send(true);
+    let loaded_end = loaded.await.unwrap_or(IsolateDirectionEnd::Retired);
+    let mut caller_close: Option<(u16, String)> = None;
+    let mut loaded_close: Option<(u16, String)> = None;
+    let mut overloaded = false;
+    for (slot, end) in [
+        (&mut caller_close, caller_end),
+        (&mut loaded_close, loaded_end),
+    ] {
+        match end {
+            IsolateDirectionEnd::Close(code, reason) => *slot = Some((code, reason)),
+            IsolateDirectionEnd::OverLimit => overloaded = true,
+            IsolateDirectionEnd::Retired => {}
+        }
+    }
+    // Set only by a close the caller sent. A close from the loaded worker
+    // is forwarded to the caller below; telling the loaded socket again
+    // would be a second close.
+    if overloaded {
+        // A flood into a peer that never reads stages frames upstream of the
+        // pull queue without bound: close both ends loudly instead. 1011 is
+        // the codebase's host-failure code, and the close is abnormal — no
+        // peer sent it — so it is not clean. Wins over a raced close, which
+        // loses to the teardown either way.
+        tracing::warn!(
+            caller_ws = id,
+            loaded_ws = loaded_id,
+            staged_cap = ISOLATE_PIPE_MAX_STAGED_BYTES,
+            "isolate WebSocket pipe staged past its cap; closing both ends",
+        );
+        let _ = pull.send_close(
+            celld::js::WS_PIPE_OVERLOAD_CODE,
+            celld::js::WS_PIPE_OVERLOAD_REASON.to_string(),
+            false,
+        );
+        let _ = inbound.send_close(
+            celld::js::WS_PIPE_OVERLOAD_CODE,
+            celld::js::WS_PIPE_OVERLOAD_REASON.to_string(),
+            false,
+        );
+    } else if let Some((code, reason)) = caller_close {
+        let _ = inbound.send_close(code, reason, true);
+    } else if let Some((code, reason)) = loaded_close {
+        let _ = pull.send_close(code, reason, true);
+    }
+    // Stop accepting output, but keep both pull endpoints: each stays
+    // reachable, owner-checked, until its terminal is consumed or its request
+    // retires, so a close queued behind text is delivered instead of turning
+    // into a synthetic 1006 on the next `__ws_next`.
+    celld::js::ws_unregister(id);
+    worker.drop_handoff();
+    let _ = target;
+    Ok(())
+}
+
 async fn local_websocket_pipe(
     app: AppHandle,
     id: u64,
@@ -490,6 +619,12 @@ async fn local_websocket_pipe(
         )));
         return Ok(());
     };
+    // A loaded worker's own 101 joins isolate-to-isolate: the stash holds
+    // its handoff, and only the single-use bind token could have authorized
+    // this request. A cell target has no stash and takes the cell pipe.
+    if let Some(worker) = celld::js::ws_take_join_handoff(target.id) {
+        return local_isolate_websocket_pipe(id, target, worker, pull, reply).await;
+    }
     // Both registrations flush whatever each end queued before it had
     // anywhere to send: the cell's greeting frame is queued while its own
     // fetch handler still runs, and the caller can send the moment it
@@ -505,8 +640,12 @@ async fn local_websocket_pipe(
     }));
     // Set only by a close the caller sent. A close from the cell needs no
     // entry here: the isolate that sent it has already told the cell's own
-    // handler, and telling it again would be a second `webSocketClose`.
+    // handler, and telling it again would be a second `webSocketClose`. An
+    // overload marker is host-originated, so both ends still need the 1011.
     let mut caller_close: Option<(u16, String)> = None;
+    // Set by an overload marker on either side: a burst staged past the cap
+    // before registration flushes the marker into this never-budgeted pipe.
+    let mut overloaded = false;
     loop {
         celld::asyncrt::select! {
             frame = from_caller.recv() => match frame {
@@ -530,6 +669,13 @@ async fn local_websocket_pipe(
                     caller_close = Some((code, reason));
                     break;
                 }
+                // A burst staged past the cap before registration flushes its
+                // overload marker into this never-budgeted pipe: end loudly
+                // below, like the isolate forwarder's `OverLimit` teardown.
+                Some(celld::js::WsOut::Overload) => {
+                    overloaded = true;
+                    break;
+                }
                 // The caller's request retired and took its socket with it.
                 None => break,
             },
@@ -544,11 +690,42 @@ async fn local_websocket_pipe(
                     let _ = pull.send_close(code, reason, true);
                     break;
                 }
+                // The cell's own pre-registration burst flushes its marker
+                // here: same loud end as the caller side below.
+                Some(celld::js::WsOut::Overload) => {
+                    overloaded = true;
+                    break;
+                }
                 None => break,
             },
         }
     }
-    if let Some((code, reason)) = caller_close {
+    if overloaded {
+        // A burst staged past the cap before registration: close both ends
+        // loudly instead of growing host memory without bound. 1011 is the
+        // codebase's host-failure code, and the close is abnormal — no peer
+        // sent it — so it is not clean. Wins over a raced caller close,
+        // which loses to the teardown either way.
+        tracing::warn!(
+            scope = %target.scope,
+            staged_cap = ISOLATE_PIPE_MAX_STAGED_BYTES,
+            "cell WebSocket pipe staged past its cap; closing both ends",
+        );
+        let _ = pull.send_close(
+            celld::js::WS_PIPE_OVERLOAD_CODE,
+            celld::js::WS_PIPE_OVERLOAD_REASON.to_string(),
+            false,
+        );
+        let _ = dispatch_ws_closed(
+            &app,
+            &socket,
+            target.id,
+            celld::js::WS_PIPE_OVERLOAD_CODE,
+            celld::js::WS_PIPE_OVERLOAD_REASON.to_string(),
+            false,
+        )
+        .await;
+    } else if let Some((code, reason)) = caller_close {
         let _ = dispatch_ws_closed(&app, &socket, target.id, code, reason, true).await;
     }
     app.websocket_closed(socket.cell().to_string(), target.id);
@@ -766,6 +943,13 @@ where
         celld::js::WsOut::Text(text) => Frame::text(text.into_bytes().into()),
         celld::js::WsOut::Binary(data) => Frame::binary(data.into()),
         celld::js::WsOut::Close(code, reason) => Frame::close(code, reason.as_bytes()),
+        // A pre-registration burst flushes its overload marker into this
+        // never-budgeted pipe: end the socket loudly with the 1011 the
+        // isolate forwarder would have sent.
+        celld::js::WsOut::Overload => Frame::close(
+            celld::js::WS_PIPE_OVERLOAD_CODE,
+            celld::js::WS_PIPE_OVERLOAD_REASON.as_bytes(),
+        ),
     };
     ws.lock().await.write_frame(frame).await.is_ok() && keep_open
 }
@@ -896,6 +1080,17 @@ where
                                 } else {
                                     (1006, String::new(), false)
                                 },
+                                initiator: CloseInitiator::Application,
+                            }),
+                            // A pre-registration burst flushes its marker
+                            // here: the pipe ends with the loud 1011 the
+                            // isolate forwarder reports for the same trip.
+                            celld::js::WsOut::Overload => Some(PumpClose {
+                                state: (
+                                    celld::js::WS_PIPE_OVERLOAD_CODE,
+                                    celld::js::WS_PIPE_OVERLOAD_REASON.to_string(),
+                                    false,
+                                ),
                                 initiator: CloseInitiator::Application,
                             }),
                             _ => None,
@@ -1322,4 +1517,56 @@ fn emit_websocket_connection_timing(
 #[cfg(all(test, celld_internal_tests))]
 mod socket_cancel_private {
     include!(env!("CELLD_CONFORMANCE_SOCKET_CANCEL_TESTS"));
+}
+
+#[cfg(test)]
+mod overload_tests {
+    use super::*;
+
+    /// A pre-registration burst flushes its overload marker into a plain
+    /// external pump: the socket must end with a loud 1011 close frame, not
+    /// a panic. The reverted `unreachable!` arm fails this test instead of
+    /// passing it (in production the same panic aborts the node).
+    #[test]
+    fn overload_marker_writes_loud_1011_close() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime builds");
+        runtime.block_on(async {
+            let (mut client, server) = tokio::io::duplex(64 * 1024);
+            let socket =
+                fastwebsockets::WebSocket::after_handshake(server, fastwebsockets::Role::Server);
+            let (_reader, writer) = socket.split(tokio::io::split);
+            let writer: SocketWriter<tokio::io::DuplexStream> =
+                std::sync::Arc::new(tokio::sync::Mutex::new(writer));
+            let open = write_ws_out(&writer, celld::js::WsOut::Overload).await;
+            assert!(!open, "the overload marker ends the socket");
+            drop(writer);
+            // The peer observes one unmasked close frame: 1011 + reason.
+            use tokio::io::AsyncReadExt;
+            let mut head = [0u8; 2];
+            client
+                .read_exact(&mut head)
+                .await
+                .expect("close frame head");
+            assert_eq!(head[0], 0x88, "FIN + close opcode");
+            let len = (head[1] & 0x7f) as usize;
+            let mut payload = vec![0u8; len];
+            client
+                .read_exact(&mut payload)
+                .await
+                .expect("close payload");
+            assert_eq!(
+                u16::from_be_bytes([payload[0], payload[1]]),
+                celld::js::WS_PIPE_OVERLOAD_CODE,
+                "loud 1011 close"
+            );
+            assert_eq!(
+                &payload[2..],
+                celld::js::WS_PIPE_OVERLOAD_REASON.as_bytes(),
+                "overload reason"
+            );
+        });
+    }
 }

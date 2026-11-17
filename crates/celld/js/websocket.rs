@@ -90,6 +90,18 @@ fn prepare_worker_websocket_handoff(scope: &mut v8::PinScope, id: u64) -> Option
     let (inbound, receiver) = ws_pull_channel();
     ws_pull_register(id, receiver, recording.clone());
     ws_register_outbound(id, "", None, recording);
+    // Quota keeps the host-owned deployment identity, not the routing scope:
+    // every loaded-worker socket routes under the empty scope, so keying the
+    // handoff share by scope alone would put all deployments in one bucket.
+    let quota = {
+        let state = actor_runtime_state(scope);
+        let cell = current_cell_event(&owner).map(|frame| frame.storage);
+        WsQuotaKey {
+            deployment: state.script_name.clone(),
+            scope: cell,
+        }
+    };
+    ws_set_quota_key(id, quota);
     owner.sockets.lock().unwrap().push(id);
     let registry = ws_registry();
     let replaced = registry.lock().unwrap().worker_handoffs.insert(id, inbound);
@@ -113,7 +125,11 @@ pub(super) fn transfer_worker_websocket_handoff(
     // The response now owns cleanup. Transfer the frame channel and request
     // ownership together so request retirement cannot close a returned socket.
     owner.sockets.lock().unwrap().retain(|opened| *opened != id);
-    Some(WorkerWebSocket { id, inbound })
+    Some(WorkerWebSocket {
+        id,
+        inbound,
+        keep_pull: false,
+    })
 }
 
 /// Close every isolate-polled socket a finished request opened.
@@ -589,9 +605,15 @@ pub(super) fn op_ws_next(
             return Ok(WsPull::Close(1006, "socket is not registered".into(), false).encode());
         };
         let mut queue = queue.lock().await;
-        Ok(queue
-            .recv()
-            .await
+        let frame = queue.recv().await;
+        // The endpoint stays reachable until its terminal is consumed: a text
+        // queued ahead of a close must still deliver that close on the next
+        // call instead of finding no queue and reporting a synthetic 1006.
+        // The request's retirement cleans up whatever never consumes one.
+        if matches!(&frame, None | Some(WsPull::Close(..))) {
+            ws_pull_unregister(id);
+        }
+        Ok(frame
             .unwrap_or_else(|| WsPull::Close(1006, String::new(), false))
             .encode())
     });
@@ -686,6 +708,25 @@ pub(super) fn op_ws_connect(
     rv.set(promise_for(scope, async_id));
 }
 
+/// Track a successful bind for request retirement: the caller's own id, and
+/// the joined target, belong to the joining request — but only when the bind
+/// is request-owned. A Durable Object caller (non-empty `cell`) owns its
+/// sockets through the cell, so tracking the joined target under the
+/// request would close the peer when the request ends. Same rule for both
+/// ids: only an empty cell tracks.
+pub(crate) fn track_bind_for_retirement(
+    sockets: &std::sync::Mutex<Vec<u64>>,
+    id: u64,
+    target_id: u64,
+    cell: &str,
+) {
+    if cell.is_empty() {
+        let mut sockets = sockets.lock().unwrap();
+        sockets.push(id);
+        sockets.push(target_id);
+    }
+}
+
 /// Join this isolate's client socket to a Durable Object socket that a
 /// subrequest already upgraded. The cell end lives in another isolate, so
 /// the host carries each direction: it is the same route an external client
@@ -757,8 +798,19 @@ pub(super) fn op_ws_bind_target(
     let recording = ws_recording_owner(&cell, &owner);
     let (pull_tx, pull_rx) = ws_pull_channel();
     ws_pull_register(id, pull_rx, recording.clone());
-    if cell.is_empty() {
-        owner.sockets.lock().unwrap().push(id);
+    // Tracked for retirement under the same rule for both ids: a Durable
+    // Object caller owns its sockets through the cell, so only
+    // request-owned binds track the joined target — tracking it for a cell
+    // bind would close the peer when the request ends.
+    track_bind_for_retirement(&owner.sockets, id, target.id, &cell);
+    // The target endpoint outlives this request for a cell-owned bind: it is
+    // not tracked for retirement, so record the cell as its cleanup scope
+    // now and let cell shutdown sweep it by scope. The read owner keeps the
+    // preparing request, so the loaded worker's `op_ws_next` stays readable
+    // wherever its next poll runs. Request-owned binds keep the preparing
+    // request's owner, which retirement reclaims.
+    if !cell.is_empty() {
+        ws_pull_set_cleanup_scope(target.id, &cell);
     }
     // Registered here, on the JS thread, so a frame sent between this op and
     // the pipe task buffers as a pending frame instead of being dropped for

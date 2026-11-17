@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): WebSocket join tokens. Apache-2.0.
+// Modified by ryuzcorp (ryuzcorp/celld): WebSocket join tokens; joinable targets for loaded-worker 101s (upstream #305). Apache-2.0.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! The HTTP stream registry: request and response bodies that cross the host
@@ -1744,11 +1744,34 @@ pub(crate) fn claim_http_stream(stream_id: u64) -> Option<HttpStreamClaim> {
     http_stream_service().claim(stream_id)
 }
 
+/// A loaded worker's own 101 as a joinable target for the caller isolate.
+/// The handoff's socket is registered under its isolate scope, so the token
+/// join verifies exactly as a cell target's does; the stashed input-queue
+/// sender lets the pipe task deliver the caller's frames to the loaded
+/// socket. `None` — no target — when the socket is already gone, and the
+/// caller then sees a null webSocket as before.
+fn joinable_worker_target(
+    worker: crate::ws_registry::WorkerWebSocket,
+) -> Option<crate::engine_api::WsTarget> {
+    use crate::ws_registry::{ws_mint_bind_token, ws_registered_scope, ws_stash_join_handoff};
+    let id = worker.id();
+    let scope = ws_registered_scope(id)?;
+    let bind = ws_mint_bind_token(id)?;
+    ws_stash_join_handoff(worker);
+    Some(crate::engine_api::WsTarget {
+        id,
+        scope,
+        tunnel: None,
+        bind: Some(bind),
+    })
+}
+
 /// Encode a host response for the JS side. A text body crosses as a
 /// JS string (cheap, lossless), binary as a byte array, and a streaming body
 /// by id — serializing a Vec<u8> as a JSON number array is the dominant cost
 /// for real DO responses. `ws_target` is carried by the paths that can answer
-/// with a WebSocket upgrade: a Durable Object call and a service-binding call.
+/// with a WebSocket upgrade: a Durable Object call, a service-binding call,
+/// and a loaded-worker fetch.
 pub(crate) fn encode_http_response(
     mut response: HttpResponse,
     ws_target: bool,
@@ -1759,16 +1782,21 @@ pub(crate) fn encode_http_response(
         "headers": response.headers,
     });
     if ws_target {
-        let target = match response.websocket.as_ref() {
+        let target = match response.websocket.take() {
             Some(HttpResponseWebSocket::Cell(target)) if target.tunnel.is_none() => {
-                let mut target = target.clone();
+                let mut target = target;
                 // Mint the join token the caller's bind (or the next proxy's
                 // pass-through) must present. No metadata — an already
                 // released socket — mints nothing, and the join fails closed.
                 target.bind = crate::js::ws_mint_bind_token(target.id);
                 Some(target)
             }
-            Some(HttpResponseWebSocket::Cell(target)) => Some(target.clone()),
+            Some(HttpResponseWebSocket::Cell(target)) => Some(target),
+            // A loaded worker's own 101: the socket lives in the loaded
+            // isolate, so the caller joins it through a bind token plus the
+            // stashed input-queue sender, exactly like a cell target (the
+            // pipe task takes the sender when the caller binds).
+            Some(HttpResponseWebSocket::Worker(worker)) => joinable_worker_target(worker),
             _ => None,
         };
         obj["wsTarget"] = serde_json::json!(target);
