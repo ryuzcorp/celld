@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): staged activation.
+// Modified by ryuzcorp (ryuzcorp/celld): staged activation; dev-store single-writer group commit (upstream #310).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! The persistent object store for `celld dev`.
@@ -22,20 +22,54 @@ use object_store::{
     ListResult, MultipartUpload, ObjectMeta, ObjectStore, PutMode, PutMultipartOptions, PutOptions,
     PutPayload, PutResult,
 };
-use rusqlite::{params, Connection, OptionalExtension as _, TransactionBehavior};
+use rusqlite::{params, Connection, OptionalExtension as _, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::fmt;
 use std::path::{Path as FsPath, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, SystemTime};
+use tokio::sync::oneshot;
 
 const STORE: &str = "celld development store";
 
 #[derive(Clone, Debug)]
 pub(crate) struct LocalStore {
     database: PathBuf,
+    writer: Arc<StoreWriter>,
 }
+
+/// The dev store's single writer (upstream #310).
+///
+/// Every `put` funnels through one thread, one connection, and one queued
+/// batch per transaction. Concurrent writers used to pile onto the file with
+/// one connection and `Immediate` transaction each, losing the SQLite lock
+/// lottery into `busy_timeout` sleeps: throughput collapsed toward one fsync
+/// per write and unlucky uploads stalled seconds past the durability budget
+/// (`DurabilityUnproven` under fan-out). Draining whatever is already queued
+/// costs nothing when idle (a batch of one is today's single PUT) and shares
+/// one commit fsync under load.
+#[derive(Debug)]
+struct StoreWriter {
+    queue: mpsc::Sender<PutRequest>,
+    /// Batches committed so far; the regression test below reads it.
+    batches: Arc<AtomicUsize>,
+}
+
+/// One queued PUT for the store's writer thread.
+struct PutRequest {
+    key: String,
+    body: Bytes,
+    options: PutOptions,
+    modified_ms: i64,
+    reply: oneshot::Sender<object_store::Result<PutResult>>,
+}
+
+/// Rows per writer transaction. Bounds one commit's hold on the file against
+/// concurrent readers and the supervisor's reload writes; a deeper queue
+/// simply takes another transaction.
+const WRITER_BATCH_ROWS: usize = 1024;
 
 #[derive(Debug)]
 struct StoredObject {
@@ -57,7 +91,20 @@ struct StoredAttribute {
 impl LocalStore {
     pub(crate) fn open(database: impl AsRef<FsPath>) -> object_store::Result<Self> {
         let database = database.as_ref().to_path_buf();
-        let store = Self { database };
+        // The writer thread ends when the last store handle drops: its
+        // receive loop breaks once every sender is gone.
+        let (queue, rx) = mpsc::channel();
+        let writer_database = database.clone();
+        let writer = Arc::new(StoreWriter {
+            queue,
+            batches: Arc::new(AtomicUsize::new(0)),
+        });
+        let writer_thread = writer.clone();
+        std::thread::Builder::new()
+            .name("celld-dev-store".to_string())
+            .spawn(move || write_loop(&writer_database, rx, &writer_thread))
+            .map_err(db_error)?;
+        let store = Self { database, writer };
         let connection = store.connect()?;
         connection
             .pragma_update(None, "journal_mode", "WAL")
@@ -138,56 +185,172 @@ impl LocalStore {
         body: Bytes,
         options: PutOptions,
     ) -> object_store::Result<PutResult> {
-        let attributes = encode_attributes(&options.attributes)?;
         let modified_ms = crate::asyncrt::wall_ms();
         let mut connection = self.connect()?;
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(db_error)?;
-        let current = transaction
-            .query_row("SELECT etag FROM objects WHERE key = ?1", [&key], |row| {
-                row.get::<_, i64>(0)
-            })
-            .optional()
-            .map_err(db_error)?;
-        match options.mode {
-            PutMode::Overwrite => {}
-            PutMode::Create if current.is_some() => return Err(already_exists(&key)),
-            PutMode::Create => {}
-            PutMode::Update(version) => {
-                let current = current.map(|etag| etag.to_string());
-                if current.as_deref().is_none() || version.e_tag.as_deref() != current.as_deref() {
-                    return Err(precondition(&key));
-                }
+        let result = apply_put(&transaction, &key, &body, &options, modified_ms)?;
+        transaction.commit().map_err(db_error)?;
+        Ok(result)
+    }
+}
+
+/// One row of a dev-store write, inside the caller's transaction: the
+/// conditional check, the ETag draw, and the upsert. Shared by the
+/// single-PUT path and the writer thread's batches so both enforce the same
+/// conflict rule.
+fn apply_put(
+    transaction: &Transaction,
+    key: &str,
+    body: &[u8],
+    options: &PutOptions,
+    modified_ms: i64,
+) -> object_store::Result<PutResult> {
+    let attributes = encode_attributes(&options.attributes)?;
+    let current = transaction
+        .query_row("SELECT etag FROM objects WHERE key = ?1", [key], |row| {
+            row.get::<_, i64>(0)
+        })
+        .optional()
+        .map_err(db_error)?;
+    match &options.mode {
+        PutMode::Overwrite => {}
+        PutMode::Create if current.is_some() => return Err(already_exists(key)),
+        PutMode::Create => {}
+        PutMode::Update(version) => {
+            let current = current.map(|etag| etag.to_string());
+            if current.as_deref().is_none() || version.e_tag.as_deref() != current.as_deref() {
+                return Err(precondition(key));
             }
         }
-        let etag = transaction
-            .query_row(
-                "UPDATE store_sequence SET next_etag = next_etag + 1
-                 WHERE singleton = 1 RETURNING next_etag - 1",
-                [],
-                |row| row.get::<_, i64>(0),
-            )
-            .map_err(db_error)?;
-        transaction
-            .execute(
-                "INSERT INTO objects(key, body, etag, modified_ms, attributes)
-                 VALUES (?1, ?2, ?3, ?4, ?5)
-                 ON CONFLICT(key) DO UPDATE SET
-                   body = excluded.body,
-                   etag = excluded.etag,
-                   modified_ms = excluded.modified_ms,
-                   attributes = excluded.attributes",
-                params![key, body.as_ref(), etag, modified_ms, attributes],
-            )
-            .map_err(db_error)?;
-        transaction.commit().map_err(db_error)?;
-        Ok(PutResult {
-            e_tag: Some(etag.to_string()),
-            version: None,
-        })
     }
+    let etag = transaction
+        .query_row(
+            "UPDATE store_sequence SET next_etag = next_etag + 1
+             WHERE singleton = 1 RETURNING next_etag - 1",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(db_error)?;
+    transaction
+        .execute(
+            "INSERT INTO objects(key, body, etag, modified_ms, attributes)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(key) DO UPDATE SET
+               body = excluded.body,
+               etag = excluded.etag,
+               modified_ms = excluded.modified_ms,
+               attributes = excluded.attributes",
+            params![key, body, etag, modified_ms, attributes],
+        )
+        .map_err(db_error)?;
+    Ok(PutResult {
+        e_tag: Some(etag.to_string()),
+        version: None,
+    })
+}
 
+/// The writer thread: one connection for the store's lifetime, one
+/// transaction per drained batch. A connection that cannot open (or
+/// configure) fails every queued PUT instead of hanging it; the loop then
+/// keeps failing newcomers until the last handle drops.
+fn write_loop(database: &FsPath, rx: mpsc::Receiver<PutRequest>, writer: &StoreWriter) {
+    let connection = Connection::open(database)
+        .map_err(db_error)
+        .and_then(|connection| configure_connection(&connection).map(|()| connection));
+    match connection {
+        Ok(mut connection) => batch_loop(&mut connection, rx, writer),
+        Err(error) => {
+            let message = error.to_string();
+            for request in rx {
+                let _ = request.reply.send(Err(message_error(message.clone())));
+            }
+        }
+    }
+}
+
+fn batch_loop(connection: &mut Connection, rx: mpsc::Receiver<PutRequest>, writer: &StoreWriter) {
+    loop {
+        let first = match rx.recv() {
+            Ok(request) => request,
+            // Every sender is gone: the last store handle dropped.
+            Err(_) => return,
+        };
+        let mut batch = vec![first];
+        while batch.len() < WRITER_BATCH_ROWS {
+            match rx.try_recv() {
+                Ok(request) => batch.push(request),
+                // Empty and disconnected both mean nothing more is
+                // available right now; the next `recv` parks or ends.
+                Err(_) => break,
+            }
+        }
+        writer.batches.fetch_add(1, Ordering::SeqCst);
+        for (request, outcome) in apply_batch(connection, batch) {
+            let _ = request.reply.send(outcome);
+        }
+    }
+}
+
+/// One commit for the whole batch. A row that fails its own check fails
+/// alone behind a savepoint — as independent transactions do today — while
+/// the surviving rows still commit together. A failure to begin or commit
+/// the shared transaction fails every row; each caller retries its own
+/// upload, and PUTs are idempotent.
+fn apply_batch(
+    connection: &mut Connection,
+    batch: Vec<PutRequest>,
+) -> Vec<(PutRequest, object_store::Result<PutResult>)> {
+    let transaction = match connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(db_error)
+    {
+        Ok(transaction) => transaction,
+        Err(error) => {
+            let message = error.to_string();
+            return batch
+                .into_iter()
+                .map(|request| (request, Err(message_error(message.clone()))))
+                .collect();
+        }
+    };
+    let mut outcomes = Vec::with_capacity(batch.len());
+    for request in batch {
+        let outcome = (|| {
+            transaction
+                .execute_batch("SAVEPOINT batch_row")
+                .map_err(db_error)?;
+            let outcome = apply_put(
+                &transaction,
+                &request.key,
+                &request.body,
+                &request.options,
+                request.modified_ms,
+            );
+            match &outcome {
+                Ok(_) => transaction
+                    .execute_batch("RELEASE batch_row")
+                    .map_err(db_error)?,
+                Err(_) => transaction
+                    .execute_batch("ROLLBACK TO batch_row")
+                    .map_err(db_error)?,
+            }
+            outcome
+        })();
+        outcomes.push((request, outcome));
+    }
+    if let Err(error) = transaction.commit().map_err(db_error) {
+        let message = error.to_string();
+        return outcomes
+            .into_iter()
+            .map(|(request, _)| (request, Err(message_error(message.clone()))))
+            .collect();
+    }
+    outcomes
+}
+
+impl LocalStore {
     fn copy_sync(&self, from: &str, to: &str, create: bool) -> object_store::Result<()> {
         let source = self.read(from)?;
         let attributes = decode_attributes(&source.attributes)?;
@@ -234,12 +397,30 @@ impl ObjectStore for LocalStore {
         payload: PutPayload,
         options: PutOptions,
     ) -> object_store::Result<PutResult> {
-        let store = self.clone();
-        let key = location.to_string();
-        let body: Bytes = payload.into();
-        crate::asyncrt::blocking(move || store.put_sync(key, body, options))
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let request = PutRequest {
+            key: location.to_string(),
+            body: payload.into(),
+            options,
+            modified_ms: crate::asyncrt::wall_ms(),
+            reply: reply_tx,
+        };
+        // The writer thread owns the only write connection. `send` never
+        // blocks, and it fails only after the thread panicked — a bug, never
+        // a store state — so fall back to today's direct PUT rather than
+        // fail every write from here on.
+        if let Err(failed) = self.writer.queue.send(request) {
+            let request = failed.0;
+            let store = self.clone();
+            return crate::asyncrt::blocking(move || {
+                store.put_sync(request.key, request.body, request.options)
+            })
             .await
-            .map_err(db_error)?
+            .map_err(db_error)?;
+        }
+        reply_rx
+            .await
+            .map_err(|_| message_error("dev store writer stopped"))?
     }
 
     async fn put_multipart_opts(
@@ -569,5 +750,184 @@ fn precondition(path: &str) -> Error {
     Error::Precondition {
         path: path.to_string(),
         source: Box::new(std::io::Error::other("the ETag does not match")),
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::disallowed_methods)] // Test tempdirs spawn burst writers outside the execution boundary.
+mod tests {
+    use super::*;
+    use object_store::UpdateVersion;
+
+    fn open_store() -> (tempfile::TempDir, LocalStore) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalStore::open(dir.path().join("objects.sqlite3")).unwrap();
+        (dir, store)
+    }
+
+    fn put_mode(mode: PutMode) -> PutOptions {
+        PutOptions {
+            mode,
+            ..PutOptions::default()
+        }
+    }
+
+    async fn body_of(store: &LocalStore, key: &str) -> Vec<u8> {
+        let location: Path = key.to_string().into();
+        store
+            .get(&location)
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap()
+            .to_vec()
+    }
+
+    /// Upstream #310: one barrier-synchronized burst of 64 PUTs lands every
+    /// row and commits in a handful of batches, not one transaction per PUT.
+    /// The bound has 4x margin over the observed 1-4; without the writer the
+    /// same burst is 64 separate commits.
+    #[test]
+    fn writer_batches_one_burst_into_few_commits() {
+        let runtime = crate::asyncrt::shared_test_runtime();
+        runtime.block_on(async {
+            let (_dir, store) = open_store();
+            let store = Arc::new(store);
+            let barrier = Arc::new(tokio::sync::Barrier::new(64));
+            let mut tasks = Vec::new();
+            for i in 0u8..64 {
+                let (store, barrier) = (store.clone(), barrier.clone());
+                tasks.push(tokio::spawn(async move {
+                    barrier.wait().await;
+                    let location: Path = format!("k{i:03}").into();
+                    store
+                        .put(&location, PutPayload::from(Bytes::from(vec![i; 64])))
+                        .await
+                        .unwrap();
+                }));
+            }
+            for task in tasks {
+                task.await.unwrap();
+            }
+            for i in 0u8..64 {
+                assert_eq!(
+                    body_of(&store, &format!("k{i:03}")).await,
+                    vec![i; 64],
+                    "every row of the burst lands intact"
+                );
+            }
+            let batches = store.writer.batches.load(Ordering::SeqCst);
+            assert!(
+                (1..=16).contains(&batches),
+                "one burst shares commits: {batches} batches for 64 PUTs"
+            );
+        });
+    }
+
+    /// The shared transaction preserves each row's own conflict rule: a
+    /// duplicate Create and a stale Update fail alone while the surviving
+    /// rows commit together.
+    #[test]
+    fn writer_batch_preserves_row_conflicts() {
+        let (_dir, store) = open_store();
+        let mut connection = store.connect().unwrap();
+        let request = |key: &str, body: &[u8], options: PutOptions| PutRequest {
+            key: key.to_string(),
+            body: Bytes::from(body.to_vec()),
+            options,
+            modified_ms: 1,
+            reply: oneshot::channel().0,
+        };
+        let outcomes = apply_batch(
+            &mut connection,
+            vec![
+                request("k", b"a", put_mode(PutMode::Create)),
+                request("k", b"b", put_mode(PutMode::Create)),
+                request(
+                    "k",
+                    b"c",
+                    put_mode(PutMode::Update(UpdateVersion {
+                        e_tag: Some("stale".to_string()),
+                        version: None,
+                    })),
+                ),
+                request("k", b"d", put_mode(PutMode::Overwrite)),
+            ],
+        );
+        assert!(outcomes[0].1.is_ok());
+        assert!(matches!(outcomes[1].1, Err(Error::AlreadyExists { .. })));
+        assert!(matches!(outcomes[2].1, Err(Error::Precondition { .. })));
+        assert!(outcomes[3].1.is_ok());
+        drop(outcomes);
+        let location: Path = "k".to_string().into();
+        let object = store.get(&location);
+        let runtime = crate::asyncrt::shared_test_runtime();
+        runtime.block_on(async {
+            assert_eq!(object.await.unwrap().bytes().await.unwrap().to_vec(), b"d");
+        });
+    }
+
+    /// Concurrent duplicate Creates have exactly one winner, and an Update
+    /// on a read-back ETag succeeds while a stale one is refused.
+    #[test]
+    fn concurrent_conditional_puts_stay_correct() {
+        let runtime = crate::asyncrt::shared_test_runtime();
+        runtime.block_on(async {
+            let (_dir, store) = open_store();
+            let location: Path = "k".to_string().into();
+            let create = || {
+                let store = &store;
+                let location = &location;
+                async move {
+                    store
+                        .put_opts(
+                            location,
+                            PutPayload::from(Bytes::from(b"x".to_vec())),
+                            put_mode(PutMode::Create),
+                        )
+                        .await
+                }
+            };
+            let results = futures_util::future::join_all([create(), create(), create()]).await;
+            assert_eq!(
+                results.iter().filter(|r| r.is_ok()).count(),
+                1,
+                "exactly one duplicate Create wins"
+            );
+            assert!(
+                results
+                    .iter()
+                    .all(|r| r.is_ok() || matches!(r, Err(Error::AlreadyExists { .. }))),
+                "losers fail as conflicts, never as store errors"
+            );
+            let head = store.head(&location).await.unwrap();
+            let good = store
+                .put_opts(
+                    &location,
+                    PutPayload::from(Bytes::from(b"z".to_vec())),
+                    put_mode(PutMode::Update(UpdateVersion {
+                        e_tag: head.e_tag,
+                        version: None,
+                    })),
+                )
+                .await;
+            assert!(good.is_ok(), "an Update on the read-back ETag lands");
+            let stale = store
+                .put_opts(
+                    &location,
+                    PutPayload::from(Bytes::from(b"w".to_vec())),
+                    put_mode(PutMode::Update(UpdateVersion {
+                        e_tag: Some("stale".to_string()),
+                        version: None,
+                    })),
+                )
+                .await;
+            assert!(
+                matches!(stale, Err(Error::Precondition { .. })),
+                "a stale ETag is refused"
+            );
+            assert_eq!(body_of(&store, "k").await, b"z");
+        });
     }
 }
