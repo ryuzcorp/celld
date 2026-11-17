@@ -1,0 +1,7 @@
+{
+  "name": "cfw-exports",
+  "main": "worker.js",
+  "compatibility_date": "2026-01-01",
+  "no_bundle": true,
+  "worker_loaders": [{ "binding": "LOADER" }]
+}

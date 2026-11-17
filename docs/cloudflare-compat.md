@@ -1,4 +1,4 @@
-<!-- Modified by ryuzcorp (ryuzcorp/celld): node:crypto scrypt; cloned streaming bodies; cross-isolate RPC stubs and streams; per-node Workers Cache API; receiver-held RPC streams; AbortSignal.timeout is unreferenced (upstream #306); loader 101 webSocket target (upstream #305). -->
+<!-- Modified by ryuzcorp (ryuzcorp/celld): node:crypto scrypt; cloned streaming bodies; cross-isolate RPC stubs and streams; per-node Workers Cache API; receiver-held RPC streams; AbortSignal.timeout is unreferenced (upstream #306); loader 101 webSocket target (upstream #305); loader sibling cloudflare:workers imports (upstream #304). -->
 # Cloudflare compatibility
 
 This page lists only the differences from the linked Cloudflare APIs. An entry
@@ -80,6 +80,9 @@ An unsupported feature that does not cause an error is a defect.
 
 Only the binding types in the [services table](#services) are available.
 
+In a Worker Loader bundle (`env.LOADER`), a `cloudflare:workers` name
+imported only by a non-entry chunk still resolves: external stubs cover the
+union of the main module's and every sibling's imports.
 ### [Context](https://developers.cloudflare.com/workers/runtime-apis/context/)
 
 - `passThroughOnException()` has no effect because celld has no CDN fallback.
