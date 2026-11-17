@@ -1,3 +1,4 @@
+// Modified by ryuzcorp (ryuzcorp/celld): facet adoption drops the restored flag (upstream #292).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! Isolate bootstrap: what a fresh context needs before user code runs.
@@ -929,7 +930,6 @@ pub(super) struct EmbeddedStartup {
     pub id_sc: Vec<u8>,
     pub props_sc: Vec<u8>,
     pub path: std::path::PathBuf,
-    pub restored: bool,
 }
 
 pub(super) fn adopt_embedded_cell(
@@ -940,15 +940,8 @@ pub(super) fn adopt_embedded_cell(
     startup: EmbeddedStartup,
     compat: Compat,
 ) -> Result<Option<i64>> {
-    storage::open_embedded(
-        cell,
-        parent,
-        name,
-        &startup.path,
-        startup.restored,
-        compat.sqlite_vec,
-    )
-    .context("facet storage open failed")?;
+    storage::open_embedded(cell, parent, name, &startup.path, compat.sqlite_vec)
+        .context("facet storage open failed")?;
     let alarm = finish_cell_adoption(tc, cell, true)?;
     let depth = parent.facet_path.len() + 1;
     // Decode in the loaded isolate and install the value directly. A JSON
