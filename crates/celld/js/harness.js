@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): ctx.container.images; clone() of streaming and disturbed bodies; __celld$do on the service-binding RPC path; container exec pty/resize; cross-isolate RPC stubs and streams; container exec AbortSignal; test-only fake kill completion; exec reads survive their subscribing event; context end aborts finished uploads; tenant egress policy; D1 export; D1 export operator gate; D1 batch; test-only fake close/signal completion; binding-forgery enforcement; Queue/KV operator fetch gate; Queue/KV stub-RPC allowlists; Queue DLQ host-op forward; Queue send/DLQ cell-side validation; trusted-RPC target pin; Queue operator internal re-checks; receiver-held RPC streams.; dropped timer ops fire their callback early so sleepers settle (upstream #317); unrefed AbortSignal.timeout timer (upstream #306); loader-fetch 101 webSocket join (upstream #305); nodejs process.env population (upstream #296); writable request /tmp files (upstream #280); Worker WebSocket close codes (upstream #279); Symbol.dispose on plain RPC results (upstream #260); workflow alarm forgets budget-orphaned drives (upstream #299).
+// Modified by ryuzcorp (ryuzcorp/celld): ctx.container.images; clone() of streaming and disturbed bodies; __celld$do on the service-binding RPC path; container exec pty/resize; cross-isolate RPC stubs and streams; container exec AbortSignal; test-only fake kill completion; exec reads survive their subscribing event; context end aborts finished uploads; tenant egress policy; D1 export; D1 export operator gate; D1 batch; test-only fake close/signal completion; binding-forgery enforcement; Queue/KV operator fetch gate; Queue/KV stub-RPC allowlists; Queue DLQ host-op forward; Queue send/DLQ cell-side validation; trusted-RPC target pin; Queue operator internal re-checks; receiver-held RPC streams.; dropped timer ops fire their callback early so sleepers settle (upstream #317); unrefed AbortSignal.timeout timer (upstream #306); loader-fetch 101 webSocket join (upstream #305); nodejs process.env population (upstream #296); writable request /tmp files (upstream #280); Worker WebSocket close codes (upstream #279); Symbol.dispose on plain RPC results (upstream #260); workflow alarm forgets budget-orphaned drives (upstream #299); env.CELLD_NODE host-wins re-assertion on loader env (upstream #219).
 // The DO object model and the Cloudflare-compatible runtime surface, run
 // once per isolate by `js.rs::install_harness` after the Web-API prelude.
 // Lived as a 4,000-line raw string inside js.rs until 2026-07-29; it is a
@@ -3915,6 +3915,17 @@ __celld.__installLoaderEnv = (bytes, routes) => {
     return v;
   };
   Object.assign(__cell.env, revive(env));
+  // The host value wins over anything the loader's props smuggled in: the
+  // node identity names where this isolate runs, and a loaded Worker that
+  // could set it could report any region it likes (denoland/celld#219).
+  // `__cell.node` is the same internal routing identity `build_env`
+  // installs from, so this re-assertion cannot drift from it. Isolates the
+  // host built without an identity (dynamic Workers) keep what the loader
+  // passed: they run wherever their loader runs, so its value is already
+  // the honest one.
+  if (__celld.__cell.node !== undefined && __celld.__cell.node !== "") {
+    __cell.env[__celld.__nodeIdentityEnv] = __celld.__cell.node;
+  }
 };
 // RPC marshalling: V8 structured clone (Workerd js-rpc semantics), so
 // undefined, Date, Map, Set, BigInt, typed arrays, and cycles survive.

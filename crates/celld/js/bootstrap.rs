@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): facet adoption drops the restored flag (upstream #292); nodejs process.env population (upstream #296).
+// Modified by ryuzcorp (ryuzcorp/celld): facet adoption drops the restored flag (upstream #292); nodejs process.env population (upstream #296); env.CELLD_NODE node identity (upstream #219).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! Isolate bootstrap: what a fresh context needs before user code runs.
@@ -695,6 +695,24 @@ pub(super) fn build_env(scope: &mut v8::PinScope, config: &WorkerConfig) -> Resu
         for (name, value) in vars {
             lines.push_str(&format!("e[{:?}] = {:?};\n", name, value));
         }
+        // The node's own identity, after every deployment binding: the one
+        // per-node value a bundle may learn, read-only (denoland/celld#219).
+        // Deployments cannot bind this name (see the reservation in
+        // `read_project`), so the host value never shadows a binding and no
+        // binding shadows it. A bundle that only needs to refuse a
+        // credential minted for another region reads this, not placement:
+        // every cell scope still routes through the host. Dynamically loaded
+        // Workers carry no node in their config, so they get no injection:
+        // their loader's props pass through as before, and
+        // `__installLoaderEnv` only re-asserts the host value where the
+        // isolate has one of its own.
+        if !config.node.is_empty() {
+            lines.push_str(&format!(
+                "e[{:?}] = {:?};\n",
+                crate::deploy::NODE_IDENTITY_ENV,
+                config.node
+            ));
+        }
         if let Some(name) = asset_binding {
             lines.push_str(&format!(
                 "e[{:?}] = __celld.__makeAssetsBinding({:?});\n",
@@ -708,6 +726,12 @@ pub(super) fn build_env(scope: &mut v8::PinScope, config: &WorkerConfig) -> Resu
         for name in &config.loader_bindings {
             lines.push_str(&format!("e[{:?}] = __celld.__makeLoader();\n", name));
         }
+        // The reserved name, for `__installLoaderEnv`'s host-wins
+        // re-assertion below. One source of truth: the Rust reservation.
+        lines.push_str(&format!(
+            "__celld.__nodeIdentityEnv = {:?};\n",
+            crate::deploy::NODE_IDENTITY_ENV,
+        ));
         lines
     };
     run_internal_snippet(scope, &src).ok_or_else(|| anyhow!("env install failed"))?;
