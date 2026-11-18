@@ -9,7 +9,8 @@
 #              commit on `main` (reachable from `origin/main`)
 #   `push`     per architecture: refuse an already-published `<version>`
 #              (only a confirmed "not found" lets it publish), then run
-#              the Dockerfile's test stage, push the arch image, record
+#              the Dockerfile's test stage, push the arch image by digest
+#              only (no arch tags, so no namespace collision), record
 #              its digest, and package the matching release tarball by
 #              copying the binary and license files out of that digest
 #   `publish`  stitch the multi-arch tags from this run's validated arch
@@ -59,7 +60,9 @@ jobs:
         run: |
           set -euo pipefail
           # The tag names the release: v<semver> (stable or prerelease).
-          semver='(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(\-((0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)(\.(0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*))*))?(\+([0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*))?'
+          # Build metadata (+...) is refused outright: Docker tags forbid
+          # '+', so such a version could never publish.
+          semver='(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(\-((0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)(\.(0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*))*))?'
           if [[ ${GITHUB_REF_NAME} =~ ^v${semver}$ ]]; then
             version="${GITHUB_REF_NAME#v}"
             major="${BASH_REMATCH[1]}"
@@ -90,10 +93,8 @@ jobs:
             echo "refusing tag $GITHUB_REF_NAME: $sha is not on origin/main" >&2
             exit 1
           fi
-          # SemVer build metadata (+...) is not a prerelease.
-          core="${version%%+*}"
           prerelease="false"
-          if [[ $core == *-* ]]; then
+          if [[ $version == *-* ]]; then
             prerelease="true"
           fi
           {
@@ -152,6 +153,9 @@ jobs:
           fi
           command -v jq >/dev/null 2>&1 || { echo "refusing: jq is required" >&2; exit 1; }
           cache="$image:buildcache-${{ matrix.suffix }}"
+          # Push by digest only: no arch tags are published, so a release
+          # tag can never collide with (or overwrite) a staging image.
+          # The never-overwrite check above stays on <version>.
           docker buildx build \
             --platform "${{ matrix.platform }}" \
             --build-arg "CELLO_COMMIT=$sha" \
@@ -163,20 +167,19 @@ jobs:
             --sbom=true \
             --cache-from "type=registry,ref=$cache" \
             --cache-to "type=registry,ref=$cache,mode=max" \
-            --tag "$image:$VERSION-${{ matrix.suffix }}" \
             --metadata-file /tmp/cello-metadata.json \
-            --push \
+            --output "type=image,name=$image,push-by-digest=true,name-canonical=true,push=true" \
             .
-          # Pin the package step to this run's pushed digest, not the tag,
-          # so the tarball cannot pick up anything pushed under the tag later.
-          digest=$(jq -r '.containerimage.digest // empty' /tmp/cello-metadata.json)
+          # Pin the package step to this run's pushed digest, not any tag,
+          # so the tarball cannot pick up anything pushed later.
+          digest=$(jq -r '."containerimage.digest" // empty' /tmp/cello-metadata.json)
           hex="${digest#sha256:}"
           case "$digest" in sha256:*) ;; *) echo "refusing: bad arch digest: $digest" >&2; exit 1 ;; esac
           [ "${#hex}" -eq 64 ] || { echo "refusing: bad arch digest: $digest" >&2; exit 1; }
           case "$hex" in *[!0-9a-f]*) echo "refusing: bad arch digest: $digest" >&2; exit 1 ;; esac
           echo "arch-digest=$digest" >> "$GITHUB_OUTPUT"
           # The publish job stitches the index from this digest (via the
-          # uploaded artifact), not from the arch tag.
+          # uploaded artifact), not from any tag.
           mkdir -p dist
           printf '%s' "$digest" > "dist/arch-digest-${{ matrix.suffix }}.txt"
       # The tarball is copied out of this run's pushed arch image (by digest),
@@ -192,6 +195,7 @@ jobs:
           ref="$image@$ARCH_DIGEST"
           rm -rf stage
           mkdir -p stage dist
+          docker pull --platform "${{ matrix.platform }}" "$ref"
           ctr=$(docker create --platform "${{ matrix.platform }}" "$ref")
           trap 'docker rm "$ctr" >/dev/null' EXIT
           docker cp "$ctr:/usr/local/bin/cello" stage/cello
@@ -240,6 +244,7 @@ jobs:
           PRERELEASE: ${{ needs.verify.outputs.prerelease }}
           MINOR_TAG: ${{ needs.verify.outputs.minor-tag }}
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
           image="ghcr.io/ryuzcorp/cello"
