@@ -5,7 +5,7 @@
 // prohibits elsewhere.
 #![allow(clippy::disallowed_methods, clippy::disallowed_types)]
 
-//! The production execution facade for celld.
+//! The production execution facade for cello.
 //!
 //! This module delegates tasks and timers to Tokio and obtains nondeterministic
 //! process values from the host. A cfg-gated build can replace this module

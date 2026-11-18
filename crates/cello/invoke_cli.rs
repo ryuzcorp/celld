@@ -3,17 +3,17 @@
 // Operator commands read operator-owned host paths and file descriptors.
 #![allow(clippy::disallowed_methods)]
 
-//! `celld invoke`: send one HTTP request to a staged script version.
+//! `cello invoke`: send one HTTP request to a staged script version.
 //!
-//! A version uploaded with `celld deploy --no-activate` serves no traffic
-//! until `celld activate` names it. This command delivers one request to a
+//! A version uploaded with `cello deploy --no-activate` serves no traffic
+//! until `cello activate` names it. This command delivers one request to a
 //! staged version on one node of the fleet — served by that version's code
 //! with its declared bindings against the real data — so an operator runs
 //! a migration endpoint before the activation that would serve it. It
 //! moves no pointer and changes nothing serving: the staged code answers
 //! this request and this request only.
 //!
-//! Like `celld d1 execute`, it finds a live node through the bucket's node
+//! Like `cello d1 execute`, it finds a live node through the bucket's node
 //! leases and signs the request with the fleet secret; the node also
 //! requires the operator token when `CELLO_OPERATOR_TOKEN` is set. The
 //! request runs to completion server-side even if this command stops
@@ -85,7 +85,7 @@ impl Command {
     ) -> anyhow::Result<Option<Self>> {
         let mut arguments = arguments.into_iter().peekable();
         let mut pins = Vec::new();
-        // Positionals come first, like `celld activate`: every leading
+        // Positionals come first, like `cello activate`: every leading
         // argument that is not a flag is a SCRIPT=VERSION pin.
         while let Some(argument) = arguments.peek() {
             if argument == "--help" || argument == "-h" || argument == "help" {
@@ -98,12 +98,12 @@ impl Command {
             pins.push(crate::deploy::parse_version_ref(&argument, "invoke")?);
         }
         if pins.is_empty() {
-            bail!("celld invoke needs at least one SCRIPT=VERSION pin");
+            bail!("cello invoke needs at least one SCRIPT=VERSION pin");
         }
         let mut seen = std::collections::BTreeSet::new();
         for pin in &pins {
             if !seen.insert(pin.script.clone()) {
-                bail!("celld invoke names script {:?} twice", pin.script);
+                bail!("cello invoke names script {:?} twice", pin.script);
             }
         }
         let mut target = None;
@@ -138,14 +138,14 @@ impl Command {
                     if fleet.consume(other, &mut value)? {
                         continue;
                     }
-                    bail!("unknown option: {other}; run `celld invoke --help` for usage")
+                    bail!("unknown option: {other}; run `cello invoke --help` for usage")
                 }
             }
         }
         if body.is_some() && body_file.is_some() {
-            bail!("celld invoke takes either --body or --body-file, not both");
+            bail!("cello invoke takes either --body or --body-file, not both");
         }
-        let path = path.ok_or_else(|| anyhow!("celld invoke needs --path /PATH"))?;
+        let path = path.ok_or_else(|| anyhow!("cello invoke needs --path /PATH"))?;
         if !path.starts_with('/') {
             bail!("--path takes an origin-form path starting with '/', not {path:?}");
         }
@@ -161,7 +161,7 @@ impl Command {
             }
             None if pins.len() == 1 => pins[0].script.clone(),
             None => bail!(
-                "celld invoke with more than one SCRIPT=VERSION needs --target SCRIPT to name the receiver"
+                "cello invoke with more than one SCRIPT=VERSION needs --target SCRIPT to name the receiver"
             ),
         };
         Ok(Some(Self {
@@ -265,7 +265,7 @@ pub async fn run(arguments: Vec<String>) -> anyhow::Result<()> {
         print_help();
         return Ok(());
     };
-    let storage = command.fleet.clone().resolve("celld invoke")?;
+    let storage = command.fleet.clone().resolve("cello invoke")?;
     let body = read_body(&command)?;
     let target = command
         .pins
@@ -318,13 +318,13 @@ pub async fn run(arguments: Vec<String>) -> anyhow::Result<()> {
 
 pub fn print_help() {
     let text = format!(
-        r#"celld invoke — send one HTTP request to a staged script version
+        r#"cello invoke — send one HTTP request to a staged script version
 
 USAGE:
-  celld invoke SCRIPT=VERSION [SCRIPT=VERSION...] --path PATH --bucket NAME
+  cello invoke SCRIPT=VERSION [SCRIPT=VERSION...] --path PATH --bucket NAME
 
-A version uploaded with `celld deploy --no-activate` serves no traffic
-until `celld activate` names it. This command delivers one request to
+A version uploaded with `cello deploy --no-activate` serves no traffic
+until `cello activate` names it. This command delivers one request to
 the staged version on one node of the fleet, served by that version's
 code with its declared bindings against the real data, so a migration
 endpoint runs before the activation that would serve it. It moves no

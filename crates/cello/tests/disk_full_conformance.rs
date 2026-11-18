@@ -69,7 +69,7 @@ fn copy_dir(src: &Path, dst: &Path) {
     }
 }
 
-/// A booted `celld dev` and its public address. Kills the child on drop.
+/// A booted `cello dev` and its public address. Kills the child on drop.
 struct TestNode {
     child: Child,
     public: String,
@@ -80,7 +80,7 @@ impl TestNode {
     fn boot(project: &Path) -> Self {
         // Bash ignores SIGXFSZ before exec so a clamped file-size limit
         // fails writes with EFBIG instead of killing the node; the ignore
-        // disposition survives exec into celld.
+        // disposition survives exec into cello.
         let mut child = Command::new("bash")
             .arg("-c")
             .arg("trap \"\" XFSZ; exec \"$0\" \"$@\"")
@@ -96,7 +96,7 @@ impl TestNode {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .expect("spawn celld dev");
+            .expect("spawn cello dev");
         let mut stdout = child.stdout.take().expect("piped stdout");
         let stderr = child.stderr.take().expect("piped stderr");
         std::thread::spawn(move || {
@@ -113,11 +113,11 @@ impl TestNode {
         node.public = poll_until("boot", Duration::from_secs(180), || {
             if let Some(status) = node.child.try_wait().expect("poll child") {
                 panic!(
-                    "celld dev exited during boot: {status}: {}",
+                    "cello dev exited during boot: {status}: {}",
                     announced_lines.lock().expect("announce lock").join("\n")
                 );
             }
-            let addr = announced(&announced_lines, "celld listening on ")?;
+            let addr = announced(&announced_lines, "cello listening on ")?;
             probe(&addr, "/health").then_some(addr)
         });
         node
@@ -237,7 +237,7 @@ fn clamp_files(node: &TestNode, soft: &str) {
 
 #[test]
 fn full_disk_keeps_reads_serving() {
-    let dir = fixture_tempdir("celld-disk-full-");
+    let dir = fixture_tempdir("cello-disk-full-");
     let app_project = dir.path().join("app");
     copy_dir(&fixture_dir(), &app_project);
     let node = TestNode::boot(&app_project);

@@ -1,5 +1,5 @@
 // Modified by ryuzcorp (ryuzcorp/celld): per-round fence credit (0062).
-// Modified by ryuzcorp (ryuzcorp/celld): ported from meln1k/celld: seal a dead lease that never opened a log (01522b3); lone-node repair backoff schedule; bucket-posture group commit: bucket session flavour, loss/witness predicates (0059).
+// Modified by ryuzcorp (ryuzcorp/celld): ported from meln1k/cello: seal a dead lease that never opened a log (01522b3); lone-node repair backoff schedule; bucket-posture group commit: bucket session flavour, loss/witness predicates (0059).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! Decision core for the in-fleet replicated log tier (design stage; not

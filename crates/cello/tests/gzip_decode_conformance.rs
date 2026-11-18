@@ -74,7 +74,7 @@ fn copy_dir(src: &Path, dst: &Path, gzip_port: u16) {
     .expect("write worker.js");
 }
 
-/// A booted `celld dev` and its address. Kills the child on drop, so a
+/// A booted `cello dev` and its address. Kills the child on drop, so a
 /// failing assertion cannot leak a server onto its port.
 struct TestNode {
     child: Child,
@@ -94,7 +94,7 @@ impl TestNode {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .expect("spawn celld dev");
+            .expect("spawn cello dev");
         let mut stdout = child.stdout.take().expect("piped stdout");
         let stderr = child.stderr.take().expect("piped stderr");
         std::thread::spawn(move || {
@@ -109,9 +109,9 @@ impl TestNode {
         };
         node.public = poll_until("boot", Duration::from_secs(120), || {
             if let Some(status) = node.child.try_wait().expect("poll child") {
-                panic!("celld dev exited during boot: {status}");
+                panic!("cello dev exited during boot: {status}");
             }
-            let addr = announced(&announced_lines, "celld listening on ")?;
+            let addr = announced(&announced_lines, "cello listening on ")?;
             probe(&addr, "/health").then_some(addr)
         });
         node
@@ -227,7 +227,7 @@ fn fetch_decompresses_gzip_transparently() {
     std::thread::spawn(move || serve_gzip(listener, 32));
 
     let fixture = fixture_dir();
-    let project = fixture_tempdir("celld-gzip-decode-");
+    let project = fixture_tempdir("cello-gzip-decode-");
     copy_dir(&fixture, project.path(), gzip_port);
     let node = TestNode::boot(project.path());
 

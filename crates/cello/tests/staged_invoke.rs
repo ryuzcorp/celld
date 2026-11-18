@@ -14,11 +14,11 @@
 //!
 //! Each test owns a hermetic fleet: a temp project serving app-v1 plus a
 //! helper-v1 deployed before boot (so the live graph resolves), a booted
-//! `celld dev` on it, and staged v2 versions uploaded in-process through
+//! `cello dev` on it, and staged v2 versions uploaded in-process through
 //! the same `deploy::build`/`write_staged` the CLI calls. The operator
 //! requests are real HTTP against the real binary, signed in-process with
 //! the fleet secret from the node's own store — the same bytes
-//! `celld invoke` would send. There are no fixed sleeps: every wait polls
+//! `cello invoke` would send. There are no fixed sleeps: every wait polls
 //! an observable condition with a deadline, and the server guard kills
 //! the child on every exit path.
 
@@ -88,7 +88,7 @@ fn copy_project(src: &str, dst: &Path) {
     }
 }
 
-/// A booted `celld dev` and its addresses. Kills the child on drop, so a
+/// A booted `cello dev` and its addresses. Kills the child on drop, so a
 /// failing assertion cannot leak a server onto its ports.
 struct TestNode {
     child: Child,
@@ -129,7 +129,7 @@ impl TestNode {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .expect("spawn celld dev");
+            .expect("spawn cello dev");
         let mut stdout = child.stdout.take().expect("piped stdout");
         let stderr = child.stderr.take().expect("piped stderr");
         std::thread::spawn(move || {
@@ -156,15 +156,15 @@ impl TestNode {
             poll_until(&format!("{name} boot"), Duration::from_secs(180), || {
                 if let Some(status) = node.child.try_wait().expect("poll child") {
                     panic!(
-                        "{name}: celld dev exited during boot: {status}: {}",
+                        "{name}: cello dev exited during boot: {status}: {}",
                         announced_lines.lock().expect("announce lock").join("\n")
                     );
                 }
-                let public = announced(&announced_lines, "celld listening on ")?;
+                let public = announced(&announced_lines, "cello listening on ")?;
                 if get_body(&public, "/version") != Some("app-v1".to_string()) {
                     return None;
                 }
-                let internal = announced(&announced_lines, "celld internal listening on ")?;
+                let internal = announced(&announced_lines, "cello internal listening on ")?;
                 Some((public, internal))
             });
         node
@@ -186,11 +186,11 @@ struct FleetStore {
 }
 
 impl FleetStore {
-    /// Prepare the store `celld dev` will open, with helper-v1 deployed:
+    /// Prepare the store `cello dev` will open, with helper-v1 deployed:
     /// the live app resolves its service binding through the helper's
     /// named pointer from the first adoption.
     fn prepare(project: &Path, helper_src: &Path) -> (Self, String) {
-        let state = project.join(".celld/dev");
+        let state = project.join(".cello/dev");
         std::fs::create_dir_all(&state).expect("state dir");
         let database = state.join("objects.sqlite3");
         let bucket = cello::dev::open_local_bucket(&database).expect("open dev bucket");
@@ -231,7 +231,7 @@ impl FleetStore {
         .expect("build")
     }
 
-    /// Upload one more staged version, like `celld deploy --no-activate`.
+    /// Upload one more staged version, like `cello deploy --no-activate`.
     fn stage(&self, project: &Path) -> String {
         let built = Self::build(project);
         let version = built.version.clone();
@@ -331,7 +331,7 @@ impl FleetStore {
     }
 
     /// The fleet secret plus the node to address: the test signs exactly
-    /// what `celld invoke` signs. Both appear once the node boots.
+    /// what `cello invoke` signs. Both appear once the node boots.
     fn signer(&self, name: &str) -> Signer {
         poll_until(&format!("{name} lease"), Duration::from_secs(120), || {
             let nodes = self.node_ids();
@@ -560,7 +560,7 @@ struct Fleet {
 impl Fleet {
     fn new(name: &str) -> Self {
         let temp = tempfile::Builder::new()
-            .prefix(&format!("celld-staged-invoke-{name}-"))
+            .prefix(&format!("cello-staged-invoke-{name}-"))
             .tempdir()
             .expect("tempdir");
         let project = temp.path().join("app");

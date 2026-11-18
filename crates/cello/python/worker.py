@@ -1,9 +1,9 @@
-# Python side of the celld Python Worker entrypoint.
+# Python side of the Cello Python Worker entrypoint.
 #
 # Adapted from workerd at commit da46ad950c54b19158c5ea5cb997a9727491ca17
 # (v1.20260926.1): src/pyodide/internal/setup_python_search_path.py and
 # `wrapper_func` in src/pyodide/internal/introspection.py. Copyright (c)
-# 2017-2026 Cloudflare, Inc. (Apache-2.0). Changed for celld: one module, the
+# 2017-2026 Cloudflare, Inc. (Apache-2.0). Changed for cello: one module, the
 # workerd session paths set up here, and no signal or snapshot handling.
 #
 # The same application sees the same `sys.path` and the same argument and

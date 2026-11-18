@@ -4,21 +4,21 @@
 #![allow(clippy::disallowed_methods)]
 // The KV listing is data; everything else it says is for a person.
 
-//! `celld kv` — read and write a deployed KV namespace.
+//! `cello kv` — read and write a deployed KV namespace.
 //!
 //! KV needs this command more than D1 does. A developer can reach a database
-//! through `env.DB` from a Worker they already wrote, so `celld d1` adds
+//! through `env.DB` from a Worker they already wrote, so `cello d1` adds
 //! migrations and convenience. Inspecting a namespace, seeding one, or clearing
 //! a bad key are operator tasks, and writing a throwaway Worker to do them is
 //! not an answer anybody accepts. This command is the operator surface for KV.
 //!
-//! It reaches a namespace the way `celld d1` reaches a database, over the
+//! It reaches a namespace the way `cello d1` reaches a database, over the
 //! machinery in [`crate::operator_cell`]: the node leases in the bucket find
 //! the fleet, the fleet secret signs the request, and `/runtime/<scope>`
 //! forwards to the owner.
 //!
 //! **The CLI implements no storage.** It transports a request and the cell
-//! decides — the same rule that keeps `celld d1` free of SQLite. The size split
+//! decides — the same rule that keeps `cello d1` free of SQLite. The size split
 //! for a large value, the expiry arithmetic and the visibility filter all live
 //! where the binding's do, so a key written here is a key the binding could
 //! have written.
@@ -136,7 +136,7 @@ pub async fn run(arguments: Vec<String>) -> anyhow::Result<()> {
         None => 0,
     };
     let scope = crate::js::kv_cell_scope(&command.namespace, shard);
-    let storage = command.fleet.clone().resolve("celld kv")?;
+    let storage = command.fleet.clone().resolve("cello kv")?;
     let namespace = Reachable::open(
         Fleet {
             bucket: &storage.bucket,
@@ -165,7 +165,7 @@ pub async fn run(arguments: Vec<String>) -> anyhow::Result<()> {
             let bytes = decode_bytes(&result)?;
             // Written to stdout as bytes, not as text. A namespace holds bytes,
             // and a value written from a Worker as an ArrayBuffer has no
-            // faithful string form — so `celld kv get` piped to a file gives
+            // faithful string form — so `cello kv get` piped to a file gives
             // back exactly what was stored.
             Output::new(Format::Text).bytes(&bytes)?;
         }
@@ -391,7 +391,7 @@ async fn bulk_export(
     writer: &mut impl std::io::Write,
 ) -> anyhow::Result<()> {
     // The whole namespace, in Wrangler's bulk-put shape, so the output of this
-    // command is the input of `celld kv bulk put`.
+    // command is the input of `cello kv bulk put`.
     let mut after = String::new();
     let mut wrote_row = false;
     writer.write_all(b"[\n").context("write the export")?;
@@ -464,7 +464,7 @@ async fn bulk_export_file(
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| std::path::Path::new("."));
     let mut temporary = tempfile::Builder::new()
-        .prefix(".celld-kv-export-")
+        .prefix(".cello-kv-export-")
         .tempfile_in(parent)
         .with_context(|| format!("create a temporary export beside {}", path.display()))?;
     {
@@ -599,7 +599,7 @@ enum Action {
     },
     Info,
     /// `bulk get` and `bulk put` move a whole namespace, which is what makes
-    /// `wrangler kv bulk get` -> `celld kv bulk put` a migration path off
+    /// `wrangler kv bulk get` -> `cello kv bulk put` a migration path off
     /// Cloudflare. The file format is Wrangler's: an array of
     /// `{key, value, expiration?, expiration_ttl?, metadata?, base64?}`.
     BulkGet {
@@ -638,19 +638,19 @@ impl Command {
                 // An option in the subcommand slot means the subcommand is
                 // missing, not that the option names one.
                 Some(other) if !other.starts_with('-') => {
-                    bail!("unknown `celld kv bulk` subcommand: {other}")
+                    bail!("unknown `cello kv bulk` subcommand: {other}")
                 }
-                _ => bail!("`celld kv bulk` needs `get`, `put`, or `delete`"),
+                _ => bail!("`cello kv bulk` needs `get`, `put`, or `delete`"),
             },
-            other => bail!("unknown `celld kv` subcommand: {other}"),
+            other => bail!("unknown `cello kv` subcommand: {other}"),
         };
         // The namespace is the `id` from `kv_namespaces`, verbatim. Upstream's
         // configuration carries no human-readable name beside it, so there is
-        // nothing else to resolve and celld invents no second key.
+        // nothing else to resolve and cello invents no second key.
         let namespace = arguments
             .next()
             .filter(|value| !value.starts_with('-'))
-            .ok_or_else(|| anyhow!("celld kv needs a namespace id"))?;
+            .ok_or_else(|| anyhow!("cello kv needs a namespace id"))?;
 
         let mut positional = Vec::new();
         let mut file = None;
@@ -686,13 +686,13 @@ impl Command {
                 "--prefix" => prefix = value("--prefix")?,
                 "--json" => json = true,
                 "--unsafe-public-advertise" => unsafe_public_advertise = true,
-                // celld has neither concept, and a flag that silently means
+                // Cello has neither concept, and a flag that silently means
                 // nothing is the gap the compatibility page forbids.
                 // `--local` and `--remote` select between miniflare's on-disk
                 // state and the account API; `--preview` selects a second
                 // namespace under `wrangler dev`.
                 flag @ ("--local" | "--remote" | "--preview") => bail!(
-                    "celld kv does not take {flag}: celld runs neither a local \
+                    "cello kv does not take {flag}: cello runs neither a local \
                      miniflare store nor a Cloudflare account, and it has no \
                      preview namespace. A namespace id addresses one namespace \
                      in one fleet."
@@ -706,7 +706,7 @@ impl Command {
                         continue;
                     }
                     if other.starts_with('-') {
-                        bail!("unknown option: {other}; run `celld kv --help` for usage")
+                        bail!("unknown option: {other}; run `cello kv --help` for usage")
                     }
                     positional.push(other.to_string());
                 }
@@ -716,7 +716,7 @@ impl Command {
         // a `get` would tell an operator they set an expiry that nothing wrote.
         let refuse = |flag: &str, set: bool| -> anyhow::Result<()> {
             if set {
-                bail!("`celld kv {verb}` takes no {flag}");
+                bail!("`cello kv {verb}` takes no {flag}");
             }
             Ok(())
         };
@@ -726,21 +726,21 @@ impl Command {
                 refuse("--ttl", expiration_ttl.is_some())?;
                 refuse("--metadata", metadata.is_some())?;
                 let [key] = positional.as_slice() else {
-                    bail!("celld kv get needs exactly one key");
+                    bail!("cello kv get needs exactly one key");
                 };
                 Action::Get { key: key.clone() }
             }
             "put" => {
                 let key = positional
                     .first()
-                    .ok_or_else(|| anyhow!("celld kv put needs a key"))?
+                    .ok_or_else(|| anyhow!("cello kv put needs a key"))?
                     .clone();
                 let inline = positional.get(1).cloned();
                 if inline.is_some() == file.is_some() {
-                    bail!("celld kv put requires exactly one of a value or --path");
+                    bail!("cello kv put requires exactly one of a value or --path");
                 }
                 if positional.len() > 2 {
-                    bail!("celld kv put takes one key and at most one value");
+                    bail!("cello kv put takes one key and at most one value");
                 }
                 Action::Put {
                     key,
@@ -754,14 +754,14 @@ impl Command {
             "delete" => {
                 refuse("--path", file.is_some())?;
                 if positional.is_empty() {
-                    bail!("celld kv delete needs at least one key");
+                    bail!("cello kv delete needs at least one key");
                 }
                 Action::Delete { keys: positional }
             }
             "list" => {
                 refuse("--path", file.is_some())?;
                 if !positional.is_empty() {
-                    bail!("celld kv list takes no positional arguments; use --prefix");
+                    bail!("cello kv list takes no positional arguments; use --prefix");
                 }
                 Action::List {
                     prefix,
@@ -771,7 +771,7 @@ impl Command {
             }
             "info" => {
                 if !positional.is_empty() {
-                    bail!("celld kv info takes no positional arguments");
+                    bail!("cello kv info takes no positional arguments");
                 }
                 Action::Info
             }
@@ -781,7 +781,7 @@ impl Command {
             "bulk-put" | "bulk-delete" => {
                 let path = file
                     .or_else(|| positional.first().map(PathBuf::from))
-                    .ok_or_else(|| anyhow!("celld kv {verb} needs a file"))?;
+                    .ok_or_else(|| anyhow!("cello kv {verb} needs a file"))?;
                 if verb == "bulk-put" {
                     Action::BulkPut { file: path }
                 } else {
@@ -806,17 +806,17 @@ impl Command {
 
 pub fn print_help() {
     let text = format!(
-        "celld kv — read and write a deployed KV namespace
+        "cello kv — read and write a deployed KV namespace
 
 USAGE
-  celld kv get    <namespace-id> <key>          [fleet options]
-  celld kv put    <namespace-id> <key> <value>  [put options] [fleet options]
-  celld kv delete <namespace-id> <key>...       [fleet options]
-  celld kv list   <namespace-id>                [--prefix P] [listing options]
-  celld kv info   <namespace-id>                [fleet options]
-  celld kv bulk get    <namespace-id> [FILE]    [fleet options]
-  celld kv bulk put    <namespace-id> FILE      [fleet options]
-  celld kv bulk delete <namespace-id> FILE      [fleet options]
+  cello kv get    <namespace-id> <key>          [fleet options]
+  cello kv put    <namespace-id> <key> <value>  [put options] [fleet options]
+  cello kv delete <namespace-id> <key>...       [fleet options]
+  cello kv list   <namespace-id>                [--prefix P] [listing options]
+  cello kv info   <namespace-id>                [fleet options]
+  cello kv bulk get    <namespace-id> [FILE]    [fleet options]
+  cello kv bulk put    <namespace-id> FILE      [fleet options]
+  cello kv bulk delete <namespace-id> FILE      [fleet options]
 
 The namespace id is the `id` from the project's `kv_namespaces` entry,
 verbatim. `get` writes the value to stdout as bytes, so a value stored as

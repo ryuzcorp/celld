@@ -93,7 +93,7 @@ struct OpenCell {
     replicated_wake: bool,
     backing: StorageBacking,
     /// The committed-write position the first event of this activation
-    /// started at. celld's own activation writes sit at or below it, so a
+    /// started at. cello's own activation writes sit at or below it, so a
     /// read-only answer reports what it observed only above it, and a reader
     /// on a cell no handler has written asks for no proof.
     published_position: Option<u64>,
@@ -407,7 +407,7 @@ impl Drop for SqlCursor {
 #[doc(hidden)]
 pub fn schema(c: &Connection) -> anyhow::Result<()> {
     // OFF while schema() runs, then NORMAL for the steady state. schema()
-    // writes only pragmas and celld's own tables, never user data, so a
+    // writes only pragmas and cello's own tables, never user data, so a
     // crash mid-schema loses nothing a re-open does not rebuild. The point
     // is the fsync the next line would otherwise force: switching a fresh
     // database to WAL is durable, so SQLite fsyncs the header under every
@@ -416,7 +416,7 @@ pub fn schema(c: &Connection) -> anyhow::Result<()> {
     // CPU while warm cells ran at 22k (engine/pathological-load.md).
     c.pragma_update(None, "synchronous", "OFF")?;
     c.pragma_update(None, "journal_mode", "WAL")?;
-    // celld shipped these as `kv`, `alarms` and `cell_metadata` until
+    // Cello shipped these as `kv`, `alarms` and `cell_metadata` until
     // 2026-08-06 -- names a userland table can collide with, and which a
     // library that drops everything except `_cf_*` will happily delete
     // (denoland/celld#122). Cloudflare's own names are `_cf_KV`, `_cf_ALARM`
@@ -485,7 +485,7 @@ pub fn schema(c: &Connection) -> anyhow::Result<()> {
     // per-commit WAL fsync (measured 1.4ms -> 19us per put on cloud
     // disks; the fsync was the entire single-cell write budget).
     // Process crashes lose nothing. An OS/power crash may lose the
-    // last commits locally — celld's durability boundary for node
+    // last commits locally — cello's durability boundary for node
     // loss is LTX replication either way, and replicated-WAL setups
     // conventionally run NORMAL.
     c.pragma_update(None, "synchronous", "NORMAL")?;
@@ -494,8 +494,8 @@ pub fn schema(c: &Connection) -> anyhow::Result<()> {
 
 thread_local! {
     /// True only while a statement the application authored is running.
-    /// The `_cf_` reservation exists to keep application SQL out of celld's
-    /// own tables, and celld's tables now carry that prefix
+    /// The `_cf_` reservation exists to keep application SQL out of cello's
+    /// own tables, and cello's tables now carry that prefix
     /// (denoland/celld#122), so the engine's own statements must not be
     /// judged by it. Everything else the authorizer denies -- pragmas,
     /// ATTACH, load_extension -- stays denied for both.
@@ -2806,7 +2806,7 @@ pub enum D1Request {
     Exec {
         sql: String,
         /// The Worker binding's `exec()` reports counts only, as upstream
-        /// does; `celld d1 execute` asks for the rows too.
+        /// does; `cello d1 execute` asks for the rows too.
         #[serde(default)]
         rows: bool,
     },
@@ -2819,7 +2819,7 @@ pub enum D1Request {
         /// refused unless it is a plain identifier.
         table: String,
     },
-    /// `celld d1 export`: the database as SQL, read under one transaction.
+    /// `cello d1 export`: the database as SQL, read under one transaction.
     Export {
         /// Empty means every user table. Each name must match a table that
         /// exists; matching is case-insensitive, as SQLite resolves names.
@@ -3409,7 +3409,7 @@ unsafe fn d1_run_prepared(
             changes,
             changed_db,
             size_after: d1_database_size(connection),
-            served_by: "celld",
+            served_by: "cello",
             served_by_region: "local",
             served_by_primary: true,
         },
@@ -6975,7 +6975,7 @@ mod d1_batch_tests {
     use super::d1_test_db::TestDb;
     use super::*;
 
-    /// The semantics `celld d1 execute --batch` relies on: the engine runs
+    /// The semantics `cello d1 execute --batch` relies on: the engine runs
     /// every statement inside one transaction and answers one result per
     /// statement. These pin that contract where the CLI reaches it.
     fn prepared(sql: &str, params: Vec<serde_json::Value>) -> D1PreparedRequest {

@@ -21,7 +21,7 @@
 //! in the victim script (cross-script, through a double pass-through upgrade
 //! the test holds directly).
 //!
-//! One `celld dev` boots the attacker fixture; the victim fixture is
+//! One `cello dev` boots the attacker fixture; the victim fixture is
 //! pre-seeded into the dev bucket via the library (the same `build` + `write`
 //! `dev` itself runs), so the node loads both scripts and the service binding
 //! resolves cross-isolate. There are no fixed sleeps: every wait polls an
@@ -62,7 +62,7 @@ fn copy_dir(src: &Path, dst: &Path) {
 /// and becomes primary (last write wins `deploy/current.json`); the
 /// victim's named pointer stays for the service binding to resolve.
 fn preseed_victim(attacker_project: &Path, victim_src: &Path) {
-    let state = attacker_project.join(".celld/dev");
+    let state = attacker_project.join(".cello/dev");
     std::fs::create_dir_all(state.join("runtime")).expect("state dir");
     let database = state.join("objects.sqlite3");
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -99,7 +99,7 @@ fn preseed_victim(attacker_project: &Path, victim_src: &Path) {
     });
 }
 
-/// A booted `celld dev` and its address. Kills the child on drop, so a
+/// A booted `cello dev` and its address. Kills the child on drop, so a
 /// failing assertion cannot leak a server onto its port.
 struct TestNode {
     child: Child,
@@ -128,7 +128,7 @@ impl TestNode {
         if with_test_hooks {
             command.env("CELLO_TEST_WAIT", "1");
         }
-        let mut child = command.spawn().expect("spawn celld dev");
+        let mut child = command.spawn().expect("spawn cello dev");
         let mut stdout = child.stdout.take().expect("piped stdout");
         let stderr = child.stderr.take().expect("piped stderr");
         // Drain stdout so a chatty child can never block on a full pipe.
@@ -154,11 +154,11 @@ impl TestNode {
         node.public = poll_until("boot", Duration::from_secs(120), || {
             if let Some(status) = node.child.try_wait().expect("poll child") {
                 panic!(
-                    "celld dev exited during boot: {status}: {}",
+                    "cello dev exited during boot: {status}: {}",
                     announced_lines.lock().expect("announce lock").join("\n")
                 );
             }
-            let public = announced(&announced_lines, "celld listening on ")?;
+            let public = announced(&announced_lines, "cello listening on ")?;
             if !probe(&public, "/seed-victim") {
                 return None;
             }
@@ -408,7 +408,7 @@ fn hold_tcp_hang(node: &TestNode) -> TcpStream {
 #[test]
 fn binding_forgery_conformance() {
     let dir = tempfile::Builder::new()
-        .prefix("celld-binding-forgery-")
+        .prefix("cello-binding-forgery-")
         .tempdir()
         .expect("tempdir");
     let attacker_project = dir.path().join("attacker");

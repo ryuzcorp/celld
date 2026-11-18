@@ -1,4 +1,4 @@
-// node:assert for celld.
+// node:assert for cello.
 //
 // A real implementation matters more than most shims: a pass-through
 // proxy would return truthy from every assertion, so any test that

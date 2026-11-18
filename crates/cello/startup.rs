@@ -1,9 +1,9 @@
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! Process startup primitives shared by the standalone and eventual managed
-//! celld adapters.
+//! cello adapters.
 //!
-//! Listener policy is copied from celld's production startup path. Keeping it
+//! Listener policy is copied from cello's production startup path. Keeping it
 //! outside the executor matters: both sockets are reserved before storage or
 //! V8 work starts, and the executor receives an already-validated peer
 //! address for the internal socket.

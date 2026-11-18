@@ -1,6 +1,6 @@
 # Modified by ryuzcorp (ryuzcorp/celld): node:crypto scrypt; C-trim threshold 8 MiB with CELLO_C_TRIM_MB knob.
-# Clean-sheet celld workspace. `crates/logic` owns all behavioral state and
-# decisions; `crates/celld` is only an effect executor and adapter host.
+# Clean-sheet cello workspace. `crates/logic` owns all behavioral state and
+# decisions; `crates/cello` is only an effect executor and adapter host.
 [workspace]
 resolver = "2"
 members = ["crates/*"]
@@ -55,7 +55,7 @@ encoding_rs = "0.8"
 #
 # The feature is unstable by name, so a 0.8.x release can rename or drop it
 # without upstream calling that a break, and a caret range would take it. Deno
-# Land maintains fastwebsockets, so celld carries that risk knowingly; the
+# Land maintains fastwebsockets, so cello carries that risk knowingly; the
 # version is exact to keep the upgrade a decision rather than a surprise.
 fastwebsockets = { version = "=0.8.1", default-features = false, features = ["upgrade", "with_axum", "unstable-split"] }
 flate2 = "1"
@@ -127,7 +127,7 @@ rustls-native-certs = "0.8"
 # 0.23.45 fixes GHSA-2mjx-qc3c-rqvc, where rustls accepts a TLS 1.3
 # handshake message across an encryption level boundary.
 rustls = { version = "0.23.46", default-features = false, features = ["ring"] }
-# celld never imports rustls-webpki; this entry only sets a floor. 0.103.16
+# Cello never imports rustls-webpki; this entry only sets a floor. 0.103.16
 # rejects every chain through the eight eMudhra intermediate CA certificates
 # whose private keys are public, and rustls itself accepts 0.103.14. Without
 # the floor, a resolver can select a version that still trusts those chains

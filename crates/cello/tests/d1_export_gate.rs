@@ -16,7 +16,7 @@
 //! database, so the suite passes whether or not a forged binding for another
 //! database is possible.
 //!
-//! One `celld dev` boots the app fixture. There are no fixed sleeps: every
+//! One `cello dev` boots the app fixture. There are no fixed sleeps: every
 //! wait polls an observable condition with a deadline, and the server guard
 //! kills the child on every exit path.
 
@@ -49,7 +49,7 @@ fn copy_dir(src: &Path, dst: &Path) {
     }
 }
 
-/// A booted `celld dev` and its address. Kills the child on drop, so a
+/// A booted `cello dev` and its address. Kills the child on drop, so a
 /// failing assertion cannot leak a server onto its port.
 struct TestNode {
     child: Child,
@@ -68,7 +68,7 @@ impl TestNode {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .expect("spawn celld dev");
+            .expect("spawn cello dev");
         let mut stdout = child.stdout.take().expect("piped stdout");
         let stderr = child.stderr.take().expect("piped stderr");
         // Drain stdout so a chatty child can never block on a full pipe.
@@ -94,11 +94,11 @@ impl TestNode {
         node.public = poll_until("boot", Duration::from_secs(120), || {
             if let Some(status) = node.child.try_wait().expect("poll child") {
                 panic!(
-                    "celld dev exited during boot: {status}: {}",
+                    "cello dev exited during boot: {status}: {}",
                     announced_lines.lock().expect("announce lock").join("\n")
                 );
             }
-            let public = announced(&announced_lines, "celld listening on ")?;
+            let public = announced(&announced_lines, "cello listening on ")?;
             if !probe(&public, "/health") {
                 return None;
             }
@@ -187,7 +187,7 @@ fn poll_until(
 #[test]
 fn d1_export_is_operator_only() {
     let dir = tempfile::Builder::new()
-        .prefix("celld-d1-export-gate-")
+        .prefix("cello-d1-export-gate-")
         .tempdir()
         .expect("tempdir");
     let app_project = dir.path().join("app");

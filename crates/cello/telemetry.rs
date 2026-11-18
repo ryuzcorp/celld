@@ -13,10 +13,10 @@
 //! unsampled request builds nothing.
 //!
 //! The hot path never blocks. `record` is a `try_send`; a full channel
-//! increments a drop counter. Under saturation celld sheds telemetry,
+//! increments a drop counter. Under saturation cello sheds telemetry,
 //! counted, never requests. The pipeline is ordinary tasks on the shared
 //! runtime — no dedicated thread (the Deno pattern needs one because its
-//! main loop is a current-thread runtime; celld's is not) — and encoding
+//! main loop is a current-thread runtime; cello's is not) — and encoding
 //! runs on `spawn_blocking`, the `prune_local_cache` treatment.
 
 use crate::bucket::Bucket;
@@ -174,7 +174,7 @@ impl Config {
         let resource_input = get("OTEL_RESOURCE_ATTRIBUTES")?;
         let service = match get("OTEL_SERVICE_NAME")? {
             Some(name) => name,
-            None => resource_service_name(&resource_input).unwrap_or_else(|| "celld".to_string()),
+            None => resource_service_name(&resource_input).unwrap_or_else(|| "cello".to_string()),
         };
         let resource_attrs = parse_resource_attributes(&resource_input);
         let logs_sink = match get("CELLO_OTEL_LOGS")?.as_deref() {
@@ -188,7 +188,7 @@ impl Config {
         // Per the otel spec: a `parentbased_*` sampler defers to the
         // caller's sampled flag and decides itself only for roots. That
         // is an explicit statement of upstream trust — appropriate here,
-        // because celld's ingress sits behind the operator's own edge.
+        // because cello's ingress sits behind the operator's own edge.
         let sampler = get("OTEL_TRACES_SAMPLER")?;
         let sampler = sampler.as_deref().unwrap_or("parentbased_always_on");
         let parent_based = sampler.starts_with("parentbased_");
@@ -260,7 +260,7 @@ impl Config {
 /// resolution, so `qa%2Cblue` exports as `qa,blue`. Duplicates resolve
 /// last-wins, and `service.name` is dropped here because `from_lookup`
 /// resolves it first (explicit `OTEL_SERVICE_NAME`, then the resource
-/// `service.name`, then `celld`). Values stay strings: the OTLP
+/// `service.name`, then `cello`). Values stay strings: the OTLP
 /// resource this feeds carries scalar attributes, and sniffing a version
 /// like `123` into an integer would corrupt the deployment tracking the
 /// operator configured it for.
@@ -289,7 +289,7 @@ pub fn parse_resource_attributes(input: &Option<String>) -> Vec<(String, String)
 }
 
 /// The `service.name` the resource attributes carry, if any: the fallback
-/// between explicit `OTEL_SERVICE_NAME` and the `celld` default. Parsed
+/// between explicit `OTEL_SERVICE_NAME` and the `cello` default. Parsed
 /// with the same leniency as [`parse_resource_attributes`] (last-wins,
 /// percent-decoded) so the two cannot disagree on what the operator wrote.
 fn resource_service_name(input: &Option<String>) -> Option<String> {
@@ -353,7 +353,7 @@ impl TraceContext {
 }
 
 /// A caller's trace context, extracted from a W3C `traceparent` header.
-/// celld does not terminate TLS; whoever can reach its ingress is the
+/// Cello does not terminate TLS; whoever can reach its ingress is the
 /// operator's own edge, so honoring this trusts the same infrastructure.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ParentContext {
@@ -915,8 +915,8 @@ impl SinkRuntime {
                     }
                 };
                 let meta = [
-                    ("celld-retention", retention.as_str()),
-                    ("celld-schema", SCHEMA_VERSION),
+                    ("cello-retention", retention.as_str()),
+                    ("cello-schema", SCHEMA_VERSION),
                 ];
                 for (prefix, bytes) in [(TRACES_PREFIX, span_bytes), (LOGS_PREFIX, log_bytes)] {
                     let Some(bytes) = bytes else { continue };
@@ -1182,7 +1182,7 @@ pub fn object_key(prefix: &str, node: &str, unix_us: i64) -> String {
     format!("{prefix}/{node}/{y:04}/{m:02}/{d:02}/{hour:02}/{unix_us}-{tag:08x}.parquet")
 }
 
-/// The retention sweep: celld deletes its own old telemetry, because
+/// The retention sweep: cello deletes its own old telemetry, because
 /// an S3 lifecycle rule needs bucket-level permissions the deliberately
 /// object-scoped credentials must not require. Prefix
 /// deletes over the day-partitioned layout, idempotent and safe to
@@ -1561,7 +1561,7 @@ mod tests {
         let config = config_with(&[("CELLO_OTEL", "http://127.0.0.1:4318")])
             .expect("valid config")
             .expect("telemetry on");
-        assert_eq!(config.service, "celld");
+        assert_eq!(config.service, "cello");
     }
 
     fn config_with(env: &[(&str, &str)]) -> anyhow::Result<Option<Config>> {
@@ -1610,7 +1610,7 @@ mod tests {
                     trace_id: [1; 16],
                     span_id: [2; 8],
                 },
-                "celld.fetch",
+                "cello.fetch",
                 KIND_SERVER,
             )
         }

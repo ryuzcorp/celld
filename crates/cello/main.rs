@@ -1,11 +1,11 @@
-// Modified by ryuzcorp (ryuzcorp/celld): cross-isolate RPC stubs and streams; operator token for the internal listener; D1 export operator-ingress marker; ported from meln1k/celld: report wake coverage after maintenance (e6cb9a3); staged activation; trusted cell RPC; WebSocket join tokens; --version reports the full build version; staged invoke operator route; non-dumpable serving process; bucket-posture group commit: paged gate judges PAGED_FORMAT (0059); bucket-posture group commit: bucket bundle gate plumbing (0060); bucket-posture group commit: bundle switch defaults off (0075); stale-route marker import from peer_auth (upstream #273); resolve the node-session id from the data-dir pin (upstream #249); boot scan takes the due scan's upcoming minute (upstream #308); unclean-restart prune of live-named epochs (upstream #290); celld versions dispatch (upstream #181); telemetry bucket for split log sink (upstream #153).
+// Modified by ryuzcorp (ryuzcorp/celld): cross-isolate RPC stubs and streams; operator token for the internal listener; D1 export operator-ingress marker; ported from meln1k/cello: report wake coverage after maintenance (e6cb9a3); staged activation; trusted cell RPC; WebSocket join tokens; --version reports the full build version; staged invoke operator route; non-dumpable serving process; bucket-posture group commit: paged gate judges PAGED_FORMAT (0059); bucket-posture group commit: bucket bundle gate plumbing (0060); bucket-posture group commit: bundle switch defaults off (0075); stale-route marker import from peer_auth (upstream #273); resolve the node-session id from the data-dir pin (upstream #249); boot scan takes the due scan's upcoming minute (upstream #308); unclean-restart prune of live-named epochs (upstream #290); cello versions dispatch (upstream #181); telemetry bucket for split log sink (upstream #153).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 // The binary contains connection, startup, shutdown, and V8 shell code. The
 // library Actor owns the execution domain and its routed adapters.
 #![allow(clippy::disallowed_methods)]
 
-//! Runnable celld vertical slice.
+//! Runnable cello vertical slice.
 //!
 //! One actor serializes every event through `cello-logic`; the actor polls its
 //! mailbox, timers, lease futures, and task completions together. Other effect
@@ -178,7 +178,7 @@ async fn flush_shutdown_connections<Frames, Connections>(
     Connections: std::future::Future<Output = ()>,
 {
     // The frames a flush still holds are behind a durability gate, and a
-    // socket whose peer is gone can never deliver them: a `celld dev` stop
+    // socket whose peer is gone can never deliver them: a `cello dev` stop
     // on OrbStack sat here for its whole process deadline once the
     // container behind an outbound socket had been destroyed. The grace is
     // for frames that can still land; the durability of the writes behind
@@ -347,7 +347,7 @@ fn peer_auth_denied(error: &peer_auth::VerifyError) -> HttpReply {
 /// including unknown paths and the recovery surface — so nothing answers
 /// without the token when one is configured. There are no exempt routes:
 /// liveness and readiness probes use the public listener's
-/// `/.well-known/celld/health`, which this token does not guard.
+/// `/.well-known/cello/health`, which this token does not guard.
 fn operator_gate(app: &AppHandle, headers: &hyper::HeaderMap) -> Option<HttpReply> {
     let token = app.operator_token.as_ref()?;
     if token.verify(headers) {
@@ -806,7 +806,7 @@ async fn arm_cron_schedule(app: AppHandle, cell: String) -> anyhow::Result<()> {
             deliver_abort_to_handler: false,
             scope: cell,
             name: None,
-            url: "https://cron.celld.internal/arm".to_string(),
+            url: "https://cron.cello.internal/arm".to_string(),
             method: "POST".to_string(),
             body_guard: cello::js::RequestBodyGuard::of(&body),
             body,
@@ -1932,7 +1932,7 @@ const INTERNAL_LOG_APPEND_PATH: &str = "/peer/log/append";
 /// A streamed body crosses the isolate boundary through a string-only error
 /// channel. Keep one private marker in that string so the HTTP entry point can
 /// restore status 413; a generic stream error would turn the refusal into 500.
-const BODY_LIMIT_STREAM_ERROR: &str = "celld request body limit exceeded";
+const BODY_LIMIT_STREAM_ERROR: &str = "cello request body limit exceeded";
 
 enum BodyReadError {
     TooLarge,
@@ -2159,16 +2159,16 @@ fn malformed_scope() -> HttpReply {
     )
 }
 
-/// Can celld put this host in `request.url`?
+/// Can cello put this host in `request.url`?
 ///
 /// `cello_logic::http::authority_decision` returns the complete sans-IO
 /// decision. A Punycode label is the one part that decision cannot settle,
 /// because deciding it is the whole of IDNA: `xn--a` passes every other rule
 /// and still makes `new URL(request.url)` throw inside a Worker.
 ///
-/// So celld runs a parser only when the decision requires one. The parser is
+/// So cello runs a parser only when the decision requires one. The parser is
 /// the same `url::Url::parse` that backs `URL` in the isolate, therefore this
-/// check agrees with the Worker by construction rather than by a rule celld
+/// check agrees with the Worker by construction rather than by a rule cello
 /// keeps in step by hand.
 fn well_formed_host(host: &str) -> Option<&str> {
     match cello_logic::http::authority_decision(host) {
@@ -2182,10 +2182,10 @@ fn well_formed_host(host: &str) -> Option<&str> {
     }
 }
 
-/// `request.url` controls application routing and absolute links, so celld
+/// `request.url` controls application routing and absolute links, so cello
 /// does not let an untrusted forwarding header or request-target authority set
 /// its scheme or host. The path and query always come from the request target.
-/// The host comes from `Host`, and the scheme is `http` because celld does not
+/// The host comes from `Host`, and the scheme is `http` because cello does not
 /// terminate TLS.
 ///
 /// An operator can set `--trust-forwarded-headers` when a trusted proxy
@@ -2237,7 +2237,7 @@ fn request_url(parts: &hyper::http::request::Parts, trust_forwarded_headers: boo
     let host = forwarded("x-forwarded-host")
         .and_then(well_formed_host)
         .or_else(|| first_value("host").and_then(well_formed_host))
-        .unwrap_or("celld.local");
+        .unwrap_or("cello.local");
     let canonical = |scheme: &str| cello_logic::http::canonical_scheme(scheme);
     let scheme = forwarded("x-forwarded-proto")
         .and_then(canonical)
@@ -2696,7 +2696,7 @@ async fn handle_ingress(
                     }
                     Ok(None) => {}
                     Err(error) => {
-                        eprintln!("celld asset response failed for {path}: {error:#}");
+                        eprintln!("cello asset response failed for {path}: {error:#}");
                         return response(
                             StatusCode::BAD_GATEWAY,
                             "Active deployment asset is unavailable",
@@ -2864,7 +2864,7 @@ async fn dispatch_queue_batch(app: AppHandle, call: QueueDispatchReq) {
             deliver_abort_to_handler: false,
             scope: scope.clone(),
             name: None,
-            url: "https://queue.celld.internal/__qSettle".to_string(),
+            url: "https://queue.cello.internal/__qSettle".to_string(),
             method: "POST".to_string(),
             body_guard: cello::js::RequestBodyGuard::of(&body),
             body,
@@ -3169,7 +3169,7 @@ async fn handle_public(
 ) -> Result<HttpReply, Infallible> {
     let path = request.uri().path().to_string();
     let draining = app.is_draining();
-    let _public_admission = if path == "/.well-known/celld/health" {
+    let _public_admission = if path == "/.well-known/cello/health" {
         None
     } else {
         let Some(admission) = app.admit_public() else {
@@ -3189,19 +3189,19 @@ async fn handle_public(
         };
         Some(admission)
     };
-    if path != "/.well-known/celld/health"
+    if path != "/.well-known/cello/health"
         && app.runtime.is_some()
         && fastwebsockets::upgrade::is_upgrade_request(&request)
     {
         return Ok(handle_websocket(request, app).await);
     }
     let mut result = match path.as_str() {
-        "/.well-known/celld/health"
+        "/.well-known/cello/health"
             if !app.is_draining() && app.fleet_ready() && app.healthy().await =>
         {
             response(StatusCode::OK, "{\"ok\":true}")
         }
-        "/.well-known/celld/health" => response(StatusCode::SERVICE_UNAVAILABLE, "{\"ok\":false}"),
+        "/.well-known/cello/health" => response(StatusCode::SERVICE_UNAVAILABLE, "{\"ok\":false}"),
         _ if app.runtime.is_some() => handle_ingress(request, app, connection).await,
         _ => response(StatusCode::NOT_FOUND, "{\"error\":\"not_found\"}"),
     };
@@ -3354,7 +3354,7 @@ async fn handle_internal(
                 ))
             }
         }
-        // The operator CLIs' way in (`celld d1`, queues, workflows): the same
+        // The operator CLIs' way in (`cello d1`, queues, workflows): the same
         // forwarding dispatch `/do/` uses, with the fleet authentication
         // `/do/` does not have. A runtime class holds application data and
         // answers an operator protocol — arbitrary SQL for D1 — so it must
@@ -3439,7 +3439,7 @@ async fn handle_internal(
             )
             .await
         }
-        // The operator's way into a staged version (`celld invoke`): one
+        // The operator's way into a staged version (`cello invoke`): one
         // HTTP request served by staged code with its declared bindings,
         // for the migration that must run before activation serves it.
         // Nowhere else answers it — the public listener has no such
@@ -3897,7 +3897,7 @@ fn main() -> anyhow::Result<()> {
     // the fleet's credentials in its environ, and the fleet uid is shared
     // with tenant builds, so they must not be able to read it through
     // /proc (patch 0053). `execve` resets the flag, and every re-exec (the
-    // node's, `celld dev`'s child) comes back through here with its serving
+    // node's, `cello dev`'s child) comes back through here with its serving
     // arguments. Operator commands stay dumpable so an operator can attach.
     if action.serves() {
         cello::hardening::set_non_dumpable().context("make the serving process non-dumpable")?;
@@ -3951,7 +3951,7 @@ async fn async_main(
         &action,
         Action::Dev(arguments) if !arguments.iter().any(|argument| argument == "--logs")
     ) {
-        // `celld dev` is an application-facing supervisor. Its default view
+        // `cello dev` is an application-facing supervisor. Its default view
         // must stay concise even when the parent inherited a broad RUST_LOG;
         // --logs is the explicit opt-in to that diagnostic stream.
         tracing_subscriber::EnvFilter::new("error")
@@ -4022,7 +4022,7 @@ async fn async_main(
                 ""
             };
             cello::cli_output::Output::new(cello::cli_output::Format::Text)
-                .line(format_args!("celld {}{profile}", cello::version::version()))?;
+                .line(format_args!("cello {}{profile}", cello::version::version()))?;
             return Ok(());
         }
         Action::Diagnose {
@@ -4062,7 +4062,7 @@ async fn async_main(
             ];
             let managed_storage = if settings.control_plane {
                 match cello::control_plane::installation_storage().context(
-                    "managed diagnostics require an existing enrollment; run `celld --control-plane` first",
+                    "managed diagnostics require an existing enrollment; run `cello --control-plane` first",
                 )? {
                     cello::control_plane::InstallationStorageConfig::Managed(storage) => {
                         settings.bucket = Some(storage.bucket.clone());
@@ -4082,7 +4082,7 @@ async fn async_main(
             };
             let bucket = settings
                 .bucket
-                .ok_or_else(|| anyhow::anyhow!("celld diagnose requires --bucket"))?;
+                .ok_or_else(|| anyhow::anyhow!("cello diagnose requires --bucket"))?;
             let client = fleet::bucket_client_with_credentials(
                 &bucket,
                 settings.endpoint.as_deref(),
@@ -4115,7 +4115,7 @@ async fn async_main(
     );
     cello::startup::raise_file_limit();
     let max_resident = cello::env_vars::optional("CELLO_MAX_RESIDENT_CELLS")?
-        // celld has no resident ceiling unless the operator configures one.
+        // Cello has no resident ceiling unless the operator configures one.
         // The clean-sheet prototype originally defaulted to eight, which
         // introduced eviction churn in otherwise unconstrained workloads and
         // made cancellation semantics depend on cold-reactivation latency.
@@ -4224,7 +4224,7 @@ async fn async_main(
     let data_dir = std::env::var_os("CELLO_TEST_DATA_DIR")
         .or_else(|| std::env::var_os("CELLO_WATCH"))
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::env::temp_dir().join(format!("celld-{}", std::process::id())));
+        .unwrap_or_else(|| std::env::temp_dir().join(format!("cello-{}", std::process::id())));
     let node = cello::machine::resolve_node_session_id(std::env::var("CELLO_NODE").ok(), &data_dir);
     let clean_reload_node = node.clone();
     cello::control_plane::install_reexec_node_session_id(&node)?;
@@ -4281,7 +4281,7 @@ async fn async_main(
                 cello::control_plane::wait_for_initial_deployment(&client).await?;
                 deploy_agent = Some(client.clone());
             } else {
-                // A self-hosted node can start before its first `celld
+                // A self-hosted node can start before its first `cello
                 // deploy`; wait for the pointer instead of exiting, or
                 // systemd restarts the node in a loop until a deployment
                 // exists. Managed mode already waited above.
@@ -4295,11 +4295,11 @@ async fn async_main(
                 flusher: wake.clone(),
             });
             // An `r2_buckets` binding lives in the fleet bucket, under the
-            // reserved `r2/<bucket_name>/` prefix. celld runs on blob storage
+            // reserved `r2/<bucket_name>/` prefix. cello runs on blob storage
             // rather than providing it, so a binding gets the store the node
             // already holds credentials for instead of a second one.
             cello::js::set_r2_store(client.clone());
-            // celld treats replication as a node service, not as a property
+            // Cello treats replication as a node service, not as a property
             // of today's manifest. Start it even for a stateless deployment
             // so a later deployment can introduce cells without changing the
             // durability contract underneath the node.
@@ -4450,7 +4450,7 @@ async fn async_main(
             // Resolved before the config is built, because the reserved workflow
             // class is script-scoped and `do_classes` has to carry the scoped name.
             let script_name = std::env::var("CELLO_TEST_SCRIPT_NAME")
-                .unwrap_or_else(|_| "celld-local".to_string());
+                .unwrap_or_else(|_| "cello-local".to_string());
             if !workflow_bindings.is_empty() {
                 do_classes.push(cello::deploy::workflow_class(&script_name));
             }
@@ -4790,7 +4790,7 @@ async fn async_main(
                         break;
                     }
                     if let Err(error) = recovered.as_ref() {
-                        eprintln!("celld predecessor recovery attempt {attempt} failed: {error:#}");
+                        eprintln!("cello predecessor recovery attempt {attempt} failed: {error:#}");
                     }
                     // At least one full TTL between attempts, so a
                     // refused-because-live predecessor lease has expired
@@ -4876,7 +4876,7 @@ async fn async_main(
     // the shared runtime and report their results back as messages.
     let (actor_exit_tx, mut actor_exit_rx) = mpsc::unbounded_channel();
     std::thread::Builder::new()
-        .name("celld-core".into())
+        .name("cello-core".into())
         .spawn(move || {
             let result = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -4935,7 +4935,7 @@ async fn async_main(
 
     // The fleet-aware first-readiness gate: withhold the first health 200
     // until no donor is mid-handoff and every live peer publishes successor
-    // capacity. CELLO_READY_FLEET_GATE_MS bounds the silent wait before celld
+    // capacity. CELLO_READY_FLEET_GATE_MS bounds the silent wait before cello
     // reports the blocking condition, but it cannot make an unsafe fleet
     // ready. Orchestrators key rollout advance on readiness, so a fail-open
     // deadline would erase the only signal that prevents another donor. The
@@ -5236,11 +5236,11 @@ async fn async_main(
     }
 
     cello::cli_output::Output::new(cello::cli_output::Format::Text).line(format_args!(
-        "celld listening on {} (ownership={ownership_name})",
+        "cello listening on {} (ownership={ownership_name})",
         listener.local_addr()?
     ))?;
     cello::cli_output::Output::new(cello::cli_output::Format::Text).line(format_args!(
-        "celld internal listening on {} (advertise={})",
+        "cello internal listening on {} (advertise={})",
         internal_listener.local_addr()?,
         app.advertise
     ))?;
@@ -5402,7 +5402,7 @@ async fn async_main(
                 let app = app.clone();
                 websockets.push(Box::pin(async move {
                     if let Err(error) = outbound_websocket_task(app, outbound).await {
-                        eprintln!("celld outbound WebSocket failed: {error:#}");
+                        eprintln!("cello outbound WebSocket failed: {error:#}");
                     }
                 }));
             }
@@ -5894,7 +5894,7 @@ async fn async_main(
                     let app = app.clone();
                     websockets.push(Box::pin(async move {
                         if let Err(error) = outbound_websocket_task(app, outbound).await {
-                            eprintln!("celld outbound WebSocket failed: {error:#}");
+                            eprintln!("cello outbound WebSocket failed: {error:#}");
                         }
                     }));
                 }
@@ -5988,7 +5988,7 @@ async fn async_main(
         }
     } else if !drained {
         eprintln!(
-            "celld preserve drain reached its {drain_ms}ms deadline: connections={} do_calls={} gate_calls={} service_calls={} queue_calls={} asset_calls={} websockets={}",
+            "cello preserve drain reached its {drain_ms}ms deadline: connections={} do_calls={} gate_calls={} service_calls={} queue_calls={} asset_calls={} websockets={}",
             connections.len(),
             do_calls.len(),
             gate_calls.len(),
@@ -6038,7 +6038,7 @@ async fn async_main(
             owner.quiesce_and_seal_within(remaining).await
         };
         if !completed {
-            eprintln!("celld durability quiesce exceeded the process deadline");
+            eprintln!("cello durability quiesce exceeded the process deadline");
         }
         completed
     } else {
@@ -6116,7 +6116,7 @@ async fn async_main(
             owner.shutdown_local_within(remaining).await
         };
         if !completed {
-            eprintln!("celld local durability shutdown exceeded the process deadline");
+            eprintln!("cello local durability shutdown exceeded the process deadline");
         }
     }
     #[cfg(all(test, cello_internal_tests))]

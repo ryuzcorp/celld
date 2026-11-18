@@ -30,7 +30,7 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     }
     let status = if path == "/" { 200 } else { 404 };
     Ok(
-        Response::ok("celld rust demo. Try: curl http://localhost:8080/c/hello\n")?
+        Response::ok("cello rust demo. Try: curl http://localhost:8080/c/hello\n")?
             .with_status(status),
     )
 }

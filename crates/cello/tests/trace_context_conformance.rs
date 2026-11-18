@@ -2,7 +2,7 @@
 //
 // Modified by ryuzcorp (ryuzcorp/celld): handler-visible trace context (upstream #313).
 
-// A black-box runner, not node code: it boots the real `celld dev` binary
+// A black-box runner, not node code: it boots the real `cello dev` binary
 // and polls TCP with wall-clock deadlines, so the execution boundary's
 // injected clock/filesystem/async rules do not apply to it.
 #![allow(clippy::disallowed_methods)]
@@ -146,7 +146,7 @@ impl TestNode {
             .env_remove("CELLO_DEV_STATE")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        let mut child = command.spawn().expect("spawn celld dev");
+        let mut child = command.spawn().expect("spawn cello dev");
         let mut stdout = child.stdout.take().expect("piped stdout");
         let stderr = child.stderr.take().expect("piped stderr");
         std::thread::spawn(move || {
@@ -162,11 +162,11 @@ impl TestNode {
         node.public = poll_until("boot", Duration::from_secs(120), || {
             if let Some(status) = node.child.try_wait().expect("poll child") {
                 panic!(
-                    "celld dev exited during boot: {status}: {}",
+                    "cello dev exited during boot: {status}: {}",
                     announced_lines.lock().expect("announce lock").join("\n")
                 );
             }
-            let public = announced(&announced_lines, "celld listening on ")?;
+            let public = announced(&announced_lines, "cello listening on ")?;
             if !probe(&public, "/") {
                 return None;
             }
@@ -262,7 +262,7 @@ fn handler_reads_its_spans_traceparent() {
     );
     // The export carries a span for the request the handler just answered:
     // the trace id the handler returned is one the collector actually sees.
-    // Matching the raw trace id bytes (not just any `celld.fetch` span)
+    // Matching the raw trace id bytes (not just any `cello.fetch` span)
     // keeps the boot probe's span for a different trace from passing.
     let trace_id = trace_id_bytes(traceparent);
     let exported = poll_until("export", Duration::from_secs(60), || {
@@ -270,8 +270,8 @@ fn handler_reads_its_spans_traceparent() {
         bodies
             .iter()
             .any(|body| {
-                body.windows(b"celld.fetch".len())
-                    .any(|window| window == b"celld.fetch")
+                body.windows(b"cello.fetch".len())
+                    .any(|window| window == b"cello.fetch")
                     && body
                         .windows(trace_id.len())
                         .any(|window| window == trace_id)

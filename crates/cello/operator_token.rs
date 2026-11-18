@@ -9,7 +9,7 @@
 //! `CELLO_OPERATOR_TOKEN` to the same value on every node of the fleet, and
 //! every internal route then requires `Authorization: Bearer <token>`.
 //! There are no exempt routes: liveness and readiness probes use the public
-//! listener's `/.well-known/celld/health`, which this token does not guard.
+//! listener's `/.well-known/cello/health`, which this token does not guard.
 //!
 //! An absent variable selects today's behavior: the internal listener stays
 //! open and every client sends no bearer header, so a fleet that never sets

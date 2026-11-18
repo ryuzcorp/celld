@@ -2,7 +2,7 @@
 
 //! The isolate pool, reified sans-IO.
 //!
-//! celld runs JS on a set of isolates that grow and shrink with demand. An
+//! cello runs JS on a set of isolates that grow and shrink with demand. An
 //! isolate is not bound to a thread: `v8::Locker` installs the entering
 //! thread's per-isolate state, so any worker can take an isolate and run a
 //! turn in it. What an isolate *is* bound to is the JS state it holds, and

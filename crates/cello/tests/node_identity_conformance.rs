@@ -2,7 +2,7 @@
 //
 // Modified by ryuzcorp (ryuzcorp/celld): node identity on env (upstream #219).
 
-// A black-box runner, not node code: it boots the real `celld dev` binary
+// A black-box runner, not node code: it boots the real `cello dev` binary
 // and polls TCP with wall-clock deadlines, so the execution boundary's
 // injected clock/filesystem/async rules do not apply to it.
 #![allow(clippy::disallowed_methods)]
@@ -70,7 +70,7 @@ impl TestNode {
             .env_remove("CELLO_DEV_STATE")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        let mut child = command.spawn().expect("spawn celld dev");
+        let mut child = command.spawn().expect("spawn cello dev");
         let mut stdout = child.stdout.take().expect("piped stdout");
         let stderr = child.stderr.take().expect("piped stderr");
         std::thread::spawn(move || {
@@ -87,11 +87,11 @@ impl TestNode {
         let (public, node_name) = poll_until("boot", Duration::from_secs(120), || {
             if let Some(status) = node.child.try_wait().expect("poll child") {
                 panic!(
-                    "celld dev exited during boot: {status}: {}",
+                    "cello dev exited during boot: {status}: {}",
                     announced_lines.lock().expect("announce lock").join("\n")
                 );
             }
-            let public = announced(&announced_lines, "celld listening on ")?;
+            let public = announced(&announced_lines, "cello listening on ")?;
             // The serving child logs its lease attempts with its own node
             // name (`node=<name>`); the supervisor names the child
             // `dev-<project hash>` through `CELLO_NODE`, so the two agree.

@@ -1,7 +1,7 @@
 <!-- Modified by ryuzcorp (ryuzcorp/celld): Workers Cache API example. -->
 # Examples
 
-These small Wrangler projects demonstrate the Workers platform that `celld`
+These small Wrangler projects demonstrate the Workers platform that `Cello`
 supports, one service or API at a time:
 
 - `hello/` — a stateless Worker `fetch` handler
@@ -40,7 +40,7 @@ supports, one service or API at a time:
 Deploy an example from its directory to the same bucket the nodes use:
 
 ```sh
-celld deploy . --bucket s3://my-cells-bucket
+cello deploy . --bucket s3://my-cells-bucket
 ```
 
 The counter example uses the `name` query parameter as the Durable Object

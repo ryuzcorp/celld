@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): ported from meln1k/celld: report wake coverage after maintenance (e6cb9a3).
+// Modified by ryuzcorp (ryuzcorp/celld): ported from meln1k/cello: report wake coverage after maintenance (e6cb9a3).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! The Actor's one boundary to whichever engine runs cells.

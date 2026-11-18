@@ -16,7 +16,7 @@
 //! cells run in a runtime-only pool whose isolates evaluate no tenant
 //! bundle, so the hosting script's top level cannot reach them.
 //!
-//! One `celld dev` boots the host fixture as primary; the victim fixture is
+//! One `cello dev` boots the host fixture as primary; the victim fixture is
 //! pre-seeded into the dev bucket via the library (the same `build` + `write`
 //! `dev` itself runs), so the node loads both scripts and the service binding
 //! resolves cross-isolate. The host declares the same D1/KV/Queue bindings,
@@ -44,7 +44,7 @@ fn fixture_dir() -> PathBuf {
         .expect("fixture exists")
 }
 
-/// One address of a `celld dev` node, from the announce line the supervisor
+/// One address of a `cello dev` node, from the announce line the supervisor
 /// forwards to its stderr. The node is non-dumpable (patch 0053), so
 /// `/proc/<pid>/fd` no longer names its listeners, and this is the node's
 /// own report of where it bound.
@@ -84,7 +84,7 @@ fn copy_dir(src: &Path, dst: &Path) {
 /// Tempdir for one fixture copy: `/dev/shm` when usable, else the
 /// default tempdir.
 ///
-/// Each booted `celld dev` keeps its SQLite store beside its fixture
+/// Each booted `cello dev` keeps its SQLite store beside its fixture
 /// copy, and the node self-fences when a lease commit stalls past the
 /// TTL bound. Parallel suites on a loaded disk stall commits for
 /// seconds, fencing healthy nodes and failing the run with
@@ -110,7 +110,7 @@ fn fixture_tempdir(prefix: &str) -> tempfile::TempDir {
 /// and becomes primary (last write wins `deploy/current.json`); the
 /// victim's named pointer stays for the service binding to resolve.
 fn preseed_victim(app_project: &Path, victim_src: &Path) {
-    let state = app_project.join(".celld/dev");
+    let state = app_project.join(".cello/dev");
     std::fs::create_dir_all(state.join("runtime")).expect("state dir");
     let database = state.join("objects.sqlite3");
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -147,7 +147,7 @@ fn preseed_victim(app_project: &Path, victim_src: &Path) {
     });
 }
 
-/// A booted `celld dev` and its address. Kills the child on drop, so a
+/// A booted `cello dev` and its address. Kills the child on drop, so a
 /// failing assertion cannot leak a server onto its port.
 struct TestNode {
     child: Child,
@@ -169,7 +169,7 @@ impl TestNode {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .expect("spawn celld dev");
+            .expect("spawn cello dev");
         let mut stdout = child.stdout.take().expect("piped stdout");
         let stderr = child.stderr.take().expect("piped stderr");
         // Drain both pipes so a chatty child can never block on a full one.
@@ -194,9 +194,9 @@ impl TestNode {
             // Liveness first: a dead child must fail fast, not burn
             // the deadline on refused probes.
             if let Some(status) = node.child.try_wait().expect("poll child") {
-                panic!("celld dev exited during boot: {status}");
+                panic!("cello dev exited during boot: {status}");
             }
-            let addr = announced(&announced_lines, "celld listening on ")?;
+            let addr = announced(&announced_lines, "cello listening on ")?;
             probe(&addr, "/health").then_some(addr)
         });
         node
@@ -281,7 +281,7 @@ fn poll_until(
 
 #[test]
 fn runtime_isolate_conformance() {
-    let dir = fixture_tempdir("celld-runtime-isolate-");
+    let dir = fixture_tempdir("cello-runtime-isolate-");
     let app_project = dir.path().join("app");
     let victim_src = dir.path().join("victim");
     copy_dir(&fixture_dir().join("app"), &app_project);

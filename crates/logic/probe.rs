@@ -1,5 +1,5 @@
 // Modified by ryuzcorp (ryuzcorp/celld): round-level fence settlement (0062); failed start disarms the restored alarm (upstream #276).
-// Modified by ryuzcorp (ryuzcorp/celld): ported from meln1k/celld: 51 code probes on the core's rare branches (b026226); keep-the-unfolded-tail probe (65fdb13); shared bucket-posture ownership reads across concurrent gates (0056).
+// Modified by ryuzcorp (ryuzcorp/celld): ported from meln1k/cello: 51 code probes on the core's rare branches (b026226); keep-the-unfolded-tail probe (65fdb13); shared bucket-posture ownership reads across concurrent gates (0056).
 //! Code probes: rare branches of the core, named and counted when taken.
 //!
 //! A probe decides nothing. It records that a branch ran, so a simulator or

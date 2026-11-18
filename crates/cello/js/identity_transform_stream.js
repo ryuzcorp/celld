@@ -1,6 +1,6 @@
 // IdentityTransformStream / FixedLengthStream -- Cloudflare's byte
 // pass-through streams. Not spec TransformStreams: in Workerd these are
-// "internal" (native) byte streams, and celld matches that
+// "internal" (native) byte streams, and cello matches that
 // contract. The readable supports one pending read at a time (a second
 // concurrent read rejects), BYOB readers with the readAtLeast()
 // extension, per-reader closed promises that reject on releaseLock, and

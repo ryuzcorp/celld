@@ -2,8 +2,8 @@
 
 //! Sans-I/O decisions for retiring compatibility ownership-index debris.
 //!
-//! celld does not create `node-cells/` markers, but it shares fleet buckets
-//! with celld and must retire markers left by dead historical generations.
+//! cello does not create `node-cells/` markers, but it shares fleet buckets
+//! with Cello and must retire markers left by dead historical generations.
 
 const MAX_BACKOFF_SHIFT: u32 = 6;
 

@@ -14,7 +14,7 @@ rustup target add wasm32-unknown-unknown
 cargo install worker-build
 
 worker-build --release
-celld deploy . --bucket s3://my-cells-bucket
+cello deploy . --bucket s3://my-cells-bucket
 ```
 
 ```sh
@@ -23,5 +23,5 @@ curl http://localhost:8080/c/hello
 curl http://localhost:8080/c/other
 ```
 
-See [the WebAssembly docs](../../docs/wasm.md) for how celld ships and runs the
+See [the WebAssembly docs](../../docs/wasm.md) for how Cello ships and runs the
 `.wasm` module. Contributed by [Connor Hindley](https://github.com/connyay).

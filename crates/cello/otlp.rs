@@ -1,9 +1,9 @@
-// Modified by ryuzcorp (ryuzcorp/celld): honor OTEL_RESOURCE_ATTRIBUTES in the OTLP resource; report celld's build as celld.version (upstream #314); export incoming HTTP method (upstream #285).
+// Modified by ryuzcorp (ryuzcorp/celld): honor OTEL_RESOURCE_ATTRIBUTES in the OTLP resource; report cello's build as cello.version (upstream #314); export incoming HTTP method (upstream #285).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! OTLP/HTTP protobuf encoding for the telemetry sink, by hand.
 //!
-//! The export messages celld emits are a small, stable corner of the
+//! The export messages cello emits are a small, stable corner of the
 //! OTLP proto — flat spans and log records with scalar attributes — and
 //! protobuf's wire format is varints and length-delimited fields. Hand
 //! encoding keeps prost, tonic, and the generated proto crates out of
@@ -83,13 +83,13 @@ fn key_value(out: &mut Vec<u8>, field: u64, name: &str, value: Vec<u8>) {
 
 /// `extra` carries the operator's `OTEL_RESOURCE_ATTRIBUTES` entries.
 /// `service.name` in `extra` is ignored (the configured service name wins),
-/// `service.version` in `extra` names the application version, and celld's
-/// own build stays visible under `celld.version`, which cannot collide with
+/// `service.version` in `extra` names the application version, and cello's
+/// own build stays visible under `cello.version`, which cannot collide with
 /// an application key. Without an operator version there is no
-/// `service.version` at all: reporting celld's version there told every
-/// deployment-tracking backend that all applications run celld's build
+/// `service.version` at all: reporting cello's version there told every
+/// deployment-tracking backend that all applications run cello's build
 /// (denoland/celld#314). Entries that collide with a built-in key
-/// (`service.instance.id`, `celld.region`, `celld.version`) are dropped in
+/// (`service.instance.id`, `cello.region`, `cello.version`) are dropped in
 /// favor of the built-in value: OTLP requires unique resource attribute
 /// keys, and the node's own identity must win over operator input.
 fn resource(node: &str, region: &str, service: &str, extra: &[(String, String)]) -> Vec<u8> {
@@ -103,11 +103,11 @@ fn resource(node: &str, region: &str, service: &str, extra: &[(String, String)])
         key_value(&mut out, 1, "service.version", any_string(version));
     }
     key_value(&mut out, 1, "service.instance.id", any_string(node));
-    key_value(&mut out, 1, "celld.region", any_string(region));
+    key_value(&mut out, 1, "cello.region", any_string(region));
     key_value(
         &mut out,
         1,
-        "celld.version",
+        "cello.version",
         any_string(env!("CARGO_PKG_VERSION")),
     );
     for (key, value) in extra {
@@ -115,8 +115,8 @@ fn resource(node: &str, region: &str, service: &str, extra: &[(String, String)])
             || key == "service.name"
             || key == "service.version"
             || key == "service.instance.id"
-            || key == "celld.region"
-            || key == "celld.version"
+            || key == "cello.region"
+            || key == "cello.version"
         {
             continue;
         }
@@ -128,7 +128,7 @@ fn resource(node: &str, region: &str, service: &str, extra: &[(String, String)])
 /// common.v1.InstrumentationScope: name=1, version=2.
 fn scope() -> Vec<u8> {
     let mut out = Vec::new();
-    field_str(&mut out, 1, "celld");
+    field_str(&mut out, 1, "cello");
     field_str(&mut out, 2, env!("CARGO_PKG_VERSION"));
     out
 }
@@ -164,22 +164,22 @@ fn span_message(span: &Span) -> Vec<u8> {
         );
     }
     if let Some(request_id) = &span.request_id {
-        key_value(&mut out, 9, "celld.request_id", any_string(request_id));
+        key_value(&mut out, 9, "cello.request_id", any_string(request_id));
     }
     if let Some(cell) = &span.cell {
-        key_value(&mut out, 9, "celld.cell", any_string(cell));
+        key_value(&mut out, 9, "cello.cell", any_string(cell));
     }
     if let Some(epoch) = span.epoch {
-        key_value(&mut out, 9, "celld.epoch", any_int(epoch as i64));
+        key_value(&mut out, 9, "cello.epoch", any_int(epoch as i64));
     }
     if let Some(isolate) = span.isolate {
-        key_value(&mut out, 9, "celld.isolate", any_int(isolate as i64));
+        key_value(&mut out, 9, "cello.isolate", any_int(isolate as i64));
     }
     if let Some(queue_wait_us) = span.queue_wait_us {
-        key_value(&mut out, 9, "celld.queue_wait_us", any_int(queue_wait_us));
+        key_value(&mut out, 9, "cello.queue_wait_us", any_int(queue_wait_us));
     }
     if let Some(remote) = span.parent_remote {
-        key_value(&mut out, 9, "celld.parent_remote", any_bool(remote));
+        key_value(&mut out, 9, "cello.parent_remote", any_bool(remote));
     }
     // Status (15): unset when ok, per the spec; ERROR (code=3 value 2)
     // with the message when not.
@@ -295,17 +295,17 @@ mod tests {
         assert!(!contains(&encoded, "ignored"));
         assert!(contains(&encoded, "deployment.environment.name"));
         assert!(contains(&encoded, "play"));
-        // celld's own build stays visible under a key that cannot collide.
-        assert!(contains(&encoded, "celld.version"));
+        // Cello's own build stays visible under a key that cannot collide.
+        assert!(contains(&encoded, "cello.version"));
         assert!(contains(&encoded, env!("CARGO_PKG_VERSION")));
     }
 
     #[test]
     fn resource_omits_service_version_without_operator_value() {
-        let encoded = traces_request(&[], "node-1", "us-east-1", "celld", &[]);
+        let encoded = traces_request(&[], "node-1", "us-east-1", "cello", &[]);
         assert!(contains(&encoded, "service.name"));
         assert!(!contains(&encoded, "service.version"));
-        assert!(contains(&encoded, "celld.version"));
+        assert!(contains(&encoded, "cello.version"));
     }
 
     fn count(haystack: &[u8], needle: &str) -> usize {
@@ -319,19 +319,19 @@ mod tests {
     fn resource_emits_each_builtin_key_once() {
         let extra = vec![
             ("service.instance.id".to_string(), "operator-id".to_string()),
-            ("celld.region".to_string(), "operator-region".to_string()),
-            ("celld.version".to_string(), "9.9.9".to_string()),
+            ("cello.region".to_string(), "operator-region".to_string()),
+            ("cello.version".to_string(), "9.9.9".to_string()),
             (
                 "deployment.environment.name".to_string(),
                 "play".to_string(),
             ),
         ];
-        let encoded = traces_request(&[], "node-1", "us-east-1", "celld", &extra);
+        let encoded = traces_request(&[], "node-1", "us-east-1", "cello", &extra);
         // The built-ins win: one key each, carrying the node's own values.
         for key in [
             "service.instance.id",
-            "celld.region",
-            "celld.version",
+            "cello.region",
+            "cello.version",
             "deployment.environment.name",
         ] {
             assert_eq!(count(&encoded, key), 1, "exactly one {key}");

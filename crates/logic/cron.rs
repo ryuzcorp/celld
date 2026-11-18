@@ -362,7 +362,7 @@ fn parse_item(item: &str, field: &Field) -> Result<u64, String> {
             }
         },
     };
-    // A descending range is refused, and this is the one place celld declines
+    // A descending range is refused, and this is the one place cello declines
     // to follow Cloudflare. Cloudflare accepts it and wraps around the end of
     // the field for Quartz's sake, but takes one value too many at the low end:
     // `SAT-SUN` matches Friday there and `NOV-FEB` matches October, which
@@ -372,7 +372,7 @@ fn parse_item(item: &str, field: &Field) -> Result<u64, String> {
     // the deploy where the developer is watching instead.
     if first > last {
         return Err(format!(
-            "{} field has a descending range in {item:?}; celld does not wrap a range around the end of a field",
+            "{} field has a descending range in {item:?}; cello does not wrap a range around the end of a field",
             field.name
         ));
     }

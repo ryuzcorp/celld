@@ -5,7 +5,7 @@
 // data lines join with "\n", an empty joined data dispatches nothing,
 // and `id:` persists as the Last-Event-ID for reconnects.
 (function () {
-  const kFrom = Symbol("celld.EventSource.from");
+  const kFrom = Symbol("cello.EventSource.from");
 
   class EventSource extends EventTarget {
     static CONNECTING = 0;

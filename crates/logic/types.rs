@@ -1,5 +1,5 @@
 // Modified by ryuzcorp (ryuzcorp/celld): round-level fence settlement (0062); renewal lease readback carries the authority bound (upstream #264); lease CAS conflict outcome (upstream #239); RestartRuntime event (upstream #291).
-// Modified by ryuzcorp (ryuzcorp/celld): ported from meln1k/celld: seal a dead lease that never opened a log (01522b3); shared bucket-posture ownership reads across concurrent gates (0056).
+// Modified by ryuzcorp (ryuzcorp/celld): ported from meln1k/cello: seal a dead lease that never opened a log (01522b3); shared bucket-posture ownership reads across concurrent gates (0056).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! The vocabulary the core is written in: what it is told, what it
@@ -125,7 +125,7 @@ pub struct Config {
     ///
     /// Without this a swallowed effect is invisible: no event ever arrives, no
     /// timer is watching, and the request waits forever while every piece of
-    /// state remains perfectly consistent. celld shipped that and parked
+    /// state remains perfectly consistent. cello shipped that and parked
     /// requests past ninety seconds. `None` restores the old behaviour, which
     /// callers use only when they need to observe an indefinite wait.
     pub operation_deadline_ms: Option<u64>,
@@ -1323,7 +1323,7 @@ pub enum StopCause {
     },
     Fence,
     /// A durability proof came back negative, so this runtime's memory and its
-    /// local database may hold writes the bucket does not. celld has just told
+    /// local database may hold writes the bucket does not. cello has just told
     /// the caller those writes failed; continuing to serve them is the
     /// divergence, not the failure. Stop, keep no local snapshot, and let the
     /// next activation restore from the bucket.

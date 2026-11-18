@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): CELLO_MEMORY_SCOPE help; operator token for the internal listener; staged activation; staged invoke command; CELLO_DEPLOY_AWS_* help; non-dumpable serving process. bucket-posture group commit: bundle switch help (0070); bundle switch defaults off (0075); CELLO_NODE pinning help (upstream #249); background budget help (upstream #275); CELLO_TMP_MAX_BYTES help (upstream #280); celld versions command (upstream #181); CELLO_SQL_STATEMENT_MS help (upstream #274); CELLO_MAX_CELLS_PER_ISOLATE help (upstream #278).
+// Modified by ryuzcorp (ryuzcorp/celld): CELLO_MEMORY_SCOPE help; operator token for the internal listener; staged activation; staged invoke command; CELLO_DEPLOY_AWS_* help; non-dumpable serving process. bucket-posture group commit: bundle switch help (0070); bundle switch defaults off (0075); CELLO_NODE pinning help (upstream #249); background budget help (upstream #275); CELLO_TMP_MAX_BYTES help (upstream #280); cello versions command (upstream #181); CELLO_SQL_STATEMENT_MS help (upstream #274); CELLO_MAX_CELLS_PER_ISOLATE help (upstream #278).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! The command line: what the process was asked to do, and the help text
@@ -20,7 +20,7 @@ pub(crate) struct Settings {
     /// Whether forwarded scheme and host headers can set `request.url`.
     /// This option is off unless a trusted proxy replaces both headers.
     pub(crate) trust_forwarded_headers: bool,
-    /// Set only by the `celld dev` supervisor for its child node. No fleet
+    /// Set only by the `cello dev` supervisor for its child node. No fleet
     /// flag or public environment variable selects the local backend.
     pub(crate) dev_store: Option<std::path::PathBuf>,
 }
@@ -57,7 +57,7 @@ pub(crate) enum Action {
 
 impl Action {
     /// Whether this invocation is the long-running process — a node, or the
-    /// `celld dev` supervisor that owns one — rather than an operator
+    /// `cello dev` supervisor that owns one — rather than an operator
     /// command. `main` consults it before anything else reads the
     /// environment, to make that process non-dumpable (patch 0053): the
     /// fleet uid is shared with tenant builds, which must not be able to
@@ -69,8 +69,8 @@ impl Action {
     /// Whether this invocation's stdout carries data rather than a log stream.
     ///
     /// A node's stdout *is* its log, and Docker and journald read it. A CLI
-    /// subcommand's stdout is its answer: `celld kv get KEY > value` must write
-    /// the value and nothing else, and `celld d1 execute` prints JSON a script
+    /// subcommand's stdout is its answer: `cello kv get KEY > value` must write
+    /// the value and nothing else, and `cello d1 execute` prints JSON a script
     /// parses. Sharing one stream between the two prefixes an operator's data
     /// with whatever the process happened to warn about at startup, which is
     /// how this was found -- an allocator warning landed in front of a value.
@@ -159,7 +159,7 @@ pub(crate) fn action_from_process() -> anyhow::Result<Action> {
         // This placeholder is resolved after command-line mode flags. An
         // explicit environment or CLI address always wins; otherwise managed
         // mode selects the first free demo port and standalone uses 8080,
-        // matching celld's listener contract.
+        // matching cello's listener contract.
         listen: configured_listen
             .map(cello::startup::Listen::Explicit)
             .unwrap_or(cello::startup::Listen::AutoLoopback),
@@ -230,7 +230,7 @@ pub(crate) fn action_from_process() -> anyhow::Result<Action> {
             "--json" if diagnose => json = true,
             "--no-control-plane" => settings.control_plane = false,
             other => {
-                anyhow::bail!("unknown command or option: {other}; run `celld --help` for usage")
+                anyhow::bail!("unknown command or option: {other}; run `cello --help` for usage")
             }
         }
     }
@@ -250,7 +250,7 @@ pub(crate) fn action_from_process() -> anyhow::Result<Action> {
     if listen_configured && public_listener_is_non_loopback && !internal_listen_configured {
         anyhow::bail!(
             "a non-loopback --listen or CELLO_ADDR requires an explicit --internal-listen or \
-             CELLO_INTERNAL_ADDR; celld does not reuse the public Worker listener for peers"
+             CELLO_INTERNAL_ADDR; cello does not reuse the public Worker listener for peers"
         );
     }
     if settings.advertise.is_some() && !internal_listen_configured {
@@ -262,10 +262,10 @@ pub(crate) fn action_from_process() -> anyhow::Result<Action> {
     if settings.dev_store.is_some() {
         anyhow::ensure!(
             !settings.control_plane
-                && settings.bucket.as_deref() == Some("celld-dev")
+                && settings.bucket.as_deref() == Some("cello-dev")
                 && settings.endpoint.is_none()
                 && settings.advertise.is_none(),
-            "the internal development store requires the celld dev node configuration"
+            "the internal development store requires the cello dev node configuration"
         );
     }
     Ok(if diagnose {
@@ -282,27 +282,27 @@ pub(crate) fn action_from_process() -> anyhow::Result<Action> {
 
 pub(crate) fn print_help() -> anyhow::Result<()> {
     let help = format!(
-        r#"celld — self-hosted, distributed Durable Objects
+        r#"cello — self-hosted, distributed Durable Objects
 
 USAGE:
-  celld --bucket [s3://|gs://|az://]NAME[/PREFIX] [OPTIONS]
-  celld deploy [PROJECT] --bucket [s3://|gs://|az://]NAME[/PREFIX] [OPTIONS]
-  celld activate SCRIPT=VERSION... --bucket [s3://|gs://|az://]NAME[/PREFIX] [OPTIONS]
-  celld discard SCRIPT=VERSION... --bucket [s3://|gs://|az://]NAME[/PREFIX] [OPTIONS]
-  celld versions [SCRIPT] --bucket [s3://|gs://|az://]NAME[/PREFIX] [OPTIONS]
-  celld invoke SCRIPT=VERSION... --path PATH --bucket [s3://|gs://|az://]NAME[/PREFIX]
-  celld dev [PROJECT] [--host IP] [--port PORT] [--logs] [--state DIR]
-  celld cell list [CLASS] --bucket [s3://|gs://|az://]NAME[/PREFIX] [OPTIONS]
-  celld cell gc --dry-run [CLASS] --bucket [s3://|gs://|az://]NAME[/PREFIX] [OPTIONS]
-  celld d1 migrations apply DATABASE [PROJECT] --bucket [s3://|gs://|az://]NAME[/PREFIX]
-  celld d1 execute DATABASE --command SQL [PROJECT] --bucket [s3://|gs://|az://]NAME[/PREFIX]
-  celld kv get|put|delete|list|info NAMESPACE --bucket [s3://|gs://|az://]NAME[/PREFIX]
-  celld queue info|peek|purge|pause|resume|redrive QUEUE --bucket [s3://|gs://|az://]NAME[/PREFIX]
-  celld r2 get|head|put|delete|list BUCKET [KEY] --bucket [s3://|gs://|az://]NAME[/PREFIX]
-  celld diagnose --bucket [s3://|gs://|az://]NAME[/PREFIX] [OPTIONS] [--peer NODE_ID]...
+  cello --bucket [s3://|gs://|az://]NAME[/PREFIX] [OPTIONS]
+  cello deploy [PROJECT] --bucket [s3://|gs://|az://]NAME[/PREFIX] [OPTIONS]
+  cello activate SCRIPT=VERSION... --bucket [s3://|gs://|az://]NAME[/PREFIX] [OPTIONS]
+  cello discard SCRIPT=VERSION... --bucket [s3://|gs://|az://]NAME[/PREFIX] [OPTIONS]
+  cello versions [SCRIPT] --bucket [s3://|gs://|az://]NAME[/PREFIX] [OPTIONS]
+  cello invoke SCRIPT=VERSION... --path PATH --bucket [s3://|gs://|az://]NAME[/PREFIX]
+  cello dev [PROJECT] [--host IP] [--port PORT] [--logs] [--state DIR]
+  cello cell list [CLASS] --bucket [s3://|gs://|az://]NAME[/PREFIX] [OPTIONS]
+  cello cell gc --dry-run [CLASS] --bucket [s3://|gs://|az://]NAME[/PREFIX] [OPTIONS]
+  cello d1 migrations apply DATABASE [PROJECT] --bucket [s3://|gs://|az://]NAME[/PREFIX]
+  cello d1 execute DATABASE --command SQL [PROJECT] --bucket [s3://|gs://|az://]NAME[/PREFIX]
+  cello kv get|put|delete|list|info NAMESPACE --bucket [s3://|gs://|az://]NAME[/PREFIX]
+  cello queue info|peek|purge|pause|resume|redrive QUEUE --bucket [s3://|gs://|az://]NAME[/PREFIX]
+  cello r2 get|head|put|delete|list BUCKET [KEY] --bucket [s3://|gs://|az://]NAME[/PREFIX]
+  cello diagnose --bucket [s3://|gs://|az://]NAME[/PREFIX] [OPTIONS] [--peer NODE_ID]...
 
-Production install: celld --bucket s3://NAME [OPTIONS]
-                    celld --bucket gs://NAME [OPTIONS]
+Production install: cello --bucket s3://NAME [OPTIONS]
+                    cello --bucket gs://NAME [OPTIONS]
 
 OPTIONS:
   --bucket [s3://|gs://|az://]NAME[/PREFIX]
@@ -310,7 +310,7 @@ OPTIONS:
                          AWS credential chain, gs:// selects Google Cloud
                          Storage via Application Default Credentials, az://
                          names an Azure Blob Storage container and takes its
-                         account from AZURE_STORAGE_ACCOUNT_NAME (celld
+                         account from AZURE_STORAGE_ACCOUNT_NAME (cello
                          rejects --endpoint and ignores --region for both). A
                          PREFIX puts every object under it, so several fleets
                          can share one bucket
@@ -325,7 +325,7 @@ OPTIONS:
                          (requires --internal-listen or CELLO_INTERNAL_ADDR)
   --peer NODE_ID         Diagnose one node with a signed direct probe; repeatable
   --json                 Print one JSON object per diagnostic check
-  --read-only            Skip the bucket write probe. celld diagnose otherwise
+  --read-only            Skip the bucket write probe. cello diagnose otherwise
                          tests the conditional write, which writes and deletes a
                          small object under the probe/ prefix
   --unsafe-public-advertise
@@ -339,7 +339,7 @@ OPTIONS:
                          scheme and host in request.url. Set this option only
                          when a trusted proxy replaces both headers
   -h, --help             Show this help
-  -V, --version          Show the celld version
+  -V, --version          Show the cello version
 
 ENVIRONMENT:
   Boolean variables accept only `0` or `1`; invalid values stop startup.
@@ -433,7 +433,7 @@ TUNING:
   CELLO_LTX_RETENTION_SECS        Grace in seconds before an owner deletes superseded epochs (default: unset, no deletion)
   RUST_LOG                        Runtime log filter (default: info)
 
-Documentation: https://celld.dev/docs"#,
+Documentation: https://cello.dev/docs"#,
         shutdown_total_ms = cello::env_vars::DEFAULT_SHUTDOWN_TOTAL_MS,
     );
     cello::cli_output::Output::new(cello::cli_output::Format::Text).help(&help)
@@ -447,7 +447,7 @@ mod action_serving_tests {
     /// operator command stays attachable.
     #[test]
     fn only_serving_invocations_are_hardened() {
-        // `celld` with no subcommand, and a `--control-plane` node, both
+        // `cello` with no subcommand, and a `--control-plane` node, both
         // take `Action::Run`: they are the node itself.
         for control_plane in [false, true] {
             let node = Action::Run(Settings {

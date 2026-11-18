@@ -2,7 +2,7 @@
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! The object-store side of an `r2_buckets` binding: the R2 object record,
-//! the request shapes, and the reads and writes that `celld r2` and the cell
+//! the request shapes, and the reads and writes that `cello r2` and the cell
 //! runtime share. Every engine reaches the fleet bucket through this module,
 //! so an operator and a Worker cannot disagree about the key an object lives
 //! under or the record it carries. The V8 ops live in `js/r2_ops.rs`.
@@ -46,7 +46,7 @@ const STREAM_PART: usize = 8 << 20;
 /// The user-metadata name the R2 object record lives under. See
 /// [`Envelope`]. The bucket stores it as `cello_r2` on Azure, which
 /// refuses a hyphen in a metadata name.
-const ENVELOPE: &str = "celld-r2";
+const ENVELOPE: &str = "cello-r2";
 
 /// The key space one binding owns inside the fleet bucket. `bucket_name`
 /// comes from the deployment manifest, which validates it, so the prefix
@@ -58,7 +58,7 @@ pub(crate) fn blob_key(bucket_name: &str, key: &str) -> String {
 /// The fleet bucket, or the error every op answers without one.
 pub(crate) fn store() -> Result<&'static Bucket, String> {
     R2_STORE.get().ok_or_else(|| {
-        "R2 bindings need a fleet bucket: start celld with --bucket (or CELLO_BUCKET)".to_string()
+        "R2 bindings need a fleet bucket: start cello with --bucket (or CELLO_BUCKET)".to_string()
     })
 }
 
@@ -95,7 +95,7 @@ pub(crate) struct HttpMeta {
 /// is written as one JSON value under a single reserved user-metadata
 /// name, escaped to ASCII, and the five content headers are *also*
 /// written as headers so the stored object is a well-formed object rather
-/// than a celld-private encoding.
+/// than a cello-private encoding.
 ///
 /// An object with no envelope — one this runtime wrote before the record
 /// existed, or one another tool put in the bucket — still reads: its user
@@ -286,7 +286,7 @@ struct ListRequest {
     include: bool,
 }
 
-/// A `list()` request in the shape `__makeR2Bucket` sends it. `celld r2
+/// A `list()` request in the shape `__makeR2Bucket` sends it. `cello r2
 /// list` builds the same JSON the binding does, so an operator's listing
 /// and a Worker's listing are one code path with one set of semantics.
 pub(crate) fn list_request(
@@ -406,7 +406,7 @@ fn verify(
                      caller asserted"
                 ))
             }
-            None => return Err(format!("R2 put: celld cannot check a {name} checksum")),
+            None => return Err(format!("R2 put: cello cannot check a {name} checksum")),
         }
     }
     Ok(())
@@ -414,7 +414,7 @@ fn verify(
 
 /// One object's record, or `None` when the key does not exist.
 ///
-/// Shared with `celld r2 head`: an operator and a Worker must not be able
+/// Shared with `cello r2 head`: an operator and a Worker must not be able
 /// to disagree about which key an object lives under, and the answer is
 /// only right because both sides scope the key the same way.
 pub(crate) async fn head(bucket_name: &str, key: &str) -> Result<Option<BlobMeta>, String> {
@@ -426,7 +426,7 @@ pub(crate) async fn head(bucket_name: &str, key: &str) -> Result<Option<BlobMeta
 
 /// One conditional read, with the body still on the wire.
 ///
-/// Shared with `celld r2 get`, which drains the body to stdout instead of
+/// Shared with `cello r2 get`, which drains the body to stdout instead of
 /// handing it to an isolate.
 pub(crate) async fn read(
     bucket_name: &str,
@@ -440,7 +440,7 @@ pub(crate) async fn read(
         .map_err(|error| error.to_string())
 }
 
-/// Remove every named key. Shared with `celld r2 delete`.
+/// Remove every named key. Shared with `cello r2 delete`.
 pub(crate) async fn delete(bucket_name: &str, keys: &[String]) -> Result<(), String> {
     let store = store()?;
     let keys = keys
@@ -553,8 +553,8 @@ fn unscope_key(strip: &str, key: &str) -> String {
 /// offset alone would re-admit keys the first page filtered out where
 /// encoded and decoded orders disagree. The token is shell-safe base64url
 /// over JSON, so the CLI prints it back unchanged.
-const CURSOR_FAMILY: &str = "celld-r2-cursor-";
-const CURSOR_V1: &str = "celld-r2-cursor-v1.";
+const CURSOR_FAMILY: &str = "cello-r2-cursor-";
+const CURSOR_V1: &str = "cello-r2-cursor-v1.";
 
 /// A seeded listing's cursor: the consumed position plus the decoded
 /// bound of the listing it came from, both in the caller's key space.
@@ -614,7 +614,7 @@ fn wrap_cursor(strip: &str, bound: Option<&str>, key: &str) -> String {
 /// `R2Objects`. `request_json` is R2's `R2ListOptions`, normalized by the
 /// harness.
 ///
-/// Shared with `celld r2 list --page`, so an operator's page applies the
+/// Shared with `cello r2 list --page`, so an operator's page applies the
 /// same prefix scoping, the same cursor rule, and the same page bound as
 /// a Worker's.
 pub(crate) async fn list(
@@ -682,7 +682,7 @@ pub(crate) async fn list(
 }
 
 /// One listing page with its rows in walk order, in the caller's key
-/// space. `celld r2 list` prints these rows and resumes past the last
+/// space. `cello r2 list` prints these rows and resumes past the last
 /// printed one, so it needs the order and the per-prefix continuations
 /// the binding's JSON shape does not carry. Same request, same scoping,
 /// same walk as [`list`]; only the projection differs.
@@ -789,7 +789,7 @@ pub(crate) struct PutStream {
 /// Open a streaming write. `request_json` is R2's `R2PutOptions`,
 /// normalized by the harness.
 ///
-/// This is the one constructor, so `celld r2 put` and a Worker's
+/// This is the one constructor, so `cello r2 put` and a Worker's
 /// `env.BUCKET.put()` cannot store a different record for the same input:
 /// the checksum set, the envelope, and the single-request/multipart choice
 /// are all decided here and in [`PutStream::finish`].
@@ -846,7 +846,7 @@ impl PutStream {
             // request; this one has outgrown that.
             if self.request.only_if.is_some() {
                 return Err(format!(
-                    "R2 put of {}: celld cannot apply `onlyIf` to a streamed body larger than \
+                    "R2 put of {}: cello cannot apply `onlyIf` to a streamed body larger than \
                      {STREAM_PART} bytes, because it is written as a multipart upload and a \
                      multipart completion takes no precondition",
                     self.key
@@ -1063,7 +1063,7 @@ mod tests {
         for (pos, bound) in [
             ("a/1", "a"),
             ("a~", "aa"),
-            ("celld-r2-cursor-v1.plain", ""),
+            ("cello-r2-cursor-v1.plain", ""),
             ("é/x", "p~/"),
             ("", "m"),
         ] {
@@ -1095,9 +1095,9 @@ mod tests {
     /// loudly instead of resuming somewhere surprising.
     #[test]
     fn corrupt_cursors_fail_loudly() {
-        assert!(decode_cursor("celld-r2-cursor-v1.not-base64!!!").is_err());
-        assert!(decode_cursor("celld-r2-cursor-v1.aGk").is_err());
-        assert!(decode_cursor("celld-r2-cursor-v9.whatever").is_err());
+        assert!(decode_cursor("cello-r2-cursor-v1.not-base64!!!").is_err());
+        assert!(decode_cursor("cello-r2-cursor-v1.aGk").is_err());
+        assert!(decode_cursor("cello-r2-cursor-v9.whatever").is_err());
     }
 
     /// A token beside a `startAfter` keeps its own bound: R2 ignores

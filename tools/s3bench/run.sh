@@ -6,7 +6,7 @@
 #
 #   1. starts a local RustFS container and creates <bucket> in it
 #      (bucket names must be lowercase; create accepts 200 or 409),
-#   2. starts a logging proxy in front of it and <nodes> celld nodes
+#   2. starts a logging proxy in front of it and <nodes> Cello nodes
 #      (CELLO_BIN, ports offset by OFF) pointed at the proxy,
 #   3. deploys the test app from app/,
 #   4. drives the workload, then runs count.py over the proxy log,
@@ -47,7 +47,7 @@ if [[ -z "${CELLO_BIN:-}" ]]; then
   [[ -x "$CELLO_BIN" ]] || CELLO_BIN="$HOME/.cargo-target/cello-wt-$(basename "$ROOT")/release/cello"
 fi
 [[ -x "$CELLO_BIN" ]] || { echo "run.sh: no executable CELLO_BIN=$CELLO_BIN (cargo build --release -p cello first)" >&2; exit 1; }
-command -v esbuild >/dev/null || { echo "run.sh: esbuild not on PATH (needed by celld deploy)" >&2; exit 1; }
+command -v esbuild >/dev/null || { echo "run.sh: esbuild not on PATH (needed by cello deploy)" >&2; exit 1; }
 command -v docker >/dev/null || { echo "run.sh: docker not on PATH" >&2; exit 1; }
 python3 -c "import boto3" 2>/dev/null || { echo "run.sh: python3 boto3 missing (pip install boto3)" >&2; exit 1; }
 
@@ -56,7 +56,7 @@ python3 -c "import boto3" 2>/dev/null || { echo "run.sh: python3 boto3 missing (
 # like a regression. Refuse rather than measure noise; a leftover container
 # from a killed run must be removed first.
 if [[ "${S3BENCH_ALLOW_PARALLEL:-0}" != 1 ]]; then
-  others=$(docker ps --filter name=celld-s3bench- --format '{{.Names}}' | tr '\n' ' ')
+  others=$(docker ps --filter name=cello-s3bench- --format '{{.Names}}' | tr '\n' ' ')
   if [[ -n "$others" ]]; then
     echo "== refusing: another s3bench run is up ($others); wait for it, remove a leftover with 'docker rm -f <name>', or set S3BENCH_ALLOW_PARALLEL=1 for counts-only runs" >&2
     exit 2
@@ -100,7 +100,7 @@ STORE_PORT="${PORTS[0]}"
 PROXY_PORT="${PORTS[1]}"
 STORE_URL="http://127.0.0.1:$STORE_PORT"
 PROXY_URL="http://127.0.0.1:$PROXY_PORT"
-CONTAINER="celld-s3bench-$$"
+CONTAINER="cello-s3bench-$$"
 
 node_pub() { echo "${PORTS[$((2 + OFF + 2 * $1))]}"; }
 node_priv() { echo "${PORTS[$((2 + OFF + 2 * $1 + 1))]}"; }

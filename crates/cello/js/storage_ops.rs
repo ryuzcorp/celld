@@ -1475,7 +1475,7 @@ pub(super) fn op_storage_delete_all(
 /// value is a JSON `[class, value, name]` string captured at brand time;
 /// the lift check and record both read this single value, so no split.
 fn do_stub_brand_private<'s>(scope: &mut v8::PinScope<'s, '_>) -> v8::Local<'s, v8::Private> {
-    let name = v8::String::new(scope, "celld#doStub").unwrap();
+    let name = v8::String::new(scope, "cello#doStub").unwrap();
     v8::Private::for_api(scope, Some(name))
 }
 

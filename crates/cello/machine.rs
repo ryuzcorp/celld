@@ -154,7 +154,7 @@ pub fn random_process_generation() -> String {
         .collect()
 }
 
-/// Watermarks from celld's public environment contract.
+/// Watermarks from cello's public environment contract.
 /// `CELLO_PRESSURE_OWNERSHIP`: `release` (the default) or `sticky`.
 /// The lease lifetime, as the capacity listing needs it to decide which node
 /// records are stale enough to skip reading. Same variable and default the

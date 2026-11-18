@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Where `program` executes from: itself when it names a path, else the
-/// first match on `PATH`, as `execvp` searches, resolved against celld's own
+/// first match on `PATH`, as `execvp` searches, resolved against cello's own
 /// working directory. Either way it must be an executable regular file;
 /// `None` when nothing qualifies. The result is canonical, so the child,
 /// which starts in the project directory, executes exactly the file the

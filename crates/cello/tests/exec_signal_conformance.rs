@@ -20,7 +20,7 @@
 //! so a fixture cannot even declare `containers[]`), and the fake stands
 //! in for it beneath the real `Container.prototype.exec` path.
 //!
-//! One `celld dev` boots the fixture; there are no fixed sleeps: every
+//! One `cello dev` boots the fixture; there are no fixed sleeps: every
 //! wait polls an observable condition with a deadline, and the server
 //! guard kills the child on every exit path.
 
@@ -53,7 +53,7 @@ fn copy_dir(src: &Path, dst: &Path) {
     }
 }
 
-/// A booted `celld dev` and its address. Kills the child on drop, so a
+/// A booted `cello dev` and its address. Kills the child on drop, so a
 /// failing assertion cannot leak a server onto its port.
 struct TestNode {
     child: Child,
@@ -73,7 +73,7 @@ impl TestNode {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .expect("spawn celld dev");
+            .expect("spawn cello dev");
         let mut stdout = child.stdout.take().expect("piped stdout");
         let stderr = child.stderr.take().expect("piped stderr");
         // Drain stdout so a chatty child can never block on a full pipe.
@@ -99,11 +99,11 @@ impl TestNode {
         node.public = poll_until("boot", Duration::from_secs(120), || {
             if let Some(status) = node.child.try_wait().expect("poll child") {
                 panic!(
-                    "celld dev exited during boot: {status}: {}",
+                    "cello dev exited during boot: {status}: {}",
                     announced_lines.lock().expect("announce lock").join("\n")
                 );
             }
-            let public = announced(&announced_lines, "celld listening on ")?;
+            let public = announced(&announced_lines, "cello listening on ")?;
             if !probe(&public, "/health") {
                 return None;
             }
@@ -192,7 +192,7 @@ fn poll_until(
 #[test]
 fn exec_signal_conformance() {
     let dir = tempfile::Builder::new()
-        .prefix("celld-exec-signal-")
+        .prefix("cello-exec-signal-")
         .tempdir()
         .expect("tempdir");
     let app_project = dir.path().join("app");
@@ -279,7 +279,7 @@ fn exec_signal_conformance() {
 #[test]
 fn exec_kill_delivery_conformance() {
     let dir = tempfile::Builder::new()
-        .prefix("celld-exec-kill-delivery-")
+        .prefix("cello-exec-kill-delivery-")
         .tempdir()
         .expect("tempdir");
     let app_project = dir.path().join("app");
@@ -306,7 +306,7 @@ fn exec_kill_delivery_conformance() {
 #[test]
 fn exec_close_delivery_conformance() {
     let dir = tempfile::Builder::new()
-        .prefix("celld-exec-close-delivery-")
+        .prefix("cello-exec-close-delivery-")
         .tempdir()
         .expect("tempdir");
     let app_project = dir.path().join("app");
@@ -333,7 +333,7 @@ fn exec_close_delivery_conformance() {
 #[test]
 fn container_signal_delivery_conformance() {
     let dir = tempfile::Builder::new()
-        .prefix("celld-signal-delivery-")
+        .prefix("cello-signal-delivery-")
         .tempdir()
         .expect("tempdir");
     let app_project = dir.path().join("app");
@@ -364,7 +364,7 @@ fn container_signal_delivery_conformance() {
 #[test]
 fn container_signal_failed_event_delivery_conformance() {
     let dir = tempfile::Builder::new()
-        .prefix("celld-signal-fail-")
+        .prefix("cello-signal-fail-")
         .tempdir()
         .expect("tempdir");
     let app_project = dir.path().join("app");

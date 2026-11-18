@@ -1,5 +1,5 @@
 // Modified by ryuzcorp (ryuzcorp/celld): node:crypto scrypt.
-// node:crypto for celld -- a port of Workerd's implementation at commit
+// node:crypto for cello -- a port of Workerd's implementation at commit
 // 191a27f941300dd8956f2afeb66c10a651108c0b. Copyright (c) 2017-2022
 // Cloudflare, Inc. (Apache-2.0), itself adapted from Node.js (Joyent and
 // Node.js contributors, MIT). Ported files:
@@ -499,7 +499,7 @@
     return asU8(bytes);
   };
 
-  // The ciphers celld can seal a PKCS#8 export under. Node reaches every
+  // The ciphers cello can seal a PKCS#8 export under. Node reaches every
   // cipher OpenSSL carries, so this list is the short one, and a name outside
   // it is refused by name -- a silent fall back to one of these would seal the
   // key under a cipher the caller never asked for.
@@ -523,7 +523,7 @@
         throw ERR_METHOD_NOT_IMPLEMENTED(`${name}.cipher ${options.cipher}`);
       // Encryption here is the PKCS#8 wrapper and nothing else. For sec1 and
       // pkcs1 Node writes a traditional PEM instead -- an "EC PRIVATE KEY"
-      // body behind Proc-Type and DEK-Info headers -- which celld cannot
+      // body behind Proc-Type and DEK-Info headers -- which cello cannot
       // produce, so it is refused rather than answered with a PKCS#8 key
       // under a header the caller did not ask for.
       if (options.type !== undefined && options.type !== "pkcs8")
@@ -536,7 +536,7 @@
       }
     } else if (type === "private" && options.passphrase !== undefined) {
       // A passphrase with no cipher named nothing to encrypt under. Node
-      // refuses it, and so must celld: the alternative is to pick a cipher
+      // refuses it, and so must cello: the alternative is to pick a cipher
       // the caller never asked for, or to write the key out in the clear.
       throw ERR_INVALID_ARG_VALUE(`${name}.cipher`, options.cipher);
     }
@@ -968,7 +968,7 @@
       }
     }
     // Everything above is Workerd's argument validation, unchanged. Below is
-    // the generation itself, for the algorithms celld carries a crate for.
+    // the generation itself, for the algorithms cello carries a crate for.
     if (type === "dh")
       throw ERR_METHOD_NOT_IMPLEMENTED(`generateKeyPairSync ${type}`);
     if (type === "rsa") {
@@ -996,7 +996,7 @@
       // With an encoding, Node returns the encoded key itself rather than a
       // KeyObject: a string for pem, a Buffer for der. A private encoding
       // can carry a cipher and a passphrase, which seal the key the same way
-      // `KeyObject.export` does -- celld dropped them before, so a caller
+      // `KeyObject.export` does -- cello dropped them before, so a caller
       // that asked for an encrypted key got a plaintext one.
       const out = keyOp("asym-key-reencode", {
         der,

@@ -680,7 +680,7 @@ export default {
     // handles rejects, and streams surface disconnect errors, while the
     // cell itself reactivates and serves fresh handles. The runner
     // passes the node's internal base URL, so this request can evict
-    // its own owner halfway through. (celld refuses to evict a cell
+    // its own owner halfway through. (cello refuses to evict a cell
     // with work in flight, so an op pending across the eviction
     // instant is not reachable; the reload probe below covers a
     // pending op across a lifecycle change instead.)

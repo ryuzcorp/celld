@@ -10,7 +10,7 @@ the `workerId` prop.
 Run the example and enable log output:
 
 ```sh
-celld dev . --logs
+cello dev . --logs
 ```
 
 Send a request from another terminal:
@@ -19,5 +19,5 @@ Send a request from another terminal:
 curl http://127.0.0.1:8787
 ```
 
-The request returns `Hello from a Dynamic Worker!`. The celld output contains
+The request returns `Hello from a Dynamic Worker!`. The Cello output contains
 `dynamic-worker-tail: hello from loaded code`.

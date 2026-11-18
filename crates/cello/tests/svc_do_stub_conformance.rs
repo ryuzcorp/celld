@@ -15,7 +15,7 @@
 //! forged `__celld$do` markers are refused. The two-hop case drives the
 //! returned stub over DO RPC (0007): the managed-sandbox two-hop path.
 //!
-//! One `celld dev` boots the app fixture; the controller fixture is
+//! One `cello dev` boots the app fixture; the controller fixture is
 //! pre-seeded into the dev bucket via the library (the same `build` + `write`
 //! `dev` itself runs), so the node loads both scripts and the service binding
 //! resolves cross-isolate. There are no fixed sleeps: every wait polls an
@@ -41,7 +41,7 @@ fn fixture_dir() -> PathBuf {
         .expect("fixture exists")
 }
 
-/// One address of a `celld dev` node, from the announce line the supervisor
+/// One address of a `cello dev` node, from the announce line the supervisor
 /// forwards to its stderr. The node is non-dumpable (patch 0053), so
 /// `/proc/<pid>/fd` no longer names its listeners, and this is the node's
 /// own report of where it bound.
@@ -81,7 +81,7 @@ fn copy_dir(src: &Path, dst: &Path) {
 /// Tempdir for one fixture copy: `/dev/shm` when usable, else the
 /// default tempdir.
 ///
-/// Each booted `celld dev` keeps its SQLite store beside its fixture
+/// Each booted `cello dev` keeps its SQLite store beside its fixture
 /// copy, and the node self-fences when a lease commit stalls past the
 /// TTL bound. Parallel suites on a loaded disk stall commits for
 /// seconds (observed: a 700-byte commit taking 4.4 s), fencing healthy
@@ -108,7 +108,7 @@ fn fixture_tempdir(prefix: &str) -> tempfile::TempDir {
 /// becomes primary (last write wins `deploy/current.json`); the
 /// controller's named pointer stays for the service binding to resolve.
 fn preseed_controller(app_project: &Path, controller_src: &Path) {
-    let state = app_project.join(".celld/dev");
+    let state = app_project.join(".cello/dev");
     std::fs::create_dir_all(state.join("runtime")).expect("state dir");
     let database = state.join("objects.sqlite3");
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -145,7 +145,7 @@ fn preseed_controller(app_project: &Path, controller_src: &Path) {
     });
 }
 
-/// A booted `celld dev` and its address. Kills the child on drop, so a
+/// A booted `cello dev` and its address. Kills the child on drop, so a
 /// failing assertion cannot leak a server onto its port.
 struct TestNode {
     child: Child,
@@ -167,7 +167,7 @@ impl TestNode {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .expect("spawn celld dev");
+            .expect("spawn cello dev");
         let mut stdout = child.stdout.take().expect("piped stdout");
         let stderr = child.stderr.take().expect("piped stderr");
         // Drain both pipes so a chatty child can never block on a full one.
@@ -192,9 +192,9 @@ impl TestNode {
             // Liveness first: a dead child must fail fast, not burn
             // the deadline on refused probes.
             if let Some(status) = node.child.try_wait().expect("poll child") {
-                panic!("celld dev exited during boot: {status}");
+                panic!("cello dev exited during boot: {status}");
             }
-            let addr = announced(&announced_lines, "celld listening on ")?;
+            let addr = announced(&announced_lines, "cello listening on ")?;
             probe(&addr, "/health").then_some(addr)
         });
         node
@@ -282,11 +282,11 @@ fn fixture_tempdir_prefers_shm() {
     // Pins the flake fix: when /dev/shm takes a tempdir, fixtures must
     // live there, not on the box's disk queue.
     let probe = tempfile::Builder::new()
-        .prefix("celld-shm-probe-")
+        .prefix("cello-shm-probe-")
         .tempdir_in("/dev/shm");
     if probe.is_ok() {
         assert!(
-            fixture_tempdir("celld-shm-pin-")
+            fixture_tempdir("cello-shm-pin-")
                 .path()
                 .starts_with("/dev/shm"),
             "fixtures must prefer /dev/shm when usable"
@@ -296,7 +296,7 @@ fn fixture_tempdir_prefers_shm() {
 
 #[test]
 fn svc_do_stub_conformance() {
-    let dir = fixture_tempdir("celld-svc-do-stub-");
+    let dir = fixture_tempdir("cello-svc-do-stub-");
     let app_project = dir.path().join("app");
     let controller_src = dir.path().join("controller");
     copy_dir(&fixture_dir().join("app"), &app_project);

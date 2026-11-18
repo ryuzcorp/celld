@@ -34,7 +34,7 @@
 //! - `checkpoint_if_needed`: the 3-tier policy + the three anti-feedback flags
 //!   (`synced_since_checkpoint`/`synced_to_wal_end`/`last_synced_wal_offset`,
 //!   issues #896/#927/#997).
-//! - Litestream #1292 / celld #150: seal passive checkpoints with a writer
+//! - Litestream #1292 / cello #150: seal passive checkpoints with a writer
 //!   barrier, retain database-growth pages, and snapshot truncate boundaries.
 //! - `crc64`, `pos` (cached + `LTXError` mapping), `reset_local_state`,
 //!   `snapshot_to_writer`.
@@ -1009,7 +1009,7 @@ impl Db {
     /// capture begins at the WAL header. The WAL must exist: an activation
     /// writes the control tables before this runs. Returns the baseline's
     /// bytes: the caller uploads the same object as the epoch's marker, so
-    /// the epoch is never empty (CelldPersistencePaged.tla, `BreakNoMarker`).
+    /// the epoch is never empty (CelloPersistencePaged.tla, `BreakNoMarker`).
     /// A whole-database opener is what a paged cell cannot afford: on the
     /// 2 GB fleet whale it took minutes through the fault path, the
     /// durability gate timed out, and every re-activation started it over.
@@ -1848,7 +1848,7 @@ impl Db {
 
     /// Collects the page set for an incremental sync, in ascending page-number
     /// order. Pages absent from the WAL growth range come from the database file
-    /// (Litestream #1292 / celld #150).
+    /// (Litestream #1292 / cello #150).
     fn collect_wal_pages(
         &self,
         wal: &WalImage,

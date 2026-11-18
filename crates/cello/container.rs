@@ -19,7 +19,7 @@
 //! container's disk is ephemeral on Cloudflare too, so a takeover that
 //! starts fresh is conformant.
 //!
-//! Images travel through the bucket. `celld deploy` saves the image the
+//! Images travel through the bucket. `cello deploy` saves the image the
 //! config names as a tar at `deploy/images/<id>.tar`, and a node loads it
 //! into its engine the first time a cell of that class starts, so a node
 //! never talks to a registry.
@@ -42,7 +42,7 @@ use tokio::sync::{mpsc, watch};
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ContainerSpec {
     pub class_name: String,
-    /// The image reference the engine starts, `celld-image:<content key>`,
+    /// The image reference the engine starts, `cello-image:<content key>`,
     /// so two deployments of one image share one tar and one load.
     pub image: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -53,7 +53,7 @@ pub struct ContainerSpec {
     /// untrusted code. Overrides the node's `CELLO_CONTAINER_RUNTIME` for
     /// this class; `None` takes the node default. A node whose daemon does
     /// not have the runtime fails every start of the class, so the class
-    /// runs only where its isolation is available. celld extends the
+    /// runs only where its isolation is available. cello extends the
     /// Cloudflare config here, which has no per-class runtime.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime: Option<String>,
@@ -63,14 +63,14 @@ pub struct ContainerSpec {
 /// The key hashes the layer digests and the image config, so an engine
 /// that rebuilds identical content under a new id still resolves it.
 pub fn image_reference(key: &str) -> String {
-    format!("celld-image:{key}")
+    format!("cello-image:{key}")
 }
 
 /// The bucket key of one saved image, from its reference.
 pub fn image_key(image: &str) -> String {
     format!(
         "deploy/images/{}.tar",
-        image.trim_start_matches("celld-image:")
+        image.trim_start_matches("cello-image:")
     )
 }
 
@@ -132,11 +132,11 @@ pub fn running_instances_by_class() -> std::collections::BTreeMap<String, u64> {
 const PIDS_LIMIT: u64 = 1024;
 /// The host interfaces of the two bridges, named so the fence can address
 /// them; Docker's default `br-<id>` changes with every recreation.
-const OPEN_BRIDGE: &str = "celld0";
-const INTERNAL_BRIDGE: &str = "celld1";
+const OPEN_BRIDGE: &str = "cello0";
+const INTERNAL_BRIDGE: &str = "cello1";
 const BRIDGE_NAME_OPTION: &str = "com.docker.network.bridge.name";
 /// The fence, installed on the node from a one-shot privileged container of
-/// the `celld-fence` image: a container may reach the Internet and nothing
+/// the `cello-fence` image: a container may reach the Internet and nothing
 /// of the node's own. Hooks before Docker's own chains (priority filter -
 /// 10) so a verdict here is final. Input: no new connection from a bridge
 /// to the node itself, which is where the internal listener and the public
@@ -145,18 +145,18 @@ const BRIDGE_NAME_OPTION: &str = "com.docker.network.bridge.name";
 /// the metadata service live. Rules on the host side of the bridge cover
 /// every runtime, gVisor included, and no process inside a container can
 /// see them, let alone remove them.
-const FENCE_RULES: &str = r#"table inet celld
-delete table inet celld
-table inet celld {
+const FENCE_RULES: &str = r#"table inet cello
+delete table inet cello
+table inet cello {
   chain input {
     type filter hook input priority -10; policy accept;
-    iifname { "celld0", "celld1" } ct state established,related accept
-    iifname { "celld0", "celld1" } reject
+    iifname { "cello0", "cello1" } ct state established,related accept
+    iifname { "cello0", "cello1" } reject
   }
   chain forward {
     type filter hook forward priority -10; policy accept;
-    iifname { "celld0", "celld1" } ip daddr { 169.254.0.0/16, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10 } reject
-    iifname { "celld0", "celld1" } ip6 daddr { fe80::/10, fc00::/7 } reject
+    iifname { "cello0", "cello1" } ip daddr { 169.254.0.0/16, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10 } reject
+    iifname { "cello0", "cello1" } ip6 daddr { fe80::/10, fc00::/7 } reject
   }
 }
 "#;
@@ -169,9 +169,9 @@ const ICC_OPTION: &str = "com.docker.network.bridge.enable_icc";
 /// The forward chain's private-range reject lines, as anchors for the
 /// node-netns exception. They must match `FENCE_RULES` verbatim, exactly
 /// once each; the fence tests pin that.
-const FENCE_FORWARD_REJECT_V4: &str = r#"    iifname { "celld0", "celld1" } ip daddr { 169.254.0.0/16, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10 } reject"#;
+const FENCE_FORWARD_REJECT_V4: &str = r#"    iifname { "cello0", "cello1" } ip daddr { 169.254.0.0/16, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10 } reject"#;
 const FENCE_FORWARD_REJECT_V6: &str =
-    r#"    iifname { "celld0", "celld1" } ip6 daddr { fe80::/10, fc00::/7 } reject"#;
+    r#"    iifname { "cello0", "cello1" } ip6 daddr { fe80::/10, fc00::/7 } reject"#;
 
 /// The private ranges the forward chain rejects, as data mirroring
 /// `FENCE_RULES` (the fence tests keep the two in sync). A node-netns
@@ -371,7 +371,7 @@ fn discover_node_addrs() -> Vec<IpAddr> {
 /// path-MTU discovery keeps working; it opens nothing without that flow.
 /// The exception says nothing about which containers the node may dial; a
 /// hoster running mutually untrusting tenants on one engine still enforces
-/// that above celld.
+/// that above cello.
 fn fence_ruleset(node_addrs: &[IpAddr]) -> String {
     let mut v4: Vec<Ipv4Addr> = Vec::new();
     let mut v6: Vec<Ipv6Addr> = Vec::new();
@@ -394,7 +394,7 @@ fn fence_ruleset(node_addrs: &[IpAddr]) -> String {
     // which fails closed (broken replies, never a hole).
     if !v4.is_empty() {
         let line = format!(
-            "    iifname {{ \"celld0\", \"celld1\" }} ip daddr {{ {} }} ct state established,related accept\n{FENCE_FORWARD_REJECT_V4}",
+            "    iifname {{ \"cello0\", \"cello1\" }} ip daddr {{ {} }} ct state established,related accept\n{FENCE_FORWARD_REJECT_V4}",
             v4.iter()
                 .map(ToString::to_string)
                 .collect::<Vec<_>>()
@@ -404,7 +404,7 @@ fn fence_ruleset(node_addrs: &[IpAddr]) -> String {
     }
     if !v6.is_empty() {
         let line = format!(
-            "    iifname {{ \"celld0\", \"celld1\" }} ip6 daddr {{ {} }} ct state established,related accept\n{FENCE_FORWARD_REJECT_V6}",
+            "    iifname {{ \"cello0\", \"cello1\" }} ip6 daddr {{ {} }} ct state established,related accept\n{FENCE_FORWARD_REJECT_V6}",
             v6.iter()
                 .map(ToString::to_string)
                 .collect::<Vec<_>>()
@@ -660,9 +660,9 @@ struct Config {
     /// `DEFAULT_CONTAINER_DNS`. Empty takes the default when a runtime is in
     /// use and the daemon's otherwise.
     dns: Vec<String>,
-    /// The node's state directory. celld writes the container resolv.conf
+    /// The node's state directory. cello writes the container resolv.conf
     /// here and bind-mounts it, so the path must be the same on the host as
-    /// celld sees it; a self-hosted node runs celld as a host process, and
+    /// Cello sees it; a self-hosted node runs cello as a host process, and
     /// the lab mounts the directory one-to-one.
     data_dir: PathBuf,
 }
@@ -671,7 +671,7 @@ static CONFIG: RwLock<Option<Config>> = RwLock::new(None);
 /// The deployment's container classes. Replaced on every generation swap;
 /// a running container keeps the spec it started with.
 static SPECS: RwLock<Vec<Arc<ContainerSpec>>> = RwLock::new(Vec::new());
-/// The deployment's `celld-fence` image; see `Manifest::fence_image`.
+/// The deployment's `cello-fence` image; see `Manifest::fence_image`.
 static FENCE_IMAGE: RwLock<Option<String>> = RwLock::new(None);
 /// The engine, connected on first use. A node whose deployment declares no
 /// container class never opens the socket.
@@ -748,7 +748,7 @@ pub fn engine_if_ready() -> Option<Arc<ContainerEngine>> {
 }
 
 /// Destroy every container of this node at process exit. A preserve
-/// shutdown (`celld dev` on Ctrl-C) keeps its cells resident and stops
+/// shutdown (`cello dev` on Ctrl-C) keeps its cells resident and stops
 /// none of them, and a handoff cut by the deadline leaves cells behind
 /// too; without this their containers ran on until the next start of the
 /// same node reaped them, invisible to the object that owned them.
@@ -861,7 +861,7 @@ impl ContainerEngine {
     }
 
     async fn reap(&self) -> anyhow::Result<()> {
-        let filters = json!({ "label": [format!("celld.node={}", self.node)] }).to_string();
+        let filters = json!({ "label": [format!("cello.node={}", self.node)] }).to_string();
         let reply = self
             .docker
             .expect_control(
@@ -928,7 +928,7 @@ impl ContainerEngine {
             .ok_or_else(|| anyhow!("image {image} is not present in the container engine"))?;
         let key = image_key(image);
         let (tar, _) = bucket.get(&key).await?.ok_or_else(|| {
-            anyhow!("image {image} is not in the bucket at {key}; run `celld deploy`")
+            anyhow!("image {image} is not in the bucket at {key}; run `cello deploy`")
         })?;
         let bytes = tar.len();
         // An image transfer, not a control call: sized by the image,
@@ -956,7 +956,7 @@ impl ContainerEngine {
         if let Some(names) = guard.as_ref() {
             return Ok(names.clone());
         }
-        for (name, internal) in [("celld", false), ("celld-internal", true)] {
+        for (name, internal) in [("cello", false), ("cello-internal", true)] {
             // A bridge keeps the options it was created with, so one from
             // before containers were isolated from each other is replaced.
             // The replacement fails while a container is attached, which a
@@ -1027,7 +1027,7 @@ impl ContainerEngine {
                 ));
             }
         }
-        let names = ("celld".to_string(), "celld-internal".to_string());
+        let names = ("cello".to_string(), "cello-internal".to_string());
         *guard = Some(names.clone());
         Ok(names)
     }
@@ -1045,8 +1045,8 @@ impl ContainerEngine {
         }
         let image = FENCE_IMAGE.read().unwrap().clone().ok_or_else(|| {
             anyhow!(
-                "this deployment has no fence image; deploy it again with this celld, which \
-                 saves the celld-fence image beside the container images"
+                "this deployment has no fence image; deploy it again with this cello, which \
+                 saves the cello-fence image beside the container images"
             )
         })?;
         self.ensure_image(&image).await?;
@@ -1056,11 +1056,11 @@ impl ContainerEngine {
             "Image": image,
             "Env": [format!("CELLO_NFT={rules}")],
             "Cmd": ["sh", "-c", "printf '%s' \"$CELLO_NFT\" | nft -f -"],
-            "Labels": { "celld.node": self.node, "celld.fence": "1" },
+            "Labels": { "cello.node": self.node, "cello.fence": "1" },
             "HostConfig": { "NetworkMode": "host", "CapAdd": ["NET_ADMIN"] },
         });
         // A timed-out create may leave a stopped fence container whose
-        // id this call never learned; it carries the celld.node label,
+        // id this call never learned; it carries the cello.node label,
         // so the next restart's reap removes it. Accepted as-is: eager
         // cleanup by label is not worth the extra calls for a stopped,
         // tiny orphan, and `fenced` stays false so the next start
@@ -1282,7 +1282,7 @@ impl ContainerEngine {
     /// shared capacity sample; `begin_run` already marked the starting cell
     /// running, so the live count includes it. A class with no
     /// `max_instances`, or a node with no bucket to read the sample from as
-    /// under `celld dev`, has no fleet ceiling. See
+    /// under `cello dev`, has no fleet ceiling. See
     /// [`crate::ownership_store::fleet_class_instances`] for the staleness
     /// the sample admits.
     async fn enforce_instance_ceiling(&self, cell: &CellContainer) -> anyhow::Result<()> {
@@ -1453,11 +1453,11 @@ impl ContainerEngine {
                 .map(|(name, value)| format!("{name}={value}")),
         );
         let mut labels = serde_json::Map::new();
-        labels.insert("celld.node".into(), json!(self.node));
-        labels.insert("celld.cell".into(), json!(cell.scope));
-        labels.insert("celld.class".into(), json!(cell.spec.class_name));
+        labels.insert("cello.node".into(), json!(self.node));
+        labels.insert("cello.cell".into(), json!(cell.scope));
+        labels.insert("cello.class".into(), json!(cell.spec.class_name));
         for (name, value) in &params.labels {
-            labels.insert(format!("celld.user.{name}"), json!(value));
+            labels.insert(format!("cello.user.{name}"), json!(value));
         }
         // Off Linux the node reaches a container only through published
         // ports, and Docker publishes nothing on an internal network, so
@@ -2143,7 +2143,7 @@ pub fn test_proc_spawn(scope: &str) -> u64 {
         pid: 0,
         user: None,
         is_pty: false,
-        docker: Docker::new("/nonexistent-celld-test.sock"),
+        docker: Docker::new("/nonexistent-cello-test.sock"),
         stdin: tokio::sync::Mutex::new(None),
         stdout: tokio::sync::Mutex::new(ExecPipe::new(stdout_rx)),
         stderr: tokio::sync::Mutex::new(ExecPipe::new(stderr_rx)),
@@ -2439,7 +2439,7 @@ fn container_logs_path(id: &str) -> String {
 fn container_name(node: &str, scope: &str) -> String {
     use sha2::Digest;
     let digest = sha2::Sha256::digest(format!("{node}\n{scope}").as_bytes());
-    format!("celld-{:x}", digest)[..30].to_string()
+    format!("cello-{:x}", digest)[..30].to_string()
 }
 
 #[cfg(test)]
@@ -2452,7 +2452,7 @@ mod start_order_tests {
             name: "n".into(),
             spec: Arc::new(ContainerSpec {
                 class_name: "C".into(),
-                image: "celld-image:x".into(),
+                image: "cello-image:x".into(),
                 instance_type: None,
                 max_instances: None,
                 runtime: None,
@@ -2570,7 +2570,7 @@ mod pty_tests {
             name: "n".into(),
             spec: Arc::new(ContainerSpec {
                 class_name: "C".into(),
-                image: "celld-image:x".into(),
+                image: "cello-image:x".into(),
                 instance_type: None,
                 max_instances: None,
                 runtime: None,
@@ -2587,7 +2587,7 @@ mod pty_tests {
             runtime: None,
             dns: Vec::new(),
             resolv_conf: None,
-            docker: Docker::new("/nonexistent-celld-test.sock"),
+            docker: Docker::new("/nonexistent-cello-test.sock"),
             node: "test".to_string(),
             bucket: None,
             images: Mutex::new(HashMap::new()),
@@ -2696,7 +2696,7 @@ mod pty_tests {
             pid: 1234,
             user: None,
             is_pty,
-            docker: Docker::new("/nonexistent-celld-test.sock"),
+            docker: Docker::new("/nonexistent-cello-test.sock"),
             stdin: tokio::sync::Mutex::new(None),
             stdout: tokio::sync::Mutex::new(ExecPipe::new(stdout_rx)),
             stderr: tokio::sync::Mutex::new(ExecPipe::new(stderr_rx)),
@@ -2818,7 +2818,7 @@ mod fence_node_netns_tests {
     #[test]
     fn container_netns_v4_topology_admits_only_replies_to_the_node() {
         let rules = fence_ruleset(&[ip("172.18.0.4")]);
-        let accept = "iifname { \"celld0\", \"celld1\" } ip daddr { 172.18.0.4 } ct state established,related accept";
+        let accept = "iifname { \"cello0\", \"cello1\" } ip daddr { 172.18.0.4 } ct state established,related accept";
         assert!(rules.contains(accept), "{rules}");
         assert!(
             rules.find(accept).unwrap() < rules.find(FENCE_FORWARD_REJECT_V4).unwrap(),
@@ -2838,7 +2838,7 @@ mod fence_node_netns_tests {
         for addr in ["fe80::1", "fd00::4"] {
             let rules = fence_ruleset(&[ip(addr)]);
             let accept = format!(
-                "iifname {{ \"celld0\", \"celld1\" }} ip6 daddr {{ {addr} }} ct state established,related accept"
+                "iifname {{ \"cello0\", \"cello1\" }} ip6 daddr {{ {addr} }} ct state established,related accept"
             );
             assert!(rules.contains(&accept), "{rules}");
             assert!(
@@ -3041,7 +3041,7 @@ mod kill_tests {
     impl MockDaemon {
         fn start() -> Self {
             let dir = tempfile::Builder::new()
-                .prefix("celld-kill-")
+                .prefix("cello-kill-")
                 .tempdir()
                 .expect("mock daemon tempdir");
             let socket = dir.path().join("d.sock");
@@ -3243,7 +3243,7 @@ mod kill_tests {
             name: "n".into(),
             spec: Arc::new(ContainerSpec {
                 class_name: "C".into(),
-                image: "celld-image:x".into(),
+                image: "cello-image:x".into(),
                 instance_type: None,
                 max_instances: None,
                 runtime: None,
@@ -3429,8 +3429,8 @@ mod kill_tests {
         ensure_domain();
         const IMAGE: &str = "node:26-trixie-slim";
         let docker =
-            Docker::discover().expect("a real daemon behind DOCKER_HOST (celld-test-dind)");
-        let name = "celld-kill-test".to_string();
+            Docker::discover().expect("a real daemon behind DOCKER_HOST (cello-test-dind)");
+        let name = "cello-kill-test".to_string();
         docker
             .call("DELETE", &format!("/containers/{name}?force=true"), None)
             .await
@@ -3530,7 +3530,7 @@ mod retained_read_tests {
             pid: 1234,
             user: None,
             is_pty: false,
-            docker: Docker::new("/nonexistent-celld-test.sock"),
+            docker: Docker::new("/nonexistent-cello-test.sock"),
             stdin: tokio::sync::Mutex::new(None),
             stdout: tokio::sync::Mutex::new(ExecPipe::new(stdout_rx)),
             stderr: tokio::sync::Mutex::new(ExecPipe::new(stderr_rx)),
@@ -3650,7 +3650,7 @@ mod control_timeout_tests {
     /// connection would fail the call with EOF instead of hanging it.
     fn silent_daemon() -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::Builder::new()
-            .prefix("celld-control-timeout-")
+            .prefix("cello-control-timeout-")
             .tempdir()
             .expect("silent daemon tempdir");
         let socket = dir.path().join("d.sock");
@@ -3740,7 +3740,7 @@ mod lifecycle_tests {
     impl StartFailingDaemon {
         fn start(name: &str) -> Self {
             let dir = tempfile::Builder::new()
-                .prefix("celld-start-failing-")
+                .prefix("cello-start-failing-")
                 .tempdir()
                 .expect("mock daemon tempdir");
             let socket = dir.path().join("d.sock");
@@ -3805,7 +3805,7 @@ mod lifecycle_tests {
             name: name.to_string(),
             spec: Arc::new(ContainerSpec {
                 class_name: "C".into(),
-                image: "celld-image:x".into(),
+                image: "cello-image:x".into(),
                 instance_type: None,
                 max_instances: None,
                 runtime: None,
@@ -3829,7 +3829,7 @@ mod lifecycle_tests {
         let mock = StartFailingDaemon::start(name);
         let mut images = HashMap::new();
         images.insert(
-            "celld-image:x".to_string(),
+            "cello-image:x".to_string(),
             Arc::new(tokio::sync::Mutex::new(true)),
         );
         let engine = ContainerEngine {
@@ -3842,8 +3842,8 @@ mod lifecycle_tests {
             images: Mutex::new(images),
             cells: Mutex::new(HashMap::new()),
             networks: tokio::sync::Mutex::new(Some((
-                "celld".to_string(),
-                "celld-internal".to_string(),
+                "cello".to_string(),
+                "cello-internal".to_string(),
             ))),
             fenced: tokio::sync::Mutex::new(true),
         };

@@ -7,7 +7,7 @@
 #![allow(clippy::disallowed_methods)]
 
 //! Upstream denoland/celld#280: with `nodejs_compat`, `node:fs` writes and
-//! streams threw `not implemented in celld`, and `node:url` lacked
+//! streams threw `not implemented in cello`, and `node:url` lacked
 //! `pathToFileURL`/`fileURLToPath`. `/tmp` is now a writable in-memory tree
 //! per request, and the URL file helpers exist.
 
@@ -53,7 +53,7 @@ fn copy_dir(src: &Path, dst: &Path) {
     }
 }
 
-/// A booted `celld dev` and its address. Kills the child on drop, so a
+/// A booted `cello dev` and its address. Kills the child on drop, so a
 /// failing assertion cannot leak a server onto its port.
 struct TestNode {
     child: Child,
@@ -83,7 +83,7 @@ impl TestNode {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .expect("spawn celld dev");
+            .expect("spawn cello dev");
         let mut stdout = child.stdout.take().expect("piped stdout");
         let stderr = child.stderr.take().expect("piped stderr");
         std::thread::spawn(move || {
@@ -98,9 +98,9 @@ impl TestNode {
         };
         node.public = poll_until("boot", Duration::from_secs(120), || {
             if let Some(status) = node.child.try_wait().expect("poll child") {
-                panic!("celld dev exited during boot: {status}");
+                panic!("cello dev exited during boot: {status}");
             }
-            let addr = announced(&announced_lines, "celld listening on ")?;
+            let addr = announced(&announced_lines, "cello listening on ")?;
             probe(&addr, "/health").then_some(addr)
         });
         node
@@ -166,7 +166,7 @@ fn poll_until(
 #[test]
 fn tmp_is_writable_and_file_urls_round_trip() {
     let fixture = fixture_dir();
-    let project = fixture_tempdir("celld-tmp-fs-");
+    let project = fixture_tempdir("cello-tmp-fs-");
     copy_dir(&fixture, project.path());
     let node = TestNode::boot(project.path());
 
@@ -194,7 +194,7 @@ fn tmp_is_writable_and_file_urls_round_trip() {
 #[test]
 fn tmp_flags_streams_and_backslash_urls() {
     let fixture = fixture_dir();
-    let project = fixture_tempdir("celld-tmp-fs-");
+    let project = fixture_tempdir("cello-tmp-fs-");
     copy_dir(&fixture, project.path());
     let node = TestNode::boot(project.path());
 
@@ -290,7 +290,7 @@ fn tmp_flags_streams_and_backslash_urls() {
 #[test]
 fn tmp_stream_ranges_reject_and_dir_urls_keep_slash() {
     let fixture = fixture_dir();
-    let project = fixture_tempdir("celld-tmp-fs-");
+    let project = fixture_tempdir("cello-tmp-fs-");
     copy_dir(&fixture, project.path());
     let node = TestNode::boot(project.path());
 
@@ -338,7 +338,7 @@ fn code_of(out: &serde_json::Value, name: &str, body: &str) -> String {
 #[test]
 fn tmp_cap_rejects_over_cap_writes_with_enospc() {
     let fixture = fixture_dir();
-    let project = fixture_tempdir("celld-tmp-cap-");
+    let project = fixture_tempdir("cello-tmp-cap-");
     copy_dir(&fixture, project.path());
     let node = TestNode::boot_with_env(project.path(), &[("CELLO_TMP_MAX_BYTES", "256")]);
 
@@ -364,7 +364,7 @@ fn tmp_cap_rejects_over_cap_writes_with_enospc() {
 #[test]
 fn tmp_cap_counts_overwrites_and_appends() {
     let fixture = fixture_dir();
-    let project = fixture_tempdir("celld-tmp-cap-");
+    let project = fixture_tempdir("cello-tmp-cap-");
     copy_dir(&fixture, project.path());
     let node = TestNode::boot_with_env(project.path(), &[("CELLO_TMP_MAX_BYTES", "256")]);
 
@@ -388,7 +388,7 @@ fn tmp_cap_counts_overwrites_and_appends() {
 #[test]
 fn tmp_stream_applies_cap_as_data_arrives() {
     let fixture = fixture_dir();
-    let project = fixture_tempdir("celld-tmp-cap-");
+    let project = fixture_tempdir("cello-tmp-cap-");
     copy_dir(&fixture, project.path());
     let node = TestNode::boot_with_env(project.path(), &[("CELLO_TMP_MAX_BYTES", "256")]);
 
@@ -419,7 +419,7 @@ fn tmp_stream_applies_cap_as_data_arrives() {
 #[test]
 fn tmp_is_isolated_between_requests() {
     let fixture = fixture_dir();
-    let project = fixture_tempdir("celld-tmp-fs-");
+    let project = fixture_tempdir("cello-tmp-fs-");
     copy_dir(&fixture, project.path());
     let node = TestNode::boot(project.path());
 
@@ -441,7 +441,7 @@ fn tmp_is_isolated_between_requests() {
 #[test]
 fn tmp_rejects_writes_outside_tmp() {
     let fixture = fixture_dir();
-    let project = fixture_tempdir("celld-tmp-fs-");
+    let project = fixture_tempdir("cello-tmp-fs-");
     copy_dir(&fixture, project.path());
     let node = TestNode::boot(project.path());
 
@@ -460,7 +460,7 @@ fn tmp_rejects_writes_outside_tmp() {
 #[test]
 fn tmp_cap_counts_empty_files() {
     let fixture = fixture_dir();
-    let project = fixture_tempdir("celld-tmp-cap-");
+    let project = fixture_tempdir("cello-tmp-cap-");
     copy_dir(&fixture, project.path());
     let node = TestNode::boot_with_env(project.path(), &[("CELLO_TMP_MAX_BYTES", "256")]);
 
@@ -478,7 +478,7 @@ fn tmp_cap_counts_empty_files() {
 #[test]
 fn tmp_cap_counts_long_paths() {
     let fixture = fixture_dir();
-    let project = fixture_tempdir("celld-tmp-cap-");
+    let project = fixture_tempdir("cello-tmp-cap-");
     copy_dir(&fixture, project.path());
     let node = TestNode::boot_with_env(project.path(), &[("CELLO_TMP_MAX_BYTES", "256")]);
 
@@ -491,7 +491,7 @@ fn tmp_cap_counts_long_paths() {
 #[test]
 fn tmp_cap_counts_directories() {
     let fixture = fixture_dir();
-    let project = fixture_tempdir("celld-tmp-cap-");
+    let project = fixture_tempdir("cello-tmp-cap-");
     copy_dir(&fixture, project.path());
     let node = TestNode::boot_with_env(project.path(), &[("CELLO_TMP_MAX_BYTES", "256")]);
 
@@ -513,7 +513,7 @@ fn tmp_cap_counts_directories() {
 #[test]
 fn tmp_oversize_write_fails_enospc() {
     let fixture = fixture_dir();
-    let project = fixture_tempdir("celld-tmp-cap-");
+    let project = fixture_tempdir("cello-tmp-cap-");
     copy_dir(&fixture, project.path());
     let node = TestNode::boot_with_env(project.path(), &[("CELLO_TMP_MAX_BYTES", "256")]);
 
@@ -542,7 +542,7 @@ fn tmp_oversize_write_fails_enospc() {
 #[test]
 fn tmp_files_report_writable_and_final_keeps_open_bytes() {
     let fixture = fixture_dir();
-    let project = fixture_tempdir("celld-tmp-fs-");
+    let project = fixture_tempdir("cello-tmp-fs-");
     copy_dir(&fixture, project.path());
     let node = TestNode::boot(project.path());
 

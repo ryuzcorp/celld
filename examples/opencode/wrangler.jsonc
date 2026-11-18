@@ -1,5 +1,5 @@
 {
-  "name": "opencode-celld-example",
+  "name": "opencode-cello-example",
   "main": "index.js",
   "compatibility_date": "2026-08-30",
   "compatibility_flags": ["nodejs_compat"],

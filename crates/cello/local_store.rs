@@ -1,7 +1,7 @@
 // Modified by ryuzcorp (ryuzcorp/celld): staged activation; dev-store single-writer group commit (upstream #310); covering listing index with prefix-bounded LIST (upstream #265).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
-//! The persistent object store for `celld dev`.
+//! The persistent object store for `cello dev`.
 //!
 //! The development supervisor and its node are separate processes, and both
 //! write the fleet store during a reload. SQLite supplies the cross-process
@@ -32,7 +32,7 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, SystemTime};
 use tokio::sync::oneshot;
 
-const STORE: &str = "celld development store";
+const STORE: &str = "cello development store";
 
 #[derive(Clone, Debug)]
 pub(crate) struct LocalStore {
@@ -151,7 +151,7 @@ impl LocalStore {
         });
         let batches = Arc::clone(&writer.batches);
         let _handle = std::thread::Builder::new()
-            .name("celld-dev-store".to_string())
+            .name("cello-dev-store".to_string())
             .spawn(move || write_loop(&writer_database, rx, &batches))
             .map_err(db_error)?;
         #[cfg(test)]

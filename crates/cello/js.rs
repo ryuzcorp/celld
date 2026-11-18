@@ -212,7 +212,7 @@ static DO_CALL_TX: OnceLock<tokio::sync::mpsc::UnboundedSender<DoCallReq>> = Onc
 ///
 /// Two calls a script makes back-to-back on one Durable Object stub reach
 /// the cell in that order. Workerd guarantees it — one pipe per stub — and
-/// celld did too, while a cell's events came off one channel. Nothing
+/// Cello did too, while a cell's events came off one channel. Nothing
 /// between the call and the cell keeps it now: the caller's two ops race to
 /// the proxy channel, the proxy polls them in a `FuturesUnordered`, and two
 /// drives race for the isolate. So the order is taken where it is still
@@ -3088,7 +3088,7 @@ fn cpu_watchdog_service() -> &'static CpuWatchdogService {
         ));
         let scheduler = shared.clone();
         std::thread::Builder::new()
-            .name("celld-cpu-watchdog".to_string())
+            .name("cello-cpu-watchdog".to_string())
             .spawn(move || run_cpu_watchdog_service(&scheduler))
             .expect("spawn the process CPU watchdog");
         CpuWatchdogService { shared }
@@ -3686,7 +3686,7 @@ pub struct InFlight {
     /// The cell's committed-write position before the handler ran.
     ///
     /// The answer carries a write position only if the handler advanced it,
-    /// so the output gate sees a write this event made and ignores celld's
+    /// so the output gate sees a write this event made and ignores cello's
     /// own activation writes (the actor name, alarm bookkeeping).
     writes_before: Option<u64>,
     request_id: Option<RequestId>,
@@ -4711,7 +4711,7 @@ fn current_reaction_or_untracked_io_context(scope: &mut v8::PinScope) -> Option<
 /// executes in, backing `cloudflare:workers`' `getCurrentTraceparent`
 /// (denoland/celld#313). A handler that can read its own span can return the
 /// trace id to the caller or record it with the data it writes; without this
-/// the only recourse was inventing ids celld never exports, which joins the
+/// the only recourse was inventing ids cello never exports, which joins the
 /// downstream span to a trace the collector never sees and breaks the trace
 /// at the outbound call. `undefined` when telemetry is off or the entry is
 /// not sampled: there is no exported span to name.
@@ -5762,7 +5762,7 @@ fn gate_positions(scope: &str, writes_before: Option<u64>) -> Result<(Option<u64
     Ok((write, observed))
 }
 
-/// A committed-write position only counts when the handler advanced it; celld's
+/// A committed-write position only counts when the handler advanced it; cello's
 /// own activation writes are already below `before`.
 pub(crate) fn write_delta(before: Option<u64>, after: Option<u64>) -> Option<u64> {
     match (before, after) {
@@ -5807,7 +5807,7 @@ fn start_cell_event<'s>(
     let previous_io_context = install_io_context(tc, &context);
     context.begin_cpu_turn();
     // Sampled before the handler runs so the output gate can tell a write
-    // this event made from celld's own activation writes. The first sample of
+    // this event made from cello's own activation writes. The first sample of
     // an activation is also the baseline a read-only answer observes above.
     let writes_before = storage::event_start_position(scope);
     // No guard: this frame is the context's outermost one and the context
@@ -8154,7 +8154,7 @@ fn dynamic_worker_code_limit() -> usize {
 
 /// The largest `props` value one loaded entrypoint or Durable Object class can
 /// carry, as structured-clone bytes. Workerd does not impose this bound, but
-/// celld holds the value on a host job for the whole call. The harness shares
+/// Cello holds the value on a host job for the whole call. The harness shares
 /// the caller's isolate and cannot prevent that unbounded host allocation, so
 /// every op that accepts call props must enforce the limit.
 const MAX_DYNAMIC_WORKER_PROPS_SIZE: usize = 1024 * 1024;
@@ -10798,7 +10798,7 @@ fn op_fetch(
     let trace = current_trace_context(scope);
     // The child's ids are minted before the request leaves so the
     // traceparent header carries them: whatever this fetch reaches can
-    // join the trace celld is part of.
+    // join the trace cello is part of.
     let child = trace.as_ref().map(crate::telemetry::child_context);
     if let Some(child) = child.as_ref() {
         if !headers
@@ -10812,7 +10812,7 @@ fn op_fetch(
     let child_recording = child.and_then(crate::telemetry::TraceContext::recording_ids);
     let span_url = recording.map(|_| url.clone());
     // Whatever this request can reveal must be durable before it leaves: a
-    // third party that has acted on a write celld then loses cannot be told to
+    // third party that has acted on a write cello then loses cannot be told to
     // un-act. That covers a write this handler made and a value it only read,
     // because the third party cannot tell the two apart.
     let gate = egress_gate_request(&context, cello_logic::Channel::Fetch);
@@ -12251,7 +12251,7 @@ fn op_test_queue_rearm_bounded(
         QUEUE_REARM_BOUND_VIOLATED.with(|violated| violated.set(true));
     }
 }
-// `celld r2` writes an object a binding then reads, so the operator command
+// `cello r2` writes an object a binding then reads, so the operator command
 // calls the very functions the ops call rather than a second implementation
 // of the object record.
 mod cache_ops;
@@ -14429,7 +14429,7 @@ fn op_cron_plan(
     };
     let mut crons = Vec::with_capacity(list.length() as usize);
     // Where each parsed expression sits in the list the caller passed. A
-    // malformed expression is already refused by `celld deploy`, but the
+    // malformed expression is already refused by `cello deploy`, but the
     // control plane checks only the field count, so one can still arrive here.
     // Skipping it keeps one bad entry from silencing a script's other crons,
     // and this map is what keeps the skip from renumbering them: the caller
@@ -14534,7 +14534,7 @@ fn op_btoa(
 /// its own — remove, decode outside the lock, insert — 256-byte chunks
 /// peaked at two threads and then went *backwards*, 8 threads serving
 /// 0.46x what 1 thread served against 6.7x for the same decoding with no
-/// table. But celld end to end shows no difference between the two, at any
+/// table. But cello end to end shows no difference between the two, at any
 /// concurrency this hardware can drive, because a chunk costs about 42us
 /// of stream and turn machinery around a lock held for about 100ns. So the
 /// mutex was not what any cell was waiting on. It was a process-wide

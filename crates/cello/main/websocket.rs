@@ -269,7 +269,7 @@ async fn finish_websocket(
     cello::js::ws_unregister(target.id);
 }
 
-/// Release a WebSocket that the Worker accepted but that celld will not upgrade.
+/// Release a WebSocket that the Worker accepted but that Cello will not upgrade.
 ///
 /// `accept()` registers the socket and charges it to the scope's regular-socket
 /// count before the Worker's response reaches this code, and `WsTarget` is plain
@@ -313,7 +313,7 @@ pub(super) async fn reply_without_upgrade(
 /// Release a socket on a path that cannot upgrade, and answer with a 500.
 ///
 /// Dropping a Worker socket or a tunnel claim releases it, and a local cell
-/// socket needs the explicit close. workerd's 500 has an empty body; celld
+/// socket needs the explicit close. workerd's 500 has an empty body; cello
 /// names the `TypeError` in the body, as it does for any other Worker failure.
 pub(super) async fn refuse_websocket_without_upgrade(
     app: &AppHandle,
@@ -1452,21 +1452,21 @@ async fn run_websocket_upgrade(
         }
         (Ok(socket), PendingWebSocket::Tunnel { upgrade, .. }) => {
             if let Err(error) = super::peer_tunnel::splice(socket.into_inner(), upgrade).await {
-                eprintln!("celld tunneled WebSocket splice ended: {error:#}");
+                eprintln!("cello tunneled WebSocket splice ended: {error:#}");
             }
         }
         (Ok(socket), PendingWebSocket::Cell(target)) => {
             websocket_task(task_app, target, socket).await;
         }
         (Err(error), PendingWebSocket::Worker(_)) => {
-            eprintln!("celld Worker WebSocket upgrade failed: {error}");
+            eprintln!("cello Worker WebSocket upgrade failed: {error}");
         }
         (Err(error), PendingWebSocket::Cell(target)) => {
-            eprintln!("celld WebSocket upgrade failed: {error}");
+            eprintln!("cello WebSocket upgrade failed: {error}");
             finish_websocket(&task_app, &target, 1006, String::new(), false).await;
         }
         (Err(error), PendingWebSocket::Tunnel { .. }) => {
-            eprintln!("celld tunneled WebSocket upgrade failed: {error}");
+            eprintln!("cello tunneled WebSocket upgrade failed: {error}");
         }
     }
 }

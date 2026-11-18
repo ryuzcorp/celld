@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): cross-isolate RPC stubs and streams; operator token for the internal listener; Workers Cache pressure shedding; ported from meln1k/celld: report wake coverage after maintenance (e6cb9a3); staged invoke reads the deploy bucket; pass the renewal readback authority bound through (upstream #264); storage-poisoned activity restarts the runtime (upstream #291).
+// Modified by ryuzcorp (ryuzcorp/celld): cross-isolate RPC stubs and streams; operator token for the internal listener; Workers Cache pressure shedding; ported from meln1k/cello: report wake coverage after maintenance (e6cb9a3); staged invoke reads the deploy bucket; pass the renewal readback authority bound through (upstream #264); storage-poisoned activity restarts the runtime (upstream #291).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! The serial lifecycle executor and its shell-side request drivers.
@@ -201,7 +201,7 @@ pub enum Ownership {
 }
 
 fn ownership_read_failed(error: anyhow::Error) -> Failure {
-    eprintln!("celld ownership read failed: {error:#}");
+    eprintln!("cello ownership read failed: {error:#}");
     Failure::Definite
 }
 
@@ -238,7 +238,7 @@ impl Ownership {
         {
             return Ok(record);
         }
-        // A claim writes the record before any LTX, and celld never deletes
+        // A claim writes the record before any LTX, and cello never deletes
         // the record, so LTX proves that a record existed before the listing.
         // A first claim on another node can still write it after the first
         // read. Only a read after the listing that finds no record proves a
@@ -249,7 +249,7 @@ impl Ownership {
         }
         // A missing record tells the core that the cell was never owned, so
         // the core claims epoch one as a fresh cell and the activation
-        // restores nothing. celld never deletes `own.json`, but a bucket
+        // restores nothing. cello never deletes `own.json`, but a bucket
         // lifecycle rule, a manual cleanup, or a partial bucket copy can. The
         // cell would then serve an empty database beside its acknowledged
         // chain and ship over `e1/`, and a node that asks while the owner
@@ -261,7 +261,7 @@ impl Ownership {
         // then advances one epoch, and a wake without a takeover can reuse a
         // stale local eviction snapshot, which skips the used-epoch check.
         eprintln!(
-            "celld ownership record lost: cells/{cell}/own.json is missing, but the bucket \
+            "cello ownership record lost: cells/{cell}/own.json is missing, but the bucket \
              holds LTX under cells/{cell}/ltx/; refusing to claim {cell} as a new cell for \
              {} s. See the ownership record repair in docs/guarantees.md.",
             crate::ownership_store::LOST_RECORD_RECHECK_MS / 1_000
@@ -274,7 +274,7 @@ impl Ownership {
         match self {
             Self::Memory(memory) => Ok(memory.lock().await.leases.get(owner).cloned()),
             Self::Bucket(bucket) => bucket.read_node_lease(owner).await.map_err(|error| {
-                eprintln!("celld node lease read failed: {error:#}");
+                eprintln!("cello node lease read failed: {error:#}");
                 Failure::Definite
             }),
         }
@@ -286,7 +286,7 @@ impl Ownership {
             // no external membership enumeration to offer.
             Self::Memory(_) => Ok(Vec::new()),
             Self::Bucket(bucket) => bucket.read_capacity_peers().await.map_err(|error| {
-                eprintln!("celld capacity peer read failed: {error:#}");
+                eprintln!("cello capacity peer read failed: {error:#}");
                 Failure::Definite
             }),
         }
@@ -297,7 +297,7 @@ impl Ownership {
         match self {
             Self::Memory(_) => Ok((now_ms(), Vec::new())),
             Self::Bucket(bucket) => bucket.read_shared_capacity_view().await.map_err(|error| {
-                eprintln!("celld capacity view read failed: {error:#}");
+                eprintln!("cello capacity view read failed: {error:#}");
                 Failure::Definite
             }),
         }
@@ -307,7 +307,7 @@ impl Ownership {
         match self {
             Self::Memory(memory) => Ok(memory.lock().await.leases.get(node).cloned()),
             Self::Bucket(bucket) => bucket.read_self_node_lease(node).await.map_err(|error| {
-                eprintln!("celld self node lease read failed: {error:#}");
+                eprintln!("cello self node lease read failed: {error:#}");
                 Failure::Definite
             }),
         }
@@ -352,7 +352,7 @@ impl Ownership {
                 // Any transport or 5xx failure may have happened after the
                 // store committed. The core reconciles by reading the owner
                 // again.
-                eprintln!("celld ownership CAS ambiguous: {error:#}");
+                eprintln!("cello ownership CAS ambiguous: {error:#}");
                 Failure::Ambiguous
             }),
         }
@@ -389,7 +389,7 @@ impl Ownership {
             // next eviction releases it again, or it does not, and the cell is
             // already free. Either way nothing is owed.
             Self::Bucket(bucket) => bucket.release_owner(cell, epoch).await.map_err(|error| {
-                eprintln!("celld ownership release failed: {error:#}");
+                eprintln!("cello ownership release failed: {error:#}");
                 Failure::Definite
             }),
         }
@@ -431,11 +431,11 @@ impl Ownership {
                     // renewal window is exactly what a store blip is
                     // eating.
                     LeaseCasError::NotCommitted(error) => {
-                        eprintln!("celld node-lease CAS did not commit: {error:#}");
+                        eprintln!("cello node-lease CAS did not commit: {error:#}");
                         Failure::Definite
                     }
                     LeaseCasError::Ambiguous(error) => {
-                        eprintln!("celld node-lease CAS ambiguous: {error:#}");
+                        eprintln!("cello node-lease CAS ambiguous: {error:#}");
                         Failure::Ambiguous
                     }
                 }),
@@ -1315,7 +1315,7 @@ pub struct AppHandle {
     /// Concurrent outbound WebSockets one cell may hold, for the refusal
     /// message; the core enforces it.
     pub max_outbound_websockets: usize,
-    /// Set the instant a graceful shutdown begins, so `/.well-known/celld/health` reports
+    /// Set the instant a graceful shutdown begins, so `/.well-known/cello/health` reports
     /// unhealthy and a load balancer stops routing here before teardown.
     pub draining: Arc<std::sync::atomic::AtomicBool>,
     /// The one-shot fleet gate on the first health 200. A fresh process
@@ -3266,7 +3266,7 @@ impl Actor {
             }
             self.settle_handoff_accepts();
             if self.validate_invariants {
-                self.state.validate().expect("celld core invariant");
+                self.state.validate().expect("cello core invariant");
             }
         }
     }
@@ -3338,7 +3338,7 @@ impl Actor {
                         // pool on the core's current-thread runtime.
                         Some(runtime) => crate::asyncrt::blocking(move || {
                             runtime.local_reload_cells().map_err(|error| {
-                                eprintln!("celld local reload scan failed: {error:#}");
+                                eprintln!("cello local reload scan failed: {error:#}");
                                 Failure::Definite
                             })
                         })
@@ -3402,7 +3402,7 @@ impl Actor {
                             .await
                             .map_err(|error| {
                                 eprintln!(
-                                    "celld node-log recovery for takeover of {cell} failed: {error:#}"
+                                    "cello node-log recovery for takeover of {cell} failed: {error:#}"
                                 );
                                 Failure::Ambiguous
                             }),
@@ -3770,7 +3770,7 @@ impl Actor {
                     out.spawn_detached(async move {
                         let started = crate::asyncrt::mono_ms();
                         let result = runtime.restore_cell(&cell, &spec).await.map_err(|error| {
-                            eprintln!("celld restore failed for {cell}: {error:#}");
+                            eprintln!("cello restore failed for {cell}: {error:#}");
                             Failure::Definite
                         });
                         CompletedEffect::timed(
@@ -3810,7 +3810,7 @@ impl Actor {
                             .start_cell(cell.clone(), epoch, fresh)
                             .await
                             .map_err(|error| {
-                                eprintln!("celld runtime start failed for {cell}: {error:#}");
+                                eprintln!("cello runtime start failed for {cell}: {error:#}");
                                 Failure::Definite
                             });
                         let isolate = placed.as_ref().ok().map(|(isolate, _)| *isolate);
@@ -3856,7 +3856,7 @@ impl Actor {
                         .as_ref()
                         .map_or(Ok(()), |runtime| runtime.publish_cell(&cell, epoch))
                         .map_err(|error| {
-                            eprintln!("celld runtime publication failed for {cell}: {error:#}");
+                            eprintln!("cello runtime publication failed for {cell}: {error:#}");
                             Failure::Definite
                         })
                 };
@@ -3917,7 +3917,7 @@ impl Actor {
                         let proved = runtime.ensure_durable(&cell, epoch, revocable).await;
                         let result = proved.map_err(|error| {
                             eprintln!(
-                                "celld durability proof failed for {cell} epoch {epoch}: {error:#}"
+                                "cello durability proof failed for {cell} epoch {epoch}: {error:#}"
                             );
                             Failure::Ambiguous
                         });
@@ -3948,7 +3948,7 @@ impl Actor {
                                 Ok((durable, source)) => (Ok(durable), source),
                                 Err(error) => {
                                     eprintln!(
-                                        "celld output-gate durability proof failed for {cell} \
+                                        "cello output-gate durability proof failed for {cell} \
                                          epoch {epoch}: {error:#}"
                                     );
                                     (Err(Failure::Ambiguous), cello_logic::ProofSource::Bucket)
@@ -3985,7 +3985,7 @@ impl Actor {
                         }
                         Ok(record) => {
                             eprintln!(
-                                "celld output gate: {cell} epoch {epoch} is no longer ours \
+                                "cello output gate: {cell} epoch {epoch} is no longer ours \
                                  (record: {record:?}); refusing to acknowledge a write in an \
                                  orphaned epoch"
                             );
@@ -4177,7 +4177,7 @@ impl Actor {
                             .fire_alarm(op, cell.clone(), scheduled_ms)
                             .await
                             .map_err(|error| {
-                                eprintln!("celld alarm dispatch failed: {error:#}");
+                                eprintln!("cello alarm dispatch failed: {error:#}");
                                 Failure::Definite
                             });
                         CompletedEffect::plain(Event::AlarmFinished {
@@ -4252,7 +4252,7 @@ impl Actor {
                 // the core it is gone, so the cell is not left believing it
                 // has a socket the node already closed.
                 eprintln!(
-                    "celld refused an outbound WebSocket for {cell}: the cell is \
+                    "cello refused an outbound WebSocket for {cell}: the cell is \
                      leaving this node or the node's outbound pin budget is spent"
                 );
                 crate::js::ws_unregister(websocket);

@@ -155,12 +155,12 @@ impl StorageBackend {
         }
     }
 
-    /// How a user-metadata name that celld writes is spelled on this
+    /// How a user-metadata name that Cello writes is spelled on this
     /// backend.
     ///
     /// Azure Blob Storage requires a metadata name to be a C# identifier,
     /// and it refuses the whole write with `400 InvalidMetadata` when a name
-    /// holds a hyphen. celld names such as `celld-r2` failed every R2 write
+    /// holds a hyphen. cello names such as `cello-r2` failed every R2 write
     /// and lost every telemetry batch on an `az://` bucket
     /// (denoland/celld#209). Azure therefore gets an underscore for each
     /// hyphen, and [`BlobAttributes::metadata_value`] reads either spelling.
@@ -533,7 +533,7 @@ impl BlobAttributes {
         attributes
     }
 
-    /// The value under a metadata name that celld writes, in whichever
+    /// The value under a metadata name that Cello writes, in whichever
     /// spelling the backend stored. A store can fold the case of a name, so
     /// case does not matter. Both spellings match on every backend, so an
     /// object copied out of an Azure container into another store still
@@ -783,7 +783,7 @@ impl Bucket {
     ) -> anyhow::Result<Bucket> {
         anyhow::ensure!(
             !bucket.starts_with("dev://"),
-            "dev:// storage is internal to `celld dev` and is not a fleet bucket"
+            "dev:// storage is internal to `cello dev` and is not a fleet bucket"
         );
         Self::open_with_sources(
             bucket,
@@ -872,7 +872,7 @@ impl Bucket {
         self.read_deploy.as_deref()
     }
 
-    /// Open the machine-local development store. Only the `celld dev`
+    /// Open the machine-local development store. Only the `cello dev`
     /// supervisor and its child node receive this constructor; fleet flags
     /// continue to resolve exclusively through the cloud backend parser.
     pub(crate) fn open_dev(database: &std::path::Path) -> anyhow::Result<Bucket> {
@@ -924,7 +924,7 @@ impl Bucket {
             .with_allow_http(true);
         if let Some(app) = app {
             options = options.with_user_agent(
-                hyper::header::HeaderValue::from_str(&format!("celld app/{app}"))
+                hyper::header::HeaderValue::from_str(&format!("cello app/{app}"))
                     .context("app user agent")?,
             );
         }
@@ -1004,7 +1004,7 @@ impl Bucket {
                 )
             }
             StorageBackend::Gcs => {
-                // The generation dialect only. celld's S3 client fences
+                // The generation dialect only. cello's S3 client fences
                 // with If-Match, which GCS does not apply to a PUT; and
                 // this GCS client authenticates with OAuth, not HMAC keys.
                 // So an S3 endpoint or S3 static credentials with gs:// is
@@ -1147,7 +1147,7 @@ impl Bucket {
     /// (denoland/celld#232). The encoding escapes `%` inside a segment, so
     /// a lone `%` segment can only be an empty one.
     ///
-    /// A location that celld did not write can decode to bytes that are not
+    /// A location that Cello did not write can decode to bytes that are not
     /// UTF-8, such as `a%FF`, and that is an error. A lossy decode lists it
     /// as `a\u{FFFD}`, which names no object, and the cursor re-encodes that
     /// key as `a%EF%BF%BD`, which sorts before `a%FF`. A one-key page then
@@ -1687,7 +1687,7 @@ impl Bucket {
     //
     // An `r2_buckets` binding is served out of the fleet bucket under the
     // reserved `r2/<bucket_name>/` prefix, so a Worker's blobs share the
-    // durability and the credentials of everything else celld stores and
+    // durability and the credentials of everything else cello stores and
     // need no second bucket. These are the only operations that reach past
     // the in-memory `Bytes` contract the rest of this module keeps: a blob
     // is a Worker's payload and can be far larger than a fleet object, so
@@ -2045,7 +2045,7 @@ impl Bucket {
     /// A store can accept a precondition header and then ignore it, and no
     /// capability API answers whether it does. So the probe provokes the
     /// two rejections a conforming store must produce, and checks it
-    /// produced them. celld decides which node owns a cell with a
+    /// produced them. cello decides which node owns a cell with a
     /// conditional write, so a store that applies a write it must reject
     /// lets two nodes own one cell (denoland/celld#137).
     ///
@@ -2078,7 +2078,7 @@ impl Bucket {
             Ok(violation) => return Ok(violation),
             Err(error) if is_unsupported_operation(&error) => {
                 return Ok(StorageProbeVerdict::Violation(
-                    "the store does not support conditional writes, so celld cannot acquire a cell"
+                    "the store does not support conditional writes, so cello cannot acquire a cell"
                         .to_string(),
                 ));
             }
@@ -2088,7 +2088,7 @@ impl Bucket {
         match self.probe_range_steps().await {
             Err(error) if is_unsupported_operation(&error) || is_invalid_range_response(&error) => {
                 Ok(StorageProbeVerdict::Violation(
-                    "the store does not honor ranged reads, so celld cannot read stored cell data"
+                    "the store does not honor ranged reads, so cello cannot read stored cell data"
                         .to_string(),
                 ))
             }
@@ -2126,8 +2126,8 @@ impl Bucket {
         let precondition = self.backend.precondition();
         let ambiguous = || {
             format!(
-                "the store answered a conditional write with an error where celld requires a \
-                 clean rejection, so celld cannot tell a lost race from a failed write and \
+                "the store answered a conditional write with an error where cello requires a \
+                 clean rejection, so cello cannot tell a lost race from a failed write and \
                  reconciles forever; the store must answer {precondition} with a rejection"
             )
         };
@@ -2200,7 +2200,7 @@ impl Bucket {
     }
 
     async fn range_contract(&self, key: &str) -> anyhow::Result<StorageProbeVerdict> {
-        const BODY: &[u8] = b"celld-range-probe";
+        const BODY: &[u8] = b"cello-range-probe";
         const START: u64 = 6;
         const END: u64 = 11;
         let requested = START..END;
@@ -2335,7 +2335,7 @@ pub fn azure_replica_store_with_env(
     ))
 }
 
-/// The `AZURE_*` variables an `az://` bucket can inspect. celld captures
+/// The `AZURE_*` variables an `az://` bucket can inspect. cello captures
 /// them instead of letting `MicrosoftAzureBuilder::from_env` read the
 /// process environment, because the fleet client must decide which
 /// recognized settings it honors, and a caller can supply an explicit set.
@@ -2388,7 +2388,7 @@ impl CloudSources {
     }
 }
 
-/// Is this a setting an `az://` bucket accepts? celld supports three
+/// Is this a setting an `az://` bucket accepts? cello supports three
 /// credential families — a storage account key, a managed identity, and
 /// a workload identity — on the public Azure cloud, and no other
 /// recognized Azure setting.
@@ -2425,8 +2425,8 @@ fn accepts_azure_config_key(key: &AzureConfigKey) -> bool {
 /// part of `env`, and refuse every other recognized Azure setting.
 ///
 /// `object_store`'s builder accepts every source the Azure chain offers.
-/// celld accepts three, which mirrors the deliberate narrowness of the S3
-/// path, where celld reads the `AWS_*` environment but no `~/.aws`
+/// Cello accepts three, which mirrors the deliberate narrowness of the S3
+/// path, where cello reads the `AWS_*` environment but no `~/.aws`
 /// profile and no SSO login. Both the fleet client and the replica store
 /// come through here, so they cannot narrow differently.
 ///
@@ -2445,7 +2445,7 @@ fn azure_builder_for(env: &AzureEnv, container: &str) -> anyhow::Result<Microsof
         };
         if !accepts_azure_config_key(&key) {
             anyhow::bail!(
-                "an az:// bucket does not accept {name}; celld authenticates with an Azure \
+                "an az:// bucket does not accept {name}; cello authenticates with an Azure \
                  storage account key, a managed identity, or a workload identity on the \
                 public Azure cloud, and it refuses every other Azure setting"
             );
@@ -2534,7 +2534,7 @@ fn azure_builder_for(env: &AzureEnv, container: &str) -> anyhow::Result<Microsof
             // Never handed on as a string. object_store would parse it
             // itself, and its parse accepts y/n as well as true/false, so
             // a second parse here could disagree with it — and a
-            // disagreement over this key means celld validates a
+            // disagreement over this key means cello validates a
             // production configuration while the client talks to a local
             // Azurite. Two such nodes each own every cell. The name
             // travels with the value so the refusal below names what the
@@ -2549,7 +2549,7 @@ fn azure_builder_for(env: &AzureEnv, container: &str) -> anyhow::Result<Microsof
             _ => builder = builder.with_config(key, value),
         }
     }
-    // Azurite is the one endpoint override celld allows, and it arrives
+    // Azurite is the one endpoint override cello allows, and it arrives
     // as a parsed bool, so object_store re-parses nothing. Its
     // conditional-write behavior is not qualified for a production fleet.
     if let Some((name, value)) = emulator {
@@ -3240,7 +3240,7 @@ mod deploy_credential_routing_tests {
             .expect("the publishing client opens");
         assert!(
             publishing.deploy_read().is_none(),
-            "`celld deploy`, `activate`, and `discard` open the publishing client only"
+            "`cello deploy`, `activate`, and `discard` open the publishing client only"
         );
         let serving = publishing
             .with_deploy_read_credentials(

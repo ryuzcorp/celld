@@ -305,7 +305,7 @@ pub async fn load_or_create(bucket: &Bucket) -> anyhow::Result<[u8; 32]> {
 pub async fn load_existing(bucket: &Bucket) -> anyhow::Result<[u8; 32]> {
     load(bucket)
         .await?
-        .context("fleet has no peer authentication secret; start a current celld node first")
+        .context("fleet has no peer authentication secret; start a current cello node first")
 }
 
 async fn load(bucket: &Bucket) -> anyhow::Result<Option<[u8; 32]>> {

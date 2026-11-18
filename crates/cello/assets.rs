@@ -165,7 +165,7 @@ impl AssetResolver {
         let redirect_rules = parse_redirect_rules(index.config.redirects.as_deref().unwrap_or(""))?;
         let cache_root = std::env::var_os("CELLO_ASSET_CACHE_DIR")
             .map(PathBuf::from)
-            .unwrap_or_else(|| std::env::temp_dir().join("celld").join("asset-cache"));
+            .unwrap_or_else(|| std::env::temp_dir().join("cello").join("asset-cache"));
         std::fs::create_dir_all(&cache_root)
             .with_context(|| format!("create asset cache directory {}", cache_root.display()))?;
         let cache_max_bytes =

@@ -3,7 +3,7 @@
 //! Whether a failed peer dispatch may be re-sent.
 //!
 //! A cell runs on exactly one node, so every other node forwards to the
-//! owner. When that forward fails, celld must decide between two bad
+//! owner. When that forward fails, cello must decide between two bad
 //! options: fail the caller, or re-send and risk running the request twice.
 //! The deciding fact is how far the attempt got. A connection that was never
 //! established carried no request bytes, so the owner's cell is untouched and

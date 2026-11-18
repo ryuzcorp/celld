@@ -1,8 +1,8 @@
 // Modified by ryuzcorp (ryuzcorp/celld): node:url file URL helpers (upstream #280).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
-// node:url for celld: `pathToFileURL`/`fileURLToPath` plus the WHATWG URL
-// re-exports. Celld runs on Linux, so only the POSIX path rules apply.
+// node:url for cello: `pathToFileURL`/`fileURLToPath` plus the WHATWG URL
+// re-exports. Cello runs on Linux, so only the POSIX path rules apply.
 // Injected lazily, so an isolate that never imports node:url pays nothing.
 (() => {
   "use strict";

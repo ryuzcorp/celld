@@ -1,15 +1,15 @@
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
-// Modified by ryuzcorp (ryuzcorp/celld): d1 export; d1 execute --batch; deploy reads stay inside the project; d1 --local targets the celld dev node (upstream #272).
+// Modified by ryuzcorp (ryuzcorp/celld): d1 export; d1 execute --batch; deploy reads stay inside the project; d1 --local targets the cello dev node (upstream #272).
 
 // The D1 CLI reads operator input and migration files outside node storage.
 #![allow(clippy::disallowed_methods)]
 // Reaching stdout past `Output` is what mixed the result rows and the
 // summary onto one stream here in the first place.
 
-//! `celld d1` — run SQL and migrations against a deployed D1 database.
+//! `cello d1` — run SQL and migrations against a deployed D1 database.
 //!
 //! A D1 database is a cell, so it is only reachable through the node that owns
-//! it. This command finds the fleet the way `celld diagnose` does — it walks
+//! it. This command finds the fleet the way `cello diagnose` does — it walks
 //! the node leases in the bucket, and it reads the same shared secret — and
 //! then sends the SQL to a live node's `/runtime/` route, which forwards to the
 //! owner. The CLI therefore holds no ownership logic and no SQLite: it reaches
@@ -256,7 +256,7 @@ async fn run_with(
         )
         .await?
     } else {
-        let storage = command.fleet.clone().resolve("celld d1")?;
+        let storage = command.fleet.clone().resolve("cello d1")?;
         Reachable::open(
             Fleet {
                 bucket: &storage.bucket,
@@ -329,7 +329,7 @@ async fn run_with(
                 }
             }
             // stderr, not stdout. This line used to follow the rows on the
-            // same stream, so `celld d1 execute | jq` parsed prose.
+            // same stream, so `cello d1 execute | jq` parsed prose.
             let count = result
                 .get("count")
                 .and_then(Value::as_u64)
@@ -422,11 +422,11 @@ struct Migration {
     sql: String,
 }
 
-/// The `celld dev` node's database, reached through the project's local
+/// The `cello dev` node's database, reached through the project's local
 /// store: the store carries that node's leases and secret exactly like a
 /// fleet bucket carries its fleet's, so discovery and signing work
 /// unchanged. The node must be running: a stopped node leaves only
-/// expired leases behind, and a project `celld dev` never ran has no
+/// expired leases behind, and a project `cello dev` never ran has no
 /// state at all.
 async fn open_dev_database(
     project: Option<PathBuf>,
@@ -441,7 +441,7 @@ async fn open_dev_database(
     let database = crate::dev::DevState::database_for_project(&project, state, environment);
     if !database.exists() {
         bail!(
-            "no celld dev state at {}; run `celld dev` in {} first, with the same `--state DIR` \
+            "no cello dev state at {}; run `cello dev` in {} first, with the same `--state DIR` \
              (or `CELLO_DEV_STATE`) when the node uses one",
             database.display(),
             project.display()
@@ -450,7 +450,7 @@ async fn open_dev_database(
     let bucket = crate::bucket::Bucket::open_dev(&database)?;
     Reachable::open_local(&bucket, unsafe_public_advertise, subject, scope, None)
         .await
-        .context("reach the `celld dev` node; it must be running while this command works")
+        .context("reach the `cello dev` node; it must be running while this command works")
 }
 
 /// One entrance into the fleet: a node's address and the identity a request
@@ -606,7 +606,7 @@ fn read_migrations(directory: &std::path::Path) -> anyhow::Result<Vec<Migration>
                 .unwrap_or(false);
             if nested {
                 bail!(
-                    "{} holds .sql files, and celld reads migrations from a flat \
+                    "{} holds .sql files, and cello reads migrations from a flat \
                      directory only; move them into {} itself",
                     path.display(),
                     directory.display()
@@ -706,11 +706,11 @@ struct Command {
     fleet: FleetFlags,
     json: bool,
     unsafe_public_advertise: bool,
-    /// Target the `celld dev` node through the project's local state
+    /// Target the `cello dev` node through the project's local state
     /// instead of a fleet bucket.
     local: bool,
     /// The dev state directory for the local path: the `--state` flag,
-    /// resolving the same way as `celld dev` (flag, `CELLO_DEV_STATE`,
+    /// resolving the same way as `cello dev` (flag, `CELLO_DEV_STATE`,
     /// project).
     state: Option<PathBuf>,
 }
@@ -746,16 +746,16 @@ impl Command {
                 Some("apply") => Some(Action::MigrationsApply),
                 Some("list") => Some(Action::MigrationsList),
                 Some(other) if !other.starts_with('-') => {
-                    bail!("unknown `celld d1 migrations` subcommand: {other}")
+                    bail!("unknown `cello d1 migrations` subcommand: {other}")
                 }
-                _ => bail!("`celld d1 migrations` needs `apply` or `list`"),
+                _ => bail!("`cello d1 migrations` needs `apply` or `list`"),
             },
-            other => bail!("unknown `celld d1` subcommand: {other}"),
+            other => bail!("unknown `cello d1` subcommand: {other}"),
         };
         let database = arguments
             .next()
             .filter(|value| !value.starts_with('-'))
-            .ok_or_else(|| anyhow!("celld d1 needs a database name"))?;
+            .ok_or_else(|| anyhow!("cello d1 needs a database name"))?;
 
         let mut sql = None;
         let mut file = None;
@@ -797,7 +797,7 @@ impl Command {
                         continue;
                     }
                     if other.starts_with('-') {
-                        bail!("unknown option: {other}; run `celld d1 --help` for usage")
+                        bail!("unknown option: {other}; run `cello d1 --help` for usage")
                     }
                     project = Some(PathBuf::from(other));
                 }
@@ -810,7 +810,7 @@ impl Command {
                 // their SQL ran when nothing read it.
                 if sql.is_some() || file.is_some() || batch || export_options {
                     bail!(
-                        "`celld d1 migrations` takes no --command, --file, --batch, or export options; \
+                        "`cello d1 migrations` takes no --command, --file, --batch, or export options; \
                          migrations come from the migrations directory"
                     );
                 }
@@ -818,16 +818,16 @@ impl Command {
             }
             None if is_export => {
                 if sql.is_some() || file.is_some() {
-                    bail!("`celld d1 export` takes no --command or --file; it dumps the live database");
+                    bail!("`cello d1 export` takes no --command or --file; it dumps the live database");
                 }
                 if batch {
-                    bail!("`celld d1 export` takes no --batch; it dumps the live database");
+                    bail!("`cello d1 export` takes no --batch; it dumps the live database");
                 }
                 if json {
-                    bail!("`celld d1 export` writes SQL text, so --json does not apply");
+                    bail!("`cello d1 export` writes SQL text, so --json does not apply");
                 }
                 if no_schema && no_data {
-                    bail!("`celld d1 export` with --no-schema and --no-data selects nothing");
+                    bail!("`cello d1 export` with --no-schema and --no-data selects nothing");
                 }
                 Action::Export {
                     output,
@@ -839,19 +839,19 @@ impl Command {
             None => {
                 if export_options {
                     bail!(
-                        "--output, --table, --no-schema, and --no-data belong to `celld d1 export`"
+                        "--output, --table, --no-schema, and --no-data belong to `cello d1 export`"
                     );
                 }
                 if batch {
                     if sql.is_some() || file.is_some() {
                         bail!(
-                            "`celld d1 execute --batch` reads its statements from stdin, so it \
+                            "`cello d1 execute --batch` reads its statements from stdin, so it \
                              takes no --command or --file"
                         );
                     }
                     if !json {
                         bail!(
-                            "`celld d1 execute --batch` requires --json: per-statement results \
+                            "`cello d1 execute --batch` requires --json: per-statement results \
                              are structured"
                         );
                     }
@@ -859,7 +859,7 @@ impl Command {
                 } else {
                     if sql.is_some() == file.is_some() {
                         bail!(
-                            "celld d1 execute requires exactly one of --command, --file, or --batch"
+                            "cello d1 execute requires exactly one of --command, --file, or --batch"
                         );
                     }
                     Action::Execute { command: sql, file }
@@ -876,12 +876,12 @@ impl Command {
         });
         if local && (fleet.bucket.is_some() || fleet.endpoint.is_some()) {
             bail!(
-                "`celld d1 --local` reaches the `celld dev` node through the project's local state, \
+                "`cello d1 --local` reaches the `cello dev` node through the project's local state, \
                  not a fleet bucket; drop --bucket/--endpoint (and CELLO_BUCKET/S3_ENDPOINT)"
             );
         }
         if !local && state.is_some() {
-            bail!("`--state DIR` names the `celld dev` state directory; it needs `--local`");
+            bail!("`--state DIR` names the `cello dev` state directory; it needs `--local`");
         }
         Ok(Some(Self {
             action,
@@ -900,42 +900,42 @@ impl Command {
 
 pub fn print_help() {
     let text = format!(
-        r#"celld d1 — run SQL, migrations, and exports against a deployed D1 database
+        r#"cello d1 — run SQL, migrations, and exports against a deployed D1 database
 
 USAGE:
-  celld d1 execute DATABASE (--command SQL | --file PATH | --batch) [PROJECT] --bucket NAME
-  celld d1 export DATABASE [--output PATH] [--table NAME]... [PROJECT] --bucket NAME
-  celld d1 migrations apply DATABASE [PROJECT] --bucket NAME
-  celld d1 migrations list  DATABASE [PROJECT] --bucket NAME
+  cello d1 execute DATABASE (--command SQL | --file PATH | --batch) [PROJECT] --bucket NAME
+  cello d1 export DATABASE [--output PATH] [--table NAME]... [PROJECT] --bucket NAME
+  cello d1 migrations apply DATABASE [PROJECT] --bucket NAME
+  cello d1 migrations list  DATABASE [PROJECT] --bucket NAME
 
-  Append --local to any of the above to target the `celld dev` node instead
+  Append --local to any of the above to target the `cello dev` node instead
   of the fleet; --local takes no --bucket.
 
 DATABASE is a `database_name` the project declares in `d1_databases`. PROJECT
 is the directory holding wrangler.jsonc, and defaults to the working directory.
 The `database_id` is the stable database identity when the declaration has one.
-Otherwise, celld uses the `database_name` as the identity.
+Otherwise, cello uses the `database_name` as the identity.
 
-celld d1 needs a running fleet. It finds a node through the bucket's node
+cello d1 needs a running fleet. It finds a node through the bucket's node
 leases and sends the SQL to that node, which forwards it to the node that owns
 the database. It signs each request with the fleet's shared secret, which it
-reads from the bucket, so it needs the same bucket credentials celld deploy
+reads from the bucket, so it needs the same bucket credentials cello deploy
 needs.
 
-`--local` runs the subcommand against the `celld dev` node instead of the
+`--local` runs the subcommand against the `cello dev` node instead of the
 fleet: it reads the database identity from PROJECT as usual, then reaches
-the running dev node through the project's local state (PROJECT/.celld/dev,
+the running dev node through the project's local state (PROJECT/.cello/dev,
 or the `--state`/`CELLO_DEV_STATE` directory when one is set) — the local
 store carries that node's leases and secret, so execute, export, and
 migrations work unchanged. Pass `--state DIR` when the node runs with
-`celld dev --state DIR` (or `CELLO_DEV_STATE`). The dev node must be running.
+`cello dev --state DIR` (or `CELLO_DEV_STATE`). The dev node must be running.
 `--local` takes no --bucket, --endpoint, CELLO_BUCKET, or S3_ENDPOINT.
 
 Migration files are `NNNN_description.sql` in `migrations/`. The `sql`
-extension is ASCII case-insensitive. celld applies the files in the order of
+extension is ASCII case-insensitive. cello applies the files in the order of
 their numeric prefixes as wrangler applies them. `migrations_dir` on the
 d1_databases entry moves the directory, and `migrations_table` renames the
-bookkeeping table. celld records applied migrations in that table
+bookkeeping table. cello records applied migrations in that table
 (`d1_migrations` by default), the same table and columns
 `wrangler d1 migrations` uses.
 
@@ -950,7 +950,7 @@ issuing many reads pays one round trip instead of one subprocess per query.
 `export` writes the database as SQL — schema beside data in creation order —
 read under one transaction on the owning node, so the dump is a single
 snapshot even while the database takes writes. It prints to stdout, or to
---output. Import a dump with `celld d1 execute DATABASE --file dump.sql`,
+--output. Import a dump with `cello d1 execute DATABASE --file dump.sql`,
 which replays it in one transaction, as `wrangler d1 execute --file` does.
 
 OPTIONS:
@@ -958,10 +958,10 @@ OPTIONS:
   --file PATH         Read the SQL from a file instead
   --batch             Read a JSON array of statements from stdin and run it
                       as one transactional batch (requires --json)
-  --local             Target the `celld dev` local database through the
+  --local             Target the `cello dev` local database through the
                       running dev node instead of the fleet
-  --state DIR         With --local, use DIR as the `celld dev` state
-                      directory instead of PROJECT/.celld/dev
+  --state DIR         With --local, use DIR as the `cello dev` state
+                      directory instead of PROJECT/.cello/dev
                       (CELLO_DEV_STATE sets the same)
   --json              Print one JSON object per row instead of a table
   --output PATH       Write the export to a file instead of stdout
@@ -1076,11 +1076,11 @@ mod d1_export_cli_tests {
             ),
             (
                 ["execute", "db", "--command", "SELECT 1", "--table", "a"].as_slice(),
-                "belong to `celld d1 export`",
+                "belong to `cello d1 export`",
             ),
             (
                 ["execute", "db", "--command", "SELECT 1", "--no-data"].as_slice(),
-                "belong to `celld d1 export`",
+                "belong to `cello d1 export`",
             ),
             (
                 ["migrations", "apply", "db", "--table", "a"].as_slice(),
@@ -1178,10 +1178,10 @@ mod d1_export_cli_tests {
         }
     }
 
-    /// No fleet, no node: the command must name `celld dev`, not fail
+    /// No fleet, no node: the command must name `cello dev`, not fail
     /// opening a bucket or dialing an address.
     #[tokio::test]
-    async fn local_without_dev_state_names_celld_dev() {
+    async fn local_without_dev_state_names_cello_dev() {
         let project = tempfile::tempdir().unwrap();
         std::fs::write(
             project.path().join("wrangler.json"),
@@ -1199,8 +1199,8 @@ mod d1_export_cli_tests {
         .expect_err("without dev state the command must refuse");
         let message = format!("{error:?}");
         assert!(
-            message.contains("celld dev"),
-            "the refusal must name `celld dev`: {message}"
+            message.contains("cello dev"),
+            "the refusal must name `cello dev`: {message}"
         );
         assert!(
             message.contains("CELLO_DEV_STATE"),
@@ -1209,7 +1209,7 @@ mod d1_export_cli_tests {
     }
 
     /// `--state DIR` points the local path at that state directory, the
-    /// same way `celld dev --state DIR` does: a directory without state
+    /// same way `cello dev --state DIR` does: a directory without state
     /// refuses naming that directory.
     #[tokio::test]
     async fn local_state_flag_selects_the_state_directory() {
@@ -1239,8 +1239,8 @@ mod d1_export_cli_tests {
     }
 
     /// A symlinked `wrangler.json` resolves to the config's own directory,
-    /// the same project `celld dev` runs in: the missing-state refusal must
-    /// name the canonical `.celld/dev`, not the link's parent.
+    /// the same project `cello dev` runs in: the missing-state refusal must
+    /// name the canonical `.cello/dev`, not the link's parent.
     #[tokio::test]
     async fn local_without_dev_state_follows_a_symlinked_config() {
         let root = tempfile::tempdir().unwrap();
@@ -1267,7 +1267,7 @@ mod d1_export_cli_tests {
         .expect_err("without dev state the command must refuse");
         let wanted = std::fs::canonicalize(&real)
             .unwrap()
-            .join(".celld")
+            .join(".cello")
             .join("dev");
         let message = format!("{error:?}");
         assert!(

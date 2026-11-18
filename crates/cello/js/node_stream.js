@@ -1,4 +1,4 @@
-// node:stream for celld. Copyright Joyent, Inc., Node.js contributors, and
+// node:stream for cello. Copyright Joyent, Inc., Node.js contributors, and
 // the Deno authors (MIT) -- readable-stream@4.2.0 (MIT, Node.js contributors),
 // via the esbuild bundle Deno ships as ext/node/polyfills/_stream.mjs (MIT,
 // the Deno authors). Workerd's node:stream at commit

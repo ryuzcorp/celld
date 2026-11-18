@@ -23,7 +23,7 @@ function _checkName(name) {
   if (!valid)
     throw new TypeError(
       "Invalid header name: " + name);
-  // The name is returned as written. Lower-casing here would put celld's
+  // The name is returned as written. Lower-casing here would put cello's
   // spelling on the wire instead of the author's, which anything that
   // canonicalizes over the received bytes can see -- an AWS SigV4 signer
   // over `SignedHeaders` being the case that breaks.

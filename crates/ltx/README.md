@@ -1,6 +1,6 @@
 # cello-ltx
 
-`cello-ltx` is celld's in-process SQLite replication library. It captures
+`cello-ltx` is cello's in-process SQLite replication library. It captures
 committed WAL data as L0 LTX segments and reports the captured position. The
 crate can write segments to a filesystem or an object store. It can restore a
 database, compact levels, create a snapshot, and read segments from bundle
@@ -9,7 +9,7 @@ each page from the segments on first use, through a page map built from the
 segments' own page indexes, and a paged epoch continues the chain it paged
 from.
 
-celld uses this library inside a larger durability protocol. The output gate,
+cello uses this library inside a larger durability protocol. The output gate,
 epoch fencing, replicated node log, and takeover recovery enforce the write
 acknowledgement contract.
 
@@ -17,8 +17,8 @@ acknowledgement contract.
 
 Seeded on 2026-08-03 from a read-only snapshot of rustyriver
 (https://github.com/mikenomitch/rustyriver), a from-scratch Rust
-reimplementation of Litestream v0.5 and the LTX file format. celld owns and
-evolves this snapshot as first-class celld source; it does not track an
+reimplementation of Litestream v0.5 and the LTX file format. cello owns and
+evolves this snapshot as first-class cello source; it does not track an
 upstream branch.
 
 Attribution for the vendored and ported work:
@@ -39,7 +39,7 @@ Attribution for the vendored and ported work:
 
 The port is not complete, deliberately. `leaser.rs` — Litestream's
 object-storage lease (`leaser.go`, `heartbeat.go`, `s3/leaser.go`) — was
-ported and then removed on 2026-08-06, unused. celld fences cell ownership
+ported and then removed on 2026-08-06, unused. cello fences cell ownership
 with a conditional-write record carrying an epoch, and fences the data path by
 stamping that epoch into the LTX prefix; a lease file under the replica prefix
 would be a second, competing layer. Upstream's own leaser is unwired for the
@@ -51,12 +51,12 @@ BSD 3-Clause License text is in
 
 ## File compatibility
 
-Celld and Litestream v0.5.16 can read the new block files and the older frame
+Cello and Litestream v0.5.16 can read the new block files and the older frame
 files. Litestream v0.5.11 can read only the older frame files. This is a reader
 compatibility boundary because LTX keeps file version 3 for both layouts.
 
-The ordinary celld L0 writer still emits the older frame representation. The
-v0.5.2 encoder and compactor emit exact block files. Celld contains a
+The ordinary cello L0 writer still emits the older frame representation. The
+v0.5.2 encoder and compactor emit exact block files. Cello contains a
 node-wide scheduler that publishes additive L1 files, and the scheduler is on
 by default. Every takeover target must have the dual decoder before the first
 L1 publication, so a mixed fleet must set `CELLO_LTX_COMPACTION=0` until all

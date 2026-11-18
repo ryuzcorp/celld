@@ -445,7 +445,7 @@ unsafe extern "C" fn x_open(
     // inspection copy, a neighbour's file) is a plain file, because a second
     // sparse view of the cut would share the hydration set and mark pages
     // the cell's file never received, so the cell reads holes
-    // (CelldPagedVfs.tla, `BreakSecondFileShares`).
+    // (CelloPagedVfs.tla, `BreakSecondFileShares`).
     let is_cell = flags & ffi::SQLITE_OPEN_MAIN_DB != 0
         && !name.is_null()
         && CStr::from_ptr(name) == app.path.as_c_str();
@@ -471,7 +471,7 @@ unsafe extern "C" fn x_open(
     // right and un-faulted pages read as holes we intercept. A later open
     // (the actor's connection, an alarm read) finds a file a checkpoint may
     // have grown past the cut; sizing it again would cut those pages off
-    // while their hydration marks survive (CelldPagedVfs.tla,
+    // while their hydration marks survive (CelloPagedVfs.tla,
     // `BreakOpenTruncates`).
     if is_cell {
         let methods = &*base_methods(file);
@@ -517,17 +517,17 @@ static REGISTRATION_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomi
 /// The next registration's name, unique in this process.
 pub fn next_registration_name() -> String {
     format!(
-        "celld-paged-{}",
+        "cello-paged-{}",
         REGISTRATION_SEQ.fetch_add(1, Ordering::SeqCst)
     )
 }
 
 /// Registers a paged VFS named `name` that faults the main db's pages in from
-/// `reader`. celld opens the cell's database through this VFS name. Call
+/// `reader`. cello opens the cell's database through this VFS name. Call
 /// [`unregister_paged_vfs`] when the cell closes.
 ///
 /// `base` names the VFS the paged one wraps; `None` is SQLite's default.
-/// celld passes its own named VFS when it runs one, so the local file's I/O
+/// Cello passes its own named VFS when it runs one, so the local file's I/O
 /// stays under that host's control — the deterministic simulation in
 /// particular, which cannot judge a crash image written past it.
 pub fn register_paged_vfs(

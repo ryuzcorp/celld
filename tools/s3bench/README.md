@@ -1,6 +1,6 @@
 # s3bench: reproducible S3 request-cost harness
 
-Measures what one celld run costs the bucket: every request the nodes make
+Measures what one Cello run costs the bucket: every request the nodes make
 to the object store goes through `proxy.py`, which logs one JSON line per
 request, and `count.py` classifies the log into `METHOD x key-family`
 counts. `stored.py` reports the `cells/` objects and bytes left behind.
@@ -29,7 +29,7 @@ counts. `stored.py` reports the `cells/` objects and bytes left behind.
 ## Prerequisites
 
 - `cargo build --release -p cello` (or set `CELLO_BIN` to the binary),
-- `esbuild` on `PATH` (needed by `celld deploy`),
+- `esbuild` on `PATH` (needed by `cello deploy`),
 - `docker` (starts a `rustfs/rustfs` container, credentials via env),
 - `python3` with `boto3`.
 
@@ -42,7 +42,7 @@ counts. `stored.py` reports the `cells/` objects and bytes left behind.
 Compare release builds only (`cargo build --release -p cello`): a debug
 binary is several times slower on the capture and SQLite paths, which
 shifts batching, request counts and every latency figure. `run.sh` refuses
-to start while another `celld-s3bench-*` container is up, because
+to start while another `cello-s3bench-*` container is up, because
 concurrent runs share CPU and Docker and skew latency;
 `S3BENCH_ALLOW_PARALLEL=1` overrides it for runs that only compare counts.
 

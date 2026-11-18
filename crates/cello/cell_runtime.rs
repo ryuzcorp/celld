@@ -439,7 +439,7 @@ fn require_cell_scope_capacity(data_dir: &Path) -> anyhow::Result<()> {
 pub(crate) fn require_cell_scope_name_max(name_max: usize) -> anyhow::Result<()> {
     anyhow::ensure!(
         name_max >= cello_logic::cell::MAX_CELL_SCOPE,
-        "the data filesystem supports {name_max}-byte names, but celld requires {}",
+        "the data filesystem supports {name_max}-byte names, but cello requires {}",
         cello_logic::cell::MAX_CELL_SCOPE
     );
     Ok(())

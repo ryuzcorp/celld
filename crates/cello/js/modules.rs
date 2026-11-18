@@ -121,7 +121,7 @@ pub(super) struct ModuleRegistry {
     /// to the static resolve callback, so the registry must retain the name
     /// that relative imports use as their base.
     source_names: Mutex<Vec<(v8::Global<v8::Module>, String)>>,
-    /// The host-generated stubs: the only modules whose `celld:internals`
+    /// The host-generated stubs: the only modules whose `cello:internals`
     /// import resolves. A user module that names the specifier is refused
     /// by [`resolve_external`], so the internals object stays out of reach
     /// of every bundle and every loaded worker.
@@ -131,7 +131,7 @@ pub(super) struct ModuleRegistry {
 
 impl ModuleRegistry {
     /// Register `module` under every spec in `specs`. `trusted` admits it to
-    /// `celld:internals`, and is the only way in: every host-generated stub
+    /// `cello:internals`, and is the only way in: every host-generated stub
     /// registers here, and a user module never passes `true`.
     fn register(
         &self,
@@ -182,11 +182,11 @@ impl ModuleRegistry {
 /// The specifier the stubs import the internals object from. It is not a
 /// builtin: `is_external` does not know it, so a dynamic import() of it
 /// rejects, and a static import from a user module fails to link.
-const INTERNALS_SPECIFIER: &str = "celld:internals";
+const INTERNALS_SPECIFIER: &str = "cello:internals";
 
-/// The host module of the Python Worker bundle that `celld deploy` builds.
+/// The host module of the Python Worker bundle that `cello deploy` builds.
 /// Its one export condemns the calling isolate; see `op_isolate_condemn`.
-const PYTHON_HOST_SPECIFIER: &str = "celld:python";
+const PYTHON_HOST_SPECIFIER: &str = "cello:python";
 
 /// One synthetic module per isolate whose default export is the internals
 /// object, built the first time a stub links.
@@ -220,7 +220,7 @@ fn internals_evaluation_steps<'s>(
     Some(v8::undefined(scope).into())
 }
 
-/// Compile a host-generated stub that imports `celld:internals` and register
+/// Compile a host-generated stub that imports `cello:internals` and register
 /// it under `spec` as a trusted referrer.
 fn register_internal_stub(scope: &mut v8::PinScope, spec: &str, source: &str) {
     let Some(module) = compile_module(scope, spec, source) else {
@@ -237,7 +237,7 @@ fn modreg(scope: &mut v8::PinScope) -> Arc<ModuleRegistry> {
         .expect("isolate has no module registry")
 }
 
-/// Is `spec` an external builtin (`node:*`, `cloudflare:*`, `celld:python`,
+/// Is `spec` an external builtin (`node:*`, `cloudflare:*`, `cello:python`,
 /// or a bare node builtin)? esbuild bundles every npm dep inline and leaves
 /// only builtins external, so a remaining bare specifier is a node builtin.
 fn is_external(spec: &str) -> bool {
@@ -275,7 +275,7 @@ static IMPORT_SCANS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicU
 
 /// A source puts this in a comment to have its scans counted.
 #[cfg(cello_internal_tests)]
-pub(super) const SCAN_PROBE_MARKER: &str = "celld-import-scan-probe";
+pub(super) const SCAN_PROBE_MARKER: &str = "cello-import-scan-probe";
 
 /// How many times a source carrying [`SCAN_PROBE_MARKER`] has been scanned.
 #[cfg(cello_internal_tests)]
@@ -871,7 +871,7 @@ pub(super) fn register_loader_modules(
 }
 
 /// Module resolve callback: serve a registered stub for `cloudflare:*`/`node:*`.
-/// celld bundles are single-file, so anything else is genuinely unresolvable.
+/// Cello bundles are single-file, so anything else is genuinely unresolvable.
 pub(super) fn resolve_external<'s>(
     context: v8::Local<'s, v8::Context>,
     specifier: v8::Local<'s, v8::String>,
@@ -888,7 +888,7 @@ pub(super) fn resolve_external<'s>(
         // A user module named the stubs' private specifier. Refuse with a
         // message: the bare miss below reports no exception, and a link
         // error that says nothing sends the author looking for a typo.
-        let message = v8::String::new(scope, "celld:internals is not importable").unwrap();
+        let message = v8::String::new(scope, "cello:internals is not importable").unwrap();
         let exception = v8::Exception::type_error(scope, message);
         scope.throw_exception(exception);
         return None;

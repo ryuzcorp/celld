@@ -1,6 +1,6 @@
 // Modified by ryuzcorp (ryuzcorp/celld): retired-continuation resume conformance (upstream #277). Apache-2.0.
 
-// A black-box runner, not node code: it boots the real `celld dev` binary
+// A black-box runner, not node code: it boots the real `cello dev` binary
 // and drives the issue's constructor-started task loop, so the execution
 // boundary's injected clock/filesystem/async rules do not apply to it.
 #![allow(clippy::disallowed_methods)]
@@ -20,7 +20,7 @@
 //! entry other than the full triple fails the assertion, and a hang fails
 //! the deadline.
 //!
-//! One `celld dev` boots the fixture per test. No fixed sleeps: the log is
+//! One `cello dev` boots the fixture per test. No fixed sleeps: the log is
 //! polled with a deadline, and the server guard kills the child on every
 //! exit path.
 
@@ -52,7 +52,7 @@ fn copy_dir(src: &Path, dst: &Path) {
     }
 }
 
-/// A booted `celld dev` and its address. Kills the child on drop, so a
+/// A booted `cello dev` and its address. Kills the child on drop, so a
 /// failing assertion cannot leak a server onto its port.
 struct TestNode {
     child: Child,
@@ -71,7 +71,7 @@ impl TestNode {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .expect("spawn celld dev");
+            .expect("spawn cello dev");
         let mut stdout = child.stdout.take().expect("piped stdout");
         let stderr = child.stderr.take().expect("piped stderr");
         // Drain stdout so a chatty child can never block on a full pipe.
@@ -111,11 +111,11 @@ fn poll_boot(node: &mut TestNode, announced_lines: &Arc<Mutex<Vec<String>>>) -> 
     loop {
         if let Some(status) = node.child.try_wait().expect("poll child") {
             panic!(
-                "celld dev exited during boot: {status}: {}",
+                "cello dev exited during boot: {status}: {}",
                 announced_lines.lock().expect("announce lock").join("\n")
             );
         }
-        if let Some(public) = announced(announced_lines, "celld listening on ") {
+        if let Some(public) = announced(announced_lines, "cello listening on ") {
             if probe(&public) {
                 return public;
             }
@@ -166,7 +166,7 @@ fn http_get(addr: &str, path: &str, timeout: Duration) -> Result<(u16, String), 
 #[test]
 fn constructor_task_loop_resumed_by_later_event_completes() {
     let dir = tempfile::Builder::new()
-        .prefix("celld-continuation-resume-")
+        .prefix("cello-continuation-resume-")
         .tempdir()
         .expect("tempdir");
     let project = dir.path().join("app");

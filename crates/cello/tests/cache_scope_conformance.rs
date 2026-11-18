@@ -25,7 +25,7 @@
 //! - `cache_scope_rejects_garbage`: a scope that names neither `script`
 //!   nor `deployment` refuses the boot.
 //!
-//! Every test boots its own `celld dev` nodes on hermetic tempdirs, so
+//! Every test boots its own `cello dev` nodes on hermetic tempdirs, so
 //! tests share nothing and run in any order. Boots use `--port 0` with
 //! worker-listener discovery from the node's own announce line, which the
 //! supervisor forwards to stderr (`--logs`), so parallel boots never share
@@ -78,7 +78,7 @@ fn fixture_dir() -> PathBuf {
         .expect("fixture exists")
 }
 
-/// One address of a `celld dev` node, from the announce line the supervisor
+/// One address of a `cello dev` node, from the announce line the supervisor
 /// forwards to its stderr. The node is non-dumpable (patch 0053), so
 /// `/proc/<pid>/fd` no longer names its listeners, and this is the node's
 /// own report of where it bound.
@@ -129,9 +129,9 @@ fn encode(value: &str) -> String {
     out
 }
 
-/// Open the dev bucket of a project that `celld dev` has not booted yet.
+/// Open the dev bucket of a project that `cello dev` has not booted yet.
 fn open_bucket(app_project: &Path) -> cello::bucket::Bucket {
-    let state = app_project.join(".celld/dev");
+    let state = app_project.join(".cello/dev");
     std::fs::create_dir_all(state.join("runtime")).expect("state dir");
     let database = state.join("objects.sqlite3");
     block_on(async {
@@ -180,7 +180,7 @@ fn preseed_probe(app_project: &Path, probe_src: &Path) {
     deploy_src(&bucket, probe_src);
 }
 
-/// A booted `celld dev` and its address. Kills the child on drop, so a
+/// A booted `cello dev` and its address. Kills the child on drop, so a
 /// failing assertion cannot leak a server onto its port.
 struct TestNode {
     child: Child,
@@ -207,7 +207,7 @@ impl TestNode {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .expect("spawn celld dev");
+            .expect("spawn cello dev");
         let mut stdout = child.stdout.take().expect("piped stdout");
         let stderr = child.stderr.take().expect("piped stderr");
         // Drain stdout so a chatty child can never block on a full pipe.
@@ -233,9 +233,9 @@ impl TestNode {
             // Liveness first: a dead child must fail fast, not burn
             // the deadline on refused probes.
             if let Some(status) = node.child.try_wait().expect("poll child") {
-                panic!("celld dev exited during boot: {status}");
+                panic!("cello dev exited during boot: {status}");
             }
-            let addr = announced(&announced_lines, "celld listening on ")?;
+            let addr = announced(&announced_lines, "cello listening on ")?;
             probe(&addr, "/health").then_some(addr)
         });
         node.public = public;
@@ -352,7 +352,7 @@ fn missed(node: &TestNode, params: &[(&str, &str)]) {
 
 fn boot_node(envs: &[(&str, &str)]) -> (tempfile::TempDir, TestNode) {
     let dir = tempfile::Builder::new()
-        .prefix("celld-cache-scope-")
+        .prefix("cello-cache-scope-")
         .tempdir()
         .expect("tempdir");
     let app_project = dir.path().join("app");
@@ -474,7 +474,7 @@ fn cache_deployment_scope_isolates_other_deployments() {
     // A redeployed generation on the same node is a new deployment
     // identity with an empty scope: the old entries stay behind.
     let dir = tempfile::Builder::new()
-        .prefix("celld-cache-scope-redeploy-")
+        .prefix("cello-cache-scope-redeploy-")
         .tempdir()
         .expect("tempdir");
     let app_project = dir.path().join("app");
@@ -525,7 +525,7 @@ fn cache_deployment_scope_isolates_other_deployments() {
 #[test]
 fn cache_scope_rejects_garbage() {
     let dir = tempfile::Builder::new()
-        .prefix("celld-cache-scope-garbage-")
+        .prefix("cello-cache-scope-garbage-")
         .tempdir()
         .expect("tempdir");
     let app_project = dir.path().join("app");
@@ -546,7 +546,7 @@ fn cache_scope_rejects_garbage() {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("spawn celld dev");
+        .expect("spawn cello dev");
     let mut stdout = child.stdout.take().expect("piped stdout");
     std::thread::spawn(move || {
         let mut sink = Vec::new();
@@ -570,7 +570,7 @@ fn cache_scope_rejects_garbage() {
     assert!(!status.success(), "garbage scope exited {status}");
     let errors = errors.join().expect("read stderr");
     assert!(
-        !errors.contains("celld listening on "),
+        !errors.contains("cello listening on "),
         "the node announced a listener before refusing the scope: {errors}"
     );
     assert!(

@@ -1,9 +1,9 @@
 // Modified by ryuzcorp (ryuzcorp/celld): round-level fence settlement (0062); renewal lease readback carries the authority bound (upstream #264); first alarm-deadline expiry only marks the firing (upstream #256); same-guard retry on lease conflicts (upstream #239); storage-poisoned runtimes restart on their own generation (upstream #291); failed start disarms the restored alarm (upstream #276); dead-owner takeovers look up fleet capacity when full (upstream #263).
-// Modified by ryuzcorp (ryuzcorp/celld): ported from meln1k/celld: coordination-core fixes (ea471ee, e46a685, 6d61462, 18d3bf9, 9d4c163, 468b456, 01522b3, b026226, 65fdb13); shared bucket-posture ownership reads across concurrent gates (0056).
+// Modified by ryuzcorp (ryuzcorp/celld): ported from meln1k/cello: coordination-core fixes (ea471ee, e46a685, 6d61462, 18d3bf9, 9d4c163, 468b456, 01522b3, b026226, 65fdb13); shared bucket-posture ownership reads across concurrent gates (0056).
 // Modified by ryuzcorp (ryuzcorp/celld): MergeTree-style lazy handoff policy (0078).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
-//! Clean-sheet celld decision core.
+//! Clean-sheet cello decision core.
 //!
 //! [`on_event`] is the only way behavioral state advances. The production
 //! executor and deterministic simulator both feed it events and perform the
@@ -88,7 +88,7 @@ pub struct RestoreSpec {
     pub epoch: Epoch,
     /// This activation conditionally created epoch one, so no replica can
     /// precede it. The bucket shell reports a missing record only when no LTX
-    /// exists under `cells/<cell>/ltx/`. A record deleted outside celld
+    /// exists under `cells/<cell>/ltx/`. A record deleted outside cello
     /// therefore produces a fresh activation only when that prefix holds no
     /// LTX of the cell: before the first drain of a node bundle, or after the
     /// LTX was deleted as well.
@@ -207,8 +207,8 @@ struct CachedNodeLease {
 /// - `Inactive` is out of memory and owned by nobody: removed from the host,
 ///   needing a cold start (state 5, and the initial state of every cell).
 ///
-/// Note that celld and Cloudflare use "evict" differently. Cloudflare evicts a
-/// cell *off its host*, which produces `Inactive`. celld evicts a cell *out of
+/// Note that Cello and Cloudflare use "evict" differently. Cloudflare evicts a
+/// cell *off its host*, which produces `Inactive`. cello evicts a cell *out of
 /// memory*, which produces `Dormant`, and shedding is what then publishes it
 /// unowned.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -329,7 +329,7 @@ pub struct StepSafetyObserverSnapshot {
 }
 
 /// The reported name of a phase. Stable across internal renames, because
-/// `/state` and `celld diagnose` publish it.
+/// `/state` and `cello diagnose` publish it.
 fn phase_name(phase: &Phase) -> &'static str {
     match phase {
         Phase::Inactive => "inactive",
@@ -921,7 +921,7 @@ pub struct State {
     /// adoption, so the pump reads it where it decides, and no cell can hold
     /// a swap flag it is not swapping under.
     swap_eager_classes: BTreeSet<String>,
-    /// The shedding latch. celld kept this in the executor, which meant the
+    /// The shedding latch. cello kept this in the executor, which meant the
     /// hysteresis -- the part with actual behaviour -- was the one piece the
     /// simulation could not reach. It is carried here so a sample
     /// sequence is replayable.
@@ -1988,7 +1988,7 @@ impl State {
     /// resident and idle, but pinned by a `Regular` or `Outbound` socket that
     /// cannot outlive the isolate.
     ///
-    /// This is the cell's own criteria, not a decision to evict. celld also
+    /// This is the cell's own criteria, not a decision to evict. cello also
     /// refuses eviction for an imminent or uncovered alarm and for state the
     /// bucket cannot restore; those are policy and are checked separately.
     pub fn is_hibernatable(&self, id: &str) -> bool {
@@ -3624,7 +3624,7 @@ impl State {
                 // Every activation takes a fresh epoch. The LTX metadata does
                 // not survive an eviction, so a same-epoch wake would restart
                 // at TXID 1 inside a populated prefix and mix two writer
-                // lineages (CelldWriterGeneration.tla, #158). The CAS also
+                // lineages (CelloWriterGeneration.tla, #158). The CAS also
                 // settles the older resume-vs-release race deterministically.
                 self.admit_or_queue_activation(id, &mut cell, ColdStart::ReadOwner, effects);
                 effects.push(Effect::ScheduleTimer {
@@ -6824,7 +6824,7 @@ impl State {
         // includes a cell whose proof is in flight, so comparing it directly
         // nominates cells the evictions already under way will account for,
         // and the node settles below its floor by up to the whole bound --
-        // the mistake celld's eviction budget documents: spend the cut on
+        // the mistake cello's eviction budget documents: spend the cut on
         // commit, never on nomination.
         while self.eviction_permits.len() < self.config.max_evictions
             && self.occupied().saturating_sub(self.eviction_permits.len()) > self.shed_floor

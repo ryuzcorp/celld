@@ -11,7 +11,7 @@
 //! and answers 401 without it; when it is set but empty, the node refuses
 //! to start.
 //!
-//! Each test boots its own `celld dev` on a private copy of the fixture,
+//! Each test boots its own `cello dev` on a private copy of the fixture,
 //! the way `rpc_stub_conformance.rs` does. The client is plain TCP with
 //! `Connection: close`, so the runner cannot mask a protocol fault. There
 //! are no fixed sleeps: every wait polls an observable condition with a
@@ -48,7 +48,7 @@ fn fixture_source() -> PathBuf {
 
 fn copy_fixture(name: &str) -> tempfile::TempDir {
     let dir = tempfile::Builder::new()
-        .prefix(&format!("celld-operator-token-{name}-"))
+        .prefix(&format!("cello-operator-token-{name}-"))
         .tempdir()
         .expect("tempdir");
     for file in ["wrangler.json", "index.js"] {
@@ -57,7 +57,7 @@ fn copy_fixture(name: &str) -> tempfile::TempDir {
     dir
 }
 
-/// A booted `celld dev` and its addresses. Kills the child on drop, so a
+/// A booted `cello dev` and its addresses. Kills the child on drop, so a
 /// failing assertion cannot leak a server onto its ports.
 /// Both listeners are ephemeral (`--port 0`): the node's own announce lines
 /// name them, so no probe-then-bind race can hand us another test's node.
@@ -85,7 +85,7 @@ impl TestNode {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .expect("spawn celld dev");
+            .expect("spawn cello dev");
         let mut stdout = child.stdout.take().expect("piped stdout");
         let stderr = child.stderr.take().expect("piped stderr");
         // Drain stdout so a chatty child can never block on a full pipe.
@@ -115,12 +115,12 @@ impl TestNode {
         node.public = poll_until(&format!("{name} boot"), Duration::from_secs(120), || {
             if let Some(status) = node.child.try_wait().expect("poll child") {
                 panic!(
-                    "{name}: celld dev exited during boot: {status}: {}",
+                    "{name}: cello dev exited during boot: {status}: {}",
                     node.stderr.lock().expect("stderr lock").join("\n")
                 );
             }
-            let public = announced(&node.stderr, "celld listening on ")?;
-            if !probe(&public, "/.well-known/celld/health") {
+            let public = announced(&node.stderr, "cello listening on ")?;
+            if !probe(&public, "/.well-known/cello/health") {
                 return None;
             }
             Some(public)
@@ -128,11 +128,11 @@ impl TestNode {
         node.internal = poll_until(&format!("{name} boot"), Duration::from_secs(120), || {
             if let Some(status) = node.child.try_wait().expect("poll child") {
                 panic!(
-                    "{name}: celld dev exited during boot: {status}: {}",
+                    "{name}: cello dev exited during boot: {status}: {}",
                     node.stderr.lock().expect("stderr lock").join("\n")
                 );
             }
-            announced(&node.stderr, "celld internal listening on ")
+            announced(&node.stderr, "cello internal listening on ")
         });
         node
     }
@@ -307,7 +307,7 @@ fn operator_token_gates_every_internal_route_class() {
 
     // Liveness and readiness probes stay open: they use the public
     // listener's health endpoint, which the token does not guard.
-    let (status, body) = get(&node.public, "/.well-known/celld/health", None).expect("health");
+    let (status, body) = get(&node.public, "/.well-known/cello/health", None).expect("health");
     assert_eq!(status, 200, "public health without a token: {body}");
 
     // The token is a credential: it must never appear in the logs.
@@ -334,7 +334,7 @@ fn empty_operator_token_refuses_to_start() {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("spawn celld dev");
+        .expect("spawn cello dev");
     let mut stdout = child.stdout.take().expect("piped stdout");
     let stderr = child.stderr.take().expect("piped stderr");
     // Drain both pipes on threads so a failing child can never block on a
@@ -357,13 +357,13 @@ fn empty_operator_token_refuses_to_start() {
         if start.elapsed() > deadline {
             let _ = child.kill();
             let _ = child.wait();
-            panic!("celld dev with an empty token still runs after {deadline:?}");
+            panic!("cello dev with an empty token still runs after {deadline:?}");
         }
         std::thread::sleep(Duration::from_millis(200));
     };
     assert!(
         !status.success(),
-        "celld dev with an empty token must exit non-zero"
+        "cello dev with an empty token must exit non-zero"
     );
     // The exit status can win the race with the last stderr bytes through
     // the pipe; poll for the refusal line itself.

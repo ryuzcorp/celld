@@ -670,7 +670,7 @@ function kvService(host) {
     //
     // Values cross this boundary as arrays of bytes rather than as text, because
     // a namespace holds bytes: a value written from a Worker as an ArrayBuffer
-    // has no faithful string form, and `celld kv` must be able to read back
+    // has no faithful string form, and `cello kv` must be able to read back
     // exactly what was written.
     async fetch(request) {
       let body;
@@ -691,12 +691,12 @@ function kvService(host) {
       // "reached only over `/runtime/`" comment above true against a Worker's
       // own stub.fetch() too.
       const operatorCommands = {
-        get: "celld kv get",
-        put: "celld kv put",
-        "put-base64": "celld kv put",
-        delete: "celld kv delete",
-        list: "celld kv list",
-        info: "celld kv info",
+        get: "cello kv get",
+        put: "cello kv put",
+        "put-base64": "cello kv put",
+        delete: "cello kv delete",
+        list: "cello kv list",
+        info: "cello kv info",
       };
       // An own-property lookup: `body.op` is tenant input, and a plain
       // index would resolve inherited names (`constructor`, `toString`)
@@ -739,7 +739,7 @@ function kvService(host) {
           case "put":
           case "put-base64": {
             // Validated here, through the same helpers the binding calls, so a
-            // key written by `celld kv` is a key the binding could have written.
+            // key written by `cello kv` is a key the binding could have written.
             // The operator route used to arrive pre-validated by the CLI, which
             // put the same bound in two processes -- and they disagreed the first
             // time a test shortened one of them.
@@ -779,7 +779,7 @@ function kvService(host) {
               now,
             });
             break;
-          // What `celld kv info` reports. `stored` counts every row and `live`
+          // What `cello kv info` reports. `stored` counts every row and `live`
           // counts only what a read would return, so the difference is exactly
           // the population the sweeper still owes -- which is the one number
           // that makes reclamation observable from outside the cell.
@@ -810,7 +810,7 @@ function kvService(host) {
   // The client half.
   //
   // Every number below is injected from `cello_logic::kv` as `host.limits()`
-  // rather than written here, so the binding, `celld kv` and deploy-time
+  // rather than written here, so the binding, `cello kv` and deploy-time
   // validation cannot disagree about what a valid key is. No new host op: D1 set
   // the bar at one and Workflows came in under it, and a limit is data rather
   // than a decision, so shipping the values is enough. What stays in JS is the
@@ -1070,7 +1070,7 @@ function kvService(host) {
       return {
         value: row.value,
         metadata: row.metadata,
-        // Null, and honestly so: celld has no read cache, and reporting a HIT
+        // Null, and honestly so: cello has no read cache, and reporting a HIT
         // from a runtime that never cached anything would be a lie in a field
         // applications read.
         cacheStatus: null,

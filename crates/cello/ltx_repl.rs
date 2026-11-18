@@ -1353,7 +1353,7 @@ pub struct EpochScan {
 /// chain over every listed epoch with the restore code, require its restore
 /// plan to resolve, and summarize each epoch below its base. `None` when the
 /// stream has no epoch or no complete chain. The owner's pass and
-/// `celld cell gc --dry-run` share this, so the dry run reports what the
+/// `cello cell gc --dry-run` share this, so the dry run reports what the
 /// owner would decide.
 pub async fn scan_epochs(
     store: &dyn ObjectStore,
@@ -1699,7 +1699,7 @@ impl LtxRepl {
         // Azure blob metadata names must be C# identifiers, so the standard
         // Litestream key cannot carry its hyphen there. External Litestream
         // tooling reads that key, therefore an az:// replica gives up
-        // Litestream-tool timestamp restore. celld never reads it back.
+        // Litestream-tool timestamp restore. cello never reads it back.
         let timestamp_metadata_key = match backend {
             crate::bucket::StorageBackend::Azure => TimestampMetadataKey::Underscore,
             crate::bucket::StorageBackend::S3
@@ -2785,7 +2785,7 @@ impl LtxRepl {
                     // before the cell serves: an empty epoch could not pass
                     // the eviction barrier, and a fenced owner's late
                     // snapshot in a lower epoch would outrank its chain
-                    // (CelldPersistencePaged.tla, `BreakNoMarker`).
+                    // (CelloPersistencePaged.tla, `BreakNoMarker`).
                     continuation = Some((TXID(chain.max_txid().0 + 1), map.commit));
                     let reader = cello_ltx::paged::EpochChainReader::new(readers);
                     let source = cello_ltx::paged::PageSource::new(map, Box::new(reader));
@@ -4645,7 +4645,7 @@ impl LtxRepl {
         // of it in place would open the destination through the same
         // registration, and every page the backup writes there would mark
         // the cell's own hydration set without the cell's file holding it
-        // (CelldPagedVfs.tla, `BreakSecondFileShares`): the live cell then
+        // (CelloPagedVfs.tla, `BreakSecondFileShares`): the live cell then
         // reads holes. Inspect a paged cell through the bucket instead.
         anyhow::ensure!(
             self.paged_vfs_name(cell, epoch).is_none(),
@@ -4739,7 +4739,7 @@ impl LtxRepl {
         self.final_durability_barrier(cell, epoch).await?;
         // A paged cell's file is a sparse cache behind a VFS this process
         // registered; the next process has neither, so it cannot resume the
-        // file in place (CelldPersistencePaged.tla, `BreakReloadKeepsPaged`).
+        // file in place (CelloPersistencePaged.tla, `BreakReloadKeepsPaged`).
         // Discard it after the proof, so the successor pages the complete
         // position in again from the bucket.
         if self.paged_vfs_name(cell, epoch).is_some() {
@@ -4949,7 +4949,7 @@ impl LtxRepl {
             .sum()
     }
 
-    /// There is no external process, so the in-process replicator is healthy while celld runs.
+    /// There is no external process, so the in-process replicator is healthy while cello runs.
     pub fn process_status(&self) -> std::io::Result<Option<std::process::ExitStatus>> {
         Ok(None)
     }
@@ -6644,7 +6644,7 @@ mod evict_trim_tests {
     use super::*;
     use cello_ltx::object_store::memory::InMemory;
     use cello_ltx::object_store::path::Path as ObjPath;
-    // `futures::stream::BoxStream`, spelled out: the celld crate carries
+    // `futures::stream::BoxStream`, spelled out: the cello crate carries
     // futures-util only, and this names the same object type.
     type ListStream = std::pin::Pin<
         Box<dyn futures_util::Stream<Item = StoreResult<ObjectMeta>> + Send + 'static>,

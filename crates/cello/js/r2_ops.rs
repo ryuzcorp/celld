@@ -3,7 +3,7 @@
 
 //! The V8 surface over an `r2_buckets` binding.
 //!
-//! celld does not run a blob service; it runs *on* one. A binding is
+//! cello does not run a blob service; it runs *on* one. A binding is
 //! therefore served out of the fleet bucket the node already holds
 //! credentials for, under the reserved `r2/<bucket_name>/` prefix — the
 //! same durability, the same store, no second set of credentials. A node
@@ -374,7 +374,7 @@ impl UploadEntry {
 
 static UPLOADS: OnceLock<Open<UploadEntry>> = OnceLock::new();
 
-/// celld runs one deployment per node, so open writes deliberately share
+/// Cello runs one deployment per node, so open writes deliberately share
 /// one deployment-global id space across that node's isolates.
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -490,7 +490,7 @@ pub(super) fn op_r2_mp_resume(
             // from an id, so an upload outlives only the node that opened
             // it — and only until that node restarts.
             None => Err(format!(
-                "R2 multipart upload {upload_id} is not open on this node: celld can resume an \
+                "R2 multipart upload {upload_id} is not open on this node: cello can resume an \
                  upload within the node that created it, not across nodes or restarts"
             )),
         }
@@ -536,7 +536,7 @@ pub(super) fn op_r2_mp_part(
             if entry.flushed.contains(&part_number) {
                 return Err(format!(
                     "R2 multipart part {part_number} of upload {upload_id} was already handed to \
-                     the object store, which appends parts and cannot rewrite one: celld \
+                     the object store, which appends parts and cannot rewrite one: cello \
                      replaces a part that is still waiting its turn, not one already written. \
                      Send the replacement before the part in front of it, or open the upload \
                      again"
@@ -552,7 +552,7 @@ pub(super) fn op_r2_mp_part(
             if held > PART_BACKLOG {
                 return Err(format!(
                     "R2 multipart upload {upload_id} is holding {} bytes of parts waiting for \
-                     part {}: celld hands parts to the object store in ascending order, so \
+                     part {}: cello hands parts to the object store in ascending order, so \
                      upload the parts in front of the ones running ahead",
                     entry.held,
                     entry.next(),
@@ -619,7 +619,7 @@ async fn complete(
     if claimed.len() < entry.flushed.len() || claimed[..entry.flushed.len()] != entry.flushed {
         return Err(format!(
             "R2 multipart complete of upload {upload_id} names {claimed:?}, which does not start \
-             with the parts already written in order ({:?}); celld hands parts to the object \
+             with the parts already written in order ({:?}); cello hands parts to the object \
              store as they arrive, so a completion may add to that order but not rewrite it",
             entry.flushed
         ));

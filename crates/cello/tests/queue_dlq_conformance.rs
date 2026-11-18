@@ -23,7 +23,7 @@
 //! (`dlq_target`, `dlq_transfer_id`, `transfer_kind = 'redrive'`) and a
 //! fresh send arms the alarm that drives it, which covers the forward
 //! and accept in the redrive direction — the marking query is untouched
-//! by this change. One `celld dev` boots the app fixture with
+//! by this change. One `cello dev` boots the app fixture with
 //! `CELLO_TEST_DATA_DIR` pinned, so the cell databases are addressable.
 //! There are no fixed sleeps: every wait polls an observable condition
 //! with a deadline, and the server guard kills the child on every exit
@@ -79,7 +79,7 @@ fn copy_dir(src: &Path, dst: &Path) {
 /// and becomes primary (last write wins `deploy/current.json`); the
 /// victim's named pointer stays for the service binding to resolve.
 fn preseed_victim(app_project: &Path, victim_src: &Path) {
-    let state = app_project.join(".celld/dev");
+    let state = app_project.join(".cello/dev");
     std::fs::create_dir_all(state.join("runtime")).expect("state dir");
     let database = state.join("objects.sqlite3");
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -116,7 +116,7 @@ fn preseed_victim(app_project: &Path, victim_src: &Path) {
     });
 }
 
-/// A booted `celld dev` and its address. Kills the child on drop, so a
+/// A booted `cello dev` and its address. Kills the child on drop, so a
 /// failing assertion cannot leak a server onto its port.
 struct TestNode {
     child: Child,
@@ -136,7 +136,7 @@ impl TestNode {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .expect("spawn celld dev");
+            .expect("spawn cello dev");
         let mut stdout = child.stdout.take().expect("piped stdout");
         let stderr = child.stderr.take().expect("piped stderr");
         // Drain stdout so a chatty child can never block on a full pipe.
@@ -162,11 +162,11 @@ impl TestNode {
         node.public = poll_until("boot", Duration::from_secs(120), || {
             if let Some(status) = node.child.try_wait().expect("poll child") {
                 panic!(
-                    "celld dev exited during boot: {status}: {}",
+                    "cello dev exited during boot: {status}: {}",
                     announced_lines.lock().expect("announce lock").join("\n")
                 );
             }
-            let public = announced(&announced_lines, "celld listening on ")?;
+            let public = announced(&announced_lines, "cello listening on ")?;
             if !probe(&public, "/health") {
                 return None;
             }
@@ -324,7 +324,7 @@ fn assert_uuidv7(id: &str, context: &str) {
 #[test]
 fn queue_dlq_move_and_redrive() {
     let dir = tempfile::Builder::new()
-        .prefix("celld-queue-dlq-")
+        .prefix("cello-queue-dlq-")
         .tempdir()
         .expect("tempdir");
     let app_project = dir.path().join("app");
@@ -502,7 +502,7 @@ fn queue_dlq_move_and_redrive() {
 #[test]
 fn queue_polluted_host_gate() {
     let dir = tempfile::Builder::new()
-        .prefix("celld-queue-pollution-")
+        .prefix("cello-queue-pollution-")
         .tempdir()
         .expect("tempdir");
     let app_project = dir.path().join("app");

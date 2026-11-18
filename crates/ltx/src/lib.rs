@@ -83,7 +83,7 @@ pub use ltx::FileInfo;
 /// Re-exported from [`crate::client::file::FileReplicaClient`].
 pub use client::file::FileReplicaClient;
 
-/// The bundle overlay (celld-original, self-contained).
+/// The bundle overlay (cello-original, self-contained).
 /// Re-exported from [`crate::client::bundle`].
 pub use client::bundle::BundleFetcher;
 pub use client::bundle::BundleOverlayClient;

@@ -89,7 +89,7 @@ const METADATA_KEY_TIMESTAMP_UNDERSCORE: &str = "litestream_timestamp";
 /// The key exists for external Litestream tooling, which reads
 /// `litestream-timestamp` to do a timestamp restore without downloading
 /// every candidate file. A renamed key therefore ends that interop on
-/// Azure. celld itself never reads the key back.
+/// Azure. cello itself never reads the key back.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum TimestampMetadataKey {
     /// `litestream-timestamp`, the standard Litestream key.
