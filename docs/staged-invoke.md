@@ -1,19 +1,19 @@
-<!-- Modified by ryuzcorp (ryuzcorp/celld): staged invoke page; invoke --header-env. -->
+<!-- Modified by Ryuz Corp (Cello): staged invoke page; invoke --header-env. -->
 # Invoke a staged version
 
-A version uploaded with `celld deploy --no-activate` serves no traffic
-until `celld activate` names it. That leaves a gap for schema migrations:
+A version uploaded with `cello deploy --no-activate` serves no traffic
+until `cello activate` names it. That leaves a gap for schema migrations:
 the migration endpoint exists only in the staged code, so nothing can
 call it before the activation — and calling it after means the new code
-serves the old schema in between. `celld invoke` closes the gap: it sends
+serves the old schema in between. `cello invoke` closes the gap: it sends
 one HTTP request to a staged version on one node of the fleet, served by
 that version's code with its declared bindings against the real data.
 Migrate first, then activate.
 
 ```sh
-celld deploy . --bucket "$CELLD_BUCKET" --no-activate  # prints VERSION
-celld invoke app=VERSION --path /migrate --method POST --bucket "$CELLD_BUCKET"
-celld activate app=VERSION --bucket "$CELLD_BUCKET"
+cello deploy . --bucket "$CELLO_BUCKET" --no-activate  # prints VERSION
+cello invoke app=VERSION --path /migrate --method POST --bucket "$CELLO_BUCKET"
+cello activate app=VERSION --bucket "$CELLO_BUCKET"
 ```
 
 The invoke moves no pointer and changes nothing serving: the staged code
@@ -59,7 +59,7 @@ from the staged generation's components, not the live pointer: a staged
 app that calls its helper reaches the staged helper when pinned, the
 carried live helper otherwise. `request.url` carries the invoked path on
 the target script as its host. The Workers Cache API is the one exception to
-real data: under `CELLD_CACHE_SCOPE=deployment` each invoke's staged
+real data: under `CELLO_CACHE_SCOPE=deployment` each invoke's staged
 generation has a scope of its own, keyed by its reserved generation id,
 so staged code never reads or writes the live deployment's cached
 entries (even when the invoke names the live versions), and the scope
@@ -74,7 +74,7 @@ settles fails the invoke instead of pinning the staged generation, so
 make migration endpoints answer only done work. Upgrades are refused and
 streamed answers are drained up to 64 MiB: only a buffered request and
 answer cross. The request body is capped by the node's ingress limit,
-`CELLD_MAX_REQUEST_BODY_BYTES`. At most four invokes run on one node at
+`CELLO_MAX_REQUEST_BODY_BYTES`. At most four invokes run on one node at
 once; past that the route sheds with 503 and the CLI tries the next node.
 
 The invoke runs to completion on the node even if the caller stops
@@ -82,7 +82,7 @@ waiting: a client disconnect or CLI timeout cannot retire the staged
 generation under a running driver, so it cannot leave a half-applied
 migration behind. A timeout therefore means the answer is unknown, never
 that the request failed; only node shutdown — or the settle deadline
-above — cancels it. `celld invoke` waits up to ten minutes. Delivery is
+above — cancels it. `cello invoke` waits up to ten minutes. Delivery is
 at-least-once across retries, so migration endpoints must be
 idempotent.
 
@@ -91,7 +91,7 @@ idempotent.
 Only the operator can invoke. `POST /invoke` on the internal listener
 requires the per-request fleet signature — the same HMAC the
 `/runtime/` operator routes require, bound to method, path, body,
-timestamp, nonce, and target node — and, when `CELLD_OPERATOR_TOKEN` is
+timestamp, nonce, and target node — and, when `CELLO_OPERATOR_TOKEN` is
 set, the operator token. A tenant Worker has neither: the token never
 enters an isolate, and the fleet secret needs bucket credentials. The
 public listener has no such route, and peer tunnels carry cell calls,
@@ -102,7 +102,7 @@ non-activated version is reachable only through this gate. See
 ## Reference
 
 ```sh
-celld invoke SCRIPT=VERSION [SCRIPT=VERSION...] --path PATH --bucket NAME
+cello invoke SCRIPT=VERSION [SCRIPT=VERSION...] --path PATH --bucket NAME
   [--target SCRIPT] [--method METHOD] [--header NAME:VALUE]...
   [--header-env NAME=VAR]...
   [--body TEXT | --body-file PATH] [--json] [--unsafe-public-advertise]

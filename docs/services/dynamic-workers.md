@@ -2,7 +2,7 @@
 
 A Dynamic Worker is Worker code that a running Worker supplies at runtime and
 loads through a Worker Loader binding, such as code that a customer uploads or
-that a model writes. celld compiles the code into a separate V8 isolate on the
+that a model writes. Cello compiles the code into a separate V8 isolate on the
 node of the loader. Cloudflare runs this feature in an
 [open beta](https://developers.cloudflare.com/changelog/post/2026-03-24-dynamic-workers-open-beta/),
 so the API can change. Read the
@@ -13,10 +13,10 @@ for the standard API.
 
 ## Example
 
-The [Dynamic Workers example](../../examples/dynamic-worker-tails) loads a
+The [Dynamic Workers example](https://github.com/ryuzcorp/cello/tree/main/examples/dynamic-worker-tails) loads a
 Worker and sends its invocation records to a Tail Worker.
 
-<!-- celld-example: dynamic-worker-tails -->
+<!-- cello-example: dynamic-worker-tails -->
 
 ## API
 
@@ -34,24 +34,24 @@ Worker and sends its invocation records to a Tail Worker.
 ## Loading a Worker
 
 A `worker_loaders` entry accepts only the `binding` name, as in Wrangler.
-celld stops the deployment when the entry sets `tails` or `limits`; set them in
+Cello stops the deployment when the entry sets `tails` or `limits`; set them in
 the `WorkerCode` object, or set `limits` in a `getEntrypoint()` call.
 
-celld calls the `getCode` callback of `env.LOADER.get(id, getCode)` only when
+Cello calls the `getCode` callback of `env.LOADER.get(id, getCode)` only when
 it must compile, so a throw in `getCode` surfaces at the first use of the
 Worker, not at `get()`.
 
 - A `modules` value can be a module object such as `{ wasm: bytes }`; the
-  [WebAssembly page](../wasm.md#dynamic-workers) shows that form. celld refuses
+  [WebAssembly page](../wasm.md#dynamic-workers) shows that form. Cello refuses
   bare bytes, as workerd does.
 - A relative import resolves from the name of the importing module, so
   `dir/a.js` can import `./b.js` when the map contains `dir/b.js`.
 - `compatibilityDate` is required, as in workerd.
 - The module sources can total 64 MiB by default, as in workerd. An operator
-  can set `CELLD_MAX_DYNAMIC_WORKER_CODE_BYTES` on each node to a larger byte
+  can set `CELLO_MAX_DYNAMIC_WORKER_CODE_BYTES` on each node to a larger byte
   count. Loaded code cannot raise it, and the heap, execution, and admission
   limits still apply.
-- When both `WorkerCode.limits` and `getEntrypoint()` set a limit, celld uses
+- When both `WorkerCode.limits` and `getEntrypoint()` set a limit, Cello uses
   the lower value.
 
 ## The isolation boundary
@@ -66,13 +66,13 @@ Containers page.
 The loaded Worker gets no binding and no `vars` entry of the deployment, and no
 Worker Loader binding, so it cannot load another Worker. It reaches only the
 `env` of its `WorkerCode`. A capability call is an RPC into the isolate of the
-loader. celld passes host operations to its internal scripts as function
+loader. Cello passes host operations to its internal scripts as function
 parameters, never as globals, so `globalThis` exposes none.
 
 When `WorkerCode` omits `globalOutbound`, the loaded Worker inherits the egress
 policy of the loader. A `null` value makes `fetch()` and `connect()` throw. A
 Fetcher brokers each `fetch()` through the loader. A `connect()` or a WebSocket
-through a Fetcher throws, because the celld service protocol carries no
+through a Fetcher throws, because the Cello service protocol carries no
 bidirectional tunnel.
 
 ## Lifetime and caching
@@ -92,7 +92,7 @@ The `dispose()` method of a stub releases its loaded Worker and removes the id
 from the map. The other stubs for that load cannot start new calls, and an
 in-flight call finishes.
 
-celld drops every loaded Worker when its host isolate retires, after in-flight
+Cello drops every loaded Worker when its host isolate retires, after in-flight
 calls finish. A loaded Worker never outlives its loader, and a redeploy
 compiles the code again.
 
@@ -101,7 +101,7 @@ compiles the code again.
 - The process limit is 256 live Dynamic Workers, and each script generation can
   use 255 slots, so one loader cannot take the whole process. Every loader and
   script shares the process limit, and a load over either limit throws.
-- The process rejects the removed `CELLD_MAX_LOADED_WORKERS` environment
+- The process rejects the removed `CELLO_MAX_LOADED_WORKERS` environment
   variable.
 - `getEntrypoint()` supports `props` and `limits` options, while
   `getDurableObjectClass()` supports only `props`. A structured-clone encoded
@@ -111,12 +111,12 @@ compiles the code again.
   receives one event after a Dynamic Worker fetch invocation finishes.
 - The event contains the request metadata, the response status, the console
   logs, the uncaught exception, and the invocation outcome.
-- celld records at most 256 KiB of serialized console log records for each
+- Cello records at most 256 KiB of serialized console log records for each
   invocation. It stops recording when the next complete record exceeds this
   limit.
 - Tail delivery starts after the response is available. A Tail Worker failure
-  does not change the response, and celld writes the failure to the console.
-- celld enforces `cpuMs` and `subRequests` in `WorkerCode.limits` and in a
+  does not change the response, and Cello writes the failure to the console.
+- Cello enforces `cpuMs` and `subRequests` in `WorkerCode.limits` and in a
   `getEntrypoint()` call. It rejects `allowExperimental`.
 - `WorkerCode.env` accepts structured-clone values and Service Binding
   capabilities. The encoded values and the capability props can total 1 MiB.

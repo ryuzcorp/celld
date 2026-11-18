@@ -1,16 +1,16 @@
 # KV
 
 KV is a key-value store that a Worker reaches through a binding. Each namespace
-is one celld cell, and a value above 1 MiB lives in the fleet bucket. Read the
+is one Cello cell, and a value above 1 MiB lives in the fleet bucket. Read the
 [Cloudflare KV documentation](https://developers.cloudflare.com/kv/api/) for the
 API.
 
 ## Example
 
-The [KV example](../../examples/kv) reads, writes, and deletes values in a KV
+The [KV example](https://github.com/ryuzcorp/cello/tree/main/examples/kv) reads, writes, and deletes values in a KV
 namespace.
 
-<!-- celld-example: kv -->
+<!-- cello-example: kv -->
 
 ## API
 
@@ -28,18 +28,18 @@ namespace.
 
 A `kv_namespaces` entry gives a `binding` and an `id`. The `id` is the namespace
 identity, and it can be any string, such as a Cloudflare hexadecimal id or
-`sessions`. Two Workers that name one `id` reach one namespace. celld ignores
+`sessions`. Two Workers that name one `id` reach one namespace. Cello ignores
 `preview_id`.
 
 `put()` reads a `ReadableStream` to its end before the write, so
 `put(key, request.body)` works. `list()` returns at most 1000 keys in byte
 order, and a concurrent write cannot make the cursor skip a key.
 
-celld enforces the
+Cello enforces the
 [Cloudflare KV limits](https://developers.cloudflare.com/kv/platform/limits/): a
 key of at most 512 bytes, a value of at most 25 MiB, metadata of at most 1024
 bytes, and at most 100 keys in one bulk `get()`. A call that crosses a limit
-fails, and celld never truncates data. The minimum expiration is 60 seconds. An
+fails, and Cello never truncates data. The minimum expiration is 60 seconds. An
 expired key becomes invisible at the moment it expires.
 
 Every call goes to the node that owns the namespace cell, so a read costs one
@@ -52,9 +52,9 @@ A write of a value above 1 MiB without a fleet bucket fails with
 
 ## Differences from Cloudflare
 
-- A celld read never returns a stale value, because it reaches the cell that
+- A Cello read never returns a stale value, because it reaches the cell that
   owns the namespace. Cloudflare KV is eventually consistent.
-- celld has no edge cache. `cacheTtl` has no effect, and `cacheStatus` is
+- Cello has no edge cache. `cacheTtl` has no effect, and `cacheStatus` is
   `null`.
 - A value above 1 MiB requires a fleet bucket.
 - A namespace has one writer. Use more namespaces to increase write capacity.

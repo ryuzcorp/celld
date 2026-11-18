@@ -1,11 +1,11 @@
 # Testing
 
-celld makes three promises:
+Cello makes three promises:
 
 - An acknowledged write is durable.
 - A cell has one writer at a time.
 - Code written for Cloudflare Workers and Durable Objects operates the same on
-  celld.
+  Cello.
 
 We test the API contract by differential execution against workerd, the
 coordination protocol by model checking and deterministic simulation, and the
@@ -14,19 +14,19 @@ full system by fault injection on live fleets.
 ## Conformance: two runtimes, one output
 
 We run the same Workers and Durable Objects programs on workerd, Cloudflare's
-production runtime, and on celld, and the outputs must match. workerd supplies
-the reference output, so the expected behavior does not depend on celld.
+production runtime, and on Cello, and the outputs must match. workerd supplies
+the reference output, so the expected behavior does not depend on Cello.
 
 Each new API adds fixtures to the corpus. We also port the workerd Durable
 Objects contract tests, its web-platform globals tests, and the upstream Web
 Platform Tests. Before a release, we replay storage, SQL, alarm, stream,
-WebSocket, and lifecycle scenarios through the full `celld` binary in each
+WebSocket, and lifecycle scenarios through the full `cello` binary in each
 deployment mode.
 
 ## Specification: exhaustive at small size
 
 The coordination protocol is specified in TLA+. Heyang Zhou wrote the
-specifications against celld v0.1.0. His model checking found four bugs and a
+specifications against Cello v0.1.0. His model checking found four bugs and a
 split-brain that lost an acknowledged write. All are fixed. None had surfaced
 in our own review or testing.
 
@@ -46,9 +46,9 @@ dormant cell resumes at its old epoch while its release is in flight,
 acknowledges a write, and the following takeover restores without it. The fix
 shipped, and the counterexample stays as a pinned failure.
 
-The checker also removed code. celld once sealed a cell's durable history at
+The checker also removed code. Cello once sealed a cell's durable history at
 restore. The verdicts showed that the seal only prevented the return of an
-unacknowledged write, which celld does not promise, and that it could turn a
+unacknowledged write, which Cello does not promise, and that it could turn a
 recoverable ordering error into permanent data loss.
 
 We update the specifications by hand with protocol changes. They do not run in
@@ -62,7 +62,7 @@ lease renewal that races a takeover, an alarm against a partially restored
 cell. These windows are too narrow and too rare to wait for.
 
 The coordination protocol is therefore a
-[pure decision core](https://github.com/denoland/celld/tree/main/crates/logic)
+[pure decision core](https://github.com/ryuzcorp/cello/tree/main/crates/logic)
 with no I/O. The clock, the randomness, and the object store are interfaces
 that a simulator drives. The simulated store injects latency, compare-and-swap
 races, and lost responses. The clocks drift, and a node can crash at each
@@ -128,7 +128,7 @@ faults, zero status faults, and zero lost messages.
 - **A restore is normal work.** Placement treats the restore of an inactive
   cell as ordinary work. The measured restore times come from the retired
   external replicator, so this page gives no number until a fleet run measures
-  `celld-ltx`.
+  `cello-ltx`.
 - **Ten small nodes held real scale.** Ten nodes, each with 4 vCPU and 8 GB,
   held 10,000 resident cells and 20,000 concurrent WebSocket connections. With
   two of the ten nodes stopped, every cell was available again on another node
@@ -142,4 +142,4 @@ capacity to measure this limit.
 
 Report a schedule that breaks a guarantee, an untested fault, or a measurement
 that you cannot reproduce in the
-[issue tracker](https://github.com/denoland/celld/issues).
+[issue tracker](https://github.com/ryuzcorp/cello/issues).

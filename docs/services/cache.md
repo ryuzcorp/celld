@@ -1,11 +1,11 @@
-<!-- Modified by ryuzcorp (ryuzcorp/celld): Workers Cache API page; deployment cache scope. -->
+<!-- Modified by Ryuz Corp (Cello): Workers Cache API page; deployment cache scope. -->
 # Cache
 
 The [Workers Cache API](https://developers.cloudflare.com/workers/runtime-apis/cache/)
 is a per-node in-memory cache: `caches.default` plus one namespace per
 `caches.open(name)`. Every isolate of a script on the node shares it, so a
 response one request stores is visible to the next. By default no script
-can read another script's entries; `CELLD_CACHE_SCOPE=deployment` shares
+can read another script's entries; `CELLO_CACHE_SCOPE=deployment` shares
 the cache across the deployment instead (see Cache scope). `caches` is a
 global; there is no binding to declare. Read the
 [Cloudflare Cache documentation](https://developers.cloudflare.com/workers/runtime-apis/cache/)
@@ -13,10 +13,10 @@ for the API.
 
 ## Example
 
-The [Cache example](../../examples/cache) computes an answer once, stores
+The [Cache example](https://github.com/ryuzcorp/cello/tree/main/examples/cache) computes an answer once, stores
 it for a minute, and serves the stored response while it is fresh.
 
-<!-- celld-example: cache -->
+<!-- cello-example: cache -->
 
 ## API
 
@@ -69,7 +69,7 @@ ignored. Answers carry no `Age` header.
 
 ## Cache scope
 
-`CELLD_CACHE_SCOPE` selects whose entries a Worker sees. `script` (the
+`CELLO_CACHE_SCOPE` selects whose entries a Worker sees. `script` (the
 default) keeps one script's entries apart from every other script's, as
 above. `deployment` shares one `caches.default` and one set of
 `caches.open(name)` namespaces across every script of the serving
@@ -108,13 +108,13 @@ hosts the shared D1, KV, and Queue cells runs no tenant fetch handlers
 and keeps its own entries under its reserved name, as does each
 dynamically loaded worker, which is not a script the deployment names.
 
-Each scope carries its own `CELLD_CACHE_MAX_BYTES` budget and recency:
+Each scope carries its own `CELLO_CACHE_MAX_BYTES` budget and recency:
 in deployment scope one deployment's writes never evict another's. In
 script scope all scripts still share the one node budget below.
 
 ## Configuration and limits
 
-`CELLD_CACHE_MAX_BYTES` caps each cache scope at 64 MiB by default;
+`CELLO_CACHE_MAX_BYTES` caps each cache scope at 64 MiB by default;
 `0` disables the cache, and a malformed value refuses the boot. One entry
 can never exceed 16 MiB, body plus headers plus key. Past the cap the
 least-recently-used entries go first; a `match` counts as use, so hot
@@ -128,7 +128,7 @@ quota, so one script's writes can evict another script's entries. This
 is accepted, not limited — the node serves one fleet and the cache is
 best-effort — so size the cap for the sum of the node's scripts.
 
-When memory pressure starts shedding load (`CELLD_MAX_RSS_MB`), the
+When memory pressure starts shedding load (`CELLO_MAX_RSS_MB`), the
 node drops the whole cache before shedding cells: best-effort bytes go
 first. Puts keep working while shedding; only entering pressure clears.
 
@@ -137,7 +137,7 @@ first. Puts keep working while shedding; only entering pressure clears.
 - The cache is node-local and best-effort across nodes: each node caches
   independently, so a fleet behind a load balancer may hold the same URL on
   every node, and a `delete` reaches only the node that ran it.
-- `fetch()` neither reads nor populates the cache: celld has no `cf` cache
+- `fetch()` neither reads nor populates the cache: Cello has no `cf` cache
   options, and the default namespace stands alone instead of being shared
   with `fetch` as Cloudflare's is.
 - Tags are accepted on `put` and stripped on `match`, but no API purges by

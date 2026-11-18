@@ -1,0 +1,128 @@
+---
+title: Security and hardening
+description: Binding isolation, operator token, egress policy, deploy confinement, and credential hygiene over upstream celld.
+---
+
+Patches that shrink what a Worker — or a stolen credential, or a
+malicious project — can reach. Opt-in hardening stays opt-in; isolation
+that fails closed is on for everyone. Each entry names its fork patch
+number.
+
+## Binding and socket isolation (fail closed)
+
+- `0040` — Bindings resolve from the script's declared resources: cell
+  dispatch and id derivation refuse names the calling script never
+  bound (D1, KV, queues, workflows, Durable Object namespaces, reserved
+  cells), runtime cells answer an RPC allowlist, and cell-scoped ops
+  (storage, SQL, alarms, containers, facets, socket registry) answer
+  only the executing cell. Stubs received over RPC or storage keep
+  working through host-recorded grants: the host checks each lifted
+  stub's brand and the sender's rights and holds the stub table itself,
+  writing the envelope tag in Rust. Stored-stub rows written before this
+  patch decode as plain data on first read; storing them again writes
+  the new envelope. Upgrade every node together: stubs sent from an old
+  node revive as plain data on a new one.
+- `0041` — The operator-only KV and Queue fetch branches demand the
+  same host-set operator-ingress marker the D1 export introduced: every
+  KV fetch op and the Queue info/purge/pause/resume/peek/redrive ops
+  refuse `stub.fetch()`, while the bindings (RPC/send) keep working.
+  The tunnel markers are protocol-negotiated — a peer that sends no
+  marker flag has its markers ignored, so a Worker on an older node
+  cannot forge them. Queue DLQ and redrive need the fleet on this
+  patch: mixed versions fail closed both ways, and the alarm replays
+  the durable DLQ and redrive marks once the fleet converges.
+- `0042` — Socket ids answer only their owner: a WebSocket id is usable
+  only by the cell scope or request context that holds it, and TCP
+  socket ids likewise by their event. Ids are unguessable (f64-safe
+  random, nonzero); joining another cell's upgrade presents a
+  single-use host-minted token.
+- `0119` — `cello deploy` refuses Durable Object bindings with a
+  foreign `script_name` — previously counted as a class of the deploying
+  script, boot-looping the node — and names `script_name` in the
+  refusal. A binding naming its own script stays local; a non-string
+  `script_name` is refused the same way
+  ([upstream #312](https://github.com/denoland/celld/issues/312)).
+- `0037` — Shared D1, KV, and Queue cells run in a dedicated runtime
+  isolate pool with no tenant bundle, bindings, vars, services,
+  loaders, or schedule (see [Workers
+  compatibility](workers-compat.md)).
+
+## Operator token and network posture
+
+- `0013` — `CELLO_OPERATOR_TOKEN` guards the internal listener: when
+  set, every internal route requires
+  `Authorization: Bearer <token>` (constant-time compare, 401 without
+  it, no exempt routes — probes use the public health endpoint) and the
+  node refuses to start on an empty value or one with surrounding
+  whitespace. Unset is today's open listener. Every in-tree internal
+  client sends the token from its environment. Set it only once every
+  node runs this release: older nodes send no token, so a mixed fleet
+  fails internal calls with 401.
+- `0021` — Tenant egress policy: `CELLO_EGRESS=public` refuses Worker
+  `fetch()` / `connect()` / outbound-WebSocket dials to non-public
+  addresses (loopback, private, link-local, CGNAT, ULA, unspecified,
+  multicast, reserved, IPv4-mapped and transition forms, the metadata
+  address), with `CELLO_EGRESS_ALLOW` CIDR/`host:port` exceptions
+  matched on every hop of the resolved address. Tenant clients ignore
+  proxies; Cello's own traffic and published container endpoints are
+  exempt; refused fetches reject with `TypeError`. Default `open` is
+  unchanged.
+- `0014` — Container fence admits replies to a node in a container
+  netns: `CELLO_FENCE_NODE_NETNS=auto` (default `off`, byte-identical)
+  cuts an `established,related` exception for the node's own addresses,
+  discovered on Linux or pinned with `CELLO_FENCE_NODE_ADDRS`. Replies
+  only — a container still cannot open a connection to the node.
+
+## Confined deploys
+
+- `0050` — `cello deploy` and `cello d1` read the project tree only
+  inside the project's own directory: every project path is
+  canonicalized and refused with an error naming its config key when it
+  resolves elsewhere — the config, `main`, assets, Dockerfiles and
+  build contexts, `migrations_dir` (entries must be regular files,
+  never links), Python sources. Unlike Wrangler, the deploy may run
+  with more privilege than the project's author, so on Linux esbuild
+  runs under Landlock with reads confined to the project (it must be
+  the self-contained release binary, not a wrapper script); every run
+  also writes a metafile, and the build fails unless every file
+  esbuild read resolves inside the project. A monorepo that hoists
+  `node_modules` above the config directory no longer bundles: install
+  the packages inside it.
+- `0051` — `cello deploy --read-root DIR` (repeatable) names
+  directories beyond the project that build inputs may come from:
+  esbuild's inputs and `containers[].image` Dockerfiles with their
+  build contexts. Only the operator names a read root, on the command
+  line, so a project cannot widen its own bounds. A platform that
+  deploys a built subdirectory of a checkout names the checkout.
+
+## Credential hygiene
+
+- `0011` — `CELLO_MEMORY_SCOPE=self` measures the process's own cgroup
+  v2 leaf instead of the container root, so nodes sharing one container
+  each shed against their own `memory.max` (which an unset
+  `CELLO_MAX_RSS_MB` defaults to a share of); cgroup v1 and an
+  unreadable leaf fall back to the root with a warning.
+- `0052` — `CELLO_DEPLOY_AWS_ACCESS_KEY_ID`,
+  `CELLO_DEPLOY_AWS_SECRET_ACCESS_KEY`, and
+  `CELLO_DEPLOY_AWS_SESSION_TOKEN` give deployment-artifact reads their
+  own credential: with the trio set, a node serves `deploy/` and
+  `deploy-blobs/` through a second S3 client while every other key
+  keeps `AWS_*`. A platform can then mint a read-only grant over the
+  deployment prefixes and a read-write grant over the state prefixes,
+  so a credential copied out of the node's environment can read a
+  deployment but never publish one. Partial settings are a startup
+  error; serving nodes refuse the trio on `gs://` / `az://` buckets;
+  control-plane nodes (managed or BYO bucket) must not set it at all.
+  Unset keeps one credential for everything, exactly as before.
+- `0053` — A serving process is non-dumpable: `main` calls
+  `prctl(PR_SET_DUMPABLE, 0)` when the invocation is a node or the
+  `cello dev` supervisor, so a same-uid sibling — a tenant build
+  running as the fleet uid — can no longer read
+  `/proc/<pid>/environ`, `mem`, or `maps`, or `ptrace` the node.
+  Operator commands stay dumpable. Linux-only; no core dumps from a
+  node, and a non-root debugger cannot attach (root can). Children a
+  serving process spawns start with an emptied environment (`PATH`,
+  `HOME`, `TMPDIR` only).
+- `0131` — The `CELLO_NODE` binding name is reserved at deploy time
+  while `.env` entries are skipped with a warning (see [Workers
+  compatibility](workers-compat.md)).

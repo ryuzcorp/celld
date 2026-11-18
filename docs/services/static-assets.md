@@ -1,7 +1,7 @@
 # Static assets
 
 Static assets serve the files of a directory, with a Worker or without one.
-`celld deploy` uploads the directory to the fleet bucket with the deployment,
+`cello deploy` uploads the directory to the fleet bucket with the deployment,
 and a node caches a file on its own disk when it first serves that file. Read
 the
 [Cloudflare Static Assets documentation](https://developers.cloudflare.com/workers/static-assets/)
@@ -9,11 +9,11 @@ for the standard behavior.
 
 ## Example
 
-The [Static assets example](../../examples/static-assets) serves an HTML file
+The [Static assets example](https://github.com/ryuzcorp/cello/tree/main/examples/static-assets) serves an HTML file
 from the `public` directory without a Worker. A `_headers` file adds a response
 header, and a `_redirects` file moves `/home` to `/`.
 
-<!-- celld-example: static-assets -->
+<!-- cello-example: static-assets -->
 
 ## API
 
@@ -34,13 +34,13 @@ The `assets` block accepts `directory`, `binding`, `html_handling`,
 deployment. A project with `assets` and no `main` cannot set `run_worker_first`
 or declare a binding.
 
-`celld deploy` stores each file body once under its SHA-256 digest, and a
+`cello deploy` stores each file body once under its SHA-256 digest, and a
 redeploy uploads only the changed bodies. A file with an unknown extension gets
 no `Content-Type` header, as with Wrangler.
 
 ## Routing
 
-celld looks up an asset only for a `GET` or a `HEAD` request. Every other
+Cello looks up an asset only for a `GET` or a `HEAD` request. Every other
 method goes to the Worker. `run_worker_first` takes `true`, or a list of up to
 100 route patterns in which a `!` prefix excludes a path. A match sends the
 request to the Worker first. The exact `/` pattern matches only the root path.
@@ -63,14 +63,14 @@ upgraded node references.
 
 `not_found_handling` set to `single-page-application` returns `/index.html`
 with status 200, and `404-page` returns the nearest `404.html` with status 404.
-With a Worker, celld applies it only to a navigation request, and the Worker
+With a Worker, Cello applies it only to a navigation request, and the Worker
 answers any other miss. With no Worker and no match, the node answers `404`. A
 body that the fleet bucket cannot supply gives `502` and never reaches the
 Worker.
 
 ## Responses
 
-The disk cache holds 512 MiB by default, and `CELLD_ASSET_CACHE_BYTES` changes
+The disk cache holds 512 MiB by default, and `CELLO_ASSET_CACHE_BYTES` changes
 it. The cache evicts the least recently used file.
 
 The `ETag` is the strong SHA-256 digest of the body, so `If-None-Match` gives
@@ -85,28 +85,28 @@ applies `not_found_handling`.
 
 ## Differences from Cloudflare
 
-- celld does not compress an asset response. Use a compressing ingress proxy
+- Cello does not compress an asset response. Use a compressing ingress proxy
   when a client needs gzip or brotli.
-- celld has no edge cache. Each node keeps a 512 MiB disk cache, configured by
-  `CELLD_ASSET_CACHE_BYTES`, and requires browser revalidation.
+- Cello has no edge cache. Each node keeps a 512 MiB disk cache, configured by
+  `CELLO_ASSET_CACHE_BYTES`, and requires browser revalidation.
 - A node checks the deployment pointer after an asset miss at most once in five
   seconds.
-- celld reads `If-None-Match` and `If-Range`. It sends no `Last-Modified` header
+- Cello reads `If-None-Match` and `If-Range`. It sends no `Last-Modified` header
   and reads no `If-Modified-Since` header.
 - A `_headers` file cannot change `connection`, `content-length`, or
   `transfer-encoding`.
 - A deployment can contain 20,000 assets and 1 GiB in total. A file can be at
-  most 25 MiB. `CELLD_MAX_ASSET_FILE_BYTES` changes the per-file limit, and it
+  most 25 MiB. `CELLO_MAX_ASSET_FILE_BYTES` changes the per-file limit, and it
   must have the same value on the deployment builder, the managed deployment
   agent, and the serving nodes. A process reads it once, so a new value needs
   a restart. An error for a file that is too large reports its path, its size,
   and the limit. Each `_headers` or `_redirects` file has a 100 KiB limit.
-- `celld deploy` accepts only `directory`, `binding`, `html_handling`,
+- `cello deploy` accepts only `directory`, `binding`, `html_handling`,
   `not_found_handling`, and `run_worker_first` in the `assets` block.
-- `celld deploy` refuses a `.assetsignore` file, and it stops the deployment
+- `cello deploy` refuses a `.assetsignore` file, and it stops the deployment
   instead of ignoring the file. It also refuses a symbolic link, a special
   file, a non-UTF-8 name, an unsafe decoded path, and a `_worker.js` entry.
-- The assets binding has one method, `fetch()`. celld supplies no `unstable_`
+- The assets binding has one method, `fetch()`. Cello supplies no `unstable_`
   helper.
 
 The [Cloudflare compatibility](../cloudflare-compat.md#services) page

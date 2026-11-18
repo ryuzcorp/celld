@@ -1,4 +1,4 @@
-<!-- Modified by ryuzcorp (ryuzcorp/celld): node:crypto scrypt; cloned streaming bodies; cross-isolate RPC stubs and streams; per-node Workers Cache API; receiver-held RPC streams; AbortSignal.timeout is unreferenced (upstream #306); loader 101 webSocket target (upstream #305); loader sibling cloudflare:workers imports (upstream #304); AES-KW and symmetric JWK (upstream #295); EC raw point format (upstream #271); writable request /tmp, node:url file helpers, and the CELLD_TMP_MAX_BYTES /tmp cap (upstream #280); workerd close codes (upstream #279); fetch gzip/deflate decoding (upstream #238); Symbol.dispose on RPC results (upstream #260); post-response DO dial (upstream #254); synchronous caller cancel (upstream #281). -->
+<!-- Modified by Ryuz Corp (Cello): node:crypto scrypt; cloned streaming bodies; cross-isolate RPC stubs and streams; per-node Workers Cache API; receiver-held RPC streams; AbortSignal.timeout is unreferenced (upstream #306); loader 101 webSocket target (upstream #305); loader sibling cloudflare:workers imports (upstream #304); AES-KW and symmetric JWK (upstream #295); EC raw point format (upstream #271); writable request /tmp, node:url file helpers, and the CELLO_TMP_MAX_BYTES /tmp cap (upstream #280); workerd close codes (upstream #279); fetch gzip/deflate decoding (upstream #238); Symbol.dispose on RPC results (upstream #260); post-response DO dial (upstream #254); synchronous caller cancel (upstream #281). -->
 # Cloudflare compatibility
 
 This page lists only the differences from the linked Cloudflare APIs. An entry
@@ -9,7 +9,7 @@ without a note matches Cloudflare.
 - **Experimental**: can change without notice.
 - **No**: not implemented.
 
-celld rejects an unsupported configuration or API at deployment or first use.
+Cello rejects an unsupported configuration or API at deployment or first use.
 An unsupported feature that does not cause an error is a defect.
 
 ## Services
@@ -67,24 +67,24 @@ An unsupported feature that does not cause an error is a defect.
   names `accept-encoding` (then the body arrives raw, as the Fetch standard
   requires). `content-encoding` stays on the response, as in workerd; the
   wire size no longer describes the body, so `content-length` is removed.
-- An inbound `Request` has a `cf` object without Cloudflare edge fields. celld
+- An inbound `Request` has a `cf` object without Cloudflare edge fields. Cello
   cannot prove the geolocation, colo, or TLS metadata.
-- celld removes `Content-Length` from a Worker response, except for a `HEAD`
+- Cello removes `Content-Length` from a Worker response, except for a `HEAD`
   response.
 - A cloned body that the platform streams (a `fetch()`, RPC, Durable Object
   or R2 body) applies backpressure at the slower copy: reading only one copy
   stalls it after 16 chunks until the other copy is read, cancelled, or
   expires. Workerd buffers for the slower copy instead.
 - A remote Durable Object call cannot retry after request-body transmission
-  starts because celld keeps no replay copy.
+  starts because Cello keeps no replay copy.
 - A remote Durable Object call waits for a rejected owner generation to change
-  for at most `CELLD_OPERATION_DEADLINE_MS`.
+  for at most `CELLO_OPERATION_DEADLINE_MS`.
 
 ### [Bindings](https://developers.cloudflare.com/workers/runtime-apis/bindings/)
 
 Only the binding types in the [services table](#services) are available.
 
-`env` additionally carries `CELLD_NODE`: the name of the node running the
+`env` additionally carries `CELLO_NODE`: the name of the node running the
 code, injected by the host after every deployment binding. A bundle that must
 refuse a credential minted for another region reads this, not placement. No
 deployment may bind the name — `vars`, `.dev.vars`, and every other binding
@@ -96,7 +96,7 @@ imported only by a non-entry chunk still resolves: external stubs cover the
 union of the main module's and every sibling's imports.
 ### [Context](https://developers.cloudflare.com/workers/runtime-apis/context/)
 
-- `passThroughOnException()` has no effect because celld has no CDN fallback.
+- `passThroughOnException()` has no effect because Cello has no CDN fallback.
 - `ctx.facets` is available only inside a Durable Object.
 
 ### [Handlers](https://developers.cloudflare.com/workers/runtime-apis/handlers/)
@@ -132,14 +132,14 @@ The `tail` and `email` handlers are unavailable.
   same-isolate marker and fails on use across isolates.
 - Minting is capped per scope (4096 live stubs) and per process (65536
   stubs, 8192 uploads), failing the call with a clear error past the cap.
-  `CELLD_STUB_SCOPE_CAP`, `CELLD_STUB_PROCESS_CAP`, and `CELLD_UPLOAD_CAP`
+  `CELLO_STUB_SCOPE_CAP`, `CELLO_STUB_PROCESS_CAP`, and `CELLO_UPLOAD_CAP`
   override the caps. Stub ids are 128-bit bearer tokens bound to the
   isolate that revived them; a stolen id alone is useless, and ids never
   log or serialize observably. Upload ids are process-wide bearer tokens
   without holder binding (any isolate presenting one can pull, push, or
   cancel it), contained by the same unguessability, uniform errors, and
   non-observability: markers never surface to script, and forwarding
-  moves the wrapper rather than the id. One celld process is one fleet,
+  moves the wrapper rather than the id. One Cello process is one fleet,
   so the bearer boundary is the process.
 - An `AbortSignal` in a Durable Object RPC call crosses on the same node
   (live: the receiver observes an abort the sender fires later) but does
@@ -157,13 +157,13 @@ The `tail` and `email` handlers are unavailable.
   disposed error instead of leaking.
 - `globalThis.__celldStubStatsForTestOnly()` reports this isolate's stub
   counts for the conformance suite. It exists only on nodes booted with
-  `CELLD_TEST_STUB_STATS=1` (a process environment variable, which tenant
+  `CELLO_TEST_STUB_STATS=1` (a process environment variable, which tenant
   code cannot set); production isolates never define it. It is test
   tooling, not a runtime API.
 
 ### [Streams](https://developers.cloudflare.com/workers/runtime-apis/streams/)
 
-- celld expires an unclaimed and inactive HTTP stream after 60 seconds. A
+- Cello expires an unclaimed and inactive HTTP stream after 60 seconds. A
   successful stream operation starts a new 60-second period.
 - An expired or unknown stream reports an error instead of EOF.
 - Byte streams cross isolate boundaries on the same node as part of Durable
@@ -181,7 +181,7 @@ The `tail` and `email` handlers are unavailable.
   socket returned in the response stays open.
 - Each isolate-polled input queue has a 1 MiB budget for non-terminal frames. A
   message larger than 1 MiB uses the complete budget.
-- If the isolate stops polling, celld discards unread frames during cleanup. A
+- If the isolate stops polling, Cello discards unread frames during cleanup. A
   later pull reports an abnormal close.
 - A WebSocket transport cannot move to a new cell owner. A client must reconnect
   with the same application operation ID.
@@ -237,7 +237,7 @@ execution.
 
 ### [Node.js compatibility](https://developers.cloudflare.com/workers/runtime-apis/nodejs/)
 
-- celld implements `node:assert`, `node:async_hooks`, `node:buffer`,
+- Cello implements `node:assert`, `node:async_hooks`, `node:buffer`,
   `node:diagnostics_channel`, `node:events`, `node:fs`, `node:os`, `node:path`,
   `node:stream`, `node:timers/promises`, and `node:util`.
 - `node:diagnostics_channel` does not export messages to a tail Worker.
@@ -254,7 +254,7 @@ execution.
   (plus `fs.promises`), and read/write streams. `/tmp` is writable and
   request-local: `writeFile` truncates unless `{ flag: "a" }` appends,
   `createWriteStream` writes chunks as they arrive, and anything that would
-  push a request past `CELLD_TMP_MAX_BYTES` (default 64 MiB) fails with
+  push a request past `CELLO_TMP_MAX_BYTES` (default 64 MiB) fails with
   `ENOSPC`, while an overwrite frees the replaced bytes. `/bundle`
   is read-only and contains the Worker modules.
 - `node:url` provides `pathToFileURL`/`fileURLToPath` plus the WHATWG URL
@@ -262,7 +262,7 @@ execution.
 - The global `process` matches workerd for each field that it defines, such
   as `process.execPath`, `process.argv`, and `process.title`. Other fields,
   such as `process.kill` and `process.features`, are undefined.
-- The celld bundler supports a synchronous CommonJS `require()` of a Node.js
+- The Cello bundler supports a synchronous CommonJS `require()` of a Node.js
   built-in module. A raw ESM Worker has no global `require()`.
 - A Node.js built-in module object is writable, so a dependency such as
   `graceful-fs` can patch it at load. The patch stays in its isolate.
@@ -284,8 +284,8 @@ limits.
 
 - A socket cannot outlive its event. A Durable Object must reconnect during a
   later event.
-- celld verifies a TLS server against its bundled Mozilla root store.
-- celld does not block the destination ports that Cloudflare blocks. The fleet
+- Cello verifies a TLS server against its bundled Mozilla root store.
+- Cello does not block the destination ports that Cloudflare blocks. The fleet
   network controls the egress policy.
 
 ### BroadcastChannel
@@ -294,7 +294,7 @@ The class exists so that a bundle can load, but its constructor throws.
 
 ## Compatibility flags
 
-celld honors these compatibility flags:
+Cello honors these compatibility flags:
 
 - `delete_all_deletes_alarm`
 - `js_rpc`
@@ -303,12 +303,12 @@ celld honors these compatibility flags:
 - `websocket_standard_binary_type`
 - The static-assets navigation flags
 
-celld accepts every other flag without effect.
+Cello accepts every other flag without effect.
 `Cloudflare.compatibilityFlags` reports only the honored flags.
 
 ## Wrangler configuration
 
-`celld deploy` accepts `wrangler.jsonc` or `wrangler.json`, not
+`cello deploy` accepts `wrangler.jsonc` or `wrangler.json`, not
 `wrangler.toml`.
 
 The `name` value must contain 1 to 63 lowercase ASCII letters, digits, or
@@ -331,12 +331,12 @@ Any other top-level key, including `routes`, stops the deployment.
 JavaScript expression, as in Wrangler. A rule `type` must be `Text`, `Data`,
 or `CompiledWasm`, and each glob must have the form `**/*.ext` or `*.ext`,
 because esbuild selects a loader by extension. Two rules that give one
-extension different types stop the deployment. celld already applies
+extension different types stop the deployment. Cello already applies
 `CompiledWasm` to `**/*.wasm`, so only that type is valid for `.wasm`.
 `no_bundle` skips esbuild, so `no_bundle` with `define` or `rules` stops the
 deployment.
 
-An asset-only project can omit `main`. `celld deploy` refuses an unsafe asset
+An asset-only project can omit `main`. `cello deploy` refuses an unsafe asset
 path, and `.assetsignore` requires Wrangler.
 
 See [Limitations](limitations.md) for the operational limits.
