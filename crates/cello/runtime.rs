@@ -1629,7 +1629,10 @@ impl RuntimeManager {
                     status: 503,
                     headers: vec![
                         ("retry-after".to_string(), "1".to_string()),
-                        (crate::peer_auth::OVERLOAD_HEADER.to_string(), "cell".to_string()),
+                        (
+                            crate::peer_auth::OVERLOAD_HEADER.to_string(),
+                            "cell".to_string(),
+                        ),
                     ],
                     body: b"cell request limit reached".to_vec(),
                     websocket: None,

@@ -3808,17 +3808,14 @@ impl LtxRepl {
         // credit both; the runtime is closed), and the fallback re-proves
         // whatever moved, so the decision needs no re-check inside.
         let journal_len = handle.epoch_uploads.lock().unwrap().len();
-        let skip_snapshot = !cello_logic::handoff::handoff_snapshot_needed(
-            &cello_logic::handoff::HandoffChain {
+        let skip_snapshot =
+            !cello_logic::handoff::handoff_snapshot_needed(&cello_logic::handoff::HandoffChain {
                 chain_from_txid1_journaled: handle.chain_from_txid1_journaled,
                 percell_txid: percell_coverage(&handle),
                 durable_txid: handle.durable_txid.load(Ordering::SeqCst),
                 journal_len,
-                journal_overflowed: handle
-                    .epoch_uploads_overflowed
-                    .load(Ordering::SeqCst),
-            },
-        );
+                journal_overflowed: handle.epoch_uploads_overflowed.load(Ordering::SeqCst),
+            });
         if skip_snapshot {
             info!(
                 event = "eviction_snapshot_skipped",
