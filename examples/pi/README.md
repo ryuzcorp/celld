@@ -1,11 +1,11 @@
 # PiHarness
 
 This example runs the experimental `PiHarness` from Cloudflare Agents pull
-request 2197 in a celld Durable Object. The harness needs a model, and the
+request 2197 in a Cello Durable Object. The harness needs a model, and the
 example gets one from any OpenAI-compatible chat completions endpoint. It
 uses OpenRouter and Llama 3.2 1B by default.
 
-The pi provider expects the `ai.run()` shape of a Workers AI binding, and celld
+The pi provider expects the `ai.run()` shape of a Workers AI binding, and Cello
 serves no such binding, so the example builds a small adapter that posts each
 request to `PI_ENDPOINT` with `OPENROUTER_API_KEY` as the bearer token. The
 example stops at startup when a variable is absent, because a stand-in model
@@ -26,7 +26,7 @@ npm install --legacy-peer-deps
 
 echo 'OPENROUTER_API_KEY=sk-or-...' > .dev.vars
 
-celld dev .
+cello dev .
 ```
 
 Run a prompt and inspect the persisted transcript:
@@ -41,4 +41,4 @@ errors for a failed one.
 
 The Durable Object storage holds the transcript, so the state survives a
 restart. A model change does not migrate that state, therefore start again with
-`celld dev --clean .` after you edit `PI_MODEL`.
+`cello dev --clean .` after you edit `PI_MODEL`.

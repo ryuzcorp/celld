@@ -4,14 +4,14 @@
 // The R2 CLI reads operator input and object bodies outside node storage.
 #![allow(clippy::disallowed_methods)]
 
-//! `celld r2` — read and write the objects behind an `r2_buckets` binding.
+//! `cello r2` — read and write the objects behind an `r2_buckets` binding.
 //!
 //! A release pipeline publishes a build artifact with
 //! `wrangler r2 object put` and the Worker serves it from its `r2_buckets`
-//! binding. celld served the binding but had no command, so the only way to
+//! binding. cello served the binding but had no command, so the only way to
 //! seed a bucket was `aws s3 cp` straight into the fleet bucket. That works
 //! for the bytes and loses the record: an R2 object carries
-//! `customMetadata`, a `cacheExpiry`, and its checksums in a celld-private
+//! `customMetadata`, a `cacheExpiry`, and its checksums in a cello-private
 //! envelope that a plain copy does not write. The result reads back with no
 //! custom metadata, which is a silent difference rather than a failure.
 //!
@@ -21,7 +21,7 @@
 //! the single-request/multipart choice therefore have one implementation,
 //! and an object written here is an object the binding could have written.
 //!
-//! Unlike `celld d1`, `celld kv` and `celld queue`, this command needs no
+//! Unlike `cello d1`, `cello kv` and `cello queue`, this command needs no
 //! node. A binding reads the fleet bucket directly, so an operator with the
 //! bucket credentials can publish into an empty fleet — which is what a
 //! release pipeline that runs before a deployment needs.
@@ -143,7 +143,7 @@ impl Resumable for Row {
     }
 }
 
-/// One object's complete record, as `celld r2 head` reports it.
+/// One object's complete record, as `cello r2 head` reports it.
 ///
 /// The JSON carries the binding's object record before the JS conversion.
 /// Its `http` and `custom` fields become `httpMetadata` and
@@ -187,7 +187,7 @@ pub async fn run(arguments: Vec<String>) -> anyhow::Result<()> {
         print_help();
         return Ok(());
     };
-    let storage = command.fleet.clone().resolve("celld r2")?;
+    let storage = command.fleet.clone().resolve("cello r2")?;
     // The binding's store, installed exactly as a node installs it, so
     // every call below reaches the same keys the Worker reads.
     crate::js::set_r2_store(storage.open().await?);
@@ -580,7 +580,7 @@ impl Command {
         let verb = match first.as_str() {
             "--help" | "-h" | "help" => return Ok(None),
             verb @ ("get" | "head" | "put" | "delete" | "list") => verb.to_string(),
-            other => bail!("unknown `celld r2` subcommand: {other}"),
+            other => bail!("unknown `cello r2` subcommand: {other}"),
         };
         // The bucket is the `bucket_name` from `r2_buckets`, not the
         // binding name: the name is what places the keys in the fleet
@@ -588,7 +588,7 @@ impl Command {
         let bucket = arguments
             .next()
             .filter(|value| !value.starts_with('-'))
-            .ok_or_else(|| anyhow!("celld r2 needs an r2 bucket name"))?;
+            .ok_or_else(|| anyhow!("cello r2 needs an r2 bucket name"))?;
         // The same rule the deployment applies to `bucket_name`. Without
         // it a name with a `/` in it would write under another binding's
         // prefix, or outside the reserved `r2/` space entirely.
@@ -633,10 +633,10 @@ impl Command {
                 "--cursor" => cursor = Some(value("--cursor")?),
                 "--json" => json = true,
                 "--page" => page = true,
-                // celld has neither concept, and a flag that silently means
+                // Cello has neither concept, and a flag that silently means
                 // nothing is the gap the compatibility page forbids.
                 flag @ ("--local" | "--remote" | "--jurisdiction") => bail!(
-                    "celld r2 does not take {flag}: celld runs neither a local \
+                    "cello r2 does not take {flag}: cello runs neither a local \
                      miniflare store nor a Cloudflare account, and it has no \
                      jurisdiction. An r2 bucket name addresses one key space in \
                      one fleet."
@@ -655,7 +655,7 @@ impl Command {
                         continue;
                     }
                     if other.starts_with('-') {
-                        bail!("unknown option: {other}; run `celld r2 --help` for usage")
+                        bail!("unknown option: {other}; run `cello r2 --help` for usage")
                     }
                     positional.push(other.to_string());
                 }
@@ -669,14 +669,14 @@ impl Command {
         // header that nothing wrote.
         let refuse = |flag: &str, set: bool| -> anyhow::Result<()> {
             if set {
-                bail!("`celld r2 {verb}` takes no {flag}");
+                bail!("`cello r2 {verb}` takes no {flag}");
             }
             Ok(())
         };
         let write_flags = !http.is_empty() || metadata.is_some();
         let one_key = |what: &str| -> anyhow::Result<String> {
             let [key] = positional.as_slice() else {
-                bail!("celld r2 {what} needs exactly one key");
+                bail!("cello r2 {what} needs exactly one key");
             };
             Ok(key.clone())
         };
@@ -702,7 +702,7 @@ impl Command {
                 // Reading a body from a terminal by default would hang
                 // with no output, so standard input is opt-in.
                 if file.is_some() == pipe {
-                    bail!("celld r2 put requires exactly one of --path FILE or --pipe");
+                    bail!("cello r2 put requires exactly one of --path FILE or --pipe");
                 }
                 let custom = match &metadata {
                     None => BTreeMap::new(),
@@ -723,7 +723,7 @@ impl Command {
                 refuse("--cursor", cursor.is_some())?;
                 refuse("--page", page)?;
                 if positional.is_empty() {
-                    bail!("celld r2 delete needs at least one key");
+                    bail!("cello r2 delete needs at least one key");
                 }
                 Action::Delete { keys: positional }
             }
@@ -732,12 +732,12 @@ impl Command {
                 refuse("--pipe", pipe)?;
                 refuse("--metadata or a content flag", write_flags)?;
                 if !positional.is_empty() {
-                    bail!("celld r2 list takes no positional arguments; use --prefix");
+                    bail!("cello r2 list takes no positional arguments; use --prefix");
                 }
                 // `--page` already prints one JSON page object, so `--json`
                 // beside it is refused rather than silently meaning nothing.
                 if page && json {
-                    bail!("`celld r2 list --page` prints JSON already; it takes no `--json`");
+                    bail!("`cello r2 list --page` prints JSON already; it takes no `--json`");
                 }
                 Action::List {
                     prefix,
@@ -809,14 +809,14 @@ pub fn print_help() {
     .collect::<Vec<_>>()
     .join("\n");
     let text = format!(
-        "celld r2 — read and write the objects behind an `r2_buckets` binding
+        "cello r2 — read and write the objects behind an `r2_buckets` binding
 
 USAGE
-  celld r2 get    <bucket-name> <key>    [--json] [fleet options]
-  celld r2 head   <bucket-name> <key>    [--json] [fleet options]
-  celld r2 put    <bucket-name> <key>    --path FILE | --pipe [put options]
-  celld r2 delete <bucket-name> <key>... [fleet options]
-  celld r2 list   <bucket-name>          [--prefix P] [--delimiter D] [listing options]
+  cello r2 get    <bucket-name> <key>    [--json] [fleet options]
+  cello r2 head   <bucket-name> <key>    [--json] [fleet options]
+  cello r2 put    <bucket-name> <key>    --path FILE | --pipe [put options]
+  cello r2 delete <bucket-name> <key>... [fleet options]
+  cello r2 list   <bucket-name>          [--prefix P] [--delimiter D] [listing options]
 
 The bucket name is the `bucket_name` from the project's `r2_buckets` entry,
 not the binding name. `get` writes the object to stdout as bytes, so an
@@ -856,7 +856,7 @@ FLEET OPTIONS
 {FLEET_HELP}
 
 An object written here carries the same record as one a Worker writes:
-customMetadata, cacheExpiry and the checksums travel in a celld envelope
+customMetadata, cacheExpiry and the checksums travel in a Cello envelope
 beside the five content headers. A copy made with another tool still reads
 through the binding, and its user metadata becomes its customMetadata."
     );

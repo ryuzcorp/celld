@@ -115,7 +115,7 @@ pub(crate) async fn probe(
 ) -> anyhow::Result<()> {
     if node.probe_public_key.is_empty() {
         return Err(anyhow!(
-            "node {} has no signed-probe key; restart it with a current celld",
+            "node {} has no signed-probe key; restart it with a current cello",
             node.node
         ));
     }

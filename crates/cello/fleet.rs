@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): staged activation; the serving bucket constructor; celld versions listing (upstream #181).
+// Modified by ryuzcorp (ryuzcorp/celld): staged activation; the serving bucket constructor; cello versions listing (upstream #181).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 // Modified by ryuzcorp (ryuzcorp/celld): deploy --sourcemap writes the bundle's external map.
 
@@ -55,7 +55,7 @@ impl Record for Deployed {
             )
         } else if self.staged {
             format!(
-                "Staged Version ID: {} (not serving; `celld activate {}={}` to serve it)",
+                "Staged Version ID: {} (not serving; `cello activate {}={}` to serve it)",
                 self.version, self.worker, self.version
             )
         } else {
@@ -177,7 +177,7 @@ impl Record for Discarded {
 /// One diagnostic verdict.
 ///
 /// Every check is a row, whatever its verdict. The old shape sent `ok` and
-/// `skip` to stdout and `fail` to stderr, so `celld diagnose > report.txt`
+/// `skip` to stdout and `fail` to stderr, so `cello diagnose > report.txt`
 /// saved the passes and lost the failures. The exit code still carries the
 /// summary, so a redirect and `$?` together say everything.
 pub struct Check {
@@ -237,7 +237,7 @@ pub fn bucket_client(bucket: &str, endpoint: Option<&str>, region: &str) -> anyh
 ///
 /// Node lease traffic must not queue behind ordinary ownership, deployment,
 /// or replica requests. Every `Bucket::open` builds its own transport, so a
-/// dedicated instance keeps the safety lane isolated, and the `celld-lease`
+/// dedicated instance keeps the safety lane isolated, and the `cello-lease`
 /// app tag labels it in black-box storage traces.
 pub fn lease_bucket_client_with_credentials(
     bucket: &str,
@@ -245,7 +245,7 @@ pub fn lease_bucket_client_with_credentials(
     region: &str,
     managed: Option<&crate::control_plane::ManagedStorageConfig>,
 ) -> anyhow::Result<Bucket> {
-    open(bucket, endpoint, region, managed, Some("celld-lease"))
+    open(bucket, endpoint, region, managed, Some("cello-lease"))
 }
 
 pub fn bucket_client_with_credentials(
@@ -260,7 +260,7 @@ pub fn bucket_client_with_credentials(
 /// The serving node's bucket: [`bucket_client_with_credentials`] plus the
 /// deployment read client when `CELLO_DEPLOY_AWS_*` is set (patch 0052).
 ///
-/// Only the long-running node calls this. The operator commands — `celld
+/// Only the long-running node calls this. The operator commands — `cello
 /// deploy`, `activate`, `discard`, and the rest — open through
 /// [`bucket_client`] and keep the publishing credential, so an operator
 /// environment that carries both credentials still publishes with `AWS_*`.
@@ -422,7 +422,7 @@ async fn probe_storage(out: &mut Output, bucket: &Bucket, read_only: bool) -> an
         }
         Err(error) => {
             let detail = if crate::bucket::is_unauthorized(&error) {
-                "the credential cannot write to the bucket, and a celld node requires write \
+                "the credential cannot write to the bucket, and a Cello node requires write \
                  access; pass --read-only to diagnose with a read-only credential"
                     .to_string()
             } else {
@@ -435,7 +435,7 @@ async fn probe_storage(out: &mut Output, bucket: &Bucket, read_only: bool) -> an
 }
 
 /// Test the required conditional writes and ranged reads before a node serves,
-/// and refuse to start when the store proves it cannot support celld.
+/// and refuse to start when the store proves it cannot support cello.
 ///
 /// The two probe outcomes get different answers on purpose. A violation
 /// is a property of the store: it never clears. A node that serves anyway can
@@ -462,7 +462,7 @@ pub async fn probe_storage_before_serving(bucket: &Bucket, managed: bool) -> any
                     );
                 }
                 bail!(
-                    "the bucket does not keep the storage contract, so celld cannot serve cells \
+                    "the bucket does not keep the storage contract, so cello cannot serve cells \
                      safely on it: {reason}. Use a store that supports the required operations"
                 )
             }
@@ -496,7 +496,7 @@ pub async fn diagnose(
     // Checks the caller already made, printed through this command's one
     // `Output`. The listener binds happen before a bucket is even opened,
     // and printing them from there put three text lines in front of the
-    // JSON, which broke `celld diagnose --json | jq` at its first line.
+    // JSON, which broke `cello diagnose --json | jq` at its first line.
     preamble: Vec<Check>,
 ) -> anyhow::Result<()> {
     let mut out = Output::new(if json { Format::Json } else { Format::Text });
@@ -753,7 +753,7 @@ pub async fn run_deploy(arguments: Vec<String>) -> anyhow::Result<()> {
     );
     if !options.dry_run && options.bucket.is_none() {
         bail!(
-            "celld deploy requires --bucket s3://NAME, gs://NAME or az://CONTAINER \
+            "cello deploy requires --bucket s3://NAME, gs://NAME or az://CONTAINER \
              (or CELLO_BUCKET)"
         );
     }
@@ -810,7 +810,7 @@ pub async fn run_deploy(arguments: Vec<String>) -> anyhow::Result<()> {
     })?;
     if options.no_activate {
         note!(
-            "Staged, not serving: `celld activate {}={}` to serve this version.",
+            "Staged, not serving: `cello activate {}={}` to serve this version.",
             built.script_name,
             built.version
         );
@@ -832,7 +832,7 @@ pub async fn run_activate(arguments: Vec<String>) -> anyhow::Result<()> {
     );
     if options.bucket.is_none() {
         bail!(
-            "celld activate requires --bucket s3://NAME, gs://NAME or az://CONTAINER \
+            "cello activate requires --bucket s3://NAME, gs://NAME or az://CONTAINER \
              (or CELLO_BUCKET)"
         );
     }
@@ -876,7 +876,7 @@ pub async fn run_discard(arguments: Vec<String>) -> anyhow::Result<()> {
     );
     if options.bucket.is_none() {
         bail!(
-            "celld discard requires --bucket s3://NAME, gs://NAME or az://CONTAINER \
+            "cello discard requires --bucket s3://NAME, gs://NAME or az://CONTAINER \
              (or CELLO_BUCKET)"
         );
     }
@@ -912,7 +912,7 @@ pub async fn run_versions(arguments: Vec<String>) -> anyhow::Result<()> {
     );
     if options.bucket.is_none() {
         bail!(
-            "celld versions requires --bucket s3://NAME, gs://NAME or az://CONTAINER \
+            "cello versions requires --bucket s3://NAME, gs://NAME or az://CONTAINER \
              (or CELLO_BUCKET)"
         );
     }
@@ -965,7 +965,7 @@ pub async fn load_current_worker(
 }
 
 /// Block until the fleet-wide pointer exists, so a self-hosted node that
-/// starts before its first `celld deploy` idles instead of exiting.
+/// starts before its first `cello deploy` idles instead of exiting.
 ///
 /// The boot path reads `deploy/current.json` and treats "no such key" as
 /// fatal, so a node started against an empty bucket exits and systemd
@@ -986,7 +986,7 @@ pub async fn wait_for_deployment_pointer(bucket: &Bucket) -> anyhow::Result<()> 
             waited = true;
             tracing::info!(
                 event = "awaiting_initial_deployment",
-                "no deployment yet; run `celld deploy` and the node serves it \
+                "no deployment yet; run `cello deploy` and the node serves it \
                  without a restart"
             );
         }
@@ -1168,7 +1168,7 @@ async fn load_worker_at_pointer(
         })
         .collect();
     // (env name, stable database identity). A Cloudflare database_id survives
-    // Worker renames and lets several Workers share the resource. A celld-only
+    // Worker renames and lets several Workers share the resource. A cello-only
     // config without one falls back to the database name.
     let d1_bindings = bindings(&manifest, "d1")
         .filter_map(|binding| {

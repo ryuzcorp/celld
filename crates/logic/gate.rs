@@ -16,7 +16,7 @@
 //! **What holds it here is not storage.** In workerd the async KV API
 //! (`actor-state.h:49`, `jsg::Promise<...> get`) can genuinely suspend on an
 //! `ActorCache` miss, so storage is what gates; the SQL API (`sql.h:41`,
-//! `exec` returning a `Cursor`) is synchronous and does not. In celld every
+//! `exec` returning a `Cursor`) is synchronous and does not. In cello every
 //! storage path is local SQLite underneath, including the async-shaped one,
 //! whose `await Promise.resolve()` drains in the same microtask checkpoint.
 //! A read or a write therefore completes inside the turn that started it and

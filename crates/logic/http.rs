@@ -2,14 +2,14 @@
 
 //! HTTP predicates, reified sans-IO.
 //!
-//! A Worker reads `request.url`, and celld builds that URL from a request
+//! A Worker reads `request.url`, and cello builds that URL from a request
 //! header. The header is client-controlled whenever no proxy sits in front, so
 //! the shape of the authority is a SECURITY fence, exactly as
-//! `cell::valid_cell_scope`'s is. celld interpolates the authority into
+//! `cell::valid_cell_scope`'s is. cello interpolates the authority into
 //! `<scheme>://<authority><path_and_query>`, so a character that is structural
 //! in a URL moves the boundary between the parts.
 //!
-//! The gate checks the structure as well as the charset. celld carries the URL
+//! The gate checks the structure as well as the charset. cello carries the URL
 //! to the Worker as a string and never parses it, so an authority a URL parser
 //! refuses reaches the application intact. `new URL(request.url)` is how a
 //! Worker reads its own path and query, and that call then throws: a `Host` of
@@ -19,7 +19,7 @@
 
 use std::net::Ipv6Addr;
 
-/// The longest authority celld accepts. A hostname is at most 253 bytes and can
+/// The longest authority cello accepts. A hostname is at most 253 bytes and can
 /// carry the root dot, and a port adds at most 6 more — a `:` and five digits —
 /// so this admits every legal value and bounds what one request can make the
 /// URL parser allocate.
@@ -40,7 +40,7 @@ pub enum AuthorityDecision<'a> {
     NeedsUrlParser(&'a str),
 }
 
-/// Classify an authority before celld installs it in `request.url`.
+/// Classify an authority before cello installs it in `request.url`.
 ///
 /// The result carries the authority with the decision, so a caller cannot use
 /// a partial syntax result as a validated value.
@@ -63,13 +63,13 @@ pub fn authority_decision(authority: &str) -> AuthorityDecision<'_> {
 /// starts a fragment, and `@` ends userinfo — so each one lets a client move
 /// the rest of the URL into a different component. A `Host: evil.example#`
 /// header on a request for `/admin` makes `request.url` read
-/// `http://evil.example#/admin`, where the real path becomes a fragment. celld
-/// dispatches on the request target, so the Worker then reads a path celld did
+/// `http://evil.example#/admin`, where the real path becomes a fragment. cello
+/// dispatches on the request target, so the Worker then reads a path cello did
 /// not route, inside one process.
 ///
 /// Whitespace and control bytes are excluded because they make the URL
 /// unparseable rather than merely wrong. Non-ASCII is excluded because a
-/// hostname reaches celld in its A-label form.
+/// hostname reaches cello in its A-label form.
 ///
 /// The structure is the second fence, because a charset alone admits shapes a
 /// URL parser refuses: `a]b`, `::1` and `999.1.1.1` carry no character that
@@ -80,7 +80,7 @@ pub fn authority_decision(authority: &str) -> AuthorityDecision<'_> {
 /// address. `_` is admitted in a name because it occurs in practice in internal
 /// hostnames.
 ///
-/// This predicate does not check that the authority is a hostname celld serves.
+/// This predicate does not check that the authority is a hostname cello serves.
 /// `authority_decision` combines this syntax result with the IDN decision, so
 /// callers cannot install the partial result by itself.
 fn valid_authority(authority: &str) -> bool {
@@ -123,7 +123,7 @@ fn valid_authority(authority: &str) -> bool {
 /// The check on an address is stricter than the parser is, and deliberately so.
 /// A parser reads `010.1.1.1` as octal and `0x7f.1` as hex, so both name a
 /// different host than the text does, and `1234567890` names a fourth host
-/// again. celld refuses all three rather than hand a Worker a URL whose host is
+/// again. cello refuses all three rather than hand a Worker a URL whose host is
 /// not the host the string shows. An address must therefore be four decimal
 /// labels, each at most 255 and none carrying a leading zero.
 fn valid_reg_name(name: &str) -> bool {
@@ -190,7 +190,7 @@ fn valid_port(port: &str) -> bool {
 /// decision is reified here and the check itself belongs with a parser.
 ///
 /// The predicate exists to keep that parser off the request path. A hostname
-/// carries no such label in almost every deployment, so celld scans for the
+/// carries no such label in almost every deployment, so cello scans for the
 /// prefix and parses only when it is present. Refusing every `xn--` label
 /// instead would cost every internationalized deployment its hostname, and
 /// admitting every one of them hands a client an error it can aim at any
@@ -204,17 +204,17 @@ fn has_idn_label(authority: &str) -> bool {
     })
 }
 
-/// The scheme celld serves for this value, or `None` for a value it cannot
+/// The scheme cello serves for this value, or `None` for a value it cannot
 /// serve. Only `http` and `https`.
 ///
 /// The scheme is interpolated into `request.url`, and a Worker builds a
 /// redirect or a link from it. An arbitrary scheme therefore becomes an
 /// arbitrary URL in an application's output: `X-Forwarded-Proto: javascript:`
-/// makes `new URL(request.url).protocol` read `javascript:`. celld speaks only
+/// makes `new URL(request.url).protocol` read `javascript:`. cello speaks only
 /// HTTP, so no other scheme can be correct.
 ///
 /// The header casing is not fixed, so the match ignores case. The return is the
-/// canonical spelling rather than the text that arrived, because celld puts the
+/// canonical spelling rather than the text that arrived, because cello puts the
 /// result in a URL it logs and hands on, and a scheme is lowercase there.
 pub fn canonical_scheme(scheme: &str) -> Option<&'static str> {
     if scheme.eq_ignore_ascii_case("http") {

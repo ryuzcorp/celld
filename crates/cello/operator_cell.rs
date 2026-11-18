@@ -113,7 +113,7 @@ impl Reachable {
 
     /// The same signed entrance behind another operator route: the live
     /// nodes, the fleet secret, and the per-entrance signature are about
-    /// the fleet, not about `/runtime/`. `celld invoke` reaches `/invoke`
+    /// the fleet, not about `/runtime/`. `cello invoke` reaches `/invoke`
     /// through this and answers the same `{result}`/`{error}` shape, so
     /// [`Reachable::call`] serves both unchanged.
     pub(crate) async fn open_path(
@@ -125,8 +125,8 @@ impl Reachable {
         Self::open_bucket(&bucket, fleet.unsafe_public_advertise, subject, path).await
     }
 
-    /// The fleet entrance over an already-open bucket. `celld d1 --local`
-    /// reaches the `celld dev` node through the project's local store,
+    /// The fleet entrance over an already-open bucket. `cello d1 --local`
+    /// reaches the `cello dev` node through the project's local store,
     /// which carries that node's leases and secret exactly like a fleet
     /// bucket carries its fleet's: discovery and signing work unchanged.
     pub(crate) async fn open_bucket(
@@ -136,7 +136,7 @@ impl Reachable {
         path: String,
     ) -> anyhow::Result<Self> {
         let nodes = live_nodes(bucket, unsafe_public_advertise, subject.source).await?;
-        // The same secret and the same source shape `celld diagnose` uses.
+        // The same secret and the same source shape `cello diagnose` uses.
         let auth = crate::peer_auth::PeerAuth::new(
             crate::peer_auth::load_existing(bucket).await?,
             subject.source,
@@ -262,7 +262,7 @@ async fn live_nodes(
 ) -> anyhow::Result<Vec<(String, String)>> {
     let nodes = crate::fleet::node_lease_ids(bucket).await?;
     if nodes.is_empty() {
-        bail!("no node leases in the bucket; celld {source} needs a running fleet");
+        bail!("no node leases in the bucket; cello {source} needs a running fleet");
     }
     let mut reachable = Vec::new();
     let mut refused = Vec::new();

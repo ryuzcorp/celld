@@ -44,7 +44,7 @@ impl<C: ReplicaClient> EpochChain<C> {
     /// epoch below that ends elsewhere is skipped. A fenced owner's late
     /// snapshot can land in an intermediate epoch, whole but older than the
     /// cut, and taking it as the base loses the writes between it and the
-    /// cut (CelldPersistencePaged.tla, `BreakLinkByOrder`). An epoch without
+    /// cut (CelloPersistencePaged.tla, `BreakLinkByOrder`). An epoch without
     /// objects contributes nothing; no chain at all is `TxNotAvailable`.
     pub async fn build(mut epochs: Vec<(u64, C)>) -> Result<Self> {
         let mut spans: Vec<Span<C>> = Vec::new();

@@ -146,7 +146,7 @@ impl TlsServer {
     }
 }
 
-/// A booted `celld dev` and its address. Kills the child on drop, so a
+/// A booted `cello dev` and its address. Kills the child on drop, so a
 /// failing assertion cannot leak a server onto its port.
 struct TestNode {
     child: Child,
@@ -173,7 +173,7 @@ impl TestNode {
         if let Some(ca) = ssl_cert_file {
             command.env("SSL_CERT_FILE", ca);
         }
-        let mut child = command.spawn().expect("spawn celld dev");
+        let mut child = command.spawn().expect("spawn cello dev");
         let mut stdout = child.stdout.take().expect("piped stdout");
         let stderr = child.stderr.take().expect("piped stderr");
         std::thread::spawn(move || {
@@ -188,9 +188,9 @@ impl TestNode {
         };
         node.public = poll_until("boot", Duration::from_secs(120), || {
             if let Some(status) = node.child.try_wait().expect("poll child") {
-                panic!("celld dev exited during boot: {status}");
+                panic!("cello dev exited during boot: {status}");
             }
-            let addr = announced(&announced_lines, "celld listening on ")?;
+            let addr = announced(&announced_lines, "cello listening on ")?;
             probe(&addr, "/health").then_some(addr)
         });
         node
@@ -264,7 +264,7 @@ fn tenant_fetch_trusts_ssl_cert_file_roots() {
         &fixture.join("server-cert.pem"),
         &fixture.join("server-key.pem"),
     );
-    let project = fixture_tempdir("celld-tls-roots-");
+    let project = fixture_tempdir("cello-tls-roots-");
     copy_dir(&fixture, project.path());
     let node = TestNode::boot(project.path(), Some(&fixture.join("ca-cert.pem")));
     let (status, body) =
@@ -305,7 +305,7 @@ fn tenant_tls_rejects_unknown_private_ca() {
         &fixture.join("server-cert.pem"),
         &fixture.join("server-key.pem"),
     );
-    let project = fixture_tempdir("celld-tls-roots-");
+    let project = fixture_tempdir("cello-tls-roots-");
     copy_dir(&fixture, project.path());
     let node = TestNode::boot(project.path(), None);
 

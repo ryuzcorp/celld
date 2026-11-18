@@ -31,8 +31,8 @@ pub const DEFAULT_MAX_BATCH_SIZE: u16 = 10;
 pub const DEFAULT_MAX_BATCH_TIMEOUT_SECONDS: u16 = 5;
 pub const DEFAULT_MAX_RETRIES: u16 = 3;
 
-/// Queue retention is deployment-independent in celld v1. Wrangler has no
-/// configuration key for it, so accepting one would make a celld project
+/// Queue retention is deployment-independent in Cello v1. Wrangler has no
+/// configuration key for it, so accepting one would make a Cello project
 /// invalid on Cloudflare.
 pub const RETENTION_MS: Ms = 4 * 24 * 60 * 60 * 1000;
 
@@ -303,7 +303,7 @@ pub fn batch_plan(
     Ok(plan)
 }
 
-/// The Wrangler Queue values whose bounds celld enforces at deploy time.
+/// The Wrangler Queue values whose bounds cello enforces at deploy time.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct QueueConfig {
     pub max_batch_size: u16,

@@ -3,7 +3,7 @@
 
 //! The build path for a Worker whose `main` is a `.py` file.
 //!
-//! celld implements one line of Cloudflare's Python Workers runtime: Pyodide
+//! cello implements one line of Cloudflare's Python Workers runtime: Pyodide
 //! 0.28 with CPython 3.13, running the application's vendored Workers SDK
 //! (the `enable_python_external_sdk` behavior). Configurations that
 //! Cloudflare would run on a different Pyodide are refused, because the
@@ -72,7 +72,7 @@ const WORKER_PY: &str = include_str!("../python/worker.py");
 /// module rules (Text, Data and CompiledWasm). Wrangler uploads a matching
 /// file beside the Python sources, and workerd exposes it as a file under
 /// /session/metadata, so an application can open a bundled template or SQL
-/// file. Leaving one out would pass on Cloudflare and fail on celld with
+/// file. Leaving one out would pass on Cloudflare and fail on cello with
 /// `FileNotFoundError`.
 const SOURCE_EXTENSIONS: &[&str] = &[".py", ".txt", ".html", ".sql", ".bin", ".wasm"];
 
@@ -137,7 +137,7 @@ pub fn python_compat(object: &Map<String, Value>) -> anyhow::Result<PythonCompat
     ] {
         if has(flag) {
             bail!(
-                "celld runs Python Workers on Pyodide {PYODIDE_VERSION} (Python 3.13); \
+                "cello runs Python Workers on Pyodide {PYODIDE_VERSION} (Python 3.13); \
                  remove the `{flag}` compatibility flag"
             );
         }
@@ -145,7 +145,7 @@ pub fn python_compat(object: &Map<String, Value>) -> anyhow::Result<PythonCompat
     if switch("python_workers_314", "no_python_workers_314", "2026-09-08") {
         bail!(
             "compatibility_date {date} selects Pyodide 314 (Python 3.14) on Cloudflare, and \
-             celld runs Pyodide {PYODIDE_VERSION} (Python 3.13); use a date before 2026-09-08 \
+             cello runs Pyodide {PYODIDE_VERSION} (Python 3.13); use a date before 2026-09-08 \
              or add the `no_python_workers_314` compatibility flag"
         );
     }
@@ -180,7 +180,7 @@ pub fn python_compat(object: &Map<String, Value>) -> anyhow::Result<PythonCompat
     for (enable, disable, day, behavior) in required {
         if !switch(enable, disable, day) {
             bail!(
-                "celld runs Python Workers only with {behavior} ({enable}); use a \
+                "cello runs Python Workers only with {behavior} ({enable}); use a \
                  compatibility_date from 2026-04-21 without opting out of it"
             );
         }
@@ -234,7 +234,7 @@ pub fn check_supported_events(object: &Map<String, Value>) -> anyhow::Result<()>
         (non_empty(object.get("containers")), "Containers"),
     ] {
         if present {
-            bail!("celld does not run {what} in Python Workers yet; a Python Worker handles `fetch` only");
+            bail!("cello does not run {what} in Python Workers yet; a Python Worker handles `fetch` only");
         }
     }
     // Refused only when they would change the build: an empty table or a
@@ -501,7 +501,7 @@ fn collect_vendored(
         }
         if name.ends_with(".so") || name.contains(".so.") {
             bail!(
-                "python_modules/{path} is a compiled extension; celld runs pure-Python \
+                "python_modules/{path} is a compiled extension; cello runs pure-Python \
                  packages only"
             );
         }
@@ -562,7 +562,7 @@ fn runtime_directory() -> anyhow::Result<PathBuf> {
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
         .ok_or_else(|| anyhow!("set CELLO_PYTHON_RUNTIME_DIR to cache the Python runtime"))?;
     Ok(cache
-        .join("celld")
+        .join("cello")
         .join(format!("pyodide-{PYODIDE_VERSION}")))
 }
 
@@ -607,7 +607,7 @@ const DOWNLOAD_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long a runtime download may wait for its next bytes. There is no
 /// total deadline: the interpreter alone is 8.6 MB, and a slow link that
 /// keeps delivering must still finish. Without this bound a stalled CDN
-/// hangs `celld deploy` and never shows the offline hint.
+/// hangs `cello deploy` and never shows the offline hint.
 const DOWNLOAD_STALL_TIMEOUT: Duration = Duration::from_secs(60);
 
 fn download(files: &[(&str, u64, &str)]) -> anyhow::Result<Vec<(String, Vec<u8>)>> {
@@ -672,7 +672,7 @@ fn download_from(
 fn run_esbuild(directory: &Path) -> anyhow::Result<()> {
     let binary = std::env::var("CELLO_ESBUILD").unwrap_or_else(|_| "esbuild".to_string());
     let mut command = Command::new(&binary);
-    // Same as the Worker bundle: `celld dev` may run this from its serving
+    // Same as the Worker bundle: `cello dev` may run this from its serving
     // supervisor, and esbuild needs none of the environment it would
     // inherit.
     crate::hardening::minimal_child_environment(&mut command);
@@ -694,7 +694,7 @@ fn run_esbuild(directory: &Path) -> anyhow::Result<()> {
         .arg("--define:location=\"https://python-runtime.invalid/\"")
         .arg("--external:cloudflare:*")
         // The host module that retires an isolate after a fatal error.
-        .arg("--external:celld:python")
+        .arg("--external:cello:python")
         // Dynamic imports on the loader's Node.js path, which never runs.
         .arg("--external:node:*")
         .arg("--external:./pyodide.asm.wasm")

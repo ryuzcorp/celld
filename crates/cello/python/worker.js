@@ -1,4 +1,4 @@
-// Entrypoint of a Python Worker bundle built by `celld deploy`.
+// Entrypoint of a Python Worker bundle built by `cello deploy`.
 //
 // Adapted from workerd at commit da46ad950c54b19158c5ea5cb997a9727491ca17
 // (v1.20260926.1): src/pyodide/python-entrypoint-helper.ts. Copyright (c)
@@ -6,10 +6,10 @@
 // WorkerEntrypoint class whose constructor creates one instance of the Python
 // `Default` class per invocation, `fetch` calls it with the SDK's RPC
 // conversions, and a Python awaitable given to waitUntil is kept alive
-// until it settles. Changed for celld: the interpreter comes from the
+// until it settles. Changed for cello: the interpreter comes from the
 // upstream Pyodide loader, and only `fetch` is dispatched.
 //
-// celld cannot evaluate an asynchronous module top level, so the interpreter
+// Cello cannot evaluate an asynchronous module top level, so the interpreter
 // starts on the first invocation of the isolate instead of at load. Every
 // concurrent first invocation shares that one start. A failed start is kept:
 // the interpreter is never started twice in one isolate, so a callback of an
@@ -24,15 +24,15 @@ import files from "./files.bin";
 import { COMPATIBILITY_FLAGS, LOCK, MAIN_MODULE, PROCESS_PTH_FILES } from "./config.js";
 import { RUNTIME_URL } from "./shims.js";
 import { fatalGate } from "./fatal.js";
-import { condemnIsolate } from "celld:python";
+import { condemnIsolate } from "cello:python";
 
 // A hard termination inside Wasm abandons the interpreter's frames, and
-// celld keeps the isolate in use afterwards, so the next entry would run
+// Cello keeps the isolate in use afterwards, so the next entry would run
 // on a broken interpreter. `process.exit()` is the only termination a
 // Worker can reach itself, so it throws here instead.
 if (globalThis.process) {
   globalThis.process.exit = function exit() {
-    throw new Error("process.exit() is not supported in Python Workers on celld");
+    throw new Error("process.exit() is not supported in Python Workers on cello");
   };
 }
 
@@ -59,7 +59,7 @@ function unpack(bytes) {
   return entries;
 }
 
-// Cloudflare stops the isolate on a fatal interpreter error. celld condemns
+// Cloudflare stops the isolate on a fatal interpreter error. cello condemns
 // it instead: placement stops choosing it, and the pool frees it once the
 // calls in flight drain. The gate fails those calls and the background work,
 // and refuses any entry that still reaches this module. Callbacks that
@@ -106,10 +106,10 @@ const entrypointHelper = {
   cloudflareSocketsModule: cloudflareSockets,
   patchWaitUntil,
   doAnImport(name) {
-    throw new Error(`JavaScript module import is not supported in Python Workers on celld: ${name}`);
+    throw new Error(`JavaScript module import is not supported in Python Workers on cello: ${name}`);
   },
   patch_env_helper() {
-    throw new Error("workers.patch_env is not supported in Python Workers on celld");
+    throw new Error("workers.patch_env is not supported in Python Workers on cello");
   },
 };
 
@@ -147,7 +147,7 @@ async function start() {
   pyodide.registerJsModule("_pyodide_entrypoint_helper", entrypointHelper);
   pyodide.registerJsModule("_cloudflare_compat_flags", COMPATIBILITY_FLAGS);
   const namespace = pyodide.globals.get("dict")();
-  pyodide.runPython(workerSource, { globals: namespace, filename: "<celld-python-worker>" });
+  pyodide.runPython(workerSource, { globals: namespace, filename: "<cello-python-worker>" });
   namespace.get("setup_python_search_path")(PROCESS_PTH_FILES);
   const main = pyodide.pyimport(MAIN_MODULE);
   return {

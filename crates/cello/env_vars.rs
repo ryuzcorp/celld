@@ -54,12 +54,12 @@ impl ShutdownTiming {
     }
 }
 
-/// A variable celld no longer reads, and the sentence that names what an
+/// A variable cello no longer reads, and the sentence that names what an
 /// operator must write instead.
 ///
-/// The lists below enumerate the names celld knows, so a name that is not on
+/// The lists below enumerate the names cello knows, so a name that is not on
 /// one of them is never looked at and never reported. That is correct for a
-/// name celld never had, but wrong for one it removed: the operator set the
+/// name cello never had, but wrong for one it removed: the operator set the
 /// removed name on purpose, and the behaviour it bought is gone. A node whose
 /// unit file still carries the name would boot clean, log nothing, and serve a
 /// deployment that no longer has the binding, so the defect would surface as a
@@ -83,7 +83,7 @@ struct Removed {
 const REMOVED: &[Removed] = &[
     Removed {
         name: "CELLO_TEST_OTEL_SWEEP_MS",
-        replacement: "remove this setting; celld manages the telemetry retention cadence",
+        replacement: "remove this setting; cello manages the telemetry retention cadence",
         empty_was_inert: false,
     },
     Removed {
@@ -104,17 +104,17 @@ const REMOVED: &[Removed] = &[
     Removed {
         name: "CELLO_PACED_HANDOFF",
         replacement:
-            "remove this setting; celld hands off ownership within CELLO_SHUTDOWN_TOTAL_MS",
+            "remove this setting; cello hands off ownership within CELLO_SHUTDOWN_TOTAL_MS",
         empty_was_inert: false,
     },
     Removed {
         name: "CELLO_LOG_GROUP_COMMIT_MS",
-        replacement: "remove this setting; celld uses its built-in Queue batching policy",
+        replacement: "remove this setting; cello uses its built-in Queue batching policy",
         empty_was_inert: false,
     },
     Removed {
         name: "CELLO_QUEUE_PRODUCER_GROUP_MS",
-        replacement: "remove this setting; celld uses its built-in Queue batching policy",
+        replacement: "remove this setting; cello uses its built-in Queue batching policy",
         empty_was_inert: false,
     },
     Removed {
@@ -130,22 +130,22 @@ const REMOVED: &[Removed] = &[
     },
     Removed {
         name: "CELLO_STORAGE_PROBE",
-        replacement: "remove this setting; celld checks the storage contract before serving",
+        replacement: "remove this setting; cello checks the storage contract before serving",
         empty_was_inert: false,
     },
     Removed {
         name: "CELLO_EVICTIONS",
-        replacement: "remove this setting; celld uses its built-in scheduling limits",
+        replacement: "remove this setting; cello uses its built-in scheduling limits",
         empty_was_inert: false,
     },
     Removed {
         name: "CELLO_LOG_CAPTURE_WORKERS",
-        replacement: "remove this setting; celld uses its built-in scheduling limits",
+        replacement: "remove this setting; cello uses its built-in scheduling limits",
         empty_was_inert: false,
     },
     Removed {
         name: "CELLO_REBALANCE_BATCH_CELLS",
-        replacement: "remove this setting; celld uses its built-in scheduling limits",
+        replacement: "remove this setting; cello uses its built-in scheduling limits",
         empty_was_inert: false,
     },
     Removed {
@@ -155,24 +155,24 @@ const REMOVED: &[Removed] = &[
     },
     Removed {
         name: "CELLO_OUTPUT_GATE",
-        replacement: "remove this setting; celld always waits for durability proof",
+        replacement: "remove this setting; cello always waits for durability proof",
         empty_was_inert: false,
     },
     Removed {
         name: "CELLO_DRAIN_TOKEN_WAIT_MS",
-        replacement: "set only CELLO_SHUTDOWN_TOTAL_MS; celld derives the drain-token wait",
+        replacement: "set only CELLO_SHUTDOWN_TOTAL_MS; cello derives the drain-token wait",
         // Zero disabled the token wait, and an empty value failed parsing.
         empty_was_inert: false,
     },
     Removed {
         name: "CELLO_SHUTDOWN_DRAIN_MS",
         replacement:
-            "set only CELLO_SHUTDOWN_TOTAL_MS; celld derives the handoff no-progress interval",
+            "set only CELLO_SHUTDOWN_TOTAL_MS; cello derives the handoff no-progress interval",
         empty_was_inert: false,
     },
     Removed {
         name: "CELLO_MAX_LOADED_WORKERS",
-        replacement: "remove this setting; celld manages Dynamic Worker admission",
+        replacement: "remove this setting; cello manages Dynamic Worker admission",
         // Even an empty value failed in the old typed reader. Refuse it rather
         // than silently changing the operator's configured admission policy.
         empty_was_inert: false,
@@ -189,7 +189,7 @@ const REMOVED: &[Removed] = &[
     },
     Removed {
         name: "CELLO_VARS_FILE",
-        replacement: "set `vars` in the Wrangler config, or `.dev.vars` for `celld dev`",
+        replacement: "set `vars` in the Wrangler config, or `.dev.vars` for `cello dev`",
         // The former reader used the path verbatim, so `CELLO_VARS_FILE=`
         // selected an empty path and failed instead of doing nothing. An
         // operator must therefore delete the empty setting.
@@ -198,12 +198,12 @@ const REMOVED: &[Removed] = &[
 ];
 
 /// The removed `CELLO_VAR_<NAME>` family. It is a prefix and not a name, so
-/// the table above cannot hold it: celld never knew which names an operator
+/// the table above cannot hold it: cello never knew which names an operator
 /// used. A node started with any of them would run with no override at all,
 /// which reads inside a Worker as a missing secret with nothing in the log.
 const REMOVED_PREFIX: (&str, &str) = (
     "CELLO_VAR_",
-    "set `vars` in the Wrangler config, or `.dev.vars` for `celld dev`",
+    "set `vars` in the Wrangler config, or `.dev.vars` for `cello dev`",
 );
 
 /// Validate every typed production variable before the runtime starts.

@@ -32,7 +32,7 @@
 // Tokio version bump must therefore re-check this facade against the select.rs
 // of the new version.
 //
-// The failure mode is a compile error in celld, not a behavior change, so
+// The failure mode is a compile error in cello, not a behavior change, so
 // nothing broken ships and no test passes wrongly. Without this note the person
 // who runs `cargo update` sees a macro that no longer resolves and gets no
 // pointer to the cause.

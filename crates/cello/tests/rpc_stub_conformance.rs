@@ -13,7 +13,7 @@
 //! (same node), driven through the `tests/fixtures/rpc-stub` fixture the way
 //! `docs/testing.md` runs examples: boot the real binary, replay HTTP.
 //!
-//! Each test boots its own `celld dev` on a private copy of the fixture
+//! Each test boots its own `cello dev` on a private copy of the fixture
 //! (dev state lives beside the project, so sharing one copy would collide),
 //! waits for the public port, then asserts the fixture's transcripts. The
 //! client is dependency-free on purpose: plain TCP with `Connection: close`
@@ -57,7 +57,7 @@ fn fixture_source() -> PathBuf {
 /// Tempdir for one fixture copy: `/dev/shm` when usable, else the
 /// default tempdir.
 ///
-/// Each booted `celld dev` keeps its SQLite store beside its fixture
+/// Each booted `cello dev` keeps its SQLite store beside its fixture
 /// copy, and the node self-fences when a lease commit stalls past the
 /// TTL bound. Parallel suites on a loaded disk stall commits for
 /// seconds (observed: a 700-byte commit taking 4.4 s), fencing healthy
@@ -80,14 +80,14 @@ fn fixture_tempdir(prefix: &str) -> tempfile::TempDir {
 }
 
 fn copy_fixture(name: &str) -> tempfile::TempDir {
-    let dir = fixture_tempdir(&format!("celld-rpc-stub-{name}-"));
+    let dir = fixture_tempdir(&format!("cello-rpc-stub-{name}-"));
     for file in ["wrangler.json", "index.js"] {
         std::fs::copy(fixture_source().join(file), dir.path().join(file)).expect("copy fixture");
     }
     dir
 }
 
-/// A booted `celld dev` and its addresses. Kills the child on drop, so a
+/// A booted `cello dev` and its addresses. Kills the child on drop, so a
 /// failing assertion cannot leak a server onto its ports.
 struct TestNode {
     child: Child,
@@ -95,7 +95,7 @@ struct TestNode {
     internal: String,
 }
 
-/// One address of a `celld dev` node, from the announce line the supervisor
+/// One address of a `cello dev` node, from the announce line the supervisor
 /// forwards to its stderr. The node is non-dumpable (patch 0053), so
 /// `/proc/<pid>/fd` no longer names its listeners, and this is the node's
 /// own report of where it bound.
@@ -146,7 +146,7 @@ impl TestNode {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .expect("spawn celld dev");
+            .expect("spawn cello dev");
         let mut stdout = child.stdout.take().expect("piped stdout");
         let stderr = child.stderr.take().expect("piped stderr");
         // Drain both pipes so a chatty child can never block on a full
@@ -176,10 +176,10 @@ impl TestNode {
                 // Liveness first: a dead child must fail fast, not burn
                 // the deadline on refused probes.
                 if let Some(status) = node.child.try_wait().expect("poll child") {
-                    panic!("{name}: celld dev exited during boot: {status}");
+                    panic!("{name}: cello dev exited during boot: {status}");
                 }
-                let public = announced(&announced_lines, "celld listening on ")?;
-                let internal = announced(&announced_lines, "celld internal listening on ")?;
+                let public = announced(&announced_lines, "cello listening on ")?;
+                let internal = announced(&announced_lines, "cello internal listening on ")?;
                 probe(&public, "/scope?name=probe").then_some((public, internal))
             });
         node.public = public;
@@ -300,11 +300,11 @@ fn fixture_tempdir_prefers_shm() {
     // Pins the flake fix: when /dev/shm takes a tempdir, fixtures must
     // live there, not on the box's disk queue.
     let probe = tempfile::Builder::new()
-        .prefix("celld-shm-probe-")
+        .prefix("cello-shm-probe-")
         .tempdir_in("/dev/shm");
     if probe.is_ok() {
         assert!(
-            fixture_tempdir("celld-shm-pin-")
+            fixture_tempdir("cello-shm-pin-")
                 .path()
                 .starts_with("/dev/shm"),
             "fixtures must prefer /dev/shm when usable"

@@ -19,7 +19,7 @@
 //!   stub answers without waiting for the `waitUntil` work that feeds
 //!   the stream, which cannot finish until the caller pulls it.
 //!
-//! One `celld dev` boots the single fixture project per test. There are
+//! One `cello dev` boots the single fixture project per test. There are
 //! no fixed sleeps: every wait polls an observable condition with a
 //! deadline, and the server guard kills the child on every exit path.
 
@@ -52,7 +52,7 @@ fn copy_dir(src: &Path, dst: &Path) {
     }
 }
 
-/// A booted `celld dev` and its address. Kills the child on drop, so a
+/// A booted `cello dev` and its address. Kills the child on drop, so a
 /// failing assertion cannot leak a server onto its port.
 struct TestNode {
     child: Child,
@@ -71,7 +71,7 @@ impl TestNode {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .expect("spawn celld dev");
+            .expect("spawn cello dev");
         let mut stdout = child.stdout.take().expect("piped stdout");
         let stderr = child.stderr.take().expect("piped stderr");
         // Drain stdout so a chatty child can never block on a full pipe.
@@ -97,11 +97,11 @@ impl TestNode {
         node.public = poll_until("boot", Duration::from_secs(120), || {
             if let Some(status) = node.child.try_wait().expect("poll child") {
                 panic!(
-                    "celld dev exited during boot: {status}: {}",
+                    "cello dev exited during boot: {status}: {}",
                     announced_lines.lock().expect("announce lock").join("\n")
                 );
             }
-            let public = announced(&announced_lines, "celld listening on ")?;
+            let public = announced(&announced_lines, "cello listening on ")?;
             if !probe(&public, "/health") {
                 return None;
             }
@@ -189,7 +189,7 @@ fn poll_until(
 
 fn boot_fixture(name: &str) -> (tempfile::TempDir, TestNode) {
     let dir = tempfile::Builder::new()
-        .prefix(&format!("celld-abort-drain-{name}-"))
+        .prefix(&format!("cello-abort-drain-{name}-"))
         .tempdir()
         .expect("tempdir");
     let project = dir.path().join("app");

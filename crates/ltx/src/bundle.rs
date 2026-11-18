@@ -1,7 +1,7 @@
 //! The bundle envelope: a container of verbatim L0 LTX files, never a
 //! format.
 //!
-//! celld-original, not a Litestream port. Layout: the concatenated raw L0
+//! cello-original, not a Litestream port. Layout: the concatenated raw L0
 //! bytes, a binary footer of rows, the footer length as a little-endian
 //! u32, and a four-byte magic. A row is `u16 cell_len | cell utf-8 |
 //! u64 cell_epoch | u64 txid | u64 offset | u64 len`, all little-endian.

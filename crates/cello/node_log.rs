@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): operator token for the internal listener; list_page resume is a cursor; ported from meln1k/celld: seal a dead lease that never opened a log (01522b3); seal_absent_log regression tests; lone-node repair backoff; bucket-posture group commit: bucket-session record encoding + old-reader interop tests (0059); bucket-posture group commit: bucket executor without ensemble (0060); bucket-posture group commit: successor fold of bucket bundles (0063); bucket-posture group commit: bucket-session drain, per-cell seal, bundle GC without ensemble, linger holds only while the dirty set is shared (0064); bucket-posture group commit: lone-cell-per-cell vs shared-bundle executor tests, and idle bucket sessions skip empty bundle-GC scans (0071); stale-target 409 proves the member gone in recovery (upstream #273); tail reads stream under a progress timeout (upstream #250); deleted sessions with surviving objects declare loss (upstream #245); same-ensemble degrade resumes the epoch (upstream #268); fragment GC collects record-less sessions (upstream #259).
+// Modified by ryuzcorp (ryuzcorp/celld): operator token for the internal listener; list_page resume is a cursor; ported from meln1k/cello: seal a dead lease that never opened a log (01522b3); seal_absent_log regression tests; lone-node repair backoff; bucket-posture group commit: bucket-session record encoding + old-reader interop tests (0059); bucket-posture group commit: bucket executor without ensemble (0060); bucket-posture group commit: successor fold of bucket bundles (0063); bucket-posture group commit: bucket-session drain, per-cell seal, bundle GC without ensemble, linger holds only while the dirty set is shared (0064); bucket-posture group commit: lone-cell-per-cell vs shared-bundle executor tests, and idle bucket sessions skip empty bundle-GC scans (0071); stale-target 409 proves the member gone in recovery (upstream #273); tail reads stream under a progress timeout (upstream #250); deleted sessions with surviving objects declare loss (upstream #245); same-ensemble degrade resumes the epoch (upstream #268); fragment GC collects record-less sessions (upstream #259).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! v0 of the in-fleet replicated log tier (`CELLO_DURABILITY=fleet`).
@@ -3080,7 +3080,7 @@ async fn post_append_to(
     );
     match serde_json::from_slice(&bytes) {
         Ok(resp) => AppendSend::Answered(resp),
-        // A 200 whose body is not an AppendResp is no celld follower.
+        // A 200 whose body is not an AppendResp is no cello follower.
         Err(error) => AppendSend::Incapable(error.into()),
     }
 }

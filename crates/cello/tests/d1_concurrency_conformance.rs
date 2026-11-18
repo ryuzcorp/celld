@@ -16,7 +16,7 @@
 //! request's resources — its event frames, its `/tmp`, its body streams —
 //! and that a first turn's settling work carries its own token.
 //!
-//! Each test boots its own `celld dev` on a private copy of the fixture
+//! Each test boots its own `cello dev` on a private copy of the fixture
 //! (dev state lives beside the project, so sharing one copy would collide),
 //! waits for the public port, then asserts the fixture's transcripts. The
 //! client is dependency-free on purpose: plain TCP with `Connection: close`
@@ -54,7 +54,7 @@ fn fixture_source() -> PathBuf {
 
 fn copy_fixture(name: &str) -> tempfile::TempDir {
     let dir = tempfile::Builder::new()
-        .prefix(&format!("celld-d1-concurrency-{name}-"))
+        .prefix(&format!("cello-d1-concurrency-{name}-"))
         .tempdir()
         .expect("tempdir");
     for file in ["wrangler.json", "worker.js"] {
@@ -63,7 +63,7 @@ fn copy_fixture(name: &str) -> tempfile::TempDir {
     dir
 }
 
-/// A booted `celld dev` and its address. Kills the child on drop, so a
+/// A booted `cello dev` and its address. Kills the child on drop, so a
 /// failing assertion cannot leak a server onto its ports.
 struct TestNode {
     child: Child,
@@ -87,7 +87,7 @@ impl TestNode {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .expect("spawn celld dev");
+            .expect("spawn cello dev");
         let mut stdout = child.stdout.take().expect("piped stdout");
         let stderr = child.stderr.take().expect("piped stderr");
         // Drain stdout so a chatty child can never block on a full pipe.
@@ -113,11 +113,11 @@ impl TestNode {
         node.public = poll_until(&format!("{name} boot"), Duration::from_secs(120), || {
             if let Some(status) = node.child.try_wait().expect("poll child") {
                 panic!(
-                    "{name}: celld dev exited during boot: {status}: {}",
+                    "{name}: cello dev exited during boot: {status}: {}",
                     announced_lines.lock().expect("announce lock").join("\n")
                 );
             }
-            let public = announced(&announced_lines, "celld listening on ")?;
+            let public = announced(&announced_lines, "cello listening on ")?;
             if !probe(&public, "/") {
                 return None;
             }

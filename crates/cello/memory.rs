@@ -599,7 +599,7 @@ mod scope_tests {
     impl FakeCgroup {
         fn build() -> Self {
             let dir = tempfile::Builder::new()
-                .prefix("celld-memory-scope-test-")
+                .prefix("cello-memory-scope-test-")
                 .tempdir()
                 .expect("tempdir");
             // The container root carries one charge and limit, the fleet leaf

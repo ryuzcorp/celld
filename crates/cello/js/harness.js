@@ -91,7 +91,7 @@ function __multipartBody(form) {
   if (globalThis.crypto && crypto.getRandomValues) crypto.getRandomValues(random);
   else for (let i = 0; i < random.length; i++)
     random[i] = Math.floor(Math.random() * 256);
-  const boundary = "----celldFormBoundary" +
+  const boundary = "----celloFormBoundary" +
     Array.from(random, (byte) => byte.toString(16).padStart(2, "0")).join("");
   const encoder = new TextEncoder();
   const chunks = [];
@@ -197,17 +197,17 @@ async function __drainBody(target) {
   target._body = undefined;
   return bytes;
 }
-class CelldBodyStream extends ReadableStream {
+class CelloBodyStream extends ReadableStream {
   constructor(owner) {
     // Couple the stream to its buffered owner, so _bodyBytes and the stream
     // cannot be installed from different arrays. Copying the owner's bytes
     // again here doubles the external memory held for every constructed body.
     if (!(owner instanceof globalThis.Request) &&
         !(owner instanceof globalThis.Response))
-      throw new TypeError("CelldBodyStream requires a buffered body owner");
+      throw new TypeError("CelloBodyStream requires a buffered body owner");
     const bytes = owner._bodyBytes;
     if (!(bytes instanceof Uint8Array))
-      throw new TypeError("CelldBodyStream owner requires buffered body bytes");
+      throw new TypeError("CelloBodyStream owner requires buffered body bytes");
     const st = { bytes, off: 0 };
     super({
       pull(controller) {
@@ -249,7 +249,7 @@ class CelldBodyStream extends ReadableStream {
     return super._cancel(reason);
   }
 }
-class CelldHttpBodyStream extends ReadableStream {
+class CelloHttpBodyStream extends ReadableStream {
   constructor(streamId) {
     const id = Number(streamId);
     super({
@@ -272,15 +272,15 @@ class CelldHttpBodyStream extends ReadableStream {
       __http_stream_tee(this.__celldStreamId),
     );
     return [
-      new CelldHttpBodyStream(left),
-      new CelldHttpBodyStream(right),
+      new CelloHttpBodyStream(left),
+      new CelloHttpBodyStream(right),
     ];
   }
 }
 // Body streams expose the standard constructor to consumers. In particular,
 // the Python Workers SDK validates JS body types by constructor.name.
 // Keep the internal prototypes and their specialized read/tee behavior.
-for (const bodyStream of [CelldBodyStream, CelldHttpBodyStream]) {
+for (const bodyStream of [CelloBodyStream, CelloHttpBodyStream]) {
   Object.defineProperty(bodyStream.prototype, "constructor", {
     value: ReadableStream, writable: true, configurable: true,
   });
@@ -319,13 +319,13 @@ globalThis.Response = class Response {
     this._body = undefined;
     // Hono rebuilds a response after middleware with
     // `new Response(response.body, response)`; the held stream (or a
-    // fresh CelldBodyStream) preserves the payload across that
+    // fresh CelloBodyStream) preserves the payload across that
     // standard clone shape.
     this.body = body == null
       ? null
       : stream !== null
         ? stream
-        : new CelldBodyStream(this);
+        : new CelloBodyStream(this);
     this.status = init.status === undefined ? 200 : Number(init.status);
     this.statusText = init.statusText === undefined ? "" : String(init.statusText);
     this.headers = new Headers(init.headers);
@@ -518,7 +518,7 @@ globalThis.Request = class Request {
     this.body = stream !== null
       ? stream
       : ["GET", "HEAD"].includes(this.method)
-        ? null : new CelldBodyStream(this);
+        ? null : new CelloBodyStream(this);
     this.redirect = String(init.redirect === undefined
       ? (prior ? prior.redirect : "follow")
       : init.redirect);
@@ -605,7 +605,7 @@ const __makeRequest = __celld.__makeRequest = (
     // The raw header JSON, not a parsed object: an incoming request whose
     // handler never reads `.headers` (a hello world, or a Worker that only
     // routes to a cell) then never parses it. See `get headers()`.
-    // celld cannot prove Cloudflare edge metadata, so the object stays empty.
+    // Cello cannot prove Cloudflare edge metadata, so the object stays empty.
     // In particular, no client-controlled header becomes a country or a colo;
     // the forwarded-authority trust flag does not establish geolocation trust.
     method, body, __headersJson: headersJson, signal, cf: {},
@@ -737,7 +737,7 @@ globalThis.fetch = async (input, init) => {
     req, ["GET", "HEAD"].includes(req.method));
   // The header list, not the iterator: the iterator sorts, lower-cases and
   // combines, so `Array.from(req.headers)` would send one `X-Trace: a, b`
-  // for two appends and put celld's casing on the wire in place of the
+  // for two appends and put cello's casing on the wire in place of the
   // author's. `op_fetch` builds the request with `RequestBuilder::header`,
   // which appends, so repeats survive.
   let raw;
@@ -781,7 +781,7 @@ globalThis.fetch = async (input, init) => {
   // globalOutbound Fetcher can answer with an inline body, as service
   // bindings do, so preserve both response representations.
   const responseBody = r.streamId !== undefined
-    ? new CelldHttpBodyStream(r.streamId)
+    ? new CelloHttpBodyStream(r.streamId)
     : r.body !== undefined ? r.body : Uint8Array.from(r.bodyBytes || []);
   const response = new Response(
     responseBody,
@@ -847,7 +847,7 @@ __celld.__makeAssetsBinding = (script) => ({
       JSON.stringify(Array.from(req.headers)),
     ));
     const responseBody = r.streamId !== undefined
-      ? new CelldHttpBodyStream(r.streamId)
+      ? new CelloHttpBodyStream(r.streamId)
       : r.body !== undefined ? r.body : Uint8Array.from(r.bodyBytes || []);
     const response = new Response(
       responseBody,
@@ -858,7 +858,7 @@ __celld.__makeAssetsBinding = (script) => ({
   },
 });
 // An `r2_buckets` binding, served out of the fleet bucket under the
-// reserved `r2/<bucketName>/` prefix. celld runs on blob storage rather
+// reserved `r2/<bucketName>/` prefix. cello runs on blob storage rather
 // than providing it, so a binding gets the store the node already holds
 // credentials for; a node started without a bucket has nowhere to put a
 // blob and every method says so.
@@ -866,14 +866,14 @@ __celld.__makeAssetsBinding = (script) => ({
 // The whole `R2Bucket` surface is here: `head`, `get`, `put`, `delete`,
 // `list`, `createMultipartUpload` and `resumeMultipartUpload`, with
 // `httpMetadata`, `customMetadata`, `checksums`, `storageClass`, `onlyIf`
-// and every range spelling. What celld cannot honor still fails loudly
+// and every range spelling. What Cello cannot honor still fails loudly
 // rather than pretending -- a silent gap is the failure mode the binding
-// is written to avoid. Those are `ssecKey` (celld has no customer-key
+// is written to avoid. Those are `ssecKey` (cello has no customer-key
 // encryption), a conditional `put` of a body too big for one request, and
 // a multipart upload resumed on a node other than the one that opened it.
 const __r2Reject = (bucket, method, detail) => {
   throw new Error(
-    `R2 ${method} is not implemented in celld (binding ${bucket})` +
+    `R2 ${method} is not implemented in Cello (binding ${bucket})` +
       (detail ? `: ${detail}` : ""),
   );
 };
@@ -989,7 +989,7 @@ const __r2Range = (binding, value) => {
     if (!header) return undefined;
     const parsed = /^bytes=(\d*)-(\d*)$/.exec(header.trim());
     if (!parsed) {
-      __r2Reject(binding, "get(range)", `celld cannot parse ${header}`);
+      __r2Reject(binding, "get(range)", `cello cannot parse ${header}`);
     }
     const [, first, last] = parsed;
     if (first === "") return { suffix: Number(last) };
@@ -1086,7 +1086,7 @@ const __r2WriteOptions = (binding, method, options) => {
     __r2Reject(
       binding,
       `${method}(ssecKey)`,
-      "celld has no customer-key encryption",
+      "cello has no customer-key encryption",
     );
   }
   const custom = {};
@@ -1181,7 +1181,7 @@ const __r2Multipart = (binding, bucketName, key, id) => ({
   },
   async uploadPart(partNumber, value, options) {
     if (options?.ssecKey !== undefined) {
-      __r2Reject(binding, "uploadPart(ssecKey)", "celld has no customer-key encryption");
+      __r2Reject(binding, "uploadPart(ssecKey)", "cello has no customer-key encryption");
     }
     const body = await __r2Value(binding, value);
     const bytes = body instanceof Uint8Array ? body : await __r2Drain(body);
@@ -1210,7 +1210,7 @@ __celld.__makeR2Bucket = (binding, bucketName) => ({
     const name = __r2Key(binding, "get", key);
     const o = options ?? {};
     if (o.ssecKey !== undefined) {
-      __r2Reject(binding, "get(ssecKey)", "celld has no customer-key encryption");
+      __r2Reject(binding, "get(ssecKey)", "cello has no customer-key encryption");
     }
     const request = {
       range: __r2Range(binding, o.range),
@@ -1221,7 +1221,7 @@ __celld.__makeR2Bucket = (binding, bucketName) => ({
     // A refused `onlyIf` answers the object without its body, which is how
     // a caller tells "not modified" from "not there".
     if (r.state === "unmet") return __r2Object(r.object);
-    return __r2Object(r.object, new CelldHttpBodyStream(r.streamId));
+    return __r2Object(r.object, new CelloHttpBodyStream(r.streamId));
   },
   async put(key, value, options) {
     const name = __r2Key(binding, "put", key);
@@ -1769,7 +1769,7 @@ class DurableObjectStorage {
   // Resolves once every write this cell committed before the call is
   // proven durable, by the proof the output gate requires before it releases
   // an egress. Workerd resolves when the pending writes have completed; on
-  // celld the local file is a cache, so "completed" is "proven". The host op
+  // Cello the local file is a cache, so "completed" is "proven". The host op
   // rejects when that proof fails or times out, so an application never
   // treats a lost write as safe.
   async sync() {
@@ -1856,7 +1856,7 @@ class DurableObjectStorage {
       // A callback can call a helper that reaches the root `ctx.storage`
       // handle instead of the transaction view, and the helper starts its own
       // synchronous transaction. Workerd nests that one under the open
-      // transaction; celld attempted a second top-level BEGIN and failed with
+      // transaction; cello attempted a second top-level BEGIN and failed with
       // "cannot start a transaction within a transaction"
       // (denoland/celld#226). The open view takes the call instead, so it
       // becomes a savepoint: an inner rollback then discards only the inner
@@ -2009,7 +2009,7 @@ class DurableObjectStorage {
     // shuts, so no other event starts in the object while the transaction is
     // open. Without it another event's reads saw uncommitted rows, its
     // writes joined the open transaction on the same connection, and a
-    // rollback discarded a write celld had already acknowledged (#714). The
+    // rollback discarded a write cello had already acknowledged (#714). The
     // callback's failure is caught inside the block: a failed transaction
     // rolls back and rejects, and must not reset the object the way a failed
     // critical section does.
@@ -2305,7 +2305,7 @@ class DurableObjectFacets {
           loader, className, manager._state._scope, record.owner, name, id,
           propsSc, req.url, req.method, body, headers, streamId));
         const responseBody = response.streamId !== undefined
-          ? new CelldHttpBodyStream(response.streamId)
+          ? new CelloHttpBodyStream(response.streamId)
           : response.body !== undefined ? response.body
           : Uint8Array.from(response.bodyBytes || []);
         // The facet's socket lives in the facet's isolate. The target lets
@@ -2576,7 +2576,7 @@ class Container {
   // dropped with its event, so the flag it would maintain could go stale.
   get running() { return __container_running(this._scope); }
   // The class's images by name, as on Cloudflare (`ctx.container.images`).
-  // celld deploys one image per class, so `default` is the only entry, and
+  // Cello deploys one image per class, so `default` is the only entry, and
   // it is what `start({ image })` takes.
   get images() { return CONTAINER_IMAGES; }
   start(options) {
@@ -2734,25 +2734,25 @@ class Container {
       id, pid, stdinMode, stdoutMode, stderrMode, isPty, signal);
   }
   inspect() {
-    return Promise.reject(new Error("inspect() is not implemented in celld"));
+    return Promise.reject(new Error("inspect() is not implemented in cello"));
   }
   snapshotDirectory() {
-    return Promise.reject(new Error("snapshotDirectory() is not implemented in celld"));
+    return Promise.reject(new Error("snapshotDirectory() is not implemented in cello"));
   }
   snapshotContainer() {
-    return Promise.reject(new Error("snapshotContainer() is not implemented in celld"));
+    return Promise.reject(new Error("snapshotContainer() is not implemented in cello"));
   }
   interceptOutboundHttp() {
-    return Promise.reject(new Error("interceptOutboundHttp() is not implemented in celld"));
+    return Promise.reject(new Error("interceptOutboundHttp() is not implemented in cello"));
   }
   interceptOutboundHttps() {
-    return Promise.reject(new Error("interceptOutboundHttps() is not implemented in celld"));
+    return Promise.reject(new Error("interceptOutboundHttps() is not implemented in cello"));
   }
   interceptAllOutboundHttp() {
-    return Promise.reject(new Error("interceptAllOutboundHttp() is not implemented in celld"));
+    return Promise.reject(new Error("interceptAllOutboundHttp() is not implemented in cello"));
   }
   interceptOutboundTcp() {
-    return Promise.reject(new Error("interceptOutboundTcp() is not implemented in celld"));
+    return Promise.reject(new Error("interceptOutboundTcp() is not implemented in cello"));
   }
 }
 class DurableObjectState {
@@ -3474,7 +3474,7 @@ __celld.__makeLoader = () => {
         }
         const r = JSON.parse(await response);
         const responseBody = r.streamId !== undefined
-          ? new CelldHttpBodyStream(r.streamId)
+          ? new CelloHttpBodyStream(r.streamId)
           : r.body !== undefined ? r.body : Uint8Array.from(r.bodyBytes || []);
         // A 101 from the loaded worker carries its socket as a join target;
         // `__wrapServiceResponse` binds the caller end to it, as for a
@@ -3810,7 +3810,7 @@ const __makeServiceBinding = __celld.__makeServiceBinding =
         script, req.url, req.method, body, headers, streamId, entrypoint,
         propsSc)));
     const responseBody = r.streamId !== undefined
-      ? new CelldHttpBodyStream(r.streamId)
+      ? new CelloHttpBodyStream(r.streamId)
       : r.body !== undefined
         ? r.body
         : Uint8Array.from(r.bodyBytes || []);
@@ -4051,7 +4051,7 @@ const __rpcProject = (value) => {
 // context and refuse to serialize elsewhere; pipeline nodes refuse
 // foreign awaits and calls -- each with Workerd's exact error.
 let __nextCtxId = 1;
-const __ctxKey = Symbol("celld.ctx");
+const __ctxKey = Symbol("cello.ctx");
 // The innermost `__ctxRun` id for synchronous execution. V8 snapshots
 // CPED when a promise reaction is registered and restores it while the
 // reaction runs -- but synchronous execution runs under no reaction, so
@@ -4522,7 +4522,7 @@ const __stubResolve = (target, prop) => {
     throw __rpcNoSuchMethod(prop);
   }
   const value = target[prop];
-  // Keep celld's own stubs and pipeline nodes unwrapped because the wrapper
+  // Keep cello's own stubs and pipeline nodes unwrapped because the wrapper
   // would lose their metadata.
   return typeof value === "function" && !__stubMeta.has(value) &&
       !(value instanceof __cf.RpcPromise) &&
@@ -6612,7 +6612,7 @@ class DurableObjectNamespace {
           );
         }));
         const body = r.streamId !== undefined
-          ? new CelldHttpBodyStream(r.streamId)
+          ? new CelloHttpBodyStream(r.streamId)
           : r.body !== undefined
             ? r.body
             : Uint8Array.from(r.bodyBytes || []);
@@ -6710,7 +6710,7 @@ __celld.__makeIncomingRequest = (
   url, method, body, headersJson, streamId,
 ) => __makeRequest(
   url, method,
-  streamId === undefined ? body : new CelldHttpBodyStream(streamId),
+  streamId === undefined ? body : new CelloHttpBodyStream(streamId),
   headersJson, undefined, true);
 const __dispatchTo = __celld.__dispatchTo = async (
   scope, url, method, body, headersJson, requestId = null, bodyStreamId = null,
@@ -6718,7 +6718,7 @@ const __dispatchTo = __celld.__dispatchTo = async (
 ) => {
   // A routed body that must not be collected crosses as a host stream id; the
   // handler here reads it in parts. A held body arrives as its bytes.
-  if (bodyStreamId !== null) body = new CelldHttpBodyStream(bodyStreamId);
+  if (bodyStreamId !== null) body = new CelloHttpBodyStream(bodyStreamId);
   // Request already allocates a default controller for an absent signal.
   // Retain that same allocation so a streamed response can report reader
   // cancellation after the handler has returned.
@@ -7599,7 +7599,7 @@ __celld.__wsClosed = async (scope, wsId, code, reason, wasClean) => {
         socket._dispatchClose(code, reason, wasClean);
       else if (!wasClean && typeof inst.webSocketError === "function")
         // A hibernatable socket reports an abnormal closure through
-        // webSocketError, which celld listed as a handler name and never
+        // webSocketError, which cello listed as a handler name and never
         // called.
         await inst.webSocketError(
           socket,
@@ -7613,7 +7613,7 @@ __celld.__wsClosed = async (scope, wsId, code, reason, wasClean) => {
     __endActorEvent(actorEvent);
   }
 };
-// called by celld's scheduler when an alarm is due. Returns a promise.
+// called by cello's scheduler when an alarm is due. Returns a promise.
 __celld.__fireAlarm = async (scope, scheduledTime, retryCount, isRedrive) => {
   const actorEvent = __beginActorEvent(scope);
   // An alarm is an invocation: a stub the handler revives dies with it.
@@ -7628,7 +7628,7 @@ __celld.__fireAlarm = async (scope, scheduledTime, retryCount, isRedrive) => {
     __endActorEvent(actorEvent);
   }
 };
-// The reserved cron cell. It is not a user class: celld registers it under
+// The reserved cron cell. It is not a user class: cello registers it under
 // `.cron` for every deployment that declares `triggers.crons`, and one cell
 // per script carries that script's whole schedule. Ownership CAS on that one
 // name is what makes a cron trigger fire once per fleet rather than once per
@@ -7637,7 +7637,7 @@ __celld.__fireAlarm = async (scope, scheduledTime, retryCount, isRedrive) => {
 // The schedule itself is never stored here. `__cell.crons` comes from the
 // deployment the cell is running under, so changing a cron expression takes
 // effect on the next activation and needs no migration of an armed alarm.
-class CelldCronSchedule {
+class CelloCronSchedule {
   constructor(state) {
     this._state = state;
     // Failures within one occurrence. Held in memory on purpose: losing the
@@ -7653,7 +7653,7 @@ class CelldCronSchedule {
     // eviction costs the retry, never the next occurrence.
     this._owed = null;
   }
-  // celld calls this once per node after a deployment loads, because a cron
+  // Cello calls this once per node after a deployment loads, because a cron
   // cell has no client to wake it. Arming is idempotent -- the same schedule
   // and the same clock give the same answer -- so it does not matter which
   // node wins the cell.
@@ -7747,7 +7747,7 @@ const __cell = __celld.__cell = {
   entrypoints: {},
   objectEntrypoints: {},
   doExports: {},
-  classes: { ".cron": CelldCronSchedule },
+  classes: { ".cron": CelloCronSchedule },
   crons: [],
   workflows: {},
   containers: {},
@@ -9183,7 +9183,7 @@ class __QueueCell {
   }
 
   async _purge(request) {
-    this._requireOperator(request, "purge", "celld queue purge");
+    this._requireOperator(request, "purge", "cello queue purge");
     const now = Date.now();
     const sql = this._open();
     let deleted = 0;
@@ -9242,7 +9242,7 @@ class __QueueCell {
     this._requireOperator(
       request,
       paused ? "pause" : "resume",
-      paused ? "celld queue pause" : "celld queue resume",
+      paused ? "cello queue pause" : "cello queue resume",
     );
     this._setMeta("paused", paused ? "1" : null);
     await this._rearm();
@@ -9258,7 +9258,7 @@ class __QueueCell {
   }
 
   _peek(limit, request) {
-    this._requireOperator(request, "peek", "celld queue peek");
+    this._requireOperator(request, "peek", "cello queue peek");
     const now = Date.now();
     const cutoff = now - __queueLimits().retentionMs;
     const rows = this._open().exec(
@@ -9302,7 +9302,7 @@ class __QueueCell {
   }
 
   async _redrive(limit, request) {
-    this._requireOperator(request, "redrive", "celld queue redrive");
+    this._requireOperator(request, "redrive", "cello queue redrive");
     // Finish an interrupted move before selecting more work. A transfer mark
     // is durable, so selecting it a second time would invent another identity
     // where replaying the existing identity is sufficient.
@@ -9380,7 +9380,7 @@ class __QueueCell {
           : new Response("stale Queue settlement", { status: 409 });
       }
       if (body.op === "info") {
-        if (!operator) return refuse("info", "celld queue info");
+        if (!operator) return refuse("info", "cello queue info");
         const metrics = this._metrics();
         const stored = this._open().exec(
           `SELECT stored_count FROM ${__QUEUE_STATS} WHERE id = 1`,
@@ -9388,25 +9388,25 @@ class __QueueCell {
         return Response.json({ result: { ...metrics, stored, paused: this._paused() } });
       }
       if (body.op === "purge") {
-        if (!operator) return refuse("purge", "celld queue purge");
+        if (!operator) return refuse("purge", "cello queue purge");
         return Response.json({ result: await this._purge(request) });
       }
       if (body.op === "pause") {
-        if (!operator) return refuse("pause", "celld queue pause");
+        if (!operator) return refuse("pause", "cello queue pause");
         return Response.json({ result: await this._setPaused(true, request) });
       }
       if (body.op === "resume") {
-        if (!operator) return refuse("resume", "celld queue resume");
+        if (!operator) return refuse("resume", "cello queue resume");
         return Response.json({ result: await this._setPaused(false, request) });
       }
       if (body.op === "peek") {
-        if (!operator) return refuse("peek", "celld queue peek");
+        if (!operator) return refuse("peek", "cello queue peek");
         return Response.json({
           result: this._peek(this._operatorLimit(body.limit, 10), request),
         });
       }
       if (body.op === "redrive") {
-        if (!operator) return refuse("redrive", "celld queue redrive");
+        if (!operator) return refuse("redrive", "cello queue redrive");
         return Response.json({
           result: await this._redrive(this._operatorLimit(body.limit, 100), request),
         });
@@ -9559,7 +9559,7 @@ class __D1DatabaseCell {
       })),
     });
   }
-  // The CLI's way in. `celld d1` signs each request with the fleet secret
+  // The CLI's way in. `cello d1` signs each request with the fleet secret
   // and sends it to a live node's `/runtime/<scope>` route, which verifies the
   // signature and then forwards to the owner over the same dispatch `/do/`
   // uses -- so the CLI needs no ownership logic and the database is reached
@@ -9585,7 +9585,7 @@ class __D1DatabaseCell {
     try {
       let result;
       if (body.migrate !== undefined) {
-        if (!operator) return refuse("migrate", "celld d1 migrations apply");
+        if (!operator) return refuse("migrate", "cello d1 migrations apply");
         result = this.__d1Migrate(
           String(body.migrate.name),
           String(body.migrate.sql),
@@ -9593,14 +9593,14 @@ class __D1DatabaseCell {
         );
       } else if (body.exec !== undefined) {
         // The CLI asks for rows; the Worker binding's exec() never does.
-        if (!!body.exec.rows && !operator) return refuse("exec with rows", "celld d1 execute");
+        if (!!body.exec.rows && !operator) return refuse("exec with rows", "cello d1 execute");
         result = __d1Run(this.ctx.storage.sql._scope, {
           mode: "exec",
           sql: String(body.exec.sql),
           rows: !!body.exec.rows,
         });
       } else if (body.export !== undefined) {
-        if (!operator) return refuse("export", "celld d1 export");
+        if (!operator) return refuse("export", "cello d1 export");
         result = this.__d1Export(body.export || {});
       } else if (body.batch !== undefined) {
         // The CLI's batch path rides the Worker's own __d1Batch, so the two
@@ -9763,10 +9763,10 @@ const __d1PublicResult = (result) => ({
   results: result.rows.map((row) => __d1Shape(result.columns, row)),
 });
 
-// celld has one primary and no replicas, so every completed query satisfies
+// Cello has one primary and no replicas, so every completed query satisfies
 // every earlier session constraint. One stable opaque token states that fact
 // without pretending an isolate-local counter is a durable database position.
-const __d1PrimaryBookmark = "celld:primary";
+const __d1PrimaryBookmark = "cello:primary";
 
 class D1DatabaseSession {
   constructor(database, constraintOrBookmark) {
@@ -9853,7 +9853,7 @@ class D1Database {
   }
   async dump() {
     throw __d1Error(
-      "dump() is not implemented in celld; the database is a SQLite file in " +
+      "dump() is not implemented in cello; the database is a SQLite file in " +
         "your own bucket",
     );
   }
@@ -9894,7 +9894,7 @@ const __WF_RETRY_LIMIT_CAP = 10000;
 const __WF_STEP_NAME_LIMIT = 256;
 const __WF_MAX_WAIT_MS = 365 * 86400000;
 const __WF_MIN_EVENT_TIMEOUT_MS = 1000;
-// celld has no account plans, so it exposes the larger published retention
+// Cello has no account plans, so it exposes the larger published retention
 // ceiling as one stable application limit. Both an omitted policy and an
 // omitted member of a partial policy use this value.
 const __WF_RETENTION_MAX_MS = 30 * 86400000;
@@ -9944,7 +9944,7 @@ const __wfRetentionDuration = (value, what) => {
   const durationMs = __wfDuration(value, what);
   if (durationMs > __WF_RETENTION_MAX_MS) {
     throw __wfError(
-      `${what} is ${durationMs} ms, above celld's 30-day retention limit`,
+      `${what} is ${durationMs} ms, above cello's 30-day retention limit`,
     );
   }
   return durationMs;
@@ -9956,7 +9956,7 @@ const __wfUnknownKey = (value, allowed) =>
 const __wfStepName = (name) => {
   // The pinned workers-sdk validator has no minimum length. An empty name is
   // therefore valid, although rejecting it looks safer at first glance. A
-  // non-empty check made celld reject Worker code that the upstream runtime
+  // non-empty check made cello reject Worker code that the upstream runtime
   // accepts, so keep only the upstream length and control-character bounds.
   if (
     typeof name !== "string" || name.length > __WF_STEP_NAME_LIMIT ||
@@ -10183,7 +10183,7 @@ const __wfEncodeValue = (value, what) => {
   } catch (error) {
     const failure = __wfError(
       `${what} is not serializable: ${String(error && error.message || error)}. ` +
-        "It must survive structured clone; a ReadableStream return is not implemented in celld.",
+        "It must survive structured clone; a ReadableStream return is not implemented in cello.",
     );
     failure.__wfPermanent = true;
     throw failure;
@@ -10247,7 +10247,7 @@ const __wfKindCheck = (record, kind, name) => {
 // inner step, so `running` never reaches zero and the instance can neither
 // suspend nor finish. The frame is what lets the inner call refuse loudly
 // at the nesting site instead.
-const __wfStepKey = Symbol("celld.wfStep");
+const __wfStepKey = Symbol("cello.wfStep");
 const __wfEnclosingStep = () => {
   const frame = __als_get();
   return frame === undefined ? undefined : frame.get(__wfStepKey);
@@ -10395,12 +10395,12 @@ const __wfMakeStep = (driver) => {
     }
     if (rollback !== undefined) {
       return Promise.reject(__wfError(
-        "step rollbackOptions are not implemented in celld; remove the rollback handler",
+        "step rollbackOptions are not implemented in cello; remove the rollback handler",
       ));
     }
     if (config.sensitive !== undefined) {
       return Promise.reject(__wfError(
-        "sensitive step output is not implemented in celld; remove `sensitive`",
+        "sensitive step output is not implemented in cello; remove `sensitive`",
       ));
     }
     if (typeof callback !== "function") {
@@ -10487,7 +10487,7 @@ const __wfMakeStep = (driver) => {
         }
         // Upstream documents the backoff names, not the arithmetic; the
         // simplest reading is used and recorded in the design page. When
-        // `retries` is given without `backoff`, celld uses constant -- the
+        // `retries` is given without `backoff`, cello uses constant -- the
         // documented exponential default is the whole-config-omitted case.
         const dynamic = typeof retries.delay === "function";
         const delay = dynamic
@@ -11284,7 +11284,7 @@ class NonRetryableError extends Error {
 }
 // Backing object for the `cloudflare:workflows` builtin module.
 __celld.__cfWorkflows = { NonRetryableError };
-// `celld:python`, imported only by the Python Worker bundle.
+// `cello:python`, imported only by the Python Worker bundle.
 __celld.__pythonHost = {
   condemnIsolate: (reason) => __isolate_condemn(String(reason)),
 };
@@ -11334,7 +11334,7 @@ class WorkflowInstance {
   async terminate(options) {
     if (options && options.rollback) {
       throw __wfError(
-        "terminate({rollback: true}) is not implemented in celld; step " +
+        "terminate({rollback: true}) is not implemented in cello; step " +
           "rollbackOptions are not implemented, so no handler could run",
       );
     }
@@ -11566,8 +11566,8 @@ const __nodeStubFor = __celld.__nodeStubFor = (path) => {
       if (typeof p !== "string") return undefined;
       return __nodeStubFor(path + "." + p);
     },
-    apply() { throw new Error(path + " is not implemented in celld"); },
-    construct() { throw new Error(path + " is not implemented in celld"); },
+    apply() { throw new Error(path + " is not implemented in cello"); },
+    construct() { throw new Error(path + " is not implemented in cello"); },
   });
   __stubCache.set(path, stub);
   return stub;
@@ -12328,7 +12328,7 @@ for (const n of ["WebSocket", "EventTarget", "Event", "MessageEvent",
   "TextEncoderStream", "TextDecoderStream"]) {
   if (!globalThis[n]) globalThis[n] = class {};
 }
-// These have no implementation anywhere in celld. An empty class would
+// These have no implementation anywhere in cello. An empty class would
 // let `new BroadcastChannel(...)` hand back an inert object that fails
 // far from the cause; the compat contract is "reject at first use", so
 // the name loads but construction throws. (EventSource, MessageChannel,
@@ -12336,13 +12336,13 @@ for (const n of ["WebSocket", "EventTarget", "Event", "MessageEvent",
 for (const n of ["BroadcastChannel", "FileReader"]) {
   if (!globalThis[n]) globalThis[n] = class {
     constructor() {
-      throw new Error(n + " is not implemented in celld");
+      throw new Error(n + " is not implemented in cello");
     }
   };
 }
 const __sockets = __celld.__sockets = new Map();
 globalThis.WebSocket = class WebSocket extends EventTarget {
-  // The spec names, which workerd exposes and real bundles use. celld only
+  // The spec names, which workerd exposes and real bundles use. cello only
   // had the READY_STATE_* aliases, which no other runtime defines.
   static CONNECTING = 0;
   static OPEN = 1;
@@ -12519,7 +12519,7 @@ globalThis.WebSocket = class WebSocket extends EventTarget {
   accept() {
     this._accepted = true;
     // A pair used directly, without being returned through a 101 response,
-    // still has to carry frames once both ends are accepted. celld only
+    // still has to carry frames once both ends are accepted. cello only
     // linked a pair on the upgrade path, so such a pair queued forever.
     if (this._peer && this._peer._accepted && !this._loopback) {
       this._loopback = this._peer;
@@ -12922,7 +12922,7 @@ __celld.__zlibModule = {
 // defined even though nothing in a cell has an executable path, a parent
 // process, or a real exit code. The values match workerd's
 // `src/node/internal/public_process.ts` at workerd revision 04a08513a419
-// (2026-09-04); celld does not invent its own, because a dependency that reads
+// (2026-09-04); cello does not invent its own, because a dependency that reads
 // them is comparing them to what workerd reports. A field whose workerd
 // implementation throws at that revision -- `kill`, `binding`, `dlopen`,
 // `cpuUsage` -- stays absent, because it fails on both runtimes and a stub

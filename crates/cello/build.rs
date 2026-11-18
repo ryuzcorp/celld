@@ -3,8 +3,8 @@
 
 //! Bake the full build version into `CELLO_VERSION` for `version::version`.
 //!
-//! Release builds set `CELLO_VERSION` (`<version>-ryuzcorp.<n>`, and
-//! `<version>-ryuzcorp.ci` in CI); a plain `cargo build` leaves it unset
+//! Release builds set `CELLO_VERSION` (the release version, and
+//! `<version>-cello.ci` in CI); a plain `cargo build` leaves it unset
 //! and the binary reports the crate version instead.
 
 fn main() {

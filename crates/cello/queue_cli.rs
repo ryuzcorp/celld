@@ -3,7 +3,7 @@
 // Operator commands read the process environment for their fleet settings.
 #![allow(clippy::disallowed_methods)]
 
-//! `celld queue` — inspect and operate a deployed Queue broker.
+//! `cello queue` — inspect and operate a deployed Queue broker.
 //!
 //! The command reaches the reserved Queue cell through the authenticated fleet
 //! operator route. It does not read SQLite or implement a queue transition.
@@ -40,7 +40,7 @@ pub async fn run(arguments: Vec<String>) -> anyhow::Result<()> {
         print_help();
         return Ok(());
     };
-    let storage = command.fleet.resolve("celld queue")?;
+    let storage = command.fleet.resolve("cello queue")?;
     let queue = Reachable::open(
         Fleet {
             bucket: &storage.bucket,
@@ -105,12 +105,12 @@ impl Command {
         let verb = match verb.as_str() {
             "--help" | "-h" | "help" => return Ok(None),
             verb @ ("info" | "purge" | "pause" | "resume" | "peek" | "redrive") => verb,
-            other => bail!("unknown `celld queue` subcommand: {other}"),
+            other => bail!("unknown `cello queue` subcommand: {other}"),
         };
         let queue = arguments
             .next()
             .filter(|value| !value.starts_with('-'))
-            .ok_or_else(|| anyhow!("celld queue {verb} needs a queue name"))?;
+            .ok_or_else(|| anyhow!("cello queue {verb} needs a queue name"))?;
         if !cello_logic::cell::valid_cell_scope(&queue) {
             bail!(
                 "queue name {queue:?} cannot name a cell; use ASCII letters, digits, and `_ - . : $`"
@@ -140,9 +140,9 @@ impl Command {
                     );
                 }
                 // These flags select a Cloudflare account API or a Miniflare
-                // store. A celld queue belongs to exactly one named fleet.
+                // store. A cello queue belongs to exactly one named fleet.
                 flag @ ("--local" | "--remote") => bail!(
-                    "celld queue does not take {flag}; a queue name addresses one queue in one fleet"
+                    "cello queue does not take {flag}; a queue name addresses one queue in one fleet"
                 ),
                 "--help" | "-h" => return Ok(None),
                 other => {
@@ -150,23 +150,23 @@ impl Command {
                         continue;
                     }
                     if other.starts_with('-') {
-                        bail!("unknown option: {other}; run `celld queue --help` for usage")
+                        bail!("unknown option: {other}; run `cello queue --help` for usage")
                     }
                     bail!(
-                        "celld queue {verb} takes no positional argument after the queue name: \
+                        "cello queue {verb} takes no positional argument after the queue name: \
                          {other:?}"
                     )
                 }
             }
         }
         if verb != "purge" && force {
-            bail!("`celld queue {verb}` takes no --force");
+            bail!("`cello queue {verb}` takes no --force");
         }
         if verb == "purge" && !force {
-            bail!("celld queue purge permanently removes messages; repeat with --force");
+            bail!("cello queue purge permanently removes messages; repeat with --force");
         }
         if !matches!(verb, "peek" | "redrive") && limit.is_some() {
-            bail!("`celld queue {verb}` takes no --limit");
+            bail!("`cello queue {verb}` takes no --limit");
         }
         let action = match verb {
             "info" => Action::Info,
@@ -189,15 +189,15 @@ impl Command {
 
 pub fn print_help() {
     let text = format!(
-        "celld queue — inspect and operate a deployed Queue
+        "cello queue — inspect and operate a deployed Queue
 
 USAGE
-  celld queue info    QUEUE                  [fleet options]
-  celld queue peek    QUEUE [--limit N]      [fleet options]
-  celld queue purge   QUEUE --force          [fleet options]
-  celld queue pause   QUEUE                  [fleet options]
-  celld queue resume  QUEUE                  [fleet options]
-  celld queue redrive QUEUE [--limit N]      [fleet options]
+  cello queue info    QUEUE                  [fleet options]
+  cello queue peek    QUEUE [--limit N]      [fleet options]
+  cello queue purge   QUEUE --force          [fleet options]
+  cello queue pause   QUEUE                  [fleet options]
+  cello queue resume  QUEUE                  [fleet options]
+  cello queue redrive QUEUE [--limit N]      [fleet options]
 
 QUEUE OPERATIONS
   info       report the backlog, stored rows, and delivery state

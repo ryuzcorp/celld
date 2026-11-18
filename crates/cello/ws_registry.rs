@@ -1891,7 +1891,7 @@ fn drain_settled(
             id,
             WsOut::Close(
                 1011,
-                "celld could not prove the write behind this message durable".to_string(),
+                "cello could not prove the write behind this message durable".to_string(),
             ),
         ));
     } else if queue.is_empty() {

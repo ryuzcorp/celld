@@ -54,7 +54,7 @@
 //! resolver, so a proxied tenant fetch cannot be policed. Open mode keeps
 //! reqwest's default proxy handling byte-identically.
 //!
-//! What the policy does not cover: celld's own traffic — the object
+//! What the policy does not cover: cello's own traffic — the object
 //! store, peer, control, telemetry, and container-engine clients — never
 //! goes through these checks (each uses its own client, proxies
 //! included), and dials to container endpoints this node published to

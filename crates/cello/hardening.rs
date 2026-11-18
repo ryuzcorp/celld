@@ -19,18 +19,18 @@
 //!
 //! `execve` resets the flag, so every serving process must set it again
 //! after it starts. `main` does that before it reads anything else, and
-//! every way celld starts a serving process (the node, `celld dev`'s
+//! every way cello starts a serving process (the node, `cello dev`'s
 //! supervisor and its node, the control plane's credential-rotation
 //! re-exec) passes through `main` with its serving arguments. Operator
-//! commands (`celld deploy`, `d1`, `r2`, ...) stay dumpable: they are not
+//! commands (`cello deploy`, `d1`, `r2`, ...) stay dumpable: they are not
 //! long-lived, and an operator debugging one needs to attach.
 //!
 //! The guarantee holds from that call onward, not from `execve`: between
 //! the two the process is still dumpable, and a same-uid sibling can read
-//! its environment. Initial boot, `celld dev`'s node respawn, and the
+//! its environment. Initial boot, `cello dev`'s node respawn, and the
 //! control-plane credential-rotation re-exec each pay that window. Closing
 //! it needs the flag set before the image runs (a launcher, or a wrapper
-//! that clears the environment), which celld does not do.
+//! that clears the environment), which cello does not do.
 //!
 //! A child a serving process spawns inherits that environment, and
 //! `execve` makes the child dumpable again — `PR_SET_DUMPABLE` does not

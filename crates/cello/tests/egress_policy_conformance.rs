@@ -8,7 +8,7 @@
 #![allow(clippy::disallowed_methods)]
 
 //! Conformance for the tenant egress policy (`CELLO_EGRESS=public`): one
-//! `celld dev` boots with the loopback echo port allowlisted, proxy
+//! `cello dev` boots with the loopback echo port allowlisted, proxy
 //! variables pointing at a blackhole listener, and the fixture worker
 //! driving every outbound path — `fetch()` to each denied range (by
 //! literal and by hostname), an allowlisted fetch, a wrong-port fetch, a
@@ -55,7 +55,7 @@ fn copy_dir(src: &Path, dst: &Path, echo_port: u16) {
     std::fs::write(dst.join("wrangler.json"), manifest).expect("write manifest");
 }
 
-/// A booted `celld dev` and its address. Kills the child on drop, so a
+/// A booted `cello dev` and its address. Kills the child on drop, so a
 /// failing assertion cannot leak a server onto its port.
 struct TestNode {
     child: Child,
@@ -82,7 +82,7 @@ impl TestNode {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .expect("spawn celld dev");
+            .expect("spawn cello dev");
         let mut stdout = child.stdout.take().expect("piped stdout");
         let stderr = child.stderr.take().expect("piped stderr");
         // Drain stdout so a chatty child can never block on a full pipe.
@@ -108,11 +108,11 @@ impl TestNode {
         node.public = poll_until("boot", Duration::from_secs(120), || {
             if let Some(status) = node.child.try_wait().expect("poll child") {
                 panic!(
-                    "celld dev exited during boot: {status}: {}",
+                    "cello dev exited during boot: {status}: {}",
                     announced_lines.lock().expect("announce lock").join("\n")
                 );
             }
-            let public = announced(&announced_lines, "celld listening on ")?;
+            let public = announced(&announced_lines, "cello listening on ")?;
             if !probe(&public, "/health") {
                 return None;
             }
@@ -384,7 +384,7 @@ fn assert_fetch_refused(node: &TestNode, path: &str, address: &str) {
 #[test]
 fn egress_policy_conformance() {
     let dir = tempfile::Builder::new()
-        .prefix("celld-egress-")
+        .prefix("cello-egress-")
         .tempdir()
         .expect("tempdir");
     let echo = EchoServer::start();

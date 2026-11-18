@@ -7,7 +7,7 @@
 //! frame per demanded page.
 //!
 //! An LTX file ends with `[page index][8-byte index length][16-byte trailer]`,
-//! and every object celld writes carries the index (`codec::Encoder::close`),
+//! and every object cello writes carries the index (`codec::Encoder::close`),
 //! so the map reads the index tail-first and never downloads the frames it does
 //! not need.
 
@@ -355,7 +355,7 @@ pub fn prefetch_plan(pgno: u32, page: &[u8]) -> Prefetch {
 /// A synchronous page reader over a [`PageMap`] for the paged SQLite VFS:
 /// the pinned cut's map plus a blocking [`RangeReader`] for its objects.
 ///
-/// celld's VFS faults a missing page into a local sparse main-db file, so
+/// Cello's VFS faults a missing page into a local sparse main-db file, so
 /// SQLite then runs entirely normally over that file (WAL, page-1 writes,
 /// checkpoint) and the local file is the cache. This source therefore holds no
 /// cache and does not rewrite page 1: it just serves the pinned cut's bytes for

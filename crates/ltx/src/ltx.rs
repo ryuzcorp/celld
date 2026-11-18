@@ -65,7 +65,7 @@ pub fn lock_pgno(page_size: u32) -> u32 {
 
 /// Streaming CRC64-ISO hasher matching Go's `hash/crc64` digest semantics
 /// (CRC-64/GO-ISO). `crc-fast` keeps the exact streaming result while using
-/// SIMD folding on the architectures that celld ships.
+/// SIMD folding on the architectures that Cello ships.
 #[derive(Clone)]
 pub struct Crc64 {
     digest: crc_fast::Digest,
@@ -484,7 +484,7 @@ pub fn decode_database_image(bytes: &[u8]) -> Result<Vec<u8>> {
 
 /// Encodes a complete LTX file with the legacy LZ4 frame representation.
 ///
-/// This function preserves the current celld write format during the staged
+/// This function preserves the current cello write format during the staged
 /// v0.5.2 reader rollout. [`decode_file`] accepts this representation and the
 /// v0.5.2 block representation.
 pub fn encode_file(

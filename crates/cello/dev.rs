@@ -1,12 +1,12 @@
-// Modified by ryuzcorp (ryuzcorp/celld): operator token for the internal listener; `celld dev --port 0` assigns an ephemeral port; staged activation; deploy --read-root option; non-dumpable serving process; local state path helper for d1 --local (upstream #272); dev --state with marker-guarded clean (upstream #302).
+// Modified by ryuzcorp (ryuzcorp/celld): operator token for the internal listener; `cello dev --port 0` assigns an ephemeral port; staged activation; deploy --read-root option; non-dumpable serving process; local state path helper for d1 --local (upstream #272); dev --state with marker-guarded clean (upstream #302).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 // Modified by ryuzcorp (ryuzcorp/celld): deploy --sourcemap writes the bundle's external map.
 
-//! The local application stack behind `celld dev`.
+//! The local application stack behind `cello dev`.
 //!
 //! Development still uses the standalone deployment, ownership, and LTX
 //! paths. This module supplies only the infrastructure those paths require:
-//! one persisted local object store and one supervised celld node.
+//! one persisted local object store and one supervised cello node.
 
 use crate::bucket::Bucket;
 use crate::{deploy, fleet};
@@ -26,7 +26,7 @@ use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, oneshot};
 
 pub const DEFAULT_PORT: u16 = 9876;
-const BUCKET: &str = "celld-dev";
+const BUCKET: &str = "cello-dev";
 
 /// The narrow bridge used by the supervised binary process. The public fleet
 /// parser never receives this path, so no regular subcommand can select it.
@@ -63,13 +63,13 @@ impl DevState {
     /// The project-relative location of the local state, and also the suffix
     /// that `discard` requires before it deletes a directory it did not
     /// create.
-    const DIRECTORY: &'static str = ".celld/dev";
+    const DIRECTORY: &'static str = ".cello/dev";
 
     /// The marker `prepare_state` writes into every state directory it
     /// creates. `--clean` over an explicit `--state` directory deletes
-    /// only when the marker proves celld created it: the directory is
-    /// arbitrary, so the `.celld/dev` suffix cannot prove that.
-    const MARKER: &'static str = ".celld-dev-state";
+    /// only when the marker proves cello created it: the directory is
+    /// arbitrary, so the `.cello/dev` suffix cannot prove that.
+    const MARKER: &'static str = ".cello-dev-state";
 
     fn for_project(project: &Path) -> Self {
         Self {
@@ -81,7 +81,7 @@ impl DevState {
     /// An explicit state directory, from `--state` or `CELLO_DEV_STATE`.
     /// Unlike `for_project` this names an arbitrary directory, so only
     /// the marker authorizes a delete — even when the path happens to end
-    /// in `.celld/dev`.
+    /// in `.cello/dev`.
     fn for_state(dir: PathBuf) -> Self {
         Self {
             path: dir,
@@ -90,7 +90,7 @@ impl DevState {
     }
 
     /// The state directory for one project: the `--state` flag wins, then
-    /// `CELLO_DEV_STATE`, then `PROJECT/.celld/dev`. Operator commands
+    /// `CELLO_DEV_STATE`, then `PROJECT/.cello/dev`. Operator commands
     /// (`d1 --local`) take the same `--state` flag and resolve through this
     /// too, so they follow the override.
     pub(crate) fn resolve(project: &Path, flag: Option<PathBuf>) -> Self {
@@ -117,11 +117,11 @@ impl DevState {
     }
 
     /// The SQLite file behind one project's local state, for operator
-    /// commands that reach the `celld dev` node through it (`d1 --local`).
+    /// commands that reach the `cello dev` node through it (`d1 --local`).
     /// Pure path math: the caller decides what a missing file means.
     /// `state` is the command's `--state` flag, so the operator command
-    /// resolves exactly like `celld dev`: the flag, then `CELLO_DEV_STATE`,
-    /// then `PROJECT/.celld/dev`. `environment` is the lookup
+    /// resolves exactly like `cello dev`: the flag, then `CELLO_DEV_STATE`,
+    /// then `PROJECT/.cello/dev`. `environment` is the lookup
     /// `CELLO_DEV_STATE` resolves through, so tests pass an empty one
     /// instead of inheriting the developer's shell.
     pub(crate) fn database_for_project(
@@ -140,8 +140,8 @@ impl DevState {
 
     /// The project directory a Wrangler config belongs to: the parent of the
     /// canonicalized config path, so a symlinked config resolves to the same
-    /// project — and the same `.celld/dev` — that `celld dev` runs in. Both
-    /// `celld dev` and `d1 --local` resolve through this, so the state
+    /// project — and the same `.cello/dev` — that `cello dev` runs in. Both
+    /// `cello dev` and `d1 --local` resolve through this, so the state
     /// directory never depends on which spelling of the config path named it.
     /// Pure path math beside the canonicalization: the caller decides what a
     /// missing directory means.
@@ -161,7 +161,7 @@ impl DevState {
 
     /// Only project-relative state proves itself by suffix. An explicit
     /// `--state` path never does, even when it happens to end in
-    /// `.celld/dev`: only the marker authorizes a delete or an adoption
+    /// `.cello/dev`: only the marker authorizes a delete or an adoption
     /// there.
     fn is_project_state(&self) -> bool {
         !self.explicit && self.path.ends_with(Self::DIRECTORY)
@@ -177,7 +177,7 @@ impl DevState {
     fn discard(&self) -> anyhow::Result<bool> {
         // A project-relative state directory proves itself by suffix. An
         // explicit `--state` directory is arbitrary, so only the marker
-        // that `prepare_state` writes proves celld created it: `--clean`
+        // that `prepare_state` writes proves cello created it: `--clean`
         // must never delete a directory the operator pointed at by
         // mistake. The check stays a refusal rather than a fallback,
         // because a recursive delete must never widen by accident.
@@ -186,7 +186,7 @@ impl DevState {
                 return Ok(false);
             }
             anyhow::bail!(
-                "refusing to discard {}, which is not a celld dev state directory",
+                "refusing to discard {}, which is not a cello dev state directory",
                 self.path.display()
             );
         }
@@ -237,7 +237,7 @@ impl Console {
     }
 
     fn header(&self) {
-        crate::note!("{}", self.paint(Color::Cyan.bold(), "celld dev"));
+        crate::note!("{}", self.paint(Color::Cyan.bold(), "cello dev"));
     }
 
     fn detail(&self, label: &str, value: &str) {
@@ -431,8 +431,8 @@ fn ignored_project_path(
     // directory and its lexical spelling below the project are excluded:
     // notify follows a symlinked state directory and can report either
     // spelling. An external state directory never shares either prefix
-    // and keeps working; the default `.celld/dev` stays ignored through
-    // the `.celld` rule below too.
+    // and keeps working; the default `.cello/dev` stays ignored through
+    // the `.cello` rule below too.
     if !state.as_os_str().is_empty() && path.starts_with(state) {
         return true;
     }
@@ -441,7 +441,7 @@ fn ignored_project_path(
     }
     const IGNORED_DIRECTORIES: &[&str] = &[
         ".cache",
-        ".celld",
+        ".cello",
         ".git",
         ".hg",
         ".next",
@@ -529,20 +529,20 @@ impl ShutdownSignals {
 
 pub fn print_help() -> anyhow::Result<()> {
     crate::cli_output::Output::new(crate::cli_output::Format::Text).help(
-        &format!("celld dev — run an application with persistent local storage\n\n\
-USAGE:\n  celld dev [PROJECT] [--host IP] [--port PORT] [--logs] [--no-watch] [--clean] [--state DIR]\n\n\
+        &format!("cello dev — run an application with persistent local storage\n\n\
+USAGE:\n  cello dev [PROJECT] [--host IP] [--port PORT] [--logs] [--no-watch] [--clean] [--state DIR]\n\n\
 PROJECT is a directory or a Wrangler config. It defaults to the current\n\
-directory. celld stores all local state in PROJECT/.celld/dev — or in DIR\n\
+directory. cello stores all local state in PROJECT/.cello/dev — or in DIR\n\
 when --state (or CELLO_DEV_STATE) names one, keeping the state outside the\n\
 source tree — and it keeps that state across a restart. A configuration\n\
 change does not migrate the state, so a cell can keep a value that the new\n\
 configuration rejects. Use --clean to start from an empty local state;\n\
-over an explicit state directory --clean deletes only what celld created.\n\n\
+over an explicit state directory --clean deletes only what Cello created.\n\n\
 A .dev.vars file beside the config supplies Worker variables in dotenv form,\n\
 as for wrangler dev. Without one, .env and then .env.local supply them, and\n\
 an entry of these files that cannot be a binding is skipped with a warning.\n\
 The entries override the vars of the config.\n\n\
-OPTIONS:\n  --host IP              Worker listener host (default: 127.0.0.1)\n  --port PORT            Worker listener port (default: {DEFAULT_PORT}; 0 assigns an ephemeral port)\n  --clean                Delete the local state before the server starts\n  --state DIR            Keep local state in DIR instead of PROJECT/.celld/dev\n                         (CELLO_DEV_STATE sets the same); --clean removes DIR\n                         only when celld created it\n  --logs                 Show the node warning and information logs\n  --no-watch             Do not rebuild when a project file changes\n  --watch-ignore PATTERN Ignore a project-relative glob; repeat as needed\n  -h, --help             Show this help"
+OPTIONS:\n  --host IP              Worker listener host (default: 127.0.0.1)\n  --port PORT            Worker listener port (default: {DEFAULT_PORT}; 0 assigns an ephemeral port)\n  --clean                Delete the local state before the server starts\n  --state DIR            Keep local state in DIR instead of PROJECT/.cello/dev\n                         (CELLO_DEV_STATE sets the same); --clean removes DIR\n                         only when cello created it\n  --logs                 Show the node warning and information logs\n  --no-watch             Do not rebuild when a project file changes\n  --watch-ignore PATTERN Ignore a project-relative glob; repeat as needed\n  -h, --help             Show this help"
         ),
     )
 }
@@ -587,15 +587,15 @@ fn options_from_arguments(arguments: Vec<String>) -> anyhow::Result<Option<Optio
                 let value = arguments.next().context("--port requires a value")?;
                 // Zero is an ephemeral port: the node binds it and the
                 // supervisor learns the assigned address from the node's
-                // announce line, so parallel `celld dev` instances never
+                // announce line, so parallel `cello dev` instances never
                 // race on a probed-free port.
                 port = value
                     .parse::<u16>()
                     .with_context(|| format!("invalid --port value {value:?}"))?;
             }
-            other if other.starts_with('-') => bail!("unknown argument for `celld dev`: {other}"),
+            other if other.starts_with('-') => bail!("unknown argument for `cello dev`: {other}"),
             value if project.is_none() => project = Some(PathBuf::from(value)),
-            value => bail!("celld dev accepts one PROJECT, but also received {value:?}"),
+            value => bail!("cello dev accepts one PROJECT, but also received {value:?}"),
         }
     }
     if !watch && !watch_ignores.is_empty() {
@@ -672,7 +672,7 @@ fn prepare_state(state: &DevState) -> anyhow::Result<()> {
     // Fail closed on adoption: an explicit `--state` directory is arbitrary,
     // so one that already exists non-empty without the marker is foreign —
     // refusing here keeps a later `--clean` from ever seeing a marker in a
-    // directory celld did not create. A missing directory is fresh and
+    // directory cello did not create. A missing directory is fresh and
     // proceeds; any other read error propagates. Project-relative state
     // proves itself by suffix and gains the marker on first start, and a
     // new or empty explicit directory is adopted. The check runs before
@@ -682,7 +682,7 @@ fn prepare_state(state: &DevState) -> anyhow::Result<()> {
             Ok(mut entries) => {
                 if entries.next().is_some() {
                     anyhow::bail!(
-                        "refusing to adopt {}, which is not a celld dev state directory",
+                        "refusing to adopt {}, which is not a cello dev state directory",
                         state.path.display()
                     );
                 }
@@ -701,8 +701,8 @@ fn prepare_state(state: &DevState) -> anyhow::Result<()> {
     }
     // The proof of authorship `--clean` requires before it deletes an
     // explicit `--state` directory. Written on every start, so a state
-    // directory made by an older celld gains it on first use.
-    std::fs::write(state.marker(), "celld dev state\n")
+    // directory made by an older Cello gains it on first use.
+    std::fs::write(state.marker(), "cello dev state\n")
         .with_context(|| format!("mark local state directory {}", state.path.display()))?;
     Ok(())
 }
@@ -719,11 +719,11 @@ async fn open_store(state: &Path, console: &Console) -> anyhow::Result<Store> {
     Ok(Store { database })
 }
 
-/// The Worker variables for `celld dev`, from the files that `wrangler dev`
+/// The Worker variables for `cello dev`, from the files that `wrangler dev`
 /// reads beside the config (Wrangler getVarsForDev()). A `.dev.vars` file
 /// wins outright. Without one, `.env` and then `.env.local` apply, and a later
 /// file overrides an earlier one. Each entry overrides the `vars` of the
-/// config. Only `celld dev` reads the files, so a local credential cannot
+/// config. Only `cello dev` reads the files, so a local credential cannot
 /// reach a fleet.
 fn read_dev_vars(config: &Path) -> anyhow::Result<deploy::VarOverrides> {
     // A present `.dev.vars` replaces the dotenv files even when it is empty,
@@ -829,7 +829,7 @@ async fn deploy_project(config: &Path, store: &Store, logs: bool) -> anyhow::Res
         json: false,
         vars: read_dev_vars(config)?,
         local_images: true,
-        // `celld dev` serves locally; deployment source maps are a deploy concern.
+        // `cello dev` serves locally; deployment source maps are a deploy concern.
         sourcemap: None,
         read_roots: Vec::new(),
         no_activate: false,
@@ -885,7 +885,7 @@ async fn run_stack(
                 if status.success() {
                     return Ok(());
                 }
-                bail!("the local celld node exited with {status}");
+                bail!("the local cello node exited with {status}");
             }
             NodeEvent::Shutdown => {
                 stop_running_node(running).await;
@@ -934,12 +934,12 @@ async fn start_node(
     store: &Store,
     console: &Console,
 ) -> anyhow::Result<RunningNode> {
-    let executable = std::env::current_exe().context("locate the celld executable")?;
+    let executable = std::env::current_exe().context("locate the cello executable")?;
     let listen = listener.to_string();
     let mut command = Command::new(executable);
     // The supervisor owns the child's complete storage and listener topology.
     // Inherited fleet settings can otherwise override that private topology or
-    // make its guard reject a valid `celld dev` invocation.
+    // make its guard reject a valid `cello dev` invocation.
     for variable in [
         "AWS_DEFAULT_REGION",
         "AWS_REGION",
@@ -975,7 +975,7 @@ async fn start_node(
     // path. An error or cancellation can instead drop it, so the child must
     // not outlive the value that proves the supervisor still owns it.
     command.kill_on_drop(true);
-    // The child re-execs `celld` with serving arguments, so it makes itself
+    // The child re-execs `cello` with serving arguments, so it makes itself
     // non-dumpable in `main` like any node (`hardening`, patch 0053). The
     // supervisor does the same at its own start; `execve` resets the flag,
     // which is why the child sets it again rather than inheriting it.
@@ -1013,7 +1013,7 @@ async fn start_node(
             });
         }
     }
-    let mut child = command.spawn().context("start the local celld node")?;
+    let mut child = command.spawn().context("start the local cello node")?;
 
     let stdout = child
         .stdout
@@ -1096,14 +1096,14 @@ async fn start_node(
 
 fn internal_origin(line: &str) -> Option<String> {
     let address = line
-        .strip_prefix("celld internal listening on ")?
+        .strip_prefix("cello internal listening on ")?
         .split_once(' ')?
         .0;
     Some(format!("http://{address}"))
 }
 
 fn public_origin(line: &str) -> Option<SocketAddr> {
-    let address = line.strip_prefix("celld listening on ")?.split_once(' ')?.0;
+    let address = line.strip_prefix("cello listening on ")?.split_once(' ')?.0;
     address.parse().ok()
 }
 
@@ -1119,13 +1119,13 @@ async fn wait_for_node(child: &mut Child, listener: SocketAddr) -> anyhow::Resul
         address => address,
     };
     let url = format!(
-        "http://{}/.well-known/celld/health",
+        "http://{}/.well-known/cello/health",
         SocketAddr::new(readiness_host, listener.port())
     );
     let mut last = "the node did not answer".to_string();
     for _ in 0..300 {
         if let Some(status) = child.try_wait().context("read the local node status")? {
-            bail!("the local celld node exited during startup with {status}");
+            bail!("the local cello node exited during startup with {status}");
         }
         match client.get(&url).send().await {
             Ok(response) if response.status().is_success() => return Ok(()),
@@ -1134,7 +1134,7 @@ async fn wait_for_node(child: &mut Child, listener: SocketAddr) -> anyhow::Resul
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    bail!("the local celld node did not become ready: {last}")
+    bail!("the local cello node did not become ready: {last}")
 }
 
 async fn wait_for_node_event(
@@ -1144,7 +1144,7 @@ async fn wait_for_node_event(
 ) -> anyhow::Result<NodeEvent> {
     crate::asyncrt::select! {
         status = child.wait() => {
-            let status = status.context("wait for the local celld node")?;
+            let status = status.context("wait for the local cello node")?;
             Ok(NodeEvent::Exited(status))
         }
         _ = signals.received() => Ok(NodeEvent::Shutdown),
@@ -1246,7 +1246,7 @@ mod dev_tests {
         let resolve = |flag: Option<&str>, env: Option<&str>| {
             DevState::resolve_with(project, flag.map(PathBuf::from), env.map(PathBuf::from)).path
         };
-        assert_eq!(resolve(None, None), project.join(".celld/dev"));
+        assert_eq!(resolve(None, None), project.join(".cello/dev"));
         assert_eq!(
             resolve(None, Some("/env/state")),
             std::path::PathBuf::from("/env/state")
@@ -1261,20 +1261,20 @@ mod dev_tests {
             resolve(Some(""), Some("/env/state")),
             std::path::PathBuf::from("/env/state")
         );
-        assert_eq!(resolve(Some(""), None), project.join(".celld/dev"));
+        assert_eq!(resolve(Some(""), None), project.join(".cello/dev"));
         assert_eq!(
             resolve(Some("   "), Some("/env/state")),
             std::path::PathBuf::from("/env/state")
         );
-        assert_eq!(resolve(None, Some(" \t ")), project.join(".celld/dev"));
-        assert_eq!(resolve(Some("  "), None), project.join(".celld/dev"));
+        assert_eq!(resolve(None, Some(" \t ")), project.join(".cello/dev"));
+        assert_eq!(resolve(Some("  "), None), project.join(".cello/dev"));
     }
 
     /// The watcher excludes the resolved state directory: SQLite and WAL
     /// writes under an in-project `--state` directory must not request a
     /// rebuild — each rebuild writes state again, so the supervisor would
     /// loop without a source change — while source files still rebuild,
-    /// the default `.celld/dev` stays ignored, and an external state
+    /// the default `.cello/dev` stays ignored, and an external state
     /// directory changes nothing.
     #[test]
     fn watcher_excludes_the_resolved_state_directory() {
@@ -1303,8 +1303,8 @@ mod dev_tests {
         assert!(!relevant(&state, &state));
         // Sources beside the state directory still rebuild.
         assert!(relevant(&state, &project.path().join("worker.js")));
-        // The default state stays ignored through the `.celld` rule too.
-        let default_state = project.path().join(".celld").join("dev");
+        // The default state stays ignored through the `.cello` rule too.
+        let default_state = project.path().join(".cello").join("dev");
         assert!(!relevant(
             &default_state,
             &default_state.join("objects.sqlite3")
@@ -1415,9 +1415,9 @@ mod dev_tests {
     }
 
     /// `prepare_state` fails closed on adoption and `--clean` deletes only
-    /// what celld created: a marked directory goes away, a non-empty foreign
+    /// what Cello created: a marked directory goes away, a non-empty foreign
     /// one is refused by both with its contents intact and no marker left
-    /// behind — even when it happens to end in `.celld/dev`, since the
+    /// behind — even when it happens to end in `.cello/dev`, since the
     /// suffix only exempts project-relative state — and a missing one is
     /// already clean.
     #[test]
@@ -1433,7 +1433,7 @@ mod dev_tests {
         std::fs::write(foreign.path().join("precious.txt"), "keep\n").unwrap();
         let foreign_state = DevState::for_state(foreign.path().to_path_buf());
         // The start itself must refuse before it writes anything, so a
-        // later `--clean` never finds a marker celld planted in a
+        // later `--clean` never finds a marker cello planted in a
         // directory it did not create.
         let error = prepare_state(&foreign_state)
             .expect_err("adopting a foreign directory must be refused");
@@ -1450,11 +1450,11 @@ mod dev_tests {
             "the refusal must say so: {error:?}"
         );
         assert!(foreign.path().join("precious.txt").exists());
-        // A foreign directory that happens to end in `.celld/dev` is still
+        // A foreign directory that happens to end in `.cello/dev` is still
         // foreign: the suffix only exempts project-relative state, never an
         // explicit `--state` path.
         let shaped = tempfile::tempdir().unwrap();
-        let shaped_dir = shaped.path().join(".celld/dev");
+        let shaped_dir = shaped.path().join(".cello/dev");
         std::fs::create_dir_all(&shaped_dir).unwrap();
         std::fs::write(shaped_dir.join("precious.txt"), "keep\n").unwrap();
         let shaped_state = DevState::for_state(shaped_dir.clone());
@@ -1479,12 +1479,12 @@ mod dev_tests {
     }
 
     /// Back-compat: project-relative state is suffix-exempt, so a non-empty
-    /// directory from an older celld gains the marker on first start; a new
+    /// directory from an older Cello gains the marker on first start; a new
     /// or empty explicit directory is adopted the same way.
     #[test]
     fn prepare_state_adopts_project_and_empty_explicit_directories() {
         let project = tempfile::tempdir().unwrap();
-        let legacy = project.path().join(".celld/dev");
+        let legacy = project.path().join(".cello/dev");
         std::fs::create_dir_all(&legacy).unwrap();
         std::fs::write(legacy.join("objects.sqlite3"), "old\n").unwrap();
         let state = DevState::for_project(project.path());
@@ -1501,8 +1501,8 @@ mod dev_tests {
 
     #[test]
     fn announce_parsers_split_worker_and_operator_lines() {
-        let worker = "celld listening on 127.0.0.1:40349 (ownership=dev-abc)";
-        let operator = "celld internal listening on 127.0.0.1:51234 (advertise=none)";
+        let worker = "cello listening on 127.0.0.1:40349 (ownership=dev-abc)";
+        let operator = "cello internal listening on 127.0.0.1:51234 (advertise=none)";
         assert_eq!(
             public_origin(worker),
             Some("127.0.0.1:40349".parse().expect("addr"))
@@ -1514,7 +1514,7 @@ mod dev_tests {
         );
         assert_eq!(internal_origin(worker), None);
         assert_eq!(
-            public_origin("celld listening on bogus (ownership=x)"),
+            public_origin("cello listening on bogus (ownership=x)"),
             None
         );
     }

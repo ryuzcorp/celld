@@ -3,7 +3,7 @@
 // Modified by ryuzcorp (ryuzcorp/celld): shared ephemeral-port boot helpers (0077).
 
 //! Shared boot helpers for the black-box runner tests: each test boots the
-//! real `celld dev` binary and polls TCP with wall-clock deadlines.
+//! real `cello dev` binary and polls TCP with wall-clock deadlines.
 //!
 //! The dev node's public port is ephemeral (`--port 0`); the node's own
 //! announce lines on the supervisor's stderr (`--logs` forwards them) name
@@ -15,9 +15,9 @@
 use std::io::{BufRead, BufReader};
 use std::sync::{Arc, Mutex};
 
-/// One address of a `celld dev` node, from the announce line the supervisor
-/// forwards to its stderr: `celld listening on <addr> (` names the public
-/// listener, `celld internal listening on <addr> (` the internal one.
+/// One address of a `cello dev` node, from the announce line the supervisor
+/// forwards to its stderr: `cello listening on <addr> (` names the public
+/// listener, `cello internal listening on <addr> (` the internal one.
 pub fn announced(lines: &Mutex<Vec<String>>, prefix: &str) -> Option<String> {
     lines
         .lock()

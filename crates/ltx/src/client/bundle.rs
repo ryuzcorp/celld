@@ -1,7 +1,7 @@
 //! A [`ReplicaClient`] overlay that makes bundle-resident L0 segments
 //! visible beside a real per-cell client.
 //!
-//! celld-original, not a Litestream port, and self-contained like
+//! cello-original, not a Litestream port, and self-contained like
 //! `crate::bundle`: nothing else in this crate depends on it. The overlay
 //! is how the additive compactor drains bundles — it lists and opens
 //! bundle rows as if they were ordinary per-cell L0 files (the bytes ARE
@@ -23,7 +23,7 @@ use crate::error::Result;
 use crate::ltx::FileInfo;
 use crate::TXID;
 
-/// A bundle row plus the opaque source (for celld: the bundle object key)
+/// A bundle row plus the opaque source (for cello: the bundle object key)
 /// it can be fetched from.
 #[derive(Clone, Debug)]
 pub struct LocatedRow {

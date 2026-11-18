@@ -1,6 +1,6 @@
 // Modified by ryuzcorp (ryuzcorp/celld): cancelled-request lazy-init conformance (upstream #294). Apache-2.0.
 
-// A black-box runner, not node code: it boots the real `celld dev` binary,
+// A black-box runner, not node code: it boots the real `cello dev` binary,
 // cancels one Durable Object request mid-flight by closing its TCP
 // connection, and asserts the next request to the same object answers, so
 // the execution boundary's injected clock/filesystem/async rules do not
@@ -21,7 +21,7 @@
 //! white-box by `retired_event_attribution` (upstream #317), which shares
 //! the cancel path.
 //!
-//! One `celld dev` boots the fixture per test. No fixed sleeps: the abort
+//! One `cello dev` boots the fixture per test. No fixed sleeps: the abort
 //! waits on the `/started` handshake, and the server guard kills the child
 //! on every exit path.
 
@@ -53,7 +53,7 @@ fn copy_dir(src: &Path, dst: &Path) {
     }
 }
 
-/// A booted `celld dev` and its address. Kills the child on drop, so a
+/// A booted `cello dev` and its address. Kills the child on drop, so a
 /// failing assertion cannot leak a server onto its port.
 struct TestNode {
     child: Child,
@@ -72,7 +72,7 @@ impl TestNode {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .expect("spawn celld dev");
+            .expect("spawn cello dev");
         let mut stdout = child.stdout.take().expect("piped stdout");
         let stderr = child.stderr.take().expect("piped stderr");
         // Drain stdout so a chatty child can never block on a full pipe.
@@ -112,11 +112,11 @@ fn poll_boot(node: &mut TestNode, announced_lines: &Arc<Mutex<Vec<String>>>) -> 
     loop {
         if let Some(status) = node.child.try_wait().expect("poll child") {
             panic!(
-                "celld dev exited during boot: {status}: {}",
+                "cello dev exited during boot: {status}: {}",
                 announced_lines.lock().expect("announce lock").join("\n")
             );
         }
-        if let Some(public) = announced(announced_lines, "celld listening on ") {
+        if let Some(public) = announced(announced_lines, "cello listening on ") {
             if probe(&public) {
                 return public;
             }
@@ -196,7 +196,7 @@ fn abort_request_after_start(addr: &str) {
 #[test]
 fn cancelled_request_leaves_no_pending_lazy_init() {
     let dir = tempfile::Builder::new()
-        .prefix("celld-cancelled-lazy-")
+        .prefix("cello-cancelled-lazy-")
         .tempdir()
         .expect("tempdir");
     let project = dir.path().join("app");

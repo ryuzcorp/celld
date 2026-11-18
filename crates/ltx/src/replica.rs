@@ -31,13 +31,13 @@
 //!   `Start`/`Stop`: need a Tokio task owning the `Db`; the
 //!   synchronous `sync()` primitive it would call is implemented here.
 //! * **V3 (v0.3.x generation) restore** (`RestoreV3`, replica.go:990-1096) is not
-//!   included because celld has no earlier replica generation to support.
+//!   included because cello has no earlier replica generation to support.
 //! * **Timestamp / `-txid` targeted restore plumbing through the public API**:
 //!   [`calc_restore_plan`] honors a target TXID, but the
 //!   timestamp path and `RestoreOptions` surface stay minimal for the one-shot.
 
 // Restore phase durations are diagnostics in this stand-alone public crate.
-// celld injects its scheduling facilities at the engine boundary.
+// Cello injects its scheduling facilities at the engine boundary.
 #![allow(clippy::disallowed_methods)]
 
 use crate::client::ReplicaClient;
@@ -76,7 +76,7 @@ const RESTORE_PLAN_CONCURRENCY: usize = SNAPSHOT_LEVEL as usize + 1;
 /// True only for errors that say the local/replica state itself diverged. A
 /// transient store or IO error is not one of these: a fenced single writer's
 /// position is still valid, and its re-upload is an idempotent overwrite. See
-/// [`Replica::sync`] for why celld narrows Litestream's clear-on-any-error.
+/// [`Replica::sync`] for why cello narrows Litestream's clear-on-any-error.
 ///
 /// The walk follows `source()` the way Go's `errors.Is` follows `%w`, and it
 /// also steps into a [`SyncStepError`], which hides its cause from `source()`.
@@ -145,7 +145,7 @@ pub struct Replica<C: ReplicaClient> {
     /// Seeded true at activation (see [`Self::seed_pos`]); reset false only when
     /// a divergence error says the position can no longer be trusted. Upstream
     /// has no equivalent -- it lists whenever `pos` is zero -- which is the
-    /// listing celld's fencing lets it skip.
+    /// listing cello's fencing lets it skip.
     pos_known: bool,
 }
 
@@ -208,7 +208,7 @@ impl<C: ReplicaClient> Replica<C> {
 
     /// Seed the replicated position from the caller's known-durable state and
     /// mark it known, so the next sync skips the `calc_pos` listing. A fresh
-    /// cell seeds 0; a just-restored cell seeds its restored max. celld always
+    /// cell seeds 0; a just-restored cell seeds its restored max. cello always
     /// knows this at activation -- local equals remote under epoch fencing --
     /// so the listing that only existed to re-discover the position, and that
     /// storms a rate-limiting store, is not issued on the activation path.
@@ -230,7 +230,7 @@ impl<C: ReplicaClient> Replica<C> {
                 // Litestream clears the cached position on *any* error so the
                 // next sync re-derives it with a `calc_pos` listing
                 // (replica.go:137-143) -- safe there only because it is single-
-                // node with no fencing. celld fences one writer per epoch
+                // node with no fencing. cello fences one writer per epoch
                 // through the store, so within an epoch a transient store/IO
                 // error does not invalidate our own position; re-uploads are
                 // idempotent overwrites. Forget the position only when the
@@ -247,7 +247,7 @@ impl<C: ReplicaClient> Replica<C> {
 
     async fn sync_inner(&mut self) -> Result<()> {
         // Re-derive the replica position with a listing only when it is not
-        // already known (replica.go:146-152). celld seeds it at activation from
+        // already known (replica.go:146-152). cello seeds it at activation from
         // local state that equals the remote under epoch fencing, so a listing
         // -- which only ever re-discovered a position the owner already knows --
         // never runs on the hot path, and a fresh cell's pointless list of an

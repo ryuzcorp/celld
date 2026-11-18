@@ -228,7 +228,7 @@ impl DeploymentGraph {
     ///
     /// A service binding names a script, and that script's own pointer names
     /// its deployment — unless the fleet-wide pointer carries an activated
-    /// generation (`celld activate`), in which case every script resolves
+    /// generation (`cello activate`), in which case every script resolves
     /// from that one pointer read and the adoption is atomic across
     /// scripts. A queue dependency names a queue, and the queue's consumer
     /// attachment names an exact deployment. The walk refuses a script that
@@ -319,7 +319,7 @@ impl DeploymentGraph {
                     else {
                         if let Some(script) = declared_by {
                             anyhow::bail!(
-                                "script {script:?} consumes queue {queue:?}, but the queue has no active consumer attachment; re-run `celld activate` (or `celld deploy` for a single script) to converge the queue attachments"
+                                "script {script:?} consumes queue {queue:?}, but the queue has no active consumer attachment; re-run `cello activate` (or `cello deploy` for a single script) to converge the queue attachments"
                             );
                         }
                         continue;
@@ -334,7 +334,7 @@ impl DeploymentGraph {
                     if let Some(prefix) = loaded_scripts.get(&consumer.script_name) {
                         anyhow::ensure!(
                             prefix == &consumer.prefix,
-                            "queue {queue:?} is attached to deployment {} of script {:?}, but deployment {prefix} is already loaded; re-run `celld activate` (or `celld deploy` for a single script) to converge the queue attachments",
+                            "queue {queue:?} is attached to deployment {} of script {:?}, but deployment {prefix} is already loaded; re-run `cello activate` (or `cello deploy` for a single script) to converge the queue attachments",
                             consumer.version,
                             consumer.script_name
                         );
@@ -362,7 +362,7 @@ impl DeploymentGraph {
                         })?;
                         anyhow::ensure!(
                             pinned.version == consumer.version && pinned.prefix == consumer.prefix,
-                            "queue {queue:?} is attached to deployment {} of script {:?}, but the activated generation names {}; re-run `celld activate` to converge the queue attachments",
+                            "queue {queue:?} is attached to deployment {} of script {:?}, but the activated generation names {}; re-run `cello activate` to converge the queue attachments",
                             consumer.version,
                             consumer.script_name,
                             pinned.version
@@ -412,7 +412,7 @@ impl DeploymentGraph {
 }
 
 impl DeploymentGraph {
-    /// Resolve the staged versions a `celld invoke` names: the target
+    /// Resolve the staged versions a `cello invoke` names: the target
     /// script as primary, plus every service-binding target it reaches,
     /// transitively.
     ///
@@ -563,7 +563,7 @@ impl DeploymentGraph {
 }
 
 /// The pointer for one staged script version: the deterministic version
-/// directory `celld deploy --no-activate` uploaded, never a mutable
+/// directory `cello deploy --no-activate` uploaded, never a mutable
 /// pointer. The caller validates the name and version shapes first, and
 /// [`fleet::load_pinned_worker`] re-checks the manifest identity, so a
 /// corrupt entry fails the load instead of serving the wrong code.
@@ -653,7 +653,7 @@ pub struct Generation {
     /// Every container class of every script in the graph.
     pub(crate) containers: Vec<crate::container::ContainerSpec>,
     /// See `Manifest::fence_image`; the first script's, they are all the
-    /// same image when one celld deployed them.
+    /// same image when one Cello deployed them.
     pub(crate) fence_image: Option<String>,
 }
 

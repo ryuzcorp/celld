@@ -1,6 +1,6 @@
 // Modified by ryuzcorp (ryuzcorp/celld): waitUntil background storage transaction conformance (upstream #300). Apache-2.0.
 
-// A black-box runner, not node code: it boots the real `celld dev` binary,
+// A black-box runner, not node code: it boots the real `cello dev` binary,
 // drives a WebSocket pair like the issue's reproduction, and asserts the
 // background storage transactions complete, so the execution boundary's
 // injected clock/filesystem/async rules do not apply to it.
@@ -23,7 +23,7 @@
 //! idling while background work is outstanding, the registering event stays
 //! alive to lend its context, and the handoff lands on a live mailbox.
 //!
-//! One `celld dev` boots the fixture per test. There are no fixed sleeps:
+//! One `cello dev` boots the fixture per test. There are no fixed sleeps:
 //! every wait polls an observable condition with a deadline, and the server
 //! guard kills the child on every exit path.
 
@@ -55,7 +55,7 @@ fn copy_dir(src: &Path, dst: &Path) {
     }
 }
 
-/// A booted `celld dev` and its address. Kills the child on drop, so a
+/// A booted `cello dev` and its address. Kills the child on drop, so a
 /// failing assertion cannot leak a server onto its port.
 struct TestNode {
     child: Child,
@@ -74,7 +74,7 @@ impl TestNode {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .expect("spawn celld dev");
+            .expect("spawn cello dev");
         let mut stdout = child.stdout.take().expect("piped stdout");
         let stderr = child.stderr.take().expect("piped stderr");
         // Drain stdout so a chatty child can never block on a full pipe.
@@ -100,11 +100,11 @@ impl TestNode {
         node.public = poll_until("boot", Duration::from_secs(120), || {
             if let Some(status) = node.child.try_wait().expect("poll child") {
                 panic!(
-                    "celld dev exited during boot: {status}: {}",
+                    "cello dev exited during boot: {status}: {}",
                     announced_lines.lock().expect("announce lock").join("\n")
                 );
             }
-            let public = announced(&announced_lines, "celld listening on ")?;
+            let public = announced(&announced_lines, "cello listening on ")?;
             if !probe(&public, "/health") {
                 return None;
             }
@@ -283,7 +283,7 @@ impl WsClient {
 #[test]
 fn waituntil_background_storage_transactions_complete() {
     let dir = tempfile::Builder::new()
-        .prefix("celld-waituntil-tx-")
+        .prefix("cello-waituntil-tx-")
         .tempdir()
         .expect("tempdir");
     let project = dir.path().join("app");

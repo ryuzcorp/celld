@@ -11,7 +11,7 @@
 // conditional and range answers -- and every answer built from a stored
 // entry carries `CF-Cache-Status: HIT`. See docs/services/cache.md.
 (function () {
-  const kCreate = Symbol("celld.Cache.create");
+  const kCreate = Symbol("cello.Cache.create");
 
   // A key is a Request or URL string, and it must parse as an absolute
   // http(s) URL -- the same rule and message as Workerd's validateUrl.

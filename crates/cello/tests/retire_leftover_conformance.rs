@@ -14,7 +14,7 @@
 //! reclaimed. Past the background budget the driver ends the background
 //! work and the generation drains.
 //!
-//! The node runs `celld dev`; a staged v2 adopted through `POST /reload`
+//! The node runs `cello dev`; a staged v2 adopted through `POST /reload`
 //! moves the cell to a new generation, stranding the first request's
 //! leftover work on the old isolate. The test waits for the old generation
 //! to be freed. Without the bound it never is. There are no fixed sleeps:
@@ -74,7 +74,7 @@ fn copy_dir(src: &Path, dst: &Path) {
     }
 }
 
-/// A booted `celld dev` and its addresses. Kills the child on drop, so a
+/// A booted `cello dev` and its addresses. Kills the child on drop, so a
 /// failing assertion cannot leak a server onto its port.
 struct TestNode {
     child: Child,
@@ -103,7 +103,7 @@ impl TestNode {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .expect("spawn celld dev");
+            .expect("spawn cello dev");
         let mut stdout = child.stdout.take().expect("piped stdout");
         let stderr = child.stderr.take().expect("piped stderr");
         // Drain stdout so a chatty child can never block on a full pipe;
@@ -127,15 +127,15 @@ impl TestNode {
         let addrs = poll_until("boot", Duration::from_secs(180), || {
             if let Some(status) = node.child.try_wait().expect("poll child") {
                 panic!(
-                    "celld dev exited during boot: {status}: {}",
+                    "cello dev exited during boot: {status}: {}",
                     announced_lines.lock().expect("announce lock").join("\n")
                 );
             }
-            let public = announced(&announced_lines, "celld listening on ")?;
+            let public = announced(&announced_lines, "cello listening on ")?;
             if !probe(&public, "/health") {
                 return None;
             }
-            let internal = announced(&announced_lines, "celld internal listening on ")?;
+            let internal = announced(&announced_lines, "cello internal listening on ")?;
             Some(format!("{public}\n{internal}"))
         });
         let mut addrs = addrs.splitn(2, '\n');
@@ -231,7 +231,7 @@ fn log_lines(node: &TestNode, needle: &str) -> Vec<String> {
 
 #[test]
 fn retiring_generation_frees_its_isolates() {
-    let dir = fixture_tempdir("celld-retire-leftover-");
+    let dir = fixture_tempdir("cello-retire-leftover-");
     let app_project = dir.path().join("app");
     copy_dir(&fixture_dir(), &app_project);
     let node = TestNode::boot(&app_project);
@@ -268,7 +268,7 @@ fn retiring_generation_frees_its_isolates() {
             .expect("tokio runtime");
         cello::asyncrt::set_host_handle(rt.handle().clone());
         rt.block_on(async {
-            let database = app_project.join(".celld/dev/objects.sqlite3");
+            let database = app_project.join(".cello/dev/objects.sqlite3");
             let bucket = cello::dev::open_local_bucket(&database).expect("open dev bucket");
             cello::fleet::validate_bucket(&bucket)
                 .await

@@ -63,7 +63,7 @@
   // standard ones.
   const _curveName = (curve) =>
     curve === "NODE-ED25519" ? "Ed25519" : String(curve ?? "");
-  // The curves celld carries, under every spelling Web Crypto and Node use.
+  // The curves cello carries, under every spelling Web Crypto and Node use.
   const _EC_CURVES = {
     "P-256": "P-256", "prime256v1": "P-256", "secp256r1": "P-256",
     "P-384": "P-384", "secp384r1": "P-384",
@@ -96,7 +96,7 @@
   // public point rather than a DER document.
   const _OKP_CURVES = { "ED25519": "Ed25519", "NODE-ED25519": "Ed25519",
     "X25519": "X25519" };
-  // Algorithms whose keys are asymmetric, whatever celld can then *do* with
+  // Algorithms whose keys are asymmetric, whatever cello can then *do* with
   // them: import validates the key, and an unsupported operation throws
   // later at sign/verify/encrypt rather than here. Derived from the table
   // above, not written twice: an algorithm that imports but has no reported
@@ -673,7 +673,7 @@
       if (kind !== undefined) {
         const options = { type: kind };
         if (kind === "rsa") {
-          // Only 3 and 65537 are legal exponents, and celld generates with
+          // Only 3 and 65537 are legal exponents, and cello generates with
           // 65537. Rejecting the rest here is what stops a pathological
           // exponent reaching the prime search at all.
           const raw = algorithm?.publicExponent;
@@ -977,7 +977,7 @@
   // Cloudflare's DigestStream: a WritableStream that hashes what is written
   // to it and resolves `digest` when the stream closes. Not Web Crypto, and
   // the reason a Worker can hash a body it never has to hold whole -- though
-  // celld buffers here, as its Hash already does.
+  // Cello buffers here, as its Hash already does.
   class DigestStream extends WritableStream {
     constructor(algorithm) {
       const name = _algorithmName(algorithm);

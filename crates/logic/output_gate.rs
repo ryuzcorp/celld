@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): ported from meln1k/celld: 51 code probes on the core's rare branches (b026226); shared bucket-posture ownership reads across concurrent gates (0056).
+// Modified by ryuzcorp (ryuzcorp/celld): ported from meln1k/cello: 51 code probes on the core's rare branches (b026226); shared bucket-posture ownership reads across concurrent gates (0056).
 // Modified by ryuzcorp (ryuzcorp/celld): round-level fence settlement (0062).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 

@@ -1,4 +1,4 @@
-// The stand-alone file replica is an external ReplicaClient backend. Celld
+// The stand-alone file replica is an external ReplicaClient backend. Cello
 // production uses the injected local node filesystem and an object client.
 #![allow(clippy::disallowed_methods)]
 

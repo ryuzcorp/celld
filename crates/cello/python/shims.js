@@ -1,6 +1,6 @@
 // Lexical globals for the upstream Pyodide loader in a Python Worker bundle.
 //
-// `celld deploy` injects this module into the generated bundle with esbuild's
+// `cello deploy` injects this module into the generated bundle with esbuild's
 // `--inject`, so each name below shadows the global of the same name only
 // inside the bundle. The isolate's own globals are untouched.
 //
@@ -40,7 +40,7 @@ export async function fetch(input, init) {
 }
 
 // JSPI members are omitted. Pyodide 0.28 turns on stack switching when it
-// finds `WebAssembly.Suspending`, and in celld each awaited async entry then
+// finds `WebAssembly.Suspending`, and in Cello each awaited async entry then
 // leaks 48 bytes of the 5 MiB Emscripten stack until an entry hangs. Without
 // them Pyodide uses its non-switching path, so `pyodide.ffi.run_sync` and
 // JS imports that need it are unavailable. Revisit when the pinned runtime

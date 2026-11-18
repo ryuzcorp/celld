@@ -6,7 +6,7 @@
 
 //! Outbound WebSocket client.
 //!
-//! celld serves WebSockets with fastwebsockets, and connects with it too. That
+//! cello serves WebSockets with fastwebsockets, and connects with it too. That
 //! matters most on the peer hop: a frame relayed from a client to the cell's
 //! owner is framed, masked, and closed by one implementation on both sides
 //! rather than translated between two.
@@ -113,7 +113,7 @@ pub async fn connect(url: &str, extra: HeaderMap) -> Result<Connection, Error> {
     connect_with_policy(url, extra, Some(crate::egress::EgressPolicy::global())).await
 }
 
-/// Open a WebSocket for celld's own control traffic. Never subject to
+/// Open a WebSocket for cello's own control traffic. Never subject to
 /// the tenant policy: the node must always reach its control plane.
 pub async fn connect_internal(url: &str, extra: HeaderMap) -> Result<Connection, Error> {
     connect_with_policy(url, extra, None).await

@@ -1166,7 +1166,7 @@ fn lease_request_logging_on() -> bool {
 /// Report one completed node-lease store request on the opt-in `store` target.
 ///
 /// The target is off under the default `info` filter, and
-/// `RUST_LOG=celld=info,store=debug` turns it on. A dedicated target rather
+/// `RUST_LOG=cello=info,store=debug` turns it on. A dedicated target rather
 /// than a `CELLO_*` variable keeps the switch on the mechanism operators
 /// already use for the `timing` target, so this adds no configuration surface.
 fn log_lease_request(

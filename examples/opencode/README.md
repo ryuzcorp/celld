@@ -11,7 +11,7 @@ provider registry, and it reports the model that answered.
 Install the example dependencies with `npm install`, then start it:
 
 ```sh
-celld dev .
+cello dev .
 curl http://127.0.0.1:9876/
 ```
 

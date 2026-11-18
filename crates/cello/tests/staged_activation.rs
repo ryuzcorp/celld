@@ -73,7 +73,7 @@ struct Fleet {
 impl Fleet {
     fn new() -> Self {
         let temp = tempfile::Builder::new()
-            .prefix("celld-staged-activation")
+            .prefix("cello-staged-activation")
             .tempdir()
             .expect("tempdir");
         let state = temp.path().join("state");
@@ -488,7 +488,7 @@ fn activate_switches_all_scripts_at_once() {
     assert_eq!(helper.version, two.helper_v2);
 
     // The named pointers moved beside the fleet pointer, so a plain
-    // `celld deploy` or an older node resolves the same versions.
+    // `cello deploy` or an older node resolves the same versions.
     for (script, version) in [
         ("staged-app", &two.app_v2),
         ("staged-helper", &two.helper_v2),
@@ -821,7 +821,7 @@ fn activate_and_discard_parse_their_arguments() {
         ["Has-Caps=0123456789abcdef"].map(str::to_string),
     )
     .expect_err("bad script name is refused");
-    // A version is exactly what `celld deploy` mints: 16 lowercase hex.
+    // A version is exactly what `cello deploy` mints: 16 lowercase hex.
     // Anything else — a pointer name, a short prefix, a slash — is a
     // usage error, never a bucket read.
     for version in [
@@ -1020,7 +1020,7 @@ fn activate_loses_race_to_concurrent_writer() {
     let error = format!("{error:#}");
     assert!(error.contains("lost a race"), "unexpected error: {error}");
     assert!(
-        error.contains("re-run `celld activate`"),
+        error.contains("re-run `cello activate`"),
         "unexpected error: {error}"
     );
     let rival: serde_json::Value =
@@ -1080,7 +1080,7 @@ fn deploy_loses_race_to_concurrent_writer() {
     let error = format!("{error:#}");
     assert!(error.contains("lost a race"), "unexpected error: {error}");
     assert!(
-        error.contains("re-run `celld deploy`"),
+        error.contains("re-run `cello deploy`"),
         "unexpected error: {error}"
     );
     let rival: serde_json::Value =
@@ -1713,7 +1713,7 @@ fn discard_detects_a_pointer_move_during_delete() {
         "unexpected error: {error}"
     );
     assert!(
-        error.contains("re-run `celld discard"),
+        error.contains("re-run `cello discard"),
         "unexpected error: {error}"
     );
     assert!(
@@ -1755,7 +1755,7 @@ fn activate_loser_heals_its_queue_attachments() {
     let error = format!("{error:#}");
     assert!(error.contains("lost a race"), "unexpected error: {error}");
     assert!(
-        error.contains("re-run `celld activate`"),
+        error.contains("re-run `cello activate`"),
         "unexpected error: {error}"
     );
     let rival: serde_json::Value =
@@ -1796,7 +1796,7 @@ fn deploy_loser_heals_the_serving_generation() {
     let error = format!("{error:#}");
     assert!(error.contains("lost a race"), "unexpected error: {error}");
     assert!(
-        error.contains("re-run `celld deploy`"),
+        error.contains("re-run `cello deploy`"),
         "unexpected error: {error}"
     );
     let rival: serde_json::Value =
@@ -1918,7 +1918,7 @@ fn activate_refuses_a_staged_manifest_that_vanished_mid_activate() {
         "unexpected error: {error}"
     );
     assert!(
-        error.contains("re-run `celld deploy --no-activate`"),
+        error.contains("re-run `cello deploy --no-activate`"),
         "unexpected error: {error}"
     );
     assert_eq!(

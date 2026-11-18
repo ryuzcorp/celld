@@ -2,8 +2,8 @@
 
 //! Operator-only HTTP invocation of staged script versions.
 //!
-//! A version uploaded with `celld deploy --no-activate` serves no traffic
-//! until `celld activate` names it, so an operator cannot migrate a live
+//! A version uploaded with `cello deploy --no-activate` serves no traffic
+//! until `cello activate` names it, so an operator cannot migrate a live
 //! database to the staged schema before the flip: the migration endpoint
 //! only exists in code nothing serves yet. This module closes that window:
 //! it builds an ephemeral shadow [`Generation`](crate::generation::Generation)
@@ -204,7 +204,7 @@ pub fn parse_envelope(body: &[u8], max_body_bytes: usize) -> Result<StagedReques
     }
     if !crate::protocol::valid_deployment_version(&envelope.target.version) {
         return Err(malformed(format!(
-            "invalid version {:?}: a deployment version as `celld deploy` printed it, 16 lowercase hex characters",
+            "invalid version {:?}: a deployment version as `cello deploy` printed it, 16 lowercase hex characters",
             envelope.target.version
         )));
     }

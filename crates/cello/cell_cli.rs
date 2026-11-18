@@ -5,7 +5,7 @@
 // The package macro policy keeps listing data behind `Output`, which is the
 // boundary that this module exists to preserve.
 
-//! `celld cell` — the operator's view of the Durable Object instances a
+//! `cello cell` — the operator's view of the Durable Object instances a
 //! fleet holds.
 //!
 //! A fleet bucket can hold millions of cells, and one `LIST` request
@@ -50,7 +50,7 @@ impl Record for Cell {
                 serde_json::Value::from(self.scope.as_str()),
             ),
         };
-        // A fleet holds celld's own cells beside the application's: D1
+        // A fleet holds cello's own cells beside the application's: D1
         // databases, KV namespaces and Workflows are each a reserved class.
         // They are real cells that hold real bytes, so hiding them would
         // understate the bucket -- but an operator asking which Durable
@@ -90,7 +90,7 @@ pub(crate) fn list_options_from_arguments(
     parse_listing(arguments, "list")
 }
 
-/// The listing flags shared by `celld cell list` and `celld cell gc`;
+/// The listing flags shared by `cello cell list` and `cello cell gc`;
 /// `command` names the subcommand in an error.
 fn parse_listing(arguments: Vec<String>, command: &str) -> anyhow::Result<Option<ListOptions>> {
     let mut options = ListOptions::default();
@@ -117,11 +117,11 @@ fn parse_listing(arguments: Vec<String>, command: &str) -> anyhow::Result<Option
                 // mistyped option rather than a class named "--clas".
                 if other.starts_with('-') {
                     bail!(
-                        "unknown cell {command} option: {other}; run `celld cell {command} --help` for usage"
+                        "unknown cell {command} option: {other}; run `cello cell {command} --help` for usage"
                     );
                 }
                 if let Some(existing) = options.class.as_deref() {
-                    bail!("celld cell {command} takes one class, and already has {existing:?}");
+                    bail!("cello cell {command} takes one class, and already has {existing:?}");
                 }
                 options.class = Some(other.to_string());
             }
@@ -146,9 +146,9 @@ pub(crate) fn help_text() -> String {
         r#"List the Durable Object instances in the fleet bucket.
 
 USAGE:
-  celld cell list [CLASS] --bucket [s3://|gs://|az://]NAME[/PREFIX] [OPTIONS]
+  cello cell list [CLASS] --bucket [s3://|gs://|az://]NAME[/PREFIX] [OPTIONS]
 
-Run `celld cell gc --help` for the report of superseded epochs.
+Run `cello cell gc --help` for the report of superseded epochs.
 
 The listing is bounded by default, because a fleet can hold far more cells
 than an operator wants to read and each request returns at most {page}
@@ -178,7 +178,7 @@ pub(crate) fn cell_scopes_from_prefixes<'a>(
         .into_iter()
         .filter_map(|prefix| prefix.strip_prefix("cells/").map(str::to_string))
         // The scope charset is the engine's storage fence. A prefix that
-        // fails it was not written by a celld node, so listing it would
+        // fails it was not written by a Cello node, so listing it would
         // present foreign bucket content as a Durable Object instance.
         .filter(|cell| cello_logic::cell::valid_cell_scope(cell))
         .filter(move |cell| after != Some(cell.as_str()))
@@ -198,7 +198,7 @@ pub async fn run(arguments: Vec<String>) -> anyhow::Result<()> {
         None | Some("-h") | Some("--help") | Some("help") => {
             Output::new(Format::Text).help(&help_text())
         }
-        Some(other) => bail!("unknown cell command: {other}; use celld cell list or celld cell gc"),
+        Some(other) => bail!("unknown cell command: {other}; use cello cell list or cello cell gc"),
     }
 }
 
@@ -206,7 +206,7 @@ async fn run_list(arguments: Vec<String>) -> anyhow::Result<()> {
     let Some(options) = list_options_from_arguments(arguments)? else {
         return Output::new(Format::Text).help(&help_text());
     };
-    let storage = options.fleet.resolve("celld cell list")?;
+    let storage = options.fleet.resolve("cello cell list")?;
     let store = storage.open().await?;
 
     let mut out = Output::new(if options.json {
@@ -343,7 +343,7 @@ pub(crate) fn gc_options_from_arguments(
     // follow it. Report only.
     if !dry_run {
         bail!(
-            "celld cell gc deletes nothing itself; pass --dry-run to report what the owners \
+            "cello cell gc deletes nothing itself; pass --dry-run to report what the owners \
              would delete, and give CELLO_LTX_RETENTION_SECS a positive value on the nodes to \
              let them"
         );
@@ -359,7 +359,7 @@ pub(crate) fn gc_help_text() -> String {
         r#"Report the superseded LTX epochs that epoch GC can delete.
 
 USAGE:
-  celld cell gc --dry-run [CLASS] --bucket [s3://|gs://|az://]NAME[/PREFIX] [OPTIONS]
+  cello cell gc --dry-run [CLASS] --bucket [s3://|gs://|az://]NAME[/PREFIX] [OPTIONS]
 
 For each cell, the report builds the restore chain the way a restore does
 and prints the candidates: the epochs below the chain's base, except the
@@ -387,7 +387,7 @@ async fn run_gc(arguments: Vec<String>) -> anyhow::Result<()> {
     let Some(options) = gc_options_from_arguments(arguments)? else {
         return Output::new(Format::Text).help(&gc_help_text());
     };
-    let storage = options.list.fleet.resolve("celld cell gc")?;
+    let storage = options.list.fleet.resolve("cello cell gc")?;
     let store = storage.open().await?;
     let mut out = Output::new(if options.list.json {
         Format::Json
@@ -458,7 +458,7 @@ async fn run_gc(arguments: Vec<String>) -> anyhow::Result<()> {
         listed.report("cell", "--after");
     }
     if skipped > 0 {
-        bail!("celld cell gc could not read {skipped} cell(s); the report is incomplete");
+        bail!("cello cell gc could not read {skipped} cell(s); the report is incomplete");
     }
     Ok(())
 }

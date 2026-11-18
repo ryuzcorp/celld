@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): cross-isolate RPC stubs and streams; D1 export operator-ingress marker; ported from meln1k/celld: report wake coverage after maintenance (e6cb9a3); wake coverage follow-ups: startup observation ordering, installation comparison; trusted cell RPC; deployment cache scope purge on generation free; staged invoke joins the driver past the reply.; answered drivers poll while waitUntil background is outstanding (upstream #300); drivers take the mailbox once more before retiring (upstream #309); post-response background budget ends orphaned drives (upstream #275); storage-poisoned cells restart on a fresh isolate (upstream #291); restore fails a vanished class before touching disk (upstream #276); incoming spans carry HTTP method/status and 5xx without exception marks error (upstream #285); CELLO_MAX_CELLS_PER_ISOLATE knob (upstream #278).
+// Modified by ryuzcorp (ryuzcorp/celld): cross-isolate RPC stubs and streams; D1 export operator-ingress marker; ported from meln1k/cello: report wake coverage after maintenance (e6cb9a3); wake coverage follow-ups: startup observation ordering, installation comparison; trusted cell RPC; deployment cache scope purge on generation free; staged invoke joins the driver past the reply.; answered drivers poll while waitUntil background is outstanding (upstream #300); drivers take the mailbox once more before retiring (upstream #309); post-response background budget ends orphaned drives (upstream #275); storage-poisoned cells restart on a fresh isolate (upstream #291); restore fails a vanished class before touching disk (upstream #276); incoming spans carry HTTP method/status and 5xx without exception marks error (upstream #285); CELLO_MAX_CELLS_PER_ISOLATE knob (upstream #278).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 // RuntimeManager is the V8 cell-host arm, so its executor and observability
@@ -49,7 +49,7 @@ const RECLAIM_RETRY: Duration = Duration::from_millis(10);
 /// blocking run loop's own cap, which exists for the same reason: a client
 /// disconnect is raised on another thread and has nothing to wake this one.
 const CANCELLATION_TICK: Duration = Duration::from_millis(10);
-/// Cell fetches that one target can hold before celld refuses excess work.
+/// Cell fetches that one target can hold before cello refuses excess work.
 ///
 /// The last nonsaturated Queue step in the AWS partition staircase held
 /// approximately 40 requests by Little's Law. A limit of 64 keeps that step
@@ -2867,21 +2867,21 @@ impl StatelessTiming {
                 *queued_at,
                 Some(method.clone()),
                 *request_id,
-                "celld.fetch",
+                "cello.fetch",
                 crate::telemetry::KIND_SERVER,
             ),
             crate::WorkerJob::Queue { queued_at, .. } => (
                 *queued_at,
                 None,
                 None,
-                "celld.queue",
+                "cello.queue",
                 crate::telemetry::KIND_CONSUMER,
             ),
             crate::WorkerJob::Rpc { .. } => (
                 Instant::now(),
                 None,
                 None,
-                "celld.fetch",
+                "cello.fetch",
                 crate::telemetry::KIND_SERVER,
             ),
         };
@@ -3309,7 +3309,7 @@ impl CellIsolateStartupTiming {
         {
             let mut span = crate::telemetry::Span::new(
                 ids,
-                "celld.cell_startup",
+                "cello.cell_startup",
                 crate::telemetry::KIND_INTERNAL,
             );
             span.start_unix_us = crate::telemetry::now_unix_us() - total_us as i64;
@@ -3382,7 +3382,7 @@ async fn drive_worker_on_cell(affiliation: crate::pool::Affiliation, job: crate:
         |entry| {
             if let (Some(ids), Some((started, start_unix))) = (recording, span_started) {
                 let mut span =
-                    crate::telemetry::Span::new(ids, "celld.fetch", crate::telemetry::KIND_SERVER);
+                    crate::telemetry::Span::new(ids, "cello.fetch", crate::telemetry::KIND_SERVER);
                 span.start_unix_us = start_unix;
                 span.duration_us = started.elapsed().as_micros() as i64;
                 span.ok = entry.finished() && entry.failure().is_none();
@@ -3720,15 +3720,15 @@ async fn drive_cell_inner(
     let recording = trace.and_then(crate::telemetry::TraceContext::recording_ids);
     let span_seed = recording.map(|_| {
         let name = match &job {
-            CellJob::Fetch { .. } => "celld.cell_fetch",
-            CellJob::Alarm { .. } => "celld.alarm",
-            CellJob::Rpc { .. } => "celld.rpc",
-            CellJob::StubOp { .. } => "celld.stub_op",
-            CellJob::WsOpen { .. } => "celld.ws_open",
-            CellJob::WsMessage { .. } => "celld.ws_message",
-            CellJob::WsClosed { .. } => "celld.ws_close",
+            CellJob::Fetch { .. } => "cello.cell_fetch",
+            CellJob::Alarm { .. } => "cello.alarm",
+            CellJob::Rpc { .. } => "cello.rpc",
+            CellJob::StubOp { .. } => "cello.stub_op",
+            CellJob::WsOpen { .. } => "cello.ws_open",
+            CellJob::WsMessage { .. } => "cello.ws_message",
+            CellJob::WsClosed { .. } => "cello.ws_close",
             #[cfg(cello_internal_tests)]
-            CellJob::SyncErrorForTest { .. } => "celld.sync_error_test",
+            CellJob::SyncErrorForTest { .. } => "cello.sync_error_test",
         };
         // The RPC method names a stub method, not an HTTP request, so only a
         // fetch contributes its method to the span.
@@ -3996,7 +3996,7 @@ async fn drive_cell_inner(
         alarm_write = write;
     }
     if let (Some(ids), Some((name, cell, started, start_unix, method))) = (recording, span_seed) {
-        let kind = if name == "celld.cell_fetch" {
+        let kind = if name == "cello.cell_fetch" {
             crate::telemetry::KIND_SERVER
         } else {
             crate::telemetry::KIND_INTERNAL
@@ -4020,7 +4020,7 @@ async fn drive_cell_inner(
 }
 
 fn path_text(path: &Path) -> &str {
-    path.to_str().expect("celld data path must be UTF-8")
+    path.to_str().expect("cello data path must be UTF-8")
 }
 
 /// Tell the container module which classes the current generation

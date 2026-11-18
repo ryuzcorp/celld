@@ -1,6 +1,6 @@
 {
   "$schema": "./node_modules/wrangler/config-schema.json",
-  "name": "pi-celld-repro",
+  "name": "pi-cello-repro",
   "main": "index.js",
   "compatibility_date": "2026-09-01",
   "compatibility_flags": ["nodejs_compat"],

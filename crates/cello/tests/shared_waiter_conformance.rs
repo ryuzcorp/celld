@@ -1,6 +1,6 @@
 // Modified by ryuzcorp (ryuzcorp/celld): shared-fetch waiter conformance (upstream #316). Apache-2.0.
 
-// A black-box runner, not node code: it boots the real `celld dev` binary,
+// A black-box runner, not node code: it boots the real `cello dev` binary,
 // awaits one request's shared subrequest from a second request that then
 // arms its own timer/fetch, and asserts the waiter answers end to end, so
 // the execution boundary's injected clock/filesystem/async rules do not
@@ -20,7 +20,7 @@
 //! hung and the read below died on its deadline; now both legs answer in
 //! about a second.
 //!
-//! One `celld dev` boots the fixture per test. There are no fixed sleeps on
+//! One `cello dev` boots the fixture per test. There are no fixed sleeps on
 //! the pass path beyond the 200 ms head start that lets A suspend first
 //! (B's in-worker wait loop covers a slow starter); the read deadline only
 //! fires when the waiter regresses to hanging. The server guard kills the
@@ -99,7 +99,7 @@ fn slow_server() -> String {
     format!("http://{addr}")
 }
 
-/// A booted `celld dev` and its address. Kills the child on drop, so a
+/// A booted `cello dev` and its address. Kills the child on drop, so a
 /// failing assertion cannot leak a server onto its port.
 struct TestNode {
     child: Child,
@@ -118,7 +118,7 @@ impl TestNode {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .expect("spawn celld dev");
+            .expect("spawn cello dev");
         let mut stdout = child.stdout.take().expect("piped stdout");
         let stderr = child.stderr.take().expect("piped stderr");
         // Drain stdout so a chatty child can never block on a full pipe.
@@ -158,11 +158,11 @@ fn poll_boot(node: &mut TestNode, announced_lines: &Arc<Mutex<Vec<String>>>) -> 
     loop {
         if let Some(status) = node.child.try_wait().expect("poll child") {
             panic!(
-                "celld dev exited during boot: {status}: {}",
+                "cello dev exited during boot: {status}: {}",
                 announced_lines.lock().expect("announce lock").join("\n")
             );
         }
-        if let Some(public) = announced(announced_lines, "celld listening on ") {
+        if let Some(public) = announced(announced_lines, "cello listening on ") {
             if probe(&public) {
                 return public;
             }
@@ -240,7 +240,7 @@ fn leg(node: &TestNode, slow: &str, key: &str, then: &str) {
 #[test]
 fn shared_fetch_waiter_answers_with_its_own_work() {
     let dir = tempfile::Builder::new()
-        .prefix("celld-shared-waiter-")
+        .prefix("cello-shared-waiter-")
         .tempdir()
         .expect("tempdir");
     let project = dir.path().join("app");

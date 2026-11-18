@@ -1,5 +1,5 @@
 {
-  "name": "celld-container-example",
+  "name": "cello-container-example",
   "private": true,
   "type": "module",
   "dependencies": {

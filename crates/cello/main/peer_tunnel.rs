@@ -321,7 +321,7 @@ async fn serve_do(upgraded: hyper::upgrade::Upgraded, app: AppHandle, marker_awa
                 match upgrade.await {
                     Ok(socket) => super::websocket::websocket_task(app, target, socket).await,
                     Err(error) => {
-                        eprintln!("celld tunneled upgrade failed: {error}");
+                        eprintln!("cello tunneled upgrade failed: {error}");
                     }
                 }
             });

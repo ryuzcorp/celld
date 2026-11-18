@@ -1,7 +1,7 @@
 // Modified by ryuzcorp (ryuzcorp/celld): staged activation.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
-//! Durable types on the bucket contract between deployment tools and celld.
+//! Durable types on the bucket contract between deployment tools and cello.
 //! These objects are the interface; nothing else is exchanged.
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
@@ -9,7 +9,7 @@ use sha2::Digest;
 use sha2::Sha256;
 use std::collections::BTreeMap;
 
-/// `deploy/<script>/<version>/manifest.json` — the normalized thing celld reads
+/// `deploy/<script>/<version>/manifest.json` — the normalized thing cello reads
 /// to know what to run. The script name is deployment identity, not a fleet
 /// selector: one fleet has one current application.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -42,10 +42,10 @@ pub struct Manifest {
     /// instance shape. Each image tar is at `deploy/images/<id>.tar`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub containers: Vec<crate::container::ContainerSpec>,
-    /// The `celld-fence` image `celld deploy` built beside the container
+    /// The `cello-fence` image `cello deploy` built beside the container
     /// images: the node runs it once, privileged, to fence its container
     /// bridges before any container starts. `None` in a deployment without
-    /// containers, and in one made by a celld that predates the fence,
+    /// containers, and in one made by a Cello that predates the fence,
     /// which a node then refuses to start containers for.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fence_image: Option<String>,
@@ -318,7 +318,7 @@ pub fn validate_required_features(required: &[String]) -> anyhow::Result<()> {
     for feature in required {
         if !SUPPORTED_DEPLOYMENT_FEATURES.contains(&feature.as_str()) {
             anyhow::bail!(
-                "deployment requires feature {feature:?} this celld build does not support; upgrade celld"
+                "deployment requires feature {feature:?} this Cello build does not support; upgrade cello"
             );
         }
     }
@@ -331,7 +331,7 @@ pub struct ModuleRef {
     pub bytes: usize,
     /// Full SHA-256 of this module's exact bytes, as lowercase hexadecimal.
     ///
-    /// The loader also accepts the 16-character prefix written by celld and
+    /// The loader also accepts the 16-character prefix written by Cello and
     /// the managed control plane before full module digests were introduced.
     pub sha256: String,
     /// Absent means UTF-8 source: the main module is ESM, siblings become
@@ -465,8 +465,8 @@ pub struct DeployPointer {
     pub prefix: String,
     pub rollout: Rollout,
     /// The activated generation: every script's version, by script name.
-    /// Present only on fleet-wide pointers written by `celld activate`; a
-    /// plain `celld deploy` moves the top-level fields and leaves this
+    /// Present only on fleet-wide pointers written by `cello activate`; a
+    /// plain `cello deploy` moves the top-level fields and leaves this
     /// absent, and nodes then resolve service bindings through the named
     /// pointers as before. Old nodes ignore the field and resolve the same
     /// versions through the named pointers `activate` moves beside it.
@@ -487,8 +487,8 @@ pub struct Rollout {
 }
 
 /// Whether `version` has the shape [`deployment_version`] mints: 16
-/// lowercase hex characters. `celld activate` and `celld discard` name
-/// versions `celld deploy` printed, so anything else is a usage error —
+/// lowercase hex characters. `cello activate` and `cello discard` name
+/// versions `cello deploy` printed, so anything else is a usage error —
 /// and for `discard` a safety gate, because an S3 listing is a byte
 /// prefix: a short or non-hex version would match sibling versions or
 /// the script's named pointer instead of one version directory.

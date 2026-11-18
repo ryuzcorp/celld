@@ -3,7 +3,7 @@
 // buffers messages until it has a message listener, close() closes both
 // ports and fires "close" on each, and transfer lists are refused.
 (function () {
-  const kCreate = Symbol("celld.MessagePort.create");
+  const kCreate = Symbol("cello.MessagePort.create");
 
   class MessagePort extends EventTarget {
     constructor(token = undefined) {

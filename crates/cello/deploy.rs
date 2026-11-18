@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): idempotent content-tagged image create; tag-race tests run the fake engine through sh; deploy --sourcemap writes the bundle's external map; service binding targets validated at deploy; staged activation; deploy --sourcemap collects the no_bundle sibling map; staged invoke shares the version-ref parsing; deploy reads stay inside the project; deploy --read-root bounds bundling and container builds; durable object bindings with a foreign script_name are refused (upstream #312); image tars upload multipart (upstream #307); celld versions lists deployed versions (upstream #181); CELLO_NODE binding reservation (upstream #219).
+// Modified by ryuzcorp (ryuzcorp/celld): idempotent content-tagged image create; tag-race tests run the fake engine through sh; deploy --sourcemap writes the bundle's external map; service binding targets validated at deploy; staged activation; deploy --sourcemap collects the no_bundle sibling map; staged invoke shares the version-ref parsing; deploy reads stay inside the project; deploy --read-root bounds bundling and container builds; durable object bindings with a foreign script_name are refused (upstream #312); image tars upload multipart (upstream #307); cello versions lists deployed versions (upstream #181); CELLO_NODE binding reservation (upstream #219).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 // Deployment is an operator control-plane path outside the Actor execution
@@ -6,7 +6,7 @@
 #![allow(clippy::disallowed_methods)]
 // Deploy narrates progress; every line of it is for a person.
 
-//! `celld deploy` — build a Wrangler project and write it to the fleet bucket.
+//! `cello deploy` — build a Wrangler project and write it to the fleet bucket.
 //!
 //! Bundling is esbuild's job; this module does config, identity, and durable
 //! bucket publication. Nothing here shells out to wrangler or speaks a
@@ -182,11 +182,11 @@ pub fn is_reserved_scope(scope: &str) -> bool {
 /// entry here is still refused and simply gets the general answer.
 pub fn operator_hint(class: &str) -> &'static str {
     if class == D1_CLASS {
-        "use `celld d1`"
+        "use `cello d1`"
     } else if class == KV_CLASS {
-        "use `celld kv`"
+        "use `cello kv`"
     } else if class == QUEUE_CLASS {
-        "use `celld queue`"
+        "use `cello queue`"
     } else if is_workflow_class(class) {
         "use the workflow binding"
     } else {
@@ -213,12 +213,12 @@ pub struct Options {
     pub region: Option<String>,
     pub dry_run: bool,
     pub json: bool,
-    /// Worker variables that override the `vars` of the config. `celld dev`
-    /// reads them from `.dev.vars` or the dotenv files; `celld deploy`
+    /// Worker variables that override the `vars` of the config. `cello dev`
+    /// reads them from `.dev.vars` or the dotenv files; `cello deploy`
     /// supplies none, so a local credential cannot reach a fleet.
     pub vars: VarOverrides,
     /// Keep container images in the local engine instead of saving them to
-    /// the bucket. `celld dev` runs its node on the same engine that built
+    /// the bucket. `cello dev` runs its node on the same engine that built
     /// them; a fleet needs the tar.
     pub local_images: bool,
     /// Write the Worker's source map to this local path: the esbuild bundle's
@@ -227,7 +227,7 @@ pub struct Options {
     /// identical with or without the flag.
     pub sourcemap: Option<PathBuf>,
     /// Upload and validate the version without moving any pointer: the
-    /// version is staged, invisible to serving, until `celld activate`
+    /// version is staged, invisible to serving, until `cello activate`
     /// names it. Queue attachments stay too — an attachment names an exact
     /// deployment, so moving it early would leak the staged version into
     /// the next adoption's queue resolution.
@@ -252,17 +252,17 @@ pub enum VarOverrides {
     /// `.env` and `.env.local` also serve other tools, such as a bundler or an
     /// ORM. An entry with a name that is not a valid binding, or a name that
     /// another binding of the config uses, is skipped with a warning. Failing
-    /// instead stops a `celld dev` that `wrangler dev` runs, and the only
+    /// instead stops a `cello dev` that `wrangler dev` runs, and the only
     /// workaround is an empty `.dev.vars`.
     DotEnv(BTreeMap<String, String>),
 }
 
 pub fn print_help() {
-    let text = "celld deploy — build a Worker with esbuild and write it to the fleet bucket\n\n\
-USAGE:\n  celld deploy [PROJECT] --bucket [s3://|gs://|az://]NAME[/PREFIX] [OPTIONS]\n\n\
+    let text = "cello deploy — build a Worker with esbuild and write it to the fleet bucket\n\n\
+USAGE:\n  cello deploy [PROJECT] --bucket [s3://|gs://|az://]NAME[/PREFIX] [OPTIONS]\n\n\
 PROJECT is a directory or a Wrangler config; it defaults to the working\n\
-directory, where celld looks for wrangler.jsonc or wrangler.json.\n\n\
-OPTIONS:\n  --sourcemap PATH       Write the Worker's source map to PATH: the bundled JS\n                         entry's external map, or the `no_bundle` entry's sibling\n                         `<entry>.map`; never wasm siblings. Asset-only and Python\n                         projects, and `no_bundle` entries without a sibling map,\n                         warn and write nothing. The deployed bytes are identical\n                         with or without it\n  --read-root DIR        A directory beyond the project that build inputs may\n                         come from: esbuild's inputs and `containers[].image`\n                         Dockerfiles with their build contexts. Repeatable\n  --config PATH          Same as passing PROJECT positionally\n  --bucket [s3://|gs://|az://]NAME[/PREFIX]\n                         Fleet bucket and prefix; defaults to CELLO_BUCKET.\n                         gs:// selects a Google Cloud Storage bucket, az://\n                         an Azure Blob Storage container with its account in\n                         AZURE_STORAGE_ACCOUNT_NAME; celld then rejects\n                         --endpoint and ignores --region\n  --endpoint URL         S3-compatible endpoint; defaults to S3_ENDPOINT\n  --region REGION        Storage region; defaults to AWS_REGION\n  --dry-run              Bundle and print the version without writing\n  --no-activate          Upload and validate without moving any pointer;\n                         the staged version serves only once `celld activate`\n                         names it\n  --json                 Print the deployment as one JSON object\n  -h, --help             Show this help\n\n\
+directory, where cello looks for wrangler.jsonc or wrangler.json.\n\n\
+OPTIONS:\n  --sourcemap PATH       Write the Worker's source map to PATH: the bundled JS\n                         entry's external map, or the `no_bundle` entry's sibling\n                         `<entry>.map`; never wasm siblings. Asset-only and Python\n                         projects, and `no_bundle` entries without a sibling map,\n                         warn and write nothing. The deployed bytes are identical\n                         with or without it\n  --read-root DIR        A directory beyond the project that build inputs may\n                         come from: esbuild's inputs and `containers[].image`\n                         Dockerfiles with their build contexts. Repeatable\n  --config PATH          Same as passing PROJECT positionally\n  --bucket [s3://|gs://|az://]NAME[/PREFIX]\n                         Fleet bucket and prefix; defaults to CELLO_BUCKET.\n                         gs:// selects a Google Cloud Storage bucket, az://\n                         an Azure Blob Storage container with its account in\n                         AZURE_STORAGE_ACCOUNT_NAME; cello then rejects\n                         --endpoint and ignores --region\n  --endpoint URL         S3-compatible endpoint; defaults to S3_ENDPOINT\n  --region REGION        Storage region; defaults to AWS_REGION\n  --dry-run              Bundle and print the version without writing\n  --no-activate          Upload and validate without moving any pointer;\n                         the staged version serves only once `cello activate`\n                         names it\n  --json                 Print the deployment as one JSON object\n  -h, --help             Show this help\n\n\
 Credentials come from the standard AWS credential chain, from Google\n\
 Application Default Credentials for a gs:// bucket, or from an Azure storage\n\
 account key, managed identity, or workload identity for an az:// bucket.\n\n\
@@ -329,10 +329,10 @@ pub fn options_from_arguments(
                 ));
             }
             other if other.starts_with('-') => {
-                bail!("unknown argument for `celld deploy`: {other}")
+                bail!("unknown argument for `cello deploy`: {other}")
             }
             other if options.config.is_none() => options.config = Some(PathBuf::from(other)),
-            other => bail!("`celld deploy` takes one project path, and already has one: {other}"),
+            other => bail!("`cello deploy` takes one project path, and already has one: {other}"),
         }
     }
     Ok(Some(options))
@@ -349,9 +349,9 @@ pub struct ActivateOptions {
 }
 
 pub fn print_activate_help() {
-    let text = "celld activate — serve staged versions as one atomic generation\n\n\
-USAGE:\n  celld activate SCRIPT=VERSION [SCRIPT=VERSION...] --bucket [s3://|gs://|az://]NAME[/PREFIX] [OPTIONS]\n\n\
-Each version is a `celld deploy --no-activate` upload. The fleet-wide pointer is\n\
+    let text = "cello activate — serve staged versions as one atomic generation\n\n\
+USAGE:\n  cello activate SCRIPT=VERSION [SCRIPT=VERSION...] --bucket [s3://|gs://|az://]NAME[/PREFIX] [OPTIONS]\n\n\
+Each version is a `cello deploy --no-activate` upload. The fleet-wide pointer is\n\
 replaced by one write naming every script's version — the named ones move, the\n\
 rest keep their activated versions — so nodes adopt the whole generation at\n\
 once. A running node polls the deployment pointer and adopts the new version in\n\
@@ -395,13 +395,13 @@ pub fn activate_options_from_arguments(
                 options.region = Some(arguments.next().context("--region requires a value")?);
             }
             other if other.starts_with('-') => {
-                bail!("unknown argument for `celld activate`: {other}")
+                bail!("unknown argument for `cello activate`: {other}")
             }
             other => options.scripts.push(parse_version_ref(other, "activate")?),
         }
     }
     if options.scripts.is_empty() {
-        bail!("`celld activate` names at least one SCRIPT=VERSION");
+        bail!("`cello activate` names at least one SCRIPT=VERSION");
     }
     Ok(Some(options))
 }
@@ -416,9 +416,9 @@ pub struct DiscardOptions {
 }
 
 pub fn print_discard_help() {
-    let text = "celld discard — delete staged versions from the fleet bucket\n\n\
-USAGE:\n  celld discard SCRIPT=VERSION [SCRIPT=VERSION...] --bucket [s3://|gs://|az://]NAME[/PREFIX] [OPTIONS]\n\n\
-Each version is a `celld deploy --no-activate` upload that will never serve.\n\
+    let text = "cello discard — delete staged versions from the fleet bucket\n\n\
+USAGE:\n  cello discard SCRIPT=VERSION [SCRIPT=VERSION...] --bucket [s3://|gs://|az://]NAME[/PREFIX] [OPTIONS]\n\n\
+Each version is a `cello deploy --no-activate` upload that will never serve.\n\
 A version any pointer names is refused; anything else is inert, so removing\n\
 it is safe. Shared content-addressed objects (asset bodies, image tars) stay:\n\
 other versions reference them. Never run discard concurrently with activate\n\
@@ -458,13 +458,13 @@ pub fn discard_options_from_arguments(
                 options.region = Some(arguments.next().context("--region requires a value")?);
             }
             other if other.starts_with('-') => {
-                bail!("unknown argument for `celld discard`: {other}")
+                bail!("unknown argument for `cello discard`: {other}")
             }
             other => options.scripts.push(parse_version_ref(other, "discard")?),
         }
     }
     if options.scripts.is_empty() {
-        bail!("`celld discard` names at least one SCRIPT=VERSION");
+        bail!("`cello discard` names at least one SCRIPT=VERSION");
     }
     Ok(Some(options))
 }
@@ -479,11 +479,11 @@ pub struct VersionsOptions {
 }
 
 pub fn print_versions_help() {
-    let text = "celld versions — list the immutable deployments the fleet bucket holds\n\n\
-USAGE:\n  celld versions [SCRIPT] --bucket [s3://|gs://|az://]NAME[/PREFIX] [OPTIONS]\n\n\
-Each `celld deploy` writes one immutable version directory per script. The\n\
-fleet-wide pointer names the serving generation; `celld activate SCRIPT=VERSION`\n\
-moves back to an earlier version for rollback, and `celld discard\n\
+    let text = "cello versions — list the immutable deployments the fleet bucket holds\n\n\
+USAGE:\n  cello versions [SCRIPT] --bucket [s3://|gs://|az://]NAME[/PREFIX] [OPTIONS]\n\n\
+Each `cello deploy` writes one immutable version directory per script. The\n\
+fleet-wide pointer names the serving generation; `cello activate SCRIPT=VERSION`\n\
+moves back to an earlier version for rollback, and `cello discard\n\
 SCRIPT=VERSION` deletes a version no pointer names. This command lists what\n\
 is there, marking the serving versions `current`.\n\n\
 OPTIONS:\n  --bucket [s3://|gs://|az://]NAME[/PREFIX]\n                         Fleet bucket and prefix; defaults to CELLO_BUCKET\n  --endpoint URL         S3-compatible endpoint; defaults to S3_ENDPOINT\n  --region REGION        Storage region; defaults to AWS_REGION\n  --json                 Print one JSON object per version\n  -h, --help             Show this help"
@@ -517,10 +517,10 @@ pub fn versions_options_from_arguments(
                 options.region = Some(arguments.next().context("--region requires a value")?);
             }
             other if other.starts_with('-') => {
-                bail!("unknown argument for `celld versions`: {other}")
+                bail!("unknown argument for `cello versions`: {other}")
             }
             other if options.script.is_none() => options.script = Some(other.to_string()),
-            other => bail!("`celld versions` takes one script, and already has one: {other}"),
+            other => bail!("`cello versions` takes one script, and already has one: {other}"),
         }
     }
     Ok(Some(options))
@@ -535,7 +535,7 @@ pub struct VersionEntry {
     /// or — under a fleet-wide pointer without a components map — the
     /// version a named pointer names. Serving loads service bindings
     /// through the named pointers there, so a current version is a
-    /// rollback target `celld activate` accepts and a version `celld
+    /// rollback target `cello activate` accepts and a version `cello
     /// discard` refuses.
     pub current: bool,
 }
@@ -544,7 +544,7 @@ pub struct VersionEntry {
 /// script then version. The serving versions come from the fleet-wide
 /// pointer — its primary and, under an activated generation, its
 /// components — plus, under a pointer without a components map (a plain
-/// `celld deploy`), every named pointer, through which serving resolves
+/// `cello deploy`), every named pointer, through which serving resolves
 /// service bindings there. A bucket without a fleet pointer (no deploy
 /// yet) marks nothing current. Pointer reads fail when they name a
 /// version, because a rollback target must resolve.
@@ -616,7 +616,7 @@ struct Project {
     /// twice is what breaks that output.
     no_bundle: bool,
     /// Entry relative to the project root. esbuild stamps this path into the
-    /// bundle, so it must not depend on the working directory celld was
+    /// bundle, so it must not depend on the working directory cello was
     /// invoked from — identical source would otherwise hash two ways.
     entry: Option<String>,
     /// What the config's `define` and `rules` add to the esbuild run.
@@ -637,9 +637,9 @@ struct Project {
     python: Option<python::PythonCompat>,
 }
 
-/// The two Wrangler bundling knobs that celld forwards to esbuild.
+/// The two Wrangler bundling knobs that Cello forwards to esbuild.
 ///
-/// Both are pass-throughs, so celld validates their shape and leaves their
+/// Both are pass-throughs, so cello validates their shape and leaves their
 /// meaning to esbuild. They travel together because both are build inputs and
 /// neither reaches the deployment metadata: a change to either changes the
 /// bundle bytes, and the deployment version hashes those.
@@ -647,7 +647,7 @@ struct BundleConfig {
     /// `define` as `--define:KEY=VALUE`. Each value is a JavaScript
     /// expression, which is what Wrangler and esbuild both take.
     define: BTreeMap<String, String>,
-    /// `rules` as `--loader:.EXT=LOADER`, plus celld's own default rule.
+    /// `rules` as `--loader:.EXT=LOADER`, plus cello's own default rule.
     loaders: BTreeMap<String, Loader>,
 }
 
@@ -673,7 +673,7 @@ impl Loader {
     }
 
     /// The `rules[].type` a config writes for this loader. An error names the
-    /// config's own word, not celld's internal one.
+    /// config's own word, not cello's internal one.
     fn rule_type(self) -> &'static str {
         match self {
             Loader::Text => "Text",
@@ -740,7 +740,7 @@ pub struct Built {
     pub bundled_in: Duration,
     /// The resolved image ids of `containers[]`, in config order.
     pub images: Vec<String>,
-    /// Save each image to the bucket. `celld dev` leaves them in the local
+    /// Save each image to the bucket. `cello dev` leaves them in the local
     /// engine, which is where the node loads them from.
     /// See `Manifest::fence_image`; saved beside `images`, reported apart.
     pub fence_image: Option<String>,
@@ -780,10 +780,10 @@ impl Built {
     }
 
     /// What the deployment weighs, the bindings it will have, and nothing we
-    /// cannot stand behind: no URL, because celld routes nothing, and no
+    /// cannot stand behind: no URL, because cello routes nothing, and no
     /// startup time, because deploying does not start an isolate.
     pub fn report(&self) {
-        note!(" celld {}", env!("CARGO_PKG_VERSION"));
+        note!(" cello {}", env!("CARGO_PKG_VERSION"));
         note!("{}", "─".repeat(47));
         note!(
             "Total Upload: {} / gzip: {}",
@@ -922,7 +922,7 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
     // the deployment's identity, so a rebuilt image is a new deployment.
     // A fleet deploy builds for the platform the nodes run, which Wrangler
     // also fixes at linux/amd64; a machine that builds for itself, as
-    // `celld dev` does, passes none.
+    // `cello dev` does, passes none.
     let platform = (!options.local_images).then(|| {
         std::env::var("CELLO_CONTAINER_PLATFORM").unwrap_or_else(|_| "linux/amd64".to_string())
     });
@@ -957,7 +957,7 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
     // The fence image rides with every deployment that has containers: a
     // node runs it once, privileged, to fence its bridges before the first
     // container starts. Built like an app image, keyed by content, so every
-    // deployment made by one celld shares one tar.
+    // deployment made by one Cello shares one tar.
     let fence_image = (!container_specs.is_empty())
         .then(|| resolve_fence_image(platform.as_deref()))
         .transpose()?;
@@ -990,7 +990,7 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
                 // Directory iteration order must not change deployment identity.
                 wasm.sort_by(|a, b| a.0.cmp(&b.0));
                 // Pre-bundled: the caller's toolchain owns the bytes, so
-                // celld produces no map for them — but the entry deploys as
+                // Cello produces no map for them — but the entry deploys as
                 // written, so its sibling `<entry>.map` still describes the
                 // deployed module, and `--sourcemap` collects it.
                 let sourcemap = options
@@ -1345,7 +1345,7 @@ fn resolve_fence_image(platform: Option<&str>) -> anyhow::Result<String> {
         "the fence Dockerfile",
         platform,
     )
-    .context("build the celld-fence image")
+    .context("build the cello-fence image")
 }
 
 /// Save the image to the bucket under its content key unless it is there.
@@ -1446,7 +1446,7 @@ pub async fn write(bucket: &Bucket, built: &Built) -> anyhow::Result<()> {
         }
         anyhow::bail!(
             "the deployment committed, but its named pointer did not converge: {error:#}; \
-             re-run `celld deploy` to converge it"
+             re-run `cello deploy` to converge it"
         );
     }
     Ok(())
@@ -1456,12 +1456,12 @@ pub async fn write(bucket: &Bucket, built: &Built) -> anyhow::Result<()> {
 /// the asset index, the manifest — without moving anything that serving
 /// reads: no queue attachment, no named pointer, no fleet pointer.
 ///
-/// This is `celld deploy --no-activate`. The version is complete and
+/// This is `cello deploy --no-activate`. The version is complete and
 /// validated (bundling already failed the tenant errors), but the next
 /// adoption cannot see it: the pointer watcher and `POST /reload` both
 /// read `deploy/current.json`, and the graph walk reads the named
-/// pointers and the queue attachments, all untouched. `celld activate`
-/// moves them all at once; `celld discard` removes the version.
+/// pointers and the queue attachments, all untouched. `cello activate`
+/// moves them all at once; `cello discard` removes the version.
 pub async fn write_staged(bucket: &Bucket, built: &Built) -> anyhow::Result<()> {
     // No attachment prepare here, deliberately: it reads the *current*
     // named pointer, but the attachments publish at activate time against
@@ -1471,8 +1471,8 @@ pub async fn write_staged(bucket: &Bucket, built: &Built) -> anyhow::Result<()> 
     upload_version(bucket, built).await
 }
 
-/// One `SCRIPT=VERSION` argument to `celld activate` or `celld discard`.
-/// The version is a deployment version as `celld deploy` printed it, not a
+/// One `SCRIPT=VERSION` argument to `cello activate` or `cello discard`.
+/// The version is a deployment version as `cello deploy` printed it, not a
 /// pointer: the script disambiguates, because a version alone names no
 /// script and two scripts hash independently.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1483,7 +1483,7 @@ pub struct VersionRef {
 
 pub(crate) fn parse_version_ref(argument: &str, command: &str) -> anyhow::Result<VersionRef> {
     let Some((script, version)) = argument.split_once('=') else {
-        bail!("`celld {command}` takes SCRIPT=VERSION arguments, not {argument:?}");
+        bail!("`cello {command}` takes SCRIPT=VERSION arguments, not {argument:?}");
     };
     anyhow::ensure!(
         valid_script_name(script),
@@ -1492,7 +1492,7 @@ pub(crate) fn parse_version_ref(argument: &str, command: &str) -> anyhow::Result
     );
     anyhow::ensure!(
         crate::protocol::valid_deployment_version(version),
-        "invalid version {version:?}: a deployment version as `celld deploy` printed it, 16 \
+        "invalid version {version:?}: a deployment version as `cello deploy` printed it, 16 \
          lowercase hex characters"
     );
     Ok(VersionRef {
@@ -1501,7 +1501,7 @@ pub(crate) fn parse_version_ref(argument: &str, command: &str) -> anyhow::Result
     })
 }
 
-/// What `celld activate` concluded.
+/// What `cello activate` concluded.
 #[derive(Debug)]
 pub struct Activated {
     /// The primary script: the one ingress serves.
@@ -1517,7 +1517,7 @@ pub struct Activated {
 
 /// Activate staged versions as one atomic generation.
 ///
-/// Every named `SCRIPT=VERSION` must exist in the bucket (a `celld deploy
+/// Every named `SCRIPT=VERSION` must exist in the bucket (a `cello deploy
 /// --no-activate` wrote it); scripts the call does not name keep their
 /// currently activated versions. Validation (staged manifests present
 /// and identified, primary resolvable, no competing queue consumer)
@@ -1550,7 +1550,7 @@ pub async fn activate(
 ) -> anyhow::Result<Activated> {
     anyhow::ensure!(
         !scripts.is_empty(),
-        "celld activate names at least one SCRIPT=VERSION"
+        "cello activate names at least one SCRIPT=VERSION"
     );
     if let Some(primary) = primary {
         anyhow::ensure!(
@@ -1589,7 +1589,7 @@ pub async fn activate(
         let key = format!("{prefix}/manifest.json");
         let Some((body, _)) = bucket.get(&key).await? else {
             bail!(
-                "no staged version {:?} of script {:?}; run `celld deploy --no-activate` first",
+                "no staged version {:?} of script {:?}; run `cello deploy --no-activate` first",
                 reference.version,
                 reference.script
             );
@@ -1615,7 +1615,7 @@ pub async fn activate(
 
     // Scripts the call does not name keep what is activated now. A
     // components generation carries itself; a legacy pointer (plain
-    // `celld deploy`, or a managed apply) carries its primary from the
+    // `cello deploy`, or a managed apply) carries its primary from the
     // top level — what serves today — and every other script from its
     // named pointer. Carried entries are trusted, not re-verified: their
     // manifests are what the fleet already serves, and a stale named
@@ -1762,12 +1762,12 @@ pub async fn activate(
         if unchanged {
             anyhow::bail!(
                 "the serving generation's named pointers did not converge: {error:#}; \
-                 re-run `celld activate` to converge them"
+                 re-run `cello activate` to converge them"
             );
         }
         anyhow::bail!(
             "the generation committed, but its named pointers did not converge: {error:#}; \
-             re-run `celld activate` to converge them"
+             re-run `cello activate` to converge them"
         );
     }
 
@@ -2010,8 +2010,8 @@ async fn verify_precommit_manifests(
         anyhow::ensure!(
             usable.is_some(),
             "staged version {:?} of script {:?} vanished before the commit — a concurrent \
-             `celld discard` may have removed it; re-run `celld deploy --no-activate` for it, \
-             then re-run `celld activate`",
+             `cello discard` may have removed it; re-run `cello deploy --no-activate` for it, \
+             then re-run `cello activate`",
             reference.version,
             reference.script
         );
@@ -2029,8 +2029,8 @@ async fn verify_precommit_manifests(
         anyhow::ensure!(
             usable.is_some(),
             "carried script {script}={} has no readable manifest — its version may have been \
-             discarded; restore it with `celld deploy` from the same source, then re-run \
-             `celld activate`",
+             discarded; restore it with `cello deploy` from the same source, then re-run \
+             `cello activate`",
             component.version
         );
     }
@@ -2210,7 +2210,7 @@ async fn heal_script_queues(
     let Some(manifest) = usable else {
         note!(
             "warning: serving script {script}={} has no readable manifest; its queue \
-             attachments cannot heal — re-run `celld {command}` once its version is restored",
+             attachments cannot heal — re-run `cello {command}` once its version is restored",
             component.version
         );
         return Ok(());
@@ -2226,7 +2226,7 @@ async fn heal_on_error(bucket: &Bucket, error: anyhow::Error, command: &str) -> 
     if let Err(heal) = heal_derivative_state(bucket, command).await {
         note!("warning: healing toward the serving pointer failed: {heal:#}");
         return error.context(format!(
-            "healing toward the serving pointer also failed: {heal:#}; re-run `celld {command}` \
+            "healing toward the serving pointer also failed: {heal:#}; re-run `cello {command}` \
              to converge"
         ));
     }
@@ -2274,7 +2274,7 @@ async fn legacy_components(bucket: &Bucket) -> anyhow::Result<BTreeMap<String, C
     Ok(components)
 }
 
-/// What `celld discard` removed.
+/// What `cello discard` removed.
 #[derive(Debug)]
 pub struct Discarded {
     pub removed: Vec<VersionRef>,
@@ -2301,8 +2301,8 @@ pub struct Discarded {
 /// it fails loudly (adoption refuses a generation whose manifest is
 /// missing, never serving wrong code) and recovers by re-deploying from
 /// the same source, which reproduces the version byte-identically for a
-/// re-activate. Never run `celld discard` concurrently with `celld
-/// activate` or `celld deploy` — the re-check reports the race, it
+/// re-activate. Never run `cello discard` concurrently with `cello
+/// activate` or `cello deploy` — the re-check reports the race, it
 /// cannot undo the delete — and hold a superseded version until
 /// draining nodes have moved past it (past `CELLO_DEPLOY_MAX_AGE_S`,
 /// with the replacement's adoption verified) before discarding a
@@ -2310,7 +2310,7 @@ pub struct Discarded {
 pub async fn discard(bucket: &Bucket, scripts: &[VersionRef]) -> anyhow::Result<Discarded> {
     anyhow::ensure!(
         !scripts.is_empty(),
-        "celld discard names at least one SCRIPT=VERSION"
+        "cello discard names at least one SCRIPT=VERSION"
     );
     let mut removed = Vec::with_capacity(scripts.len());
     let mut objects = 0;
@@ -2337,7 +2337,7 @@ pub async fn discard(bucket: &Bucket, scripts: &[VersionRef]) -> anyhow::Result<
         let gone = bucket.delete_many(&keys).await;
         anyhow::ensure!(
             gone.len() == keys.len(),
-            "discard of {}={} deleted {}/{} objects; re-run `celld discard`",
+            "discard of {}={} deleted {}/{} objects; re-run `cello discard`",
             reference.script,
             reference.version,
             gone.len(),
@@ -2379,7 +2379,7 @@ pub async fn discard(bucket: &Bucket, scripts: &[VersionRef]) -> anyhow::Result<
         if ensure_not_activated(bucket, reference).await.is_err() {
             bail!(
                 "a concurrent activate or deploy named {}={} while it was discarded; re-run \
-                 `celld deploy --no-activate` from the same source and `celld activate {}={}` \
+                 `cello deploy --no-activate` from the same source and `cello activate {}={}` \
                  before any node adopts",
                 reference.script,
                 reference.version,
@@ -2391,7 +2391,7 @@ pub async fn discard(bucket: &Bucket, scripts: &[VersionRef]) -> anyhow::Result<
             bail!(
                 "a concurrent deploy or activate moved the {} pointer while {}={} was \
                  discarded; the version is named by no pointer, so the delete was safe — \
-                 re-run `celld discard {}={}` to confirm",
+                 re-run `cello discard {}={}` to confirm",
                 if fleet_moved { "fleet" } else { "named" },
                 reference.script,
                 reference.version,
@@ -2759,10 +2759,10 @@ async fn publish_one_queue_attachment(
         Ok(Some(_)) => Ok(()),
         Ok(None) => Err(anyhow!(
             "queue consumer attachment {key} lost a race; another deploy or activate may have \
-             landed first; re-run `celld {command}`"
+             landed first; re-run `cello {command}`"
         )),
         Err(error) => Err(error.context(format!(
-            "a queue consumer attachment write may have committed; re-run `celld {command}`"
+            "a queue consumer attachment write may have committed; re-run `cello {command}`"
         ))),
     }
 }
@@ -2793,12 +2793,12 @@ async fn put_pointer(
         Ok(Some(_)) => Ok(()),
         Ok(None) => Err(anyhow!(
             "write {}://{}/{key} lost a race\n\
-             Another deploy or activate may have landed first; re-run `celld {command}`.",
+             Another deploy or activate may have landed first; re-run `cello {command}`.",
             bucket.scheme(),
             bucket.name
         )),
         Err(error) => Err(error.context(format!(
-            "Another deploy or activate may have landed first; re-run `celld {command}`."
+            "Another deploy or activate may have landed first; re-run `cello {command}`."
         ))),
     }
 }
@@ -2837,17 +2837,17 @@ async fn commit_pointer(
         Ok(Some(_)) => Ok(()),
         Ok(None) => Err(anyhow!(
             "write {}://{}/{key} lost a race\n\
-             Another deploy or activate landed first; re-run `celld {command}`.",
+             Another deploy or activate landed first; re-run `cello {command}`.",
             bucket.scheme(),
             bucket.name
         )),
         Err(error) => Err(error.context(format!(
-            "Another deploy or activate may have landed first; re-run `celld {command}`."
+            "Another deploy or activate may have landed first; re-run `cello {command}`."
         ))),
     }
 }
 
-/// What `celld d1` needs out of a project: the declared databases, so a name
+/// What `cello d1` needs out of a project: the declared databases, so a name
 /// the project never declared fails here instead of creating an empty one.
 pub struct D1Project {
     /// One entry per declaration, in config order.
@@ -2857,21 +2857,21 @@ pub struct D1Project {
 pub struct D1Declaration {
     pub database_name: String,
     /// Cloudflare's stable resource ID when present, otherwise the database
-    /// name for a celld-only project.
+    /// name for a cello-only project.
     pub database_identity: String,
     /// Wrangler scopes `migrations_dir` to the binding, so this is per
     /// database and never shared. A single shared directory would apply one
     /// database's migrations to another.
     pub migrations_dir: PathBuf,
     /// The bookkeeping table, per binding as on wrangler
-    /// (`migrations_table`). Hard-coding `d1_migrations` here made celld
+    /// (`migrations_table`). Hard-coding `d1_migrations` here made cello
     /// read an empty table on a project that had renamed it, and every
     /// already-applied migration re-ran.
     pub migrations_table: String,
 }
 
 /// Read a project's D1 declarations. This reads the same config `build` reads,
-/// but it does not bundle: `celld d1` acts on a database that is already
+/// but it does not bundle: `cello d1` acts on a database that is already
 /// deployed, and a project that fails to build must still be migratable.
 pub fn read_d1_project(given: Option<PathBuf>) -> anyhow::Result<D1Project> {
     let (path, root) = resolve_project_config(given)?;
@@ -2893,13 +2893,13 @@ pub fn read_d1_project(given: Option<PathBuf>) -> anyhow::Result<D1Project> {
                 continue;
             };
             // Wrangler discovers migrations through more knobs than the two
-            // celld reads. An unread knob must be a refusal, not a silent
+            // Cello reads. An unread knob must be a refusal, not a silent
             // default: honoring half of a project's migration config applies
             // the wrong files in the wrong order.
             if entry.get("migrations_pattern").is_some() {
                 bail!(
-                    "d1 database {name:?} sets `migrations_pattern`, which celld \
-                     does not support; celld reads `*.sql` from `migrations_dir`"
+                    "d1 database {name:?} sets `migrations_pattern`, which cello \
+                     does not support; cello reads `*.sql` from `migrations_dir`"
                 );
             }
             let migrations_table = match entry.get("migrations_table") {
@@ -2935,7 +2935,7 @@ pub fn read_d1_project(given: Option<PathBuf>) -> anyhow::Result<D1Project> {
             };
             // The lexical check above cannot see directory links: the joined
             // path must resolve inside the project. A missing directory stays
-            // missing so `celld d1` can report it when it reads.
+            // missing so `cello d1` can report it when it reads.
             let migrations_dir = match std::fs::symlink_metadata(&migrations_dir) {
                 Ok(_) => contain_path(
                     &root,
@@ -3038,7 +3038,7 @@ fn read_project(path: &Path, root: &Path, overrides: &VarOverrides) -> anyhow::R
         .collect::<Vec<_>>();
     if !unsupported.is_empty() {
         bail!(
-            "`celld deploy` does not support these config keys: {}.\n\
+            "`cello deploy` does not support these config keys: {}.\n\
              Deploy this project with Wrangler instead, or remove them.",
             unsupported.join(", ")
         );
@@ -3150,7 +3150,7 @@ fn read_project(path: &Path, root: &Path, overrides: &VarOverrides) -> anyhow::R
             .get("class_name")
             .and_then(Value::as_str)
             .ok_or_else(|| anyhow!("durable object binding {name} has no `class_name`"))?;
-        // A `script_name` names the script that owns the class. celld
+        // A `script_name` names the script that owns the class. cello
         // deploys one script, so a binding naming another script is
         // refused here rather than counted as a class of this one: the
         // node would otherwise fail to start, reporting the class as
@@ -3162,7 +3162,7 @@ fn read_project(path: &Path, root: &Path, overrides: &VarOverrides) -> anyhow::R
             })?;
             if script != script_name {
                 bail!(
-                    "durable object binding {name} sets `script_name` {script:?}; celld runs a \
+                    "durable object binding {name} sets `script_name` {script:?}; cello runs a \
                      Durable Object class only in the script that declares it"
                 );
             }
@@ -3241,7 +3241,7 @@ fn read_project(path: &Path, root: &Path, overrides: &VarOverrides) -> anyhow::R
             .get("database_name")
             .and_then(Value::as_str)
             .ok_or_else(|| {
-                anyhow!("d1 binding {binding} has no `database_name`; celld uses the name to select the database from the CLI")
+                anyhow!("d1 binding {binding} has no `database_name`; cello uses the name to select the database from the CLI")
             })?;
         if database_name.is_empty() {
             bail!("d1 binding {binding} has an empty `database_name`");
@@ -3274,9 +3274,9 @@ fn read_project(path: &Path, root: &Path, overrides: &VarOverrides) -> anyhow::R
     };
     let mut kv_ids = BTreeSet::new();
     for namespace in kv_namespaces {
-        // Every key celld does not model stops the deploy, per the loud-gap
+        // Every key cello does not model stops the deploy, per the loud-gap
         // rule. `preview_id` is the exception and is accepted below: it selects
-        // a different namespace under `wrangler dev`, which celld does not run,
+        // a different namespace under `wrangler dev`, which cello does not run,
         // so ignoring it costs a developer nothing at deploy time.
         let unsupported = namespace
             .as_object()
@@ -3290,8 +3290,8 @@ fn read_project(path: &Path, root: &Path, overrides: &VarOverrides) -> anyhow::R
             .unwrap_or_default();
         if let Some(key) = unsupported.first() {
             bail!(
-                "kv namespace declares `{key}`, which celld does not model; \
-                 celld models `binding`, `id`, and `preview_id`"
+                "kv namespace declares `{key}`, which cello does not model; \
+                 cello models `binding`, `id`, and `preview_id`"
             );
         }
         let binding = namespace
@@ -3301,17 +3301,17 @@ fn read_project(path: &Path, root: &Path, overrides: &VarOverrides) -> anyhow::R
         if !valid_binding(binding) {
             bail!("invalid kv binding name: {binding:?}");
         }
-        // `id` is the namespace identity, verbatim, and celld invents no
+        // `id` is the namespace identity, verbatim, and cello invents no
         // `namespace_name` key beside it. Upstream's `kv_namespaces` carries no
         // human-readable name at all -- only `binding`, `id` and `preview_id` --
-        // and celld's accepted configuration is a strict subset of Wrangler's:
-        // a key celld accepts and Wrangler diagnoses would make the file
+        // and cello's accepted configuration is a strict subset of Wrangler's:
+        // a key cello accepts and Wrangler diagnoses would make the file
         // unportable, which is the one property the deploy story rests on. A
         // project ported from Cloudflare therefore keeps its hex id and works;
         // a project that was never there writes a readable string.
         let id = namespace.get("id").and_then(Value::as_str).ok_or_else(|| {
             anyhow!(
-                "kv binding {binding} has no `id`; celld uses the id as the \
+                "kv binding {binding} has no `id`; cello uses the id as the \
                      namespace identity, so any stable string serves"
             )
         })?;
@@ -3353,7 +3353,7 @@ fn read_project(path: &Path, root: &Path, overrides: &VarOverrides) -> anyhow::R
         .flat_map(|queues| queues.keys())
         .find(|key| !matches!(key.as_str(), "producers" | "consumers"))
     {
-        bail!("config `queues` declares `{key}`, which celld does not model");
+        bail!("config `queues` declares `{key}`, which cello does not model");
     }
     let queue_producers = match queues.and_then(|queues| queues.get("producers")) {
         None => &[][..],
@@ -3397,7 +3397,7 @@ fn read_project(path: &Path, root: &Path, overrides: &VarOverrides) -> anyhow::R
     let mut consumed_queues = BTreeSet::new();
     for consumer in queue_consumers_raw {
         if consumer.get("script_name").is_some() {
-            bail!("queue consumer declares `script_name`; celld attaches it to the current script");
+            bail!("queue consumer declares `script_name`; cello attaches it to the current script");
         }
         reject_queue_keys(
             consumer,
@@ -3467,7 +3467,7 @@ fn read_project(path: &Path, root: &Path, overrides: &VarOverrides) -> anyhow::R
     };
     let mut workflow_names = BTreeSet::new();
     for workflow in workflows {
-        // Any key celld does not model stops the deploy, per the loud-gap
+        // Any key cello does not model stops the deploy, per the loud-gap
         // rule: an unread knob (`schedules` is the notable one) must be a
         // refusal, never a workflow that silently lacks the behavior it
         // declares.
@@ -3488,8 +3488,8 @@ fn read_project(path: &Path, root: &Path, overrides: &VarOverrides) -> anyhow::R
             .unwrap_or_default();
         if !unsupported.is_empty() {
             bail!(
-                "`celld deploy` does not support these workflow keys: {}.\n\
-                 celld models `name`, `binding`, `class_name`, and `script_name`; \
+                "`cello deploy` does not support these workflow keys: {}.\n\
+                 cello models `name`, `binding`, `class_name`, and `script_name`; \
                  remove the rest (`schedules` included).",
                 unsupported.join(", ")
             );
@@ -3528,7 +3528,7 @@ fn read_project(path: &Path, root: &Path, overrides: &VarOverrides) -> anyhow::R
         if let Some(script) = workflow.get("script_name").and_then(Value::as_str) {
             if script != script_name {
                 bail!(
-                    "workflow {workflow_name:?} sets `script_name` {script:?}; celld runs a \
+                    "workflow {workflow_name:?} sets `script_name` {script:?}; cello runs a \
                      workflow only in the script that declares it"
                 );
             }
@@ -3569,7 +3569,7 @@ fn read_project(path: &Path, root: &Path, overrides: &VarOverrides) -> anyhow::R
             .get("bucket_name")
             .and_then(Value::as_str)
             .ok_or_else(|| {
-                anyhow!("r2 binding {binding} has no `bucket_name`; celld uses the name to place the bucket's keys in the fleet bucket")
+                anyhow!("r2 binding {binding} has no `bucket_name`; cello uses the name to place the bucket's keys in the fleet bucket")
             })?;
         if !valid_resource_name(bucket_name) {
             bail!(
@@ -3580,11 +3580,11 @@ fn read_project(path: &Path, root: &Path, overrides: &VarOverrides) -> anyhow::R
         if !r2_bucket_names.insert(bucket_name.to_string()) {
             bail!("two r2 bindings name the same bucket: {bucket_name:?}");
         }
-        // Cloudflare scopes a jurisdiction to an account's R2; celld has
+        // Cloudflare scopes a jurisdiction to an account's R2; cello has
         // neither, and silently ignoring it would put the keys somewhere
         // the operator did not ask for.
         if bucket.get("jurisdiction").is_some() {
-            bail!("r2 binding {binding} sets `jurisdiction`, which celld does not have");
+            bail!("r2 binding {binding} sets `jurisdiction`, which cello does not have");
         }
         bindings.push(json!({
             "type": "r2_bucket",
@@ -3596,7 +3596,7 @@ fn read_project(path: &Path, root: &Path, overrides: &VarOverrides) -> anyhow::R
     // Loader. workerd declares the loaders in a `List(Binding)`, so a config
     // can name more than one, and each one holds its own cache of the Workers
     // it loaded. Two loaders are therefore two cache namespaces and not a
-    // duplicate of one namespace, so celld binds every entry. The shared
+    // duplicate of one namespace, so cello binds every entry. The shared
     // binding-name check below refuses two entries that carry the same name.
     let worker_loaders = match object.get("worker_loaders") {
         None => &[][..],
@@ -3624,7 +3624,7 @@ fn read_project(path: &Path, root: &Path, overrides: &VarOverrides) -> anyhow::R
                 match key.as_str() {
                     "limits" => bail!("worker loader {binding} sets `limits`; set limits in WorkerCode or getEntrypoint()"),
                     "tails" => bail!("worker loader {binding} sets `tails`; set tails in WorkerCode"),
-                    "allowExperimental" => bail!("worker loader {binding} sets `allowExperimental`, which celld does not support"),
+                    "allowExperimental" => bail!("worker loader {binding} sets `allowExperimental`, which cello does not support"),
                     _ => bail!("worker loader {binding} sets `{key}`, which is not a supported worker_loaders option"),
                 }
             }
@@ -3793,8 +3793,8 @@ fn read_project(path: &Path, root: &Path, overrides: &VarOverrides) -> anyhow::R
 
 /// The config's `define` and `rules`, as esbuild arguments.
 ///
-/// Wrangler owns the spelling of both keys, so celld reads them as written
-/// rather than inventing a celld-only escape hatch: a project keeps one
+/// Wrangler owns the spelling of both keys, so cello reads them as written
+/// rather than inventing a cello-only escape hatch: a project keeps one
 /// config, and a later move back to Wrangler bundles the same way.
 fn read_bundle_config(object: &Map<String, Value>) -> anyhow::Result<BundleConfig> {
     let mut bundle = BundleConfig::default();
@@ -3832,7 +3832,7 @@ fn read_bundle_config(object: &Map<String, Value>) -> anyhow::Result<BundleConfi
         };
         for key in rule.keys() {
             if !matches!(key.as_str(), "type" | "globs") {
-                bail!("module rule sets `{key}`, which celld does not have");
+                bail!("module rule sets `{key}`, which cello does not have");
             }
         }
         let Some(rule_type) = rule.get("type").and_then(Value::as_str) else {
@@ -3843,7 +3843,7 @@ fn read_bundle_config(object: &Map<String, Value>) -> anyhow::Result<BundleConfi
             "Data" => Loader::Binary,
             "CompiledWasm" => Loader::Copy,
             other => bail!(
-                "module rule type {other:?} is not supported; celld supports \
+                "module rule type {other:?} is not supported; cello supports \
                  Text, Data, and CompiledWasm"
             ),
         };
@@ -3878,7 +3878,7 @@ fn read_bundle_config(object: &Map<String, Value>) -> anyhow::Result<BundleConfi
 /// The file extension a Wrangler module glob selects.
 ///
 /// esbuild chooses a loader by extension, and Wrangler chooses one by glob, so
-/// only a glob that is exactly an extension match crosses that gap. celld
+/// only a glob that is exactly an extension match crosses that gap. cello
 /// refuses every other glob rather than load a different set of files than the
 /// config asks for.
 fn rule_extension(glob: &str) -> anyhow::Result<String> {
@@ -3892,7 +3892,7 @@ fn rule_extension(glob: &str) -> anyhow::Result<String> {
         })
         .ok_or_else(|| {
             anyhow!(
-                "module rule glob {glob:?} is not an extension match; celld \
+                "module rule glob {glob:?} is not an extension match; cello \
                  supports a glob of the form `**/*.ext`"
             )
         })?;
@@ -3924,7 +3924,7 @@ fn read_containers(
                 "class_name" | "image" | "name" | "instance_type" | "max_instances" | "runtime"
             )
         }) {
-            bail!("config `containers[{index}]` declares `{key}`, which celld does not model");
+            bail!("config `containers[{index}]` declares `{key}`, which cello does not model");
         }
         let class_name = entry
             .get("class_name")
@@ -4016,7 +4016,7 @@ fn reject_queue_keys(value: &Value, accepted: &[&str], kind: &str) -> anyhow::Re
         .as_object()
         .ok_or_else(|| anyhow!("queue {kind} must be an object"))?;
     if let Some(key) = object.keys().find(|key| !accepted.contains(&key.as_str())) {
-        bail!("queue {kind} declares `{key}`, which celld does not model");
+        bail!("queue {kind} declares `{key}`, which cello does not model");
     }
     Ok(())
 }
@@ -4085,7 +4085,7 @@ pub(crate) fn valid_resource_name(name: &str) -> bool {
 }
 
 /// The Wrangler-compatible Worker name that is safe in every place where
-/// celld reuses it. Checking only the generated Workflow class would leave
+/// Cello reuses it. Checking only the generated Workflow class would leave
 /// deployment keys and operator output with a different accepted language.
 pub(crate) fn valid_script_name(name: &str) -> bool {
     name.len() <= MAX_SCRIPT_NAME_BYTES
@@ -4150,7 +4150,7 @@ fn read_sqlite_classes(project: &Map<String, Value>) -> anyhow::Result<Vec<Strin
             .collect::<Vec<_>>();
         if !unsupported.is_empty() {
             bail!(
-                "`celld deploy` does not support these migration keys: {}.\n\
+                "`cello deploy` does not support these migration keys: {}.\n\
                  Class rename, delete, transfer, and non-SQLite migration semantics need an explicit persisted-state contract before deployment.",
                 unsupported.join(", ")
             );
@@ -4208,7 +4208,7 @@ fn read_asset_project(
         .collect::<Vec<_>>();
     if !unsupported.is_empty() {
         bail!(
-            "`celld deploy` does not support these assets keys: {}",
+            "`cello deploy` does not support these assets keys: {}",
             unsupported.join(", ")
         );
     }
@@ -4607,7 +4607,7 @@ fn collect_asset_files(
         })?;
         if relative.is_empty() && name == ".assetsignore" {
             bail!(
-                "{} is not supported by `celld deploy`; remove it or deploy with Wrangler",
+                "{} is not supported by `cello deploy`; remove it or deploy with Wrangler",
                 entry.path().display()
             );
         }
@@ -4764,9 +4764,9 @@ fn collect_unbundled_wasm(
             )
         })?;
         // Wrangler excludes its state tree. The other exclusions prevent a
-        // project-root entry from turning repository or celld state into an
-        // application module when celld performs the same recursive scan.
-        if file_type.is_dir() && matches!(name.as_str(), ".git" | ".celld" | ".wrangler") {
+        // project-root entry from turning repository or cello state into an
+        // application module when cello performs the same recursive scan.
+        if file_type.is_dir() && matches!(name.as_str(), ".git" | ".cello" | ".wrangler") {
             continue;
         }
         if name.contains(['\\', '\0']) {
@@ -4797,7 +4797,7 @@ fn run_esbuild(
     config: &BundleConfig,
     sourcemap: bool,
 ) -> anyhow::Result<BundleOutput> {
-    // node: builtins stay external. Wrangler polyfills them with unenv; celld
+    // node: builtins stay external. Wrangler polyfills them with unenv; cello
     // implements the workerd `nodejs_compat` subset itself, so the runtime
     // provides them.
     let binary = std::env::var("CELLO_ESBUILD").unwrap_or_else(|_| "esbuild".to_string());
@@ -4831,7 +4831,7 @@ fn run_esbuild(
     let Some(program) = confine::locate_executable(&binary) else {
         bail!(
             "esbuild not found ({binary}).\n\
-             `celld deploy` bundles with esbuild; install it and retry,\n\
+             `cello deploy` bundles with esbuild; install it and retry,\n\
              or set CELLO_ESBUILD to its path."
         );
     };
@@ -4849,7 +4849,7 @@ fn run_esbuild(
         );
     }
     let mut command = Command::new(&program);
-    // `celld dev` bundles from its serving supervisor, whose environment
+    // `cello dev` bundles from its serving supervisor, whose environment
     // holds the fleet's credentials; `execve` also makes the child
     // dumpable again. esbuild needs none of that — its entry, project,
     // output, and metafile paths arrive as arguments — so it starts from
@@ -4894,7 +4894,7 @@ fn run_esbuild(
         if error.kind() == std::io::ErrorKind::NotFound {
             anyhow!(
                 "esbuild not found ({binary}).\n\
-                     `celld deploy` bundles with esbuild; install it and retry,\n\
+                     `cello deploy` bundles with esbuild; install it and retry,\n\
                      or set CELLO_ESBUILD to its path."
             )
         } else if error.kind() == std::io::ErrorKind::PermissionDenied && confinement.confines() {
@@ -5850,10 +5850,10 @@ fi
         assert!(!entries[0].current);
     }
 
-    /// A plain `celld deploy` leaves the fleet-wide pointer without a
+    /// A plain `cello deploy` leaves the fleet-wide pointer without a
     /// components map while service versions stay on their named pointers:
     /// serving loads the service binding through `deploy/<service>/
-    /// current.json`, and `celld discard` refuses that version, so the
+    /// current.json`, and `cello discard` refuses that version, so the
     /// listing must mark it current beside the primary.
     #[tokio::test]
     async fn versions_list_marks_named_pointer_versions_current_without_a_generation() {
@@ -5871,7 +5871,7 @@ fi
                 .await
                 .unwrap();
         }
-        // What a plain `celld deploy` of each script leaves behind: a
+        // What a plain `cello deploy` of each script leaves behind: a
         // primary-only fleet pointer and one named pointer per script.
         let plain = |script: &str, version: &str| DeployPointer {
             script_name: Some(script.to_string()),
@@ -6361,7 +6361,7 @@ mod sourcemap_tests {
         assert_eq!(plain.modules, mapped.modules);
         assert_eq!(plain.version, mapped.version);
         // The caller's bytes deploy untouched, trailing comment included:
-        // celld never rewrites a pre-bundled entry.
+        // Cello never rewrites a pre-bundled entry.
         assert_eq!(plain.modules[0].1, entry);
         assert!(mapped.sourcemap.is_some());
     }

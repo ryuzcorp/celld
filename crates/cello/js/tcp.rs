@@ -92,7 +92,7 @@ fn owns(owner: &Weak<IoContext>, context: &Arc<IoContext>) -> bool {
 
 /// The shared tenant roots (`crate::tls_roots`), the same choice `ws_client`
 /// makes: Mozilla's plus the OS store and `SSL_CERT_FILE`, so a downloaded
-/// celld still reaches public TLS hosts on a machine with no
+/// Cello still reaches public TLS hosts on a machine with no
 /// `/etc/ssl/certs`. Test TLS servers use a root injected through the
 /// gated seam below.
 #[cfg(cello_internal_tests)]
@@ -168,13 +168,13 @@ pub(super) fn op_tcp_connect(
                 "This worker is not permitted to access the internet via global functions.",
             );
         }
-        // A Fetcher is still an authority boundary for sockets. celld's
+        // A Fetcher is still an authority boundary for sockets. cello's
         // service protocol has no bidirectional CONNECT tunnel, so refusing is
         // required: a direct TcpStream here would silently bypass the broker.
         EgressPolicy::Broker(_) => {
             return loader_throw(
                 scope,
-                "A globalOutbound Fetcher cannot broker connect() in celld.",
+                "A globalOutbound Fetcher cannot broker connect() in cello.",
             );
         }
     }

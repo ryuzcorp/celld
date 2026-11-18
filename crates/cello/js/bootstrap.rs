@@ -531,7 +531,7 @@ fn alias_workflow_class(
 
 /// `__cell.kvLimits`: every bound `cello_logic::kv` declares, as data.
 ///
-/// Injected rather than written in `harness.js` so the binding, `celld kv` and
+/// Injected rather than written in `harness.js` so the binding, `cello kv` and
 /// deploy-time validation cannot disagree about what a valid key is. No host
 /// op: a limit is data rather than a decision, so shipping the values is
 /// enough, and D1 set the bar at one op with Workflows coming in under it.

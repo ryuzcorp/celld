@@ -1,4 +1,4 @@
-// node:os for celld -- a port of Workerd's deterministic Workers shim.
+// node:os for cello -- a port of Workerd's deterministic Workers shim.
 // Copyright (c) 2017-2022 Cloudflare, Inc. (Apache-2.0).
 //
 // A Worker cannot observe its host operating system. These values describe

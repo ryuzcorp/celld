@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): D1 export operator-ingress marker; ported from meln1k/celld: report wake coverage after maintenance (e6cb9a3); shared-cell compat union; WebSocket join tokens; post-response background budget (upstream #275); nodejs process.env population flag (upstream #296).
+// Modified by ryuzcorp (ryuzcorp/celld): D1 export operator-ingress marker; ported from meln1k/cello: report wake coverage after maintenance (e6cb9a3); shared-cell compat union; WebSocket join tokens; post-response background budget (upstream #275); nodejs process.env population flag (upstream #296).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! Engine-neutral types and helpers that the cell runtimes and the host
@@ -234,7 +234,7 @@ pub struct CellOverloaded;
 /// value.
 #[doc(hidden)]
 pub const CELL_OVERLOAD_ERROR_MARKER: &str =
-    "celld-internal-cell-overload-7ec38c64-12d7-4ddc-9e77-b63f9dc14130";
+    "cello-internal-cell-overload-7ec38c64-12d7-4ddc-9e77-b63f9dc14130";
 
 impl std::fmt::Display for CellOverloaded {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -265,7 +265,7 @@ pub struct Compat {
     pub sqlite_vec: bool,
     /// `websocket_standard_binary_type`: `binaryType` defaults to `"blob"` and
     /// a binary message arrives as a `Blob`, per the WHATWG default. Without
-    /// it celld keeps the historical `"arraybuffer"`.
+    /// it cello keeps the historical `"arraybuffer"`.
     pub websocket_standard_binary_type: bool,
     /// Queue bodies default to JSON on compatibility dates after 2024-03-18;
     /// older deployments retain the V8 structured-clone default.
@@ -617,7 +617,7 @@ pub(crate) fn namespace_key(script_name: &str, class_name: &str) -> String {
 }
 
 /// The cell scope a D1 database lives at, for a caller outside any isolate.
-/// `celld d1` addresses a database over the operator route, which takes a
+/// `cello d1` addresses a database over the operator route, which takes a
 /// scope, so this derives what `getByName` derives in the harness, from the
 /// same key and the same HMAC.
 pub fn d1_cell_scope(database_identity: &str) -> String {
@@ -626,7 +626,7 @@ pub fn d1_cell_scope(database_identity: &str) -> String {
 }
 
 /// The cell scope one shard of a KV namespace lives at, for a caller outside
-/// any isolate. `celld kv` addresses a namespace over the operator route, and
+/// any isolate. `cello kv` addresses a namespace over the operator route, and
 /// this derives what `getByName` derives in the harness -- from the same key,
 /// the same name, and the same HMAC.
 ///

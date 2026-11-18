@@ -73,7 +73,7 @@ impl HostFile {
     }
 }
 
-/// The complete local-file surface used by celld and the LTX engine.
+/// The complete local-file surface used by Cello and the LTX engine.
 pub trait FileSystem: Send + Sync {
     /// Opens an anonymous read/write scratch file. The handle owns its storage,
     /// so cancellation and process exit cannot leave a compaction scratch file.
@@ -374,7 +374,7 @@ impl LtxHost {
     }
 }
 
-// This is the lower crate's stand-alone production backend. celld injects an
+// This is the lower crate's stand-alone production backend. cello injects an
 // execution-domain-backed host on every engine path.
 #[allow(clippy::disallowed_methods)]
 impl Default for LtxHost {

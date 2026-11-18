@@ -55,7 +55,7 @@ fn copy_dir(src: &Path, dst: &Path) {
     }
 }
 
-/// A booted `celld dev` and its address. Kills the child on drop, so a
+/// A booted `cello dev` and its address. Kills the child on drop, so a
 /// failing assertion cannot leak a server onto its port.
 struct TestNode {
     child: Child,
@@ -75,7 +75,7 @@ impl TestNode {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .expect("spawn celld dev");
+            .expect("spawn cello dev");
         let mut stdout = child.stdout.take().expect("piped stdout");
         let stderr = child.stderr.take().expect("piped stderr");
         std::thread::spawn(move || {
@@ -90,9 +90,9 @@ impl TestNode {
         };
         node.public = poll_until("boot", Duration::from_secs(120), || {
             if let Some(status) = node.child.try_wait().expect("poll child") {
-                panic!("celld dev exited during boot: {status}");
+                panic!("cello dev exited during boot: {status}");
             }
-            let addr = announced(&announced_lines, "celld listening on ")?;
+            let addr = announced(&announced_lines, "cello listening on ")?;
             probe(&addr, "/health").then_some(addr)
         });
         node
@@ -222,7 +222,7 @@ fn websocket_roundtrip(addr: &str, path: &str) -> String {
 #[test]
 fn loader_101_response_carries_its_websocket() {
     let fixture = fixture_dir();
-    let project = fixture_tempdir("celld-ws-loader-");
+    let project = fixture_tempdir("cello-ws-loader-");
     copy_dir(&fixture, project.path());
     let node = TestNode::boot(project.path());
 
@@ -240,7 +240,7 @@ fn loader_101_response_carries_its_websocket() {
 #[test]
 fn caller_initiated_close_reaches_the_caller() {
     let fixture = fixture_dir();
-    let project = fixture_tempdir("celld-ws-loader-close-");
+    let project = fixture_tempdir("cello-ws-loader-close-");
     copy_dir(&fixture, project.path());
     let node = TestNode::boot(project.path());
 
@@ -268,7 +268,7 @@ fn caller_initiated_close_reaches_the_caller() {
 #[test]
 fn flooded_pipe_still_delivers_caller_close() {
     let fixture = fixture_dir();
-    let project = fixture_tempdir("celld-ws-loader-flood-");
+    let project = fixture_tempdir("cello-ws-loader-flood-");
     copy_dir(&fixture, project.path());
     let node = TestNode::boot(project.path());
 
@@ -298,7 +298,7 @@ fn flooded_pipe_still_delivers_caller_close() {
 #[test]
 fn overloaded_pipe_closes_with_1011() {
     let fixture = fixture_dir();
-    let project = fixture_tempdir("celld-ws-loader-overload-");
+    let project = fixture_tempdir("cello-ws-loader-overload-");
     copy_dir(&fixture, project.path());
     let node = TestNode::boot(project.path());
 
@@ -322,7 +322,7 @@ fn overloaded_pipe_closes_with_1011() {
 #[test]
 fn closing_pipe_flushes_queued_frames_first() {
     let fixture = fixture_dir();
-    let project = fixture_tempdir("celld-ws-loader-order-");
+    let project = fixture_tempdir("cello-ws-loader-order-");
     copy_dir(&fixture, project.path());
     let node = TestNode::boot(project.path());
 
@@ -367,7 +367,7 @@ fn closing_pipe_flushes_queued_frames_first() {
 #[test]
 fn queued_close_reaches_the_caller() {
     let fixture = fixture_dir();
-    let project = fixture_tempdir("celld-ws-loader-queued-");
+    let project = fixture_tempdir("cello-ws-loader-queued-");
     copy_dir(&fixture, project.path());
     let node = TestNode::boot(project.path());
 
@@ -395,7 +395,7 @@ fn queued_close_reaches_the_caller() {
 #[test]
 fn queued_close_sync_reaches_the_caller() {
     let fixture = fixture_dir();
-    let project = fixture_tempdir("celld-ws-loader-queued-sync-");
+    let project = fixture_tempdir("cello-ws-loader-queued-sync-");
     copy_dir(&fixture, project.path());
     let node = TestNode::boot(project.path());
 
@@ -427,7 +427,7 @@ fn queued_close_sync_reaches_the_caller() {
 #[test]
 fn loaded_queued_close_reaches_the_loaded() {
     let fixture = fixture_dir();
-    let project = fixture_tempdir("celld-ws-loader-loaded-queued-");
+    let project = fixture_tempdir("cello-ws-loader-loaded-queued-");
     copy_dir(&fixture, project.path());
     let node = TestNode::boot(project.path());
 
@@ -469,7 +469,7 @@ fn loaded_queued_close_reaches_the_loaded() {
 #[test]
 fn cell_queued_close_reaches_the_caller() {
     let fixture = fixture_dir();
-    let project = fixture_tempdir("celld-ws-do-queued-");
+    let project = fixture_tempdir("cello-ws-do-queued-");
     copy_dir(&fixture, project.path());
     let node = TestNode::boot(project.path());
 
@@ -496,7 +496,7 @@ fn cell_queued_close_reaches_the_caller() {
 #[test]
 fn cell_target_caller_initiated_close_reaches_the_caller() {
     let fixture = fixture_dir();
-    let project = fixture_tempdir("celld-ws-do-close-");
+    let project = fixture_tempdir("cello-ws-do-close-");
     copy_dir(&fixture, project.path());
     let node = TestNode::boot(project.path());
 

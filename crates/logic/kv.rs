@@ -18,7 +18,7 @@
 //!
 //! What stays is what production genuinely reads: the bounds themselves, the
 //! shard function, the cell name, and the large-value reference. Those decide
-//! where data lives and what celld will accept, and every runtime path must
+//! where data lives and what Cello will accept, and every runtime path must
 //! agree about them exactly.
 //!
 //! Deliberately absent: the SQL, the object-store I/O for a large value, and
@@ -38,7 +38,7 @@ pub const RESERVED_CLASS: &str = "__KvNamespace";
 pub const MAX_KEY_BYTES: usize = 512;
 pub const MAX_VALUE_BYTES: usize = 25 * 1024 * 1024;
 
-/// The largest value celld stores inside the namespace cell.
+/// The largest value cello stores inside the namespace cell.
 ///
 /// A cell's writes replicate as LTX, so an inline value is paid for twice: once
 /// in SQLite and once on the wire, on every write. Upstream permits 25 MiB, and

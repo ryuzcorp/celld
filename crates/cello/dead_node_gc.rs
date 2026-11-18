@@ -1,10 +1,10 @@
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
-//! Compatibility garbage collection for dead celld process generations.
+//! Compatibility garbage collection for dead cello process generations.
 //!
 //! Wake entries and lazy ownership takeover provide serving correctness.
 //! This adapter retires the historical `node-cells/` index debris and expired
-//! node-session records left in fleet buckets shared with celld.
+//! node-session records left in fleet buckets shared with cello.
 
 use crate::bucket::Bucket;
 use anyhow::Context as _;

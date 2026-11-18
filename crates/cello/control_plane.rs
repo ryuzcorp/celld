@@ -23,7 +23,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
-const DEFAULT_CONTROL_URL: &str = "https://celld.dev";
+const DEFAULT_CONTROL_URL: &str = "https://cello.dev";
 const DEFAULT_ENVIRONMENT: &str = "prod";
 const MAX_PRESENCE_CELLS: usize = 50;
 const MAX_PRESENCE_CELL_ID_BYTES: usize = 200;
@@ -48,7 +48,7 @@ fn restart_with_rotated_credentials() -> ! {
                 event = "control_plane_restart_exec_failed",
                 trigger = "credential_rotation",
                 %error,
-                "could not locate celld for process reload; exiting for an external supervisor"
+                "could not locate cello for process reload; exiting for an external supervisor"
             );
             std::process::exit(75);
         }
@@ -79,7 +79,7 @@ fn restart_with_rotated_credentials() -> ! {
         event = "control_plane_restart_exec_failed",
         trigger = "credential_rotation",
         %error,
-        "could not re-exec celld for process reload; exiting for an external supervisor"
+        "could not re-exec cello for process reload; exiting for an external supervisor"
     );
     std::process::exit(75);
 }
@@ -152,15 +152,15 @@ pub fn report_managed_runtime_state(state: ManagedRuntimeState) {
         ManagedRuntimeState::CredentialRevoked => warn!(
             event = "managed_runtime_state",
             managed_state,
-            "managed storage credential was rejected; restart celld to fetch a \
-             fresh one, or run `celld credentials refresh` if a rotation is pending"
+            "managed storage credential was rejected; restart cello to fetch a \
+             fresh one, or run `cello credentials refresh` if a rotation is pending"
         ),
         // No remedy on this node: the store lacks a required operation, so a
         // restart repeats the refusal. The operator needs a compatible store.
         ManagedRuntimeState::StorageContractViolated => warn!(
             event = "managed_runtime_state",
             managed_state,
-            "the fleet bucket does not support a storage operation celld requires, \
+            "the fleet bucket does not support a storage operation cello requires, \
              so serving cannot start; move the fleet to a compatible store"
         ),
     }
@@ -173,8 +173,8 @@ impl std::fmt::Display for ManagedControlCredentialRevoked {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(
             "Managed Control Plane credential was rejected or revoked.\n\
-             Restart celld to fetch a fresh credential. If that does not help, \
-             run `celld credentials refresh`, and `celld diagnose` to check \
+             Restart cello to fetch a fresh credential. If that does not help, \
+             run `cello credentials refresh`, and `cello diagnose` to check \
              bucket access.",
         )
     }
@@ -399,7 +399,7 @@ pub async fn handle_connect_command(
     connect(options, true).await
 }
 
-/// `celld token` — print the fleet's deploy token and the exact commands to
+/// `cello token` — print the fleet's deploy token and the exact commands to
 /// use it.
 ///
 /// Wrangler expects deployment credentials in environment variables, so this
@@ -413,7 +413,7 @@ pub async fn handle_token_command(
         // Help is prose an operator redirects on purpose, so it is stdout.
         return crate::cli_output::Output::new(crate::cli_output::Format::Text).help(
             "Print this fleet's deploy token, and how to deploy with it.\n\n\
-             USAGE:\n  celld token [--format shell]\n\n\
+             USAGE:\n  cello token [--format shell]\n\n\
              OPTIONS:\n  --format shell  Print only shell exports, suitable for `eval`.\n",
         );
     }
@@ -422,15 +422,15 @@ pub async fn handle_token_command(
         [format, value] if format == "--format" && value == "shell" => true,
         _ => {
             return Err(anyhow!(
-                "expected `celld token` or `celld token --format shell`; \
-                 run `celld token --help` for usage"
+                "expected `cello token` or `cello token --format shell`; \
+                 run `cello token --help` for usage"
             ))
         }
     };
     let path = config_path()?;
     let contents = std::fs::read_to_string(&path).with_context(|| {
         format!(
-            "read {}. This celld installation is not enrolled yet — run `celld` \
+            "read {}. This Cello installation is not enrolled yet — run `cello` \
              and approve the link it prints.",
             path.display()
         )
@@ -438,8 +438,8 @@ pub async fn handle_token_command(
     let config: CloudConfig =
         serde_json::from_str(&contents).with_context(|| format!("decode {}", path.display()))?;
     let token = config.installation_token.as_deref().context(
-        "this celld installation is not enrolled in the Managed Control Plane — \
-         run `celld` and approve the link it prints",
+        "this Cello installation is not enrolled in the Managed Control Plane — \
+         run `cello` and approve the link it prints",
     )?;
     let client = reqwest::Client::new();
     let response = client
@@ -453,7 +453,7 @@ pub async fn handle_token_command(
         let body = response.text().await.unwrap_or_default();
         return Err(anyhow!(
             "could not get a deploy token ({status}): {body}\n\
-             If this installation was disconnected, run `celld` to re-enrol."
+             If this installation was disconnected, run `cello` to re-enrol."
         ));
     }
     #[derive(serde::Deserialize)]
@@ -466,7 +466,7 @@ pub async fn handle_token_command(
     let exports = render_deploy_token(&issued.token, &issued.account_id, &issued.api_base_url);
     if !shell_only {
         // Say what to do next, not merely what happened -- on stderr, so
-        // that `eval "$(celld token)"` sees only the exports.
+        // that `eval "$(cello token)"` sees only the exports.
         note!("Deploy token for this fleet:\n\n  {}\n", issued.token);
         note!("Deploy your app with these exports, then `npx wrangler@4 deploy`:\n");
     }
@@ -498,7 +498,7 @@ pub async fn handle_credentials_command(
     }
     if !matches!(arguments.as_slice(), [command] if command == "refresh") {
         return Err(anyhow!(
-            "expected `celld credentials refresh`; run `celld credentials --help` for usage"
+            "expected `cello credentials refresh`; run `cello credentials --help` for usage"
         ));
     }
     refresh_credentials().await
@@ -514,7 +514,7 @@ pub async fn handle_disconnect_command(
     }
     if !matches!(arguments.as_slice(), [confirmation] if confirmation == "--yes") {
         return Err(anyhow!(
-            "disconnect revokes every process sharing this installation; rerun `celld disconnect --yes` to confirm"
+            "disconnect revokes every process sharing this installation; rerun `cello disconnect --yes` to confirm"
         ));
     }
     let path = config_path()?;
@@ -538,7 +538,7 @@ async fn disconnect_at_path(path: PathBuf, client: &reqwest::Client) -> anyhow::
     let token = config
         .installation_token
         .as_deref()
-        .context("this celld installation is not enrolled in the Managed Control Plane")?;
+        .context("this Cello installation is not enrolled in the Managed Control Plane")?;
     let response = client
         .post(format!(
             "{}/api/agent/credentials/revoke",
@@ -558,7 +558,7 @@ async fn disconnect_at_path(path: PathBuf, client: &reqwest::Client) -> anyhow::
 
     // Keep a recoverable, permission-preserving record rather than deleting
     // secrets in place. The provider credential is already revoked, and bare
-    // `celld` will create a fresh installation record on its next start.
+    // `cello` will create a fresh installation record on its next start.
     let file_name = path
         .file_name()
         .and_then(|value| value.to_str())
@@ -593,7 +593,7 @@ async fn refresh_credentials_at_path(
     let token = config
         .installation_token
         .as_deref()
-        .context("this celld installation is not enrolled in the Managed Control Plane")?;
+        .context("this Cello installation is not enrolled in the Managed Control Plane")?;
     let current_storage = config
         .storage
         .as_ref()
@@ -666,7 +666,7 @@ async fn refresh_credentials_at_path(
     acknowledge_credential_handoff(client, &config, &replacement.credential_handoff_id)
         .await
         .context(
-            "replacement credential is saved, but acknowledgement is pending; rerun `celld credentials refresh`",
+            "replacement credential is saved, but acknowledgement is pending; rerun `cello credentials refresh`",
         )?;
     config.credential_handoff_id = None;
     config.previous_credential = None;
@@ -831,13 +831,13 @@ fn restart_for_credential_rotation(previous_version: u64, credential_version: u6
         event = "control_plane_restart_for_credentials",
         previous_credential_version = previous_version,
         credential_version,
-        "managed credential changed; restarting celld to rebuild every credentialed adapter"
+        "managed credential changed; restarting cello to rebuild every credentialed adapter"
     );
     restart_with_rotated_credentials()
 }
 
 /// Watch the durable installation record for the lifetime of the advisory
-/// presence agent. `celld credentials refresh` persists the replacement before
+/// presence agent. `cello credentials refresh` persists the replacement before
 /// acknowledging its handoff; seeing that version is therefore enough to
 /// rebuild the complete adapter graph. Replacing only one S3 client here would
 /// leave the lease pool, replication, explorer, or deploy agent on revoked
@@ -928,7 +928,7 @@ async fn presence_session(
         move || async move {
             let snapshot = (runtime.snapshot)()
                 .await
-                .context("celld core stopped before presence snapshot")?;
+                .context("cello core stopped before presence snapshot")?;
             let mut cells = snapshot
                 .cells
                 .iter()
@@ -1298,8 +1298,8 @@ async fn list_durable_cells(
         .await?
         .into_iter()
         .filter_map(|prefix| prefix.strip_prefix("cells/").map(str::to_string))
-        // The same fence `celld cell list` applies: the engine's storage
-        // charset decides what a celld node could have written. A second
+        // The same fence `cello cell list` applies: the engine's storage
+        // charset decides what a Cello node could have written. A second
         // opinion here would show foreign bucket content as a cell in one
         // surface and hide it in the other.
         .filter(|cell| cello_logic::cell::valid_cell_scope(cell))
@@ -1918,7 +1918,7 @@ pub async fn apply_deployment(
         .await?;
     // A producer can run in a different script, so the manifest is not a
     // discoverable consumer index. Publish the same fleet-wide attachment as
-    // `celld deploy`, after its exact deployment prefix is complete.
+    // `cello deploy`, after its exact deployment prefix is complete.
     crate::deploy::publish_queue_attachments(
         bucket,
         &deployment.manifest,
@@ -1935,7 +1935,7 @@ pub async fn apply_deployment(
         .await?;
     // This fleet-wide pointer is the sole application selector. The named
     // pointer above remains only for resolving service-binding components and
-    // for migrating buckets written by older celld releases.
+    // for migrating buckets written by older Cello releases.
     bucket
         .put(
             "deploy/current.json",
@@ -2253,7 +2253,7 @@ async fn connect_at_path(path: PathBuf, options: ConnectOptions, wait: bool) -> 
             installation_id = %config.installation_id,
             environment = %config.environment,
             control_url = %config.control_url,
-            "celld is already connected to the Managed Control Plane"
+            "cello is already connected to the Managed Control Plane"
         );
         return Ok(());
     }
@@ -2321,10 +2321,10 @@ async fn connect_at_path(path: PathBuf, options: ConnectOptions, wait: bool) -> 
         environment = %config.environment,
         verification_url = %claim.verification_uri_complete,
         expires_in_seconds = claim.expires_in,
-        "authenticate to connect this celld instance"
+        "authenticate to connect this Cello instance"
     );
     note!(
-        "\nConnect this celld instance to the Managed Control Plane:\n\n  {}\n\nEnvironment: {}\n",
+        "\nConnect this Cello instance to the Managed Control Plane:\n\n  {}\n\nEnvironment: {}\n",
         claim.verification_uri_complete,
         config.environment
     );
@@ -2480,11 +2480,11 @@ async fn wait_for_approval(
             fleet_id = %config.fleet_id.as_deref().unwrap_or_default(),
             environment_id = %config.environment_id.as_deref().unwrap_or_default(),
             environment = %config.environment,
-            "celld connected to the Managed Control Plane"
+            "cello connected to the Managed Control Plane"
         );
         note!(
             "Connected to the Managed Control Plane ({}).\n\
-             Keep celld running. In your app directory, run `celld token`, apply the \
+             Keep cello running. In your app directory, run `cello token`, apply the \
              exports it prints, then run `npx wrangler@4 deploy`.",
             config.environment
         );
@@ -2494,10 +2494,10 @@ async fn wait_for_approval(
     // dead approval URL.
     note!(
         "\nThe activation link expired before it was approved.\n\
-         Restart celld to get a new one.\n"
+         Restart cello to get a new one.\n"
     );
     Err(anyhow!(
-        "activation link expired before approval; restart celld for a new link"
+        "activation link expired before approval; restart cello for a new link"
     ))
 }
 
@@ -2515,11 +2515,11 @@ fn config_path() -> anyhow::Result<PathBuf> {
     let base = if let Some(path) = std::env::var_os("CELLO_CONFIG_DIR") {
         PathBuf::from(path)
     } else if let Some(path) = std::env::var_os("XDG_CONFIG_HOME") {
-        PathBuf::from(path).join("celld")
+        PathBuf::from(path).join("cello")
     } else if let Some(path) = std::env::var_os("HOME") {
-        PathBuf::from(path).join(".config").join("celld")
+        PathBuf::from(path).join(".config").join("cello")
     } else {
-        std::env::current_dir()?.join(".celld")
+        std::env::current_dir()?.join(".cello")
     };
     Ok(base.join("cloud.json"))
 }
@@ -2744,7 +2744,7 @@ async fn wait_for_shared_enrollment(path: &Path) -> anyhow::Result<EnrollmentLoc
                 if let Some(pending) = config.pending_claim {
                     if pending.expires_at_ms > current_time_ms() {
                         note!(
-                            "\nConnect this celld installation to the Managed Control Plane:\n\n  {}\n\nEnvironment: {}\n",
+                            "\nConnect this Cello installation to the Managed Control Plane:\n\n  {}\n\nEnvironment: {}\n",
                             pending.verification_uri_complete, config.environment
                         );
                         return acquire_enrollment_lock(path).await;
@@ -2828,7 +2828,7 @@ fn machine_hostname() -> String {
                 && value.is_ascii()
                 && !value.chars().any(char::is_control)
         })
-        .unwrap_or_else(|| "celld".to_string())
+        .unwrap_or_else(|| "cello".to_string())
 }
 
 // The presence session read the socket in the same select! as the heartbeat
@@ -2838,15 +2838,15 @@ fn machine_hostname() -> String {
 
 fn print_connect_help() {
     let _ = crate::cli_output::Output::new(crate::cli_output::Format::Text)
-        .help("Connect this celld installation to the Managed Control Plane.\n\nUSAGE:\n  celld connect [--env prod] [--control-url https://celld.dev] [--force]");
+        .help("Connect this Cello installation to the Managed Control Plane.\n\nUSAGE:\n  cello connect [--env prod] [--control-url https://cello.dev] [--force]");
 }
 
 fn print_credentials_help() {
     let _ = crate::cli_output::Output::new(crate::cli_output::Format::Text)
-        .help("Refresh a staged Managed Control Plane credential.\n\nUSAGE:\n  celld credentials refresh\n\nRunning celld processes sharing this installation automatically reload after the replacement is saved. Unix processes re-exec; other platforms exit 75 for their supervisor.");
+        .help("Refresh a staged Managed Control Plane credential.\n\nUSAGE:\n  cello credentials refresh\n\nRunning cello processes sharing this installation automatically reload after the replacement is saved. Unix processes re-exec; other platforms exit 75 for their supervisor.");
 }
 
 fn print_disconnect_help() {
     let _ = crate::cli_output::Output::new(crate::cli_output::Format::Text)
-        .help("Revoke and disconnect this Managed Control Plane installation.\n\nUSAGE:\n  celld disconnect --yes\n\nStop every celld process sharing this installation first. Other installations in the fleet are unaffected.");
+        .help("Revoke and disconnect this Managed Control Plane installation.\n\nUSAGE:\n  cello disconnect --yes\n\nStop every Cello process sharing this installation first. Other installations in the fleet are unaffected.");
 }

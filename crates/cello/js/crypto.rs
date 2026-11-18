@@ -80,7 +80,7 @@ const SECP384R1_OID: rsa::pkcs8::ObjectIdentifier =
 const SECP521R1_OID: rsa::pkcs8::ObjectIdentifier =
     rsa::pkcs8::ObjectIdentifier::new_unwrap("1.3.132.0.35");
 
-/// The NIST curves celld reads, as (OID, Node's `namedCurve`, JWK `crv`).
+/// The NIST curves cello reads, as (OID, Node's `namedCurve`, JWK `crv`).
 const EC_CURVES: &[(rsa::pkcs8::ObjectIdentifier, &str, &str)] = &[
     (SECP256R1_OID, "prime256v1", "P-256"),
     (SECP384R1_OID, "secp384r1", "P-384"),
@@ -236,12 +236,12 @@ fn jwk_bytes(value: &serde_json::Value, kty: &str, name: &str) -> Result<Vec<u8>
 /// Salt length OpenSSL uses for a PBES2 export, which is what Node inherits.
 const PBES2_SALT_LEN: usize = 8;
 /// PBKDF2 iteration count OpenSSL uses for a PBES2 export. Node inherits it,
-/// so an encrypted key celld writes costs a reader the same as a Node one.
+/// so an encrypted key cello writes costs a reader the same as a Node one.
 ///
 /// This is far weaker than the scrypt cost `pkcs5` reaches for on its own, and
 /// deliberately so: an encrypted key is only as strong as the reader that has
 /// to open it, and every Node and OpenSSL reader expects these parameters. Do
-/// not raise it to harden the KDF -- that hardens celld's keys against celld
+/// not raise it to harden the KDF -- that hardens cello's keys against cello
 /// alone and desyncs the format from the one the ecosystem writes.
 const PBES2_ITERATIONS: u32 = 2048;
 
@@ -250,7 +250,7 @@ const PBES2_ITERATIONS: u32 = 2048;
 /// `pkcs8::PrivateKeyInfo::encrypt` picks scrypt at its recommended cost
 /// (2^15 rounds over 32 MiB) and AES-256-CBC, and it ignores the cipher the
 /// caller asked for. Node derives with PBKDF2-HMAC-SHA256 over 2048
-/// iterations and honours the cipher, so celld builds the parameters itself.
+/// iterations and honours the cipher, so cello builds the parameters itself.
 /// The scrypt default also made an export cost seconds, which is why the two
 /// crypto suites were slow.
 ///
@@ -375,7 +375,7 @@ fn describe_key(der: &[u8], private: bool) -> Result<ParsedKey> {
             })
         }
         other => Err(anyhow!(
-            "unsupported key algorithm {other}; celld implements RSA, EC P-256 and Ed25519"
+            "unsupported key algorithm {other}; cello implements RSA, EC P-256 and Ed25519"
         )),
     }
 }
@@ -445,9 +445,9 @@ fn normalize_key(der: &[u8], structure: &str) -> Result<(Vec<u8>, bool)> {
             Ok((key.to_pkcs8_der()?.as_bytes().to_vec(), true))
         }
         "sec1" => {
-            // SEC1 names no algorithm, so P-256 is the only reading celld has.
+            // SEC1 names no algorithm, so P-256 is the only reading cello has.
             let key = p256::SecretKey::from_sec1_der(der)
-                .map_err(|_| anyhow!("invalid SEC1 EC private key (celld implements P-256)"))?;
+                .map_err(|_| anyhow!("invalid SEC1 EC private key (cello implements P-256)"))?;
             Ok((
                 p256::pkcs8::EncodePrivateKey::to_pkcs8_der(&key)?
                     .as_bytes()

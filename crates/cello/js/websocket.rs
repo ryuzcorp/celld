@@ -480,7 +480,7 @@ pub(super) fn op_ws_upgrade(
         EgressPolicy::Broker(_) => {
             return loader_throw(
                 scope,
-                "A globalOutbound Fetcher cannot broker WebSockets in celld.",
+                "A globalOutbound Fetcher cannot broker WebSockets in cello.",
             );
         }
     }
@@ -654,7 +654,7 @@ pub(super) fn op_ws_connect(
         EgressPolicy::Broker(_) => {
             return loader_throw(
                 scope,
-                "A globalOutbound Fetcher cannot broker WebSockets in celld.",
+                "A globalOutbound Fetcher cannot broker WebSockets in cello.",
             );
         }
     }

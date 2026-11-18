@@ -37,7 +37,7 @@ pub const MAX_CELL_SCOPE: usize = 255;
 /// identifier character, so it is a legal exported class name. Both are inert
 /// in a path component.
 ///
-/// The bound is also the minimum `NAME_MAX` that celld accepts for a data
+/// The bound is also the minimum `NAME_MAX` that Cello accepts for a data
 /// filesystem. The runtime checks that capability at startup. Therefore, a
 /// scope that passes this gate fits every node in the fleet.
 pub fn valid_cell_scope(scope: &str) -> bool {
