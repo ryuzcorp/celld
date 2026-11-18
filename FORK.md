@@ -1044,6 +1044,660 @@ push to `ghcr.io/denoland`, but still. Pushing a branch named
   the L0s in place (agent-200: 1200 objects until epoch GC, against 200
   snapshot objects) instead of trimming them behind a snapshot; single-key
   DELETEs are free, so the request saving is the whole win.
+- `0079` (`9805b72`) cancelled requests reject shared work instead of hanging co-awaiters (upstream #317).
+  A stateless request that disconnected while its subrequest was in flight
+  dropped the op's resolver, so every other request awaiting the same promise
+  hung to the 300s handler budget with nothing logged. `reject_pending_ops`
+  now rejects the refed operations the event still waits on — the fetch
+  wrapper carries the rejection to each co-awaiter's catch — and drops the
+  unrefed ones: their awaiters re-subscribe in a later event (a retained exec
+  read re-armed under a later subscription). Timer ops cannot reject into
+  callback-style `setTimeout`, so the harness fires an armed timer's callback
+  when its op dies with the event; the value the callback computes is
+  unchanged, only early. Shutdown keeps the old silent drop. Tests:
+  white-box, two entries sharing one promise driven through `turn_cancel`,
+  plus the `retained-disconnect` black-box conformance (a disconnecting
+  request with a pending unrefed retained wait drops it; rejecting it would
+  settle the record fatally).
+- `0080` (`d4304d7`) pin shared-promise op attribution for waiter-owned next ops (upstream #316).
+  No runtime change: the issue's `celld dev` repro (B awaits A's shared fetch,
+  then arms its own timer/fetch) already answers on this tree, because the
+  0036 continuation-token line attributes B's next op to B's driver and hands
+  it over instead of adopting it into A. The new white-box test drives two
+  entries sharing one promise through a real timer firing and asserts the
+  resuming entry's driver adopts nothing foreign. The `shared-waiter`
+  black-box conformance drives the issue's repro shape end to end (B awaits
+  A's shared slow fetch, then arms its own timer/fetch); with the adopt-owner
+  filter broken B hangs to the 15 s read deadline, with it the run answers in
+  about a second.
+- `0081` (`2d4a84f`) answered drivers poll while waitUntil background is outstanding (upstream #300).
+  An answered entry driving waitUntil work with no native op of its own
+  concluded it waited on nothing: the cell branch returned `Idle` at once, so
+  `stuck()` abandoned the background and retired the registering event, and the
+  stateless branch spun on its tick without ever observing the settlement. A
+  later event resolving the awaited promise then resumed a continuation whose
+  origin context was dead: storage transactions failed with "the cell event
+  ended before it could acquire an input gate", and the error report over the
+  same socket failed with "the event that issued this operation already ended",
+  so the client saw nothing. Both branches now poll while background work is
+  outstanding, keeping the registering event alive to lend its context and take
+  the handoff; for an entry with a request id, the answered empty-ops branch
+  samples shutdown cancellation before polling, so a lifecycle cancellation
+  still retires the background entry instead of spinning past it to the
+  budget (only shutdown interrupts the poll once answered). An answered entry
+  without a request id does not sample shutdown in that branch; the background
+  budget (`0101`) still bounds it. Tests: `waituntil-tx` black-box conformance drives
+  the issue's WebSocket start/complete dance and asserts both transactions
+  commit and read back (times out on the old code, answers in milliseconds
+  with the fix), plus the `shutdown-retire` conformance (a lifecycle
+  cancellation retires an answered entry with pending background work).
+- `0082` (`7cb31af`) pin cancelled-request lazy-init settlement for Durable Objects (upstream #294).
+  No runtime change: a Durable Object lazily starts a timer shared through
+  `this.ready`, the first request is cancelled mid-flight, and the retry must
+  answer. The cancel path fixed for #317 is shared with cell entries (the cell
+  driver reaches the same `turn_cancel`), so the dropped timer op rejects, the
+  harness fires the armed callback early, and the retry answers "timer fired".
+  Tests: `cancelled-lazy` black-box conformance boots `celld dev`, waits on
+  the `/started` handshake until the object's lazy init provably started (well
+  before the 60 s timer — the handshake, not a sleep, decides when the abort
+  lands), aborts one `/timer` request over TCP, and asserts the retry answers;
+  on pre-fix code the retry hangs onto the read deadline.
+- `0083` (`430bf06`) retire with the mailbox drained so late handoffs rejoin the drive (upstream #309).
+  A driver could retire with a handed-but-untaken op still queued: another
+  event's turn enqueued after this driver's last take but before its exit check,
+  and `finished()` only looked at the adopted set. The op's future was then
+  dropped with the mailbox while its JavaScript promise pended forever. Both
+  drive loops now take the mailbox once more before leaving — closing it in
+  the same turn, so a handoff racing the take is refused at the source instead
+  of landing after it unresolved. Refused handoffs and trailing takes reject
+  refed ops and drop unrefed ones (a retained exec read re-armed under a
+  retired owner's slot follows the unrefed path); this fixed a regression in
+  `rpc_stub_response_body_across_events`. Tests: `abort-timer`
+  black-box conformance drives the issue's start/abort/status dance and asserts
+  "done"; it wedges pre-fix. Trailing handed ops for finished, non-keeping
+  events now reject (via `turn_reject_trailing_handed_ops` with the
+  refused-handoff message): `finished_non_keeping_event_rejects_trailing_handoff`
+  and `trailing_take_closes_mailbox_so_late_handoff_refuses` in
+  `retired_event_attribution` (integration placement — the same lib-suite
+  SIGSEGV hazard as the #289 test); each fails with its path gutted and passes
+  with it. The refused-handoff half is pinned white-box for #207 below.
+- `0084` (`d46df02`) pin refused-handoff settlement for retired owners (upstream #207).
+  No runtime change beyond the #309 trailing-take: the issue's trace shows a
+  mailbox accepting cross-request work and then retirement discarding it when
+  cleanup removes the promise resolver. The trailing-take now delivers handoffs
+  that land during exit, and refused handoffs — owner truly gone or mailbox
+  already closed — reject instead of dropping the resolver. Tests: white-box in
+  `retired_event_attribution`; a stale continuation's timer op names its retired
+  owner, the releasing turn refuses the handoff, and the promise settles.
+  Verified failing on pre-fix code.
+- `0085` (`ba66236`) pin answered waitUntil retirement with no native ops (upstream #289).
+  No new runtime change beyond the #300 wake path: the stateless driver used to
+  sleep-loop once an answered entry's own ops ran out, so a waitUntil aggregate
+  settled through another event was never observed and the entry never retired,
+  pinning old generations after a deploy. The wake path now polls while
+  background work is outstanding; `settle()` observes the settlement and the
+  entry retires. The ignored lib test is gone: in-process V8 turns SIGSEGV a
+  later manager test, so `answered_waituntil_without_ops_retires_once_background_settles`
+  in `retired_event_attribution.rs` drives both entries through the real driver
+  on one pool-built isolate via public API only. Pre-fix the answered entry's
+  wake spins to the 300 s budget and the 30 s deadline fires; post-fix both
+  drives finish in milliseconds. The same-branch `waituntil-tx` black-box
+  conformance covers the cell side of the fix in CI.
+- `0086` (`93d8e09`) pin constructor task loop resumed by a later event (upstream #277).
+  No runtime change: a task loop started in the constructor without keeping that
+  event alive, resumed by a later request, then fetching and storing, reports
+  the expected `[awaited, fetched, stored]` on this tree — the
+  continuation-token and cross-entry-gate line already roots the woken work.
+  Tests: `continuation-resume` black-box conformance pins the shape (fetching
+  the node's own `/plain`, so no external network) so a future attribution or
+  retirement regression fails loudly instead of wedging the object.
+- `0087` (`ba81a8a`) pin woken-continuation outbound settlement (upstream #258).
+  No runtime change: a request starts async work and returns, a later request
+  wakes the continuation, which then fetches or writes. The reported hang is
+  already gone on the base tree — the dead origin's ops refuse at creation and
+  the waiter settles loudly, while the self-woken control still succeeds.
+  Tests: `woken-outbound` black-box conformance drives both legs and asserts
+  every result settles instead of hanging. Full workerd parity — running the
+  woken call under the live waker instead of refusing it — needs the
+  live-ambient adoption design and stays open.
+- `0088` (`187ac7a`) treat a stale-target 409 as proof the member is gone (upstream #273).
+  The seal path could not tell a dead member from transport noise. Only a 409
+  `WrongTarget` carrying the peer-auth gate's stale-route marker counts as "the
+  old member is gone"; every other seal failure stays inconclusive and retries
+  as before. The denial lives in one shared helper (`peer_auth_denied` in
+  `main.rs`) so the seal/tail route cannot drift from the abort route; `Replay`
+  is also a 409 and must not carry the marker — a replay proves nothing about
+  the member, and marking it would seal away intact rows. Wire-level tests
+  serve real seal requests through `internal_log` over a socket. Tests:
+  `stale_target_409_proves_member_gone`,
+  `other_seal_failures_stay_inconclusive`.
+- `0089` (`767080a`) bound the renewal lease readback to remaining authority (upstream #264).
+  The renewal readback hung on a stalled store and wedged every renewal until
+  the fence timer, even with proven headroom left. `Effect::ReadSelfNodeLease`
+  now carries `authority_expires_ms` taken from the prior record, bounding the
+  read to the remaining authority. Tests:
+  `a_renewal_readback_carries_the_authority_bound`.
+- `0090` (`d63de1b`) first alarm-deadline expiry only marks the firing (upstream #256).
+  The operation deadline firing while the alarm copy was still running retired
+  the op at once, re-firing while the first copy ran. The first expiry now only
+  marks `Firing { expired: true }`; the running copy settles the alarm when it
+  answers, so a slow handler is never doubled. A second expiry with the op still
+  outstanding treats the op as lost and retires it exactly as a failed handler
+  would, keeping alarms at-least-once instead of turning a stuck handler into a
+  lost one. Tests: `an_alarm_deadline_waits_for_the_running_copy`,
+  `a_twice_expired_alarm_still_refires`.
+- `0091` (`effe445`) read follower tails under a progress timeout (upstream #250).
+  Follower tail reads ran under one whole-request timeout. The body now streams
+  under a 10 s progress timeout (`TAIL_PROGRESS_TIMEOUT`; connection setup
+  stays bounded by a 5 s connect timeout), which matches the old whole-request
+  timeout for a stalled peer while a slow-but-moving transfer completes. The
+  send rides the same budget: the stream client carries no whole-request
+  timeout, so a peer that accepts TCP then stalls before the response headers
+  would hang `post_tail` forever. The transfer beats the recovery claim while
+  streaming (`post_tail_with_beats`): a healthy tail slower than the heartbeat
+  still holds its claim when it lands, instead of reading 30 s stale.
+  Tests: `steady_chunks_complete`,
+  `stalled_stream_fails_at_the_progress_budget`,
+  `stalled_response_headers_fail_at_the_progress_budget`,
+  `slow_tail_holds_the_recovery_claim`.
+- `0092` (`7d57736`) pin the node-session id in the data dir across restarts (upstream #249).
+  Every restart generated a fresh node-session id, so a restarted process
+  stranded its predecessor's leases and fragments behind `WrongTarget`. The id
+  is now pinned in a `node-id` file beside the follower fragments, so the id
+  and the disks it recovers share a fate: an explicit `CELLD_NODE` wins
+  outright and is recorded for the next boot, otherwise the boot reuses the
+  pinned id, generating and pinning one on first boot. A missing or unwritable
+  directory degrades to today's ephemeral id with a loud line, never a boot
+  failure; a corrupt pin warns and regenerates, naming the discarded id for
+  operator recovery. The pin lands durably (tmp file, fsync, rename, dir
+  fsync; a stale tmp from a crashed boot is consumed). `celld -h` documents
+  the default as "generated and pinned to node-id in the data dir", reused
+  across restarts on the same data dir — the PID-scoped default temp dir
+  mints a new id every boot, so set `CELLD_WATCH` to a persistent directory
+  to keep the id. Tests: `explicit_id_wins_and_is_recorded`,
+  `restart_reuses_the_pinned_id`, `corrupt_pin_regenerates`.
+- `0093` (`8de22b3`) retry transient CAS conflicts with the same guard (upstream #239).
+  Every transient store conflict (HTTP 409) on renewal paid a full readback
+  round trip out of the remaining authority for an ETag the readback would only
+  re-learn. Renewals now retry twice with the same guard
+  (`MAX_SAME_GUARD_CONFLICT_RETRIES = 2`, AWS's documented behavior), then fall
+  back to the readback like a lost race; an initial acquisition with no prior
+  authority always reads back. Tests:
+  `a_lease_conflict_retries_with_the_same_guard`.
+- `0094` (`fd5ef12`) declare loss for a deleted session with surviving objects (upstream #245).
+  A restarted leader moves its lease to the new generation and a dead session
+  never opens a new epoch, so the old generation's record reads back absent and
+  the sweep skipped its sealed fragments forever. An absent record now counts as
+  closed — the fragments are garbage no new epoch will ever adopt — and the
+  sweep writes a `log/<node>.loss.json` record naming the leader, so the loss
+  is bounded and loud instead of silent; a session that never existed seals
+  absent quietly with no record, and a read error still retries next pass. The
+  seal mark extends as before, so a straggling append is refused rather than
+  resurrected. The record marks the first declaration: its `declared_at_ms` /
+  `declared_by` are the forensics of when the loss was found, so every later
+  pass over the still-deleted session keeps them (a conditional create wins
+  the first write and loses later ones). `declare_absent_loss` retries a
+  create that hits a 409 conflict with the same guard (up to 3 attempts with
+  backoff): only a 412 lost race proves another pass declared it, so a still
+  conflicting record falls back to a GET and fails closed. Tests:
+  `deleted_session_with_objects_declares_loss` (asserts the loss object parses
+  and names the leader), `never_existed_session_seals_absent_quietly`,
+  `loss_record_keeps_the_first_declaration`.
+- `0095` (`01a7ad1`) resume a degraded same-member ensemble without an epoch step (upstream #268).
+  Every pass over a degraded ensemble stepped the epoch even when the eligible
+  membership still matched the record, churning records while a sick member
+  healed. A degraded ensemble whose membership matches its record now resumes
+  its epoch; past `MAX_SAME_ENSEMBLE_RESUMES = 3` consecutive same-ensemble
+  resumes the loop steps the epoch anyway, so a member that lost its fragment
+  can still rejoin. Residual: under a persistently failing append verdict the
+  pattern is three cheap resumes and then one full step — a lease write and
+  posture repair per fourth consecutive degrade — so the loop still pays about
+  a quarter of the pre-#268 lease-write rate instead of zero. The guard
+  mitigates the 429-to-self-fence churn; it does not eliminate the step while
+  the failure persists. A degraded resume additionally requires the folded
+  record to name the shipper's epoch and ensemble (`folded_names_shipper`):
+  only a match may clear `degraded`. Tests:
+  `degraded_same_ensemble_resumes_without_an_epoch_step`,
+  `resume_budget_steps_past_three`.
+- `0096` (`b3bc3ea`) sleep until the next upcoming alarm minute, not the next tick (upstream #308).
+  The periodic scan slept to the next 60 s tick, so a persisted alarm fired up
+  to a tick late. `partition_minutes` splits armed minutes into the due set and
+  the next not-yet-due minute, and the caller sleeps until that minute instead.
+  Tests: `due_and_next_upcoming_split`, `no_upcoming_without_future_minutes`.
+- `0097` (`3a4a474`) stable node ids, witness grace, loss record, lease conflicts, alarm deadline, wake timing (upstream #244).
+  Docs only: `docs/guarantees.md` covers the pinned node-session id and witness
+  grace, the `log/<node>.loss.json` loss record, the same-guard lease-conflict
+  retry and authority-bounded readback, the mark-first alarm deadline (the
+  no-duplicate guarantee covers only the first expiry — a second expiry with
+  the op still outstanding retires and re-fires, preserving at-least-once),
+  and the wake-for-the-upcoming-minute timing. No code change, no tests.
+- `0098` (`f36e6e2`) retain local L0/epoch LTX files after compaction (upstream #311).
+  After a successful L1 fold the node deleted local L0 files the fold covered,
+  including the newest file `pos()` and verify still read back. Deletion now
+  keeps the newest covered file, and each activation plus each node startup
+  drops live-named epoch dirs a newer local epoch supersedes, skipping resident
+  replicas; the clean-reload path already pruned to its exact resident set, so
+  the startup sweep is a no-op there and every other boot restores from the
+  bucket. Tests: `retain_l0_through_keeps_newest_covered_file`,
+  `superseded_live_epochs_pruned_at_startup_and_activation`.
+- `0099` (`440fdf2`) dev-store single-writer group commit (upstream #310).
+  Concurrent PUTs piled onto `objects.sqlite3` with one connection and one
+  `Immediate` transaction each, losing the SQLite lock lottery into
+  `busy_timeout` sleeps: aggregate write throughput collapsed toward one fsync
+  per write, and unlucky uploads stalled seconds past the durability budget
+  (`DurabilityUnproven` under fan-out, plus renewal starvation that can
+  self-fence the node). Every PUT now funnels through one writer thread, one
+  connection, and one queued batch per transaction. Draining whatever is already
+  queued costs nothing when idle (a batch of one is today's single PUT) and
+  shares one commit fsync under load; each row keeps its own savepoint so
+  create/update conflicts still fail alone. A panicked writer falls back to a
+  direct PUT rather than failing every write. The writer thread holds only the
+  batches counter, never a channel sender, so dropping the last store handle
+  disconnects the channel and the thread exits (its handle is joined). Local
+  dev-store only; fleet and bucket durability paths are untouched. Tests:
+  `writer_batches_one_burst_into_few_commits`,
+  `writer_batch_preserves_row_conflicts`,
+  `concurrent_conditional_puts_stay_correct`.
+- `0100` (`cce8f3b`) repair 0.5.1 facet-image import (upstream #292).
+  The 0.6.0–0.6.2 import tested `page_count == 0`, but under replication the
+  replica opens the facet file first and its control tables already push the
+  count past zero, so the import never ran: silent upgrade data loss. The check
+  is now no-user-data, which also repairs the files those versions left behind.
+  The image replays through ordinary SQL writes, which commit beside a live
+  replica read lock (a `Backup` would take `EXCLUSIVE` and fail), and the
+  decision is stamped in `user_version` so a later wipe never resurrects it.
+  Live file content always wins over the legacy image, which is safe because
+  0.5.1 never wrote facet files; the legacy row stays for manual recovery. One
+  corner remains: an all-content wipe made on 0.6.0–0.6.2 followed by this
+  upgrade replays the image once — delete again on the fixed version. Tests:
+  `status_tracks_marker_then_content`,
+  `status_ignores_names_and_sequences_but_counts_writes`,
+  `replay_restores_rows_schema_and_index`.
+- `0101` (`2212df2`) bound post-response background work (upstream #275).
+  A handler that answered but left timers or waitUntil pending held its drive's
+  affiliation until the event finished, so a retiring generation's isolates
+  never drained: each deploy leaked a heap until shedding latched
+  `CapacityExhausted` forever. Past the background budget the driver ends the
+  background work without failing the answered request, and the abort pass
+  releases the isolate. New knob `CELLD_BACKGROUND_BUDGET_S`, default 30
+  seconds — Cloudflare's waitUntil limit. An event that still holds the cell's
+  input gate or runs another event's critical section keeps its ops by design,
+  and stays loud about it. `expire_background` clears `background_since`, so a
+  gate-holding event past budget warns at most once per budget window. Tests:
+  `default_matches_cloudflare_waituntil_limit`,
+  `override_applies_and_restores`, `expired_background_re_arms_its_clock`,
+  plus the `retire-leftover` black-box conformance.
+- `0102` (`1fd0c1d`) keep an O(1) hydration count (upstream #270).
+  A full walk of the cut per faulted read made a whale's fill quadratic in its
+  size (111 min for 8.9 GB) and stalled foreground reads behind the walk's
+  mutex hold. The hydration set now carries an exact cut-relative count,
+  maintained on every insert and truncation, so `hydration()` is constant time.
+  Live file content still always wins over fault data, and the count never
+  covers the lock page or past-cut holes. Tests: unit tests in `paged_vfs`
+  covering the count against an oracle walk, clean-after-sync,
+  dirty-after-unsynced-commit, and clean-after-timed-checkpoint.
+- `0103` (`6fad8e9`) collect fragments of record-less sessions (upstream #259).
+  A follower dropped a sealed fragment only when its record said so, but a
+  restarted leader moves its lease to the new generation and a dead session
+  never opens a new epoch: the old generation's record reads back absent, and
+  the sweep skipped it forever. An absent record now counts as closed — the
+  fragments are garbage no new epoch will ever adopt — while a read error still
+  retries next pass. The seal mark extends as before, so a straggling append is
+  refused rather than resurrected. Absence now distinguishes terminal cases —
+  no lease at all, or a lease whose generation superseded this session — from
+  a live lease that simply has no log yet (before its first publication, or a
+  slow first-open racing fragment arrival): only the terminal cases collect,
+  a live logless lease's fragments are kept. Tests:
+  `sealed_session_fragments_are_collected_without_a_new_epoch`,
+  `sealed_generation_scoped_fragments_are_collected`,
+  `superseded_generation_fragments_are_collected_without_a_record`,
+  `deleted_lease_fragments_are_collected_without_a_record`,
+  `live_logless_lease_fragments_are_kept`.
+- `0104` (`36c498c`) restart the cell after SQLite destroys a transaction (upstream #291).
+  A write failing with `SQLITE_FULL`, `IOERR`, `NOMEM`, or `INTERRUPT` destroys
+  its transaction, and every later event on the cell — reads included — failed
+  until something reopened the database. Only an eviction recovered the cell.
+  The actor now restarts the runtime when a finished activity leaves its scope
+  broken; the swap pump carries the restart on the current generation, and the
+  placement opens the database on a fresh isolate, which clears the poison. The
+  mark lives only in memory and a reopen clears it, so this is downgrade-safe.
+  Tests: `full_disk_poisons_until_reopen` plus the `disk-full` black-box
+  conformance.
+- `0105` (`e391da1`) prune live-named epochs after an unclean restart (upstream #290).
+  A node that lost its DO to another node kept the dead live-named files
+  forever after a crash or a `handoff=preserve` stop, rotting outside the
+  local-cache budget. At boot after predecessor recovery — unless the boot is a
+  clean reload — the node now deletes every live-named epoch, since only a
+  clean reload resumes one and a restart claims each cell at a new epoch from
+  the bucket. The deleted cells stay in a take-once boot list that the local
+  reload replays, so ownership confirmation still finds the cells that were
+  resident when the predecessor died. Tests:
+  `unclean_restart_prunes_live_keeps_snapshots`.
+- `0106` (`08b983b`) unref `AbortSignal.timeout` so it frees the cell slot (upstream #306).
+  A signal created by `AbortSignal.timeout()` held its cell slot past its
+  usefulness. The timer is now unref'd in `js.rs` and the harness. Tests:
+  the `abort-timeout` black-box conformance (70 requests, past the 64-request
+  `DEFAULT_MAX_CELL_REQUESTS` admission limit the test boots with, each
+  minting an unused 60 s timeout signal to prove unreferenced timers never
+  hold a slot).
+- `0107` (`f1df460`) carry the 101 webSocket target across loader fetch (upstream #305).
+  The upgrade target was lost when the loader fetched, so the 101 response had
+  nowhere to route. The target now crosses the loader fetch through
+  `http_streams`/`js`/websocket routing. Handoff quotas are keyed by
+  deployment (the host `script_name`, or `__loader:{id}` for loader-loaded
+  workers) plus scope, so loaded workers sharing the empty routing scope do
+  not share one bucket: 64 per quota, 1024 globally, share-aware
+  displacement, 60 s expiry sweeps first. The forwarder lives in
+  `celld::isolate_pipe`: `local_isolate_websocket_pipe` runs each direction
+  in its own task with a shared shutdown, and a producer-side `WsPipeBudget`
+  charges frames at admit — pre-registration `pending` included — against
+  16 MiB staged per direction (`ISOLATE_PIPE_MAX_STAGED_BYTES`);
+  `register_budgeted` adopts a pre-existing budget with its used count and
+  tripped state instead of charging the backlog twice. The first refused
+  data frame queues a `WsOut::Overload` marker behind everything admitted
+  ahead of it, and the tripped budget refuses every later data frame
+  (closes and the marker bypass), so the pipe ends loudly instead of
+  parking silently; every consumer turns the marker into an unclean 1011,
+  and the staged-cap `OverLimit` path closes both ends the same way,
+  winning over a raced close. A close waits behind queued data with a
+  per-frame 5 s progress bound (each forwarded frame restarts the wait).
+  The pull endpoint survives teardown until its terminal is consumed or
+  the request retires. A cell- or facet-owned bind's target endpoint keeps
+  a host-set `cleanup_scope` on its pull entry instead of a re-owner (the
+  re-owner broke `op_ws_next` for loaded workers polling outside the
+  joining cell and hid frames behind a synthetic 1006): read authorization
+  stays with the request owner, while cell shutdown reclaims the endpoint
+  by scope (`ws_pull_unregister_cell`, a tree sweep that takes the dying
+  root's facet scopes along via registry metadata, run before output
+  unregister removes that metadata); only request-owned binds track the
+  target for request-retirement close. A caller-initiated close reaches
+  the caller on both pipes instead of reporting an abnormal 1006. Tests:
+  `ws-loader` fixture plus `ws_loader_upgrade_conformance`.
+- `0108` (`5a7db54`) build external stubs from the union of main + sibling imports (upstream #304).
+  External stubs were built from the main module's imports only, missing ones
+  only a sibling imported. The loader now unions main and sibling imports.
+  Tests: `loader-imports` fixture plus `loader_imports_conformance`.
+- `0109` (`d735aeb`) populate `process.env` from worker vars under `nodejs_compat` (upstream #296).
+  Under `nodejs_compat` the Worker's `vars` now populate `process.env` before
+  the module evaluates (host value wins; the harness and module loader carry
+  it through); `nodejs_compat_do_not_populate_process_env` opts back out. A
+  dynamically loaded Worker's loader-supplied strings reach the handler's
+  `env` and — under `nodejs_compat` — `process.env` alike, while the
+  host-owned `CELLD_NODE` name never crosses into `process.env`. Dangerous
+  keys are skipped: `__proto__`, `constructor`, and `prototype` never cross.
+  Tests: `env-probe` conformance (`worker.js`, `wrangler.json`, plus the
+  force-added `.dev.vars` fixture the folded fixup supplies, since the root
+  `.gitignore` excludes real `.dev.vars` secrets),
+  `loaded_worker_env_populates_process_env`, and the `__proto__`-smuggle pins.
+- `0110` (`1b42f82`) support AES-KW wrap/unwrap plus symmetric JWK import/export (upstream #295).
+  `SubtleCrypto` gains AES-KW key wrapping/unwrapping and `raw`/`jwk`
+  import/export of symmetric keys; a large JWK export builds its binary
+  string in 32 KiB chunks instead of one spread. AES JWK keys must be 16,
+  24, or 32 bytes; SHA-1 HMAC exports as `HS1` (reimported under that name);
+  a JWK's `alg` (when present) must match the key, and a present AES `use`
+  must be `enc`. AES-KW needs an AES-KW wrapping key, and the RFC 3394
+  minimum sizes are enforced (one 8-byte semiblock is not wrappable;
+  off-shape lengths stay rejected). Tests: `aes-kw` fixture plus
+  `aes_kw_conformance` (including `single_semiblock_is_rejected`).
+- `0111` (`8ff2708`) import/export EC public keys in raw point format (upstream #271).
+  `SubtleCrypto` imports and exports EC public keys in uncompressed raw point
+  form alongside the existing formats. Tests: `ec-raw` fixture plus
+  `ec_raw_conformance`.
+- `0112` (`cf98b29`) writable request `/tmp` files and `url` file helpers (upstream #280).
+  Requests get writable `/tmp` files (`node:fs` over a per-request dir) and
+  `node:url` gains the file-URL helpers (`new node_url.js`, plumbed through
+  the harness and module loader). New knob `CELLD_TMP_MAX_BYTES` (default
+  67108864, 64 MiB; validated positive): each new entry costs `path.len() +
+  64` bytes against it, and any write, append, or stream chunk that would
+  push a request past it fails with `ENOSPC` — an oversize write is refused
+  before its bytes are copied — while an overwrite frees the replaced bytes.
+  Also new: `appendFile`, `appendFileSync`, and `fs.promises.appendFile`;
+  `writeFile` honours `{ flag: "a" }` (and `wx`/`ax` fail with `EEXIST` while
+  `a` appends; read-mode flags are refused), and `createWriteStream` writes
+  chunks as they arrive so the cap applies during the stream instead of at
+  close. Write streams honour `encoding` for string chunks (unknown encodings
+  refused up front) but refuse `start`; read streams refuse `start`/`end` /
+  `encoding` — all with `ERR_INVALID_ARG_VALUE`. A stream opens its file
+  before emitting `open` (`final` never re-truncates the file `open`
+  initialized), and recursive `mkdir` charges each missing prefix as it goes
+  (no half-created prefix on refusal) while a recursive `mkdir` on a file
+  returns `EEXIST`. `/tmp` files report writable (`W_OK` passes, mode
+  `0o100666`). `fileURLToPath` accepts `%5C` (only an encoded slash is
+  rejected), and `pathToFileURL` keeps a directory's trailing slash so the
+  URL round-trips. Tests: `tmp-fs` fixture plus `tmp_fs_conformance` (cap,
+  overwrite/append accounting, streaming cap, cross-request isolation via
+  `ENOENT`, outside-`/tmp` `EPERM`).
+- `0113` (`0449525`) accept workerd's sendable close codes so `server.close` delivers (upstream #279).
+  The harness enforced the WHATWG-only rule (1000 or 3000–4999) and threw
+  `InvalidAccessError` on workerd's sendable application range — refusing the
+  1008 policy-violation close dropped a Worker's refusal on the floor: the
+  listener threw and the client hung. An endpoint may now send 1000–4999 except
+  the reserved no-status codes 1004, 1005, 1006, and 1015, which stay refused.
+  This changes default close-code behavior: codes 1001–1014 (other than the
+  reserved ones) that used to throw now close. A caller-initiated close is
+  delivered on both pipes (direct and cell-targeted joins), so the caller
+  sees the close it sent instead of an abnormal 1006. Tests: `ws-close`
+  fixture plus `ws_close_conformance`.
+- `0114` (`2568d44`) transparently decompress gzip/deflate response bodies (upstream #238).
+  `fetch()` responses with `Content-Encoding: gzip` or `deflate` are now
+  decompressed before delivery, chunk by chunk: a truncated body is an error
+  (reported as a `response stream` error), not a clean end, and multi-member
+  gzip concatenates. Tests: `gzip-decode` fixture plus `gzip_decode_conformance`.
+- `0115` (`20f638f`) attach `Symbol.dispose` to plain object and array results (upstream #260).
+  RPC results that are plain objects or arrays now carry `Symbol.dispose`, so
+  `using` declarations clean them up like other RPC handles — on pure-data
+  results the dispose is a no-op (a bare clone with no table to revive).
+  Tests: `rpc-dispose` fixture plus `rpc_dispose_conformance`.
+- `0116` (`ea1d58a`) serve `dir/index.html` at its trailing-slash URL (upstream #318).
+  The static asset server mapped a directory URL to its `index.html`; the
+  trailing-slash form missed. Both now serve the index. Tests:
+  `static-dir-index` fixture (root and `sub/` indexes) plus
+  `static_dir_index_conformance`.
+- `0117` (`ca53a67`) route a post-response DO dial by its object's cell (upstream #254).
+  A Durable Object opening a WebSocket after its response was already sent dialed
+  without its object's cell attached, misrouting the connection. The dial now
+  carries the object's cell. Tests: `do-later-ws` fixture plus
+  `do_later_ws_conformance`.
+- `0118` (`078cd14`) publish the abort synchronously on caller cancel (upstream #281).
+  Cancelling a loader call published the abort a turn late, so work the caller
+  had already abandoned kept running into the next turn. The abort is now
+  published synchronously (a `DoCallCancels` registry in `js.rs`). A loader
+  fetch dropped before dispatch releases its cancellation state (the dispatch
+  guard disarms right after spawn), while aborts after dispatch still
+  propagate. Tests: `loader-abort` fixture plus `loader_abort_conformance`
+  (including `retired_dispatch_clears_a_published_abort`).
+- `0119` (`38afd3f`) refuse durable object bindings with a foreign `script_name` (upstream #312).
+  A binding carrying another script's `script_name` was counted as a class of
+  the deploying script, so the node boot-looped reporting the class as exported
+  by more than one co-hosted script. `celld deploy` now refuses such bindings
+  and names `script_name`; a binding naming its own script stays local. This
+  changes deploy behavior: projects that declared a foreign `script_name` and
+  previously booted (or boot-looped) now fail fast at deploy time. A
+  non-string `script_name` is refused the same way instead of being treated
+  as absent. Tests:
+  `durable_object_binding_with_foreign_script_name_is_refused`,
+  `durable_object_binding_with_own_script_name_is_local`,
+  `durable_object_binding_with_non_string_script_name_is_refused`.
+- `0120` (`60cfb61`) upload image tars multipart instead of one PUT (upstream #307).
+  A container image tar rode one PUT under the client's 30 s single-try
+  timeout, so any GB-scale image failed deterministically and retries could not
+  help. `Bucket::put_multipart_bytes` splits the tar into 8 MiB parts, each on
+  its own request, and `ensure_image_tar` uses it. The timeout itself is
+  untouched: it is a correctness condition for the node self-fence, not tuning.
+  Tests: `failed_complete_aborts_the_session` (a failed `complete` aborts the
+  multipart session instead of leaking its parts) plus bucket unit tests
+  driving a conflicting store through the multipart path.
+- `0121` (`a1e6d11`) add `--local` to run execute, export, and migrations against `celld dev` (upstream #272).
+  `celld d1 execute`, `export`, and migrations gain `--local`: the dev node's
+  local store carries its leases and shared secret like a fleet bucket carries
+  its fleet's, so discovery and request signing work unchanged through a
+  bucket-backed entrance. `--local` resolves the project through the
+  canonicalized config (`DevState::project_dir`), so a symlinked
+  `wrangler.json` resolves to the config's own directory — and names its
+  canonical `.celld/dev`, not the link's parent — opens
+  `PROJECT/.celld/dev` (following the `--state`/`CELLD_DEV_STATE` override),
+  and posts to the running dev node, which must be up. Combining it with
+  `--bucket`/`--endpoint` (or `CELLD_BUCKET`) is a refusal, so migrations can
+  never run against the wrong database by a silent bucket choice. `d1` also
+  takes `--state DIR` (resolving like `celld dev`: flag, then
+  `CELLD_DEV_STATE`, then the project); `--state` without `--local` is
+  refused. Docs: `docs/services/d1.md`. Tests:
+  `local_without_dev_state_names_celld_dev`, `local_state_flag_parses`,
+  `state_without_local_is_refused`,
+  `local_state_flag_selects_the_state_directory`, and the d1 CLI suites.
+- `0122` (`4695c31`) answer local LISTs from a covering index over a prefix range (upstream #265).
+  `LocalStore::metadata` read every row and filtered the prefix in Rust, and the
+  listed columns sat behind body overflow pages, so each list read the whole
+  `objects.sqlite3` — about 21 s per cold cell on a 4.7 GB store. The open now
+  creates the covering `objects_listing` index and bounds the scan to the prefix
+  (`key >= prefix AND key < prefix-upper`, `CAST` back to `TEXT`); the Rust-side
+  prefix check stays as the semantic backstop. The listing statement lives in
+  `listing_sql`, EXPLAINed by `listing_plan_uses_the_covering_index`, which
+  requires a bounded SEARCH with the prefix upper bound — a regression to the
+  unprefixable scan fails it. No new knob; dev-store only.
+- `0123` (`8f20767`) add `celld versions` to list deployed versions (upstream #181).
+  Rollback (`activate`) and prune (`discard`) existed but there was no way to
+  list previous versions. `celld versions [SCRIPT]` lists every
+  `deploy/<script>/<version>/manifest.json` from one LIST, marking the serving
+  generation current from the fleet-wide pointer: the top-level version,
+  staged components, and — under a pointer without a components map — every
+  named-pointer service version serving resolves bindings through, matching
+  what `discard` refuses to delete; an optional `SCRIPT` narrows the rows.
+  Preview access stays out of scope: serving an old version against live
+  cell state needs a contract this command does not invent. New CLI:
+  `celld versions`.
+- `0124` (`694395b`) add `dev --state DIR` for local state outside the project (upstream #302).
+  `celld dev` always kept state in `PROJECT/.celld/dev`, where backups and
+  search tools pick it up. `--state DIR` (or `CELLD_DEV_STATE`, default
+  `PROJECT/.celld/dev`) moves it anywhere else; `d1 --local` resolves through
+  the same rule, so it follows the override with no flag of its own. The
+  watcher ignores the `--state` dir subtree, and the watch root is
+  canonicalized first: event paths otherwise arrive uncanonicalized past a
+  symlink and miss the canonical state prefix, reviving the loop that the
+  ignore was added to stop. `--clean`
+  over an explicit directory deletes only when the marker `prepare_state`
+  writes proves celld created it: a missing directory is already clean, and
+  `--state` refuses to adopt a non-empty foreign dir (fail closed, contents
+  intact) — and an explicit path ending in `.celld/dev` is not exempt: the
+  suffix cannot prove celld created it, so it needs the marker too. An empty
+  or whitespace-only flag or variable counts as unset, not a directory.
+  `d1.md` lists the flags `--local` refuses (`--bucket`, `--endpoint`,
+  `CELLD_BUCKET`, `S3_ENDPOINT`). New CLI flag `--state` and new env knob
+  `CELLD_DEV_STATE`.
+- `0125` (`b88dad7`) drop the budget-orphaned drive when a retry arrives (upstream #299).
+  A workflow retry arriving after the old drive was budget-orphaned left both
+  drives alive. The retry now drops the orphaned drive; an in-memory redrive
+  bit (`isRedrive`, threaded through `__fireAlarm`) marks the orphaned
+  workflow drive even when a nudge races the retry — a plain alarm counter
+  cannot carry this, since any nudge resets it to zero. Tests:
+  `workflow_steps_past_the_handler_budget_complete`,
+  `workflow_nudge_racing_the_budget_retry_completes`. Docs:
+  `docs/services/workflows.md`.
+- `0126` (`d5f2f5b`) retry transient `OperationAborted` write conflicts (upstream #283).
+  Transient bucket write conflicts (`OperationAborted`) failed the write at
+  once. The bucket layer now retries them with backoff instead of surfacing a
+  lost-race error; the retry matches the tagged service code in the error's
+  `source`, not the object key (a key containing `OperationAborted` must not
+  read as transient). Tests: `operation_aborted_is_not_a_lost_race` plus
+  bucket unit tests over a conflicting fake store.
+- `0127` (`4121b20`) disarm the restored alarm on failed start (upstream #276).
+  A restored alarm whose start failed stayed armed and refired into the same
+  failure. A failed start now disarms it — if the alarm is covered — in both
+  the runtime and the logic layer (plus its probe); an uncovered restored
+  alarm has no entry for the scan to rediscover, so the core re-arms its
+  timer at scan pace (`FAILED_START_ALARM_REARM_MS = 60 s`) instead of
+  dropping it. Tests: `a_failed_start_disarms_the_restored_alarm`.
+- `0128` (`a581f5e`) bound per-statement execution time (upstream #274).
+  A runaway SQL statement ran until the operation deadline. New knob
+  `CELLD_SQL_STATEMENT_MS`: when set, each statement is interrupted past the
+  bound and fails with a catchable timeout error naming the armed budget —
+  the message names the captured budget, never a fresh knob read — that rolls
+  the statement back; unset means unbounded, the historical behavior. A spent
+  deadline rejects before stepping, and a write cursor that expires after its
+  first row drops only the cursor: its write already ran, so the expiry
+  error carries the timeout's prefix but never claims a rollback. Streaming
+  cursors are bounded end to end, and a cursor shares its call's single
+  deadline with the prefix run: one budget for the whole scan, since a second
+  fresh budget at cursor creation would let a slow prefix plus a slow stream
+  run up to ~2x the knob. A timeout flag left set by an armed run must not
+  rewrite a later unarmed error: only a run that armed a deadline may report
+  a timeout. The knob lives in the process environment, so the tests that
+  flip it run serially. Tests: `long_statement_fails_catchable_and_rolls_back`,
+  `streaming_cursor_is_bounded_end_to_end`,
+  `unarmed_error_after_timeout_is_not_retimed`,
+  `streaming_cursor_shares_the_calls_single_deadline`.
+- `0129` (`bb4ebc0`) route dead-owner takeovers with fleet capacity (upstream #263).
+  Dead-owner takeovers ignored fleet capacity, piling cells onto nodes with no
+  room. Placement now routes with capacity: a zero-capacity node hands the dead
+  owner's cell to a peer. Tests:
+  `a_zero_capacity_node_hands_a_dead_owners_cell_to_a_peer`.
+- `0130` (`79b5a9c`) share tenant roots across fetch, sockets, websockets (upstream #230).
+  Tenant TLS trust differed per surface. `fetch()`, worker sockets, and outbound
+  WebSockets now share one root set: Mozilla's anchors plus the OS store and
+  `SSL_CERT_FILE` (via `rustls-native-certs`, cached). Native anchors a
+  parser rejects are skipped before reqwest sees the bytes: under
+  `rustls-tls`, one malformed anchor fails `ClientBuilder::build()` and
+  breaks every tenant client, as the rustls clients skip what they cannot
+  parse. A downloaded CA the OS trusts now works for tenant `fetch` too.
+  Tests: `native_loader_honors_ssl_cert_file`,
+  `root_store_holds_mozilla_anchors` (plus the `test-ca-230.pem` fixture),
+  and the `tls-roots` black-box conformance: a loopback HTTPS server whose
+  self-signed anchor is trusted only through `SSL_CERT_FILE`, fetched through
+  the real tenant `fetch` client — with the variable set the fetch succeeds,
+  without it the fetch fails.
+- `0131` (`f3d54f7`) host-injected `CELLD_NODE` identity (upstream #219).
+  `env` additionally carries `CELLD_NODE`: the name of the node running the
+  code, injected by the host after every deployment binding. A bundle that must
+  refuse a credential minted for another region reads this, not placement. The
+  name is reserved — `vars`, `.dev.vars`, and every other binding kind are
+  refused at deploy time, and a loaded Worker's props cannot smuggle it past
+  the host value. This changes deploy behavior: projects binding the name now
+  fail fast. A `CELLD_NODE` entry in `.env`/`.env.local` is skipped with a
+  warning instead of refused (dotenv files serve other tools too; the host
+  value wins at runtime regardless), while explicit `vars` and `.dev.vars`
+  keep the hard refusal. Tests: `node-identity` fixture plus
+  `node_identity_conformance` (including `node_identity_binding_name_is_reserved`
+  and `node_identity_dotenv_entry_is_skipped`). Docs:
+  `docs/cloudflare-compat.md`.
+- `0132` (`668a051`) export `OTEL_RESOURCE_ATTRIBUTES` (upstream #314).
+  The OTLP resource now parses the standard `OTEL_RESOURCE_ATTRIBUTES` env var
+  into ordered resource entries. `service.name` in the extra entries is ignored
+  (the configured service name wins); `service.version` in the extra entries names
+  the application version, and celld's own build stays visible under
+  `celld.version`, which cannot collide with an application key. Built-in
+  resource keys win over colliding entries (OTLP requires unique attributes),
+  and keys and values are percent-decoded before export. `service.name`
+  precedence is env (`OTEL_SERVICE_NAME`), then resource attributes, then
+  the `celld` default; docs scope these attributes to OTLP (the bucket
+  Parquet files carry only `node` and `region`). Default behavior change:
+  without an operator version there is no `service.version` at all —
+  reporting celld's version there told every deployment-tracking backend
+  that all applications run celld's build. New env knob
+  `OTEL_RESOURCE_ATTRIBUTES` (default unset). Tests:
+  `resource_attributes_parse_leniently`. Docs: `docs/telemetry.md`.
+- `0133` (`0ad36af`) expose the handler traceparent (upstream #313).
+  celld reads the W3C `traceparent` header on incoming requests and sends it
+  on; a handler reads the traceparent of the span it runs in through
+  `getCurrentTraceparent()` from `cloudflare:workers`, so it can return the
+  value for end-to-end tracing. Tests: `trace-context` fixture plus
+  `trace_context_conformance`. Docs: `docs/telemetry.md`.
+- `0134` (`985a71e`) record incoming HTTP method and status (upstream #285).
+  Incoming spans now carry the HTTP method and response status. The conformance
+  re-issues calls with rewritten methods and, for the failure case, a masked
+  status, so the export tells the worker spans (GET/200) apart from the DO's
+  cell fetch spans (POST-or-PUT/500). Tests: `telemetry-http` fixture plus
+  `telemetry_http_conformance`. Docs: `docs/telemetry.md`.
+- `0135` (`4fbf738`) cap cells per isolate (upstream #278).
+  New knob `CELLD_MAX_CELLS_PER_ISOLATE`, default 32 (unset restores the
+  historical packing); heavyweight cells such as agents can lower the
+  per-isolate packing. Tests: `max_cells_per_isolate_is_configurable`.
+- `0136` (`a926ae5`) split log sink from traces (upstream #153).
+  New knob `CELLD_OTEL_LOGS`: unset means logs follow the traces sink, the
+  historical behavior; `bucket` sends logs to bucket Parquet whatever the
+  traces sink is; any other value refuses startup. A fleet can point its
+  collector at traces while its logs land in the bucket. Tests:
+  `lookup_parses_the_logs_sink`, `split_flush_routes_each_signal_to_its_sink`.
+  Docs: `docs/telemetry.md`.
 
 Patches `0025`–`0034` are ported fixes from
 [meln1k/celld](https://github.com/meln1k/celld) by Nikita
@@ -1210,7 +1864,7 @@ source commit; the commits keep the original author with a
     once per isolate (`0067`).
   - `tools/s3bench` (`0058`, `0069`, `0072`) measures bucket request counts
     and per-write latency against a local S3 for cost claims.
-- `v0.6.3-ryuzcorp.12` (the commit that adds this entry): adds `0076`–`0078`.
+- `v0.6.3-ryuzcorp.12` (`00df62d`): adds `0076`–`0078`.
   There is no API, CLI or bucket format change, so `.11` and `.12` nodes can
   share a bucket, and a downgrade restores everything `.12` wrote.
   Upgrade notes:
@@ -1229,6 +1883,82 @@ source commit; the commits keep the original author with a
     while another run is up (`0076`).
   - The integration tests boot nodes on ephemeral ports, which removes a
     port-reuse flake (`0077`).
+- `v0.6.3-ryuzcorp.13` (the commit that adds this entry): adds `0079`–`0136`.
+  New CLI: `celld versions [SCRIPT]` lists deployed versions (`0123`), `celld
+  d1 --local` runs execute, export, and migrations against the running `celld
+  dev` (`0121`), and `celld dev --state DIR` (or `CELLD_DEV_STATE`) keeps local
+  state outside the project (`0124`). No bucket format bump and no wire
+  protocol change between nodes, so `.12` and `.13` nodes can share a bucket;
+  the only new bucket-side artifact is the `log/<node>.loss.json` loss record
+  (`0094`), which older nodes never write but read past, and a downgrade
+  restores everything `.13` wrote. Default behavior changes: the node-session
+  id is pinned in the data dir (`0092`), `service.version` now carries the
+  operator's application version instead of celld's build (`0132`), and
+  WebSocket close codes 1001–1014 (other than the reserved no-status codes)
+  now close instead of throwing (`0113`).
+  Upgrade notes:
+  - Runtime and cancellation: cancelled requests settle shared work instead of
+    hanging co-awaiters (`0079`); answered drivers keep polling while waitUntil
+    background is outstanding (`0081`); drivers take the mailbox once more
+    before retiring and refused handoffs reject (`0083`); cells per isolate
+    are capped by `CELLD_MAX_CELLS_PER_ISOLATE` (default 32) (`0135`);
+    post-response background work ends past `CELLD_BACKGROUND_BUDGET_S`
+    (default 30 s) without failing the answered request (`0101`); a cell
+    whose SQLite transaction was destroyed restarts on a fresh isolate
+    (`0104`); `AbortSignal.timeout` frees its cell slot (`0106`); loader
+    cancellation publishes the abort synchronously (`0118`); the
+    budget-orphaned workflow drive drops when a retry arrives (`0125`);
+    covered restored alarms disarm on failed start while uncovered ones
+    re-arm at scan pace (`0127`).
+  - Fleet and durability: stale-target 409s prove a member is gone (`0088`);
+    renewal readbacks are bounded to the remaining authority (`0089`); the
+    first alarm-deadline expiry only marks the firing (`0090`); follower tails
+    stream under a 10 s progress timeout (`0091`); same-guard CAS conflicts
+    retry twice before the readback (`0093`); degraded same-member ensembles
+    resume without an epoch step up to 3 consecutive resumes (`0095`);
+    transient `OperationAborted` bucket writes retry (`0126`); dead-owner
+    takeovers route with fleet capacity (`0129`); record-less session fragments
+    are collected (`0103`); deleted sessions with surviving objects leave a loss
+    record (`0094`); wake sleeps until the next upcoming alarm minute (`0096`).
+  - Storage: local L0/epoch files survive compaction (`0098`); unclean
+    restarts prune live-named epochs (`0105`); the dev store commits through
+    one writer thread (`0099`); local LISTs read from a covering index
+    (`0122`); the 0.5.1 facet-image import is repaired (`0100`); per-statement
+    SQL time is bounded by `CELLD_SQL_STATEMENT_MS` (unset means unbounded)
+    (`0128`); hydration counting is O(1) (`0102`).
+  - Workers compatibility: `process.env` populates from worker vars under
+    `nodejs_compat` (`0109`, with a `nodejs_compat_do_not_populate_process_env`
+    opt-out); AES-KW wrap/unwrap plus symmetric JWK
+    import/export (`0110`); EC public keys import and export as raw points
+    (`0111`); writable request `/tmp` files and `node:url` file
+    helpers (`0112`, capped per request by `CELLD_TMP_MAX_BYTES`, default
+    64 MiB); gzip/deflate response bodies decompress transparently (`0114`);
+    `Symbol.dispose` attaches to plain object and array RPC results (`0115`);
+    `dir/index.html` serves at its trailing-slash URL (`0116`); post-response
+    DO dials route by the object's cell (`0117`); external stubs union main
+    and sibling imports (`0108`); the 101 webSocket target crosses the loader
+    fetch (`0107`);
+    tenant TLS roots are shared across fetch, sockets, and websockets
+    (`0130`); close codes accept workerd's sendable range (`0113`).
+  - CLI and deploy: `celld versions` (`0123`); `d1 --local` with `--state DIR`
+    selecting the local state dir (`0121`); `dev --state` / `CELLD_DEV_STATE`
+    (`0124`); image tars upload multipart in 8 MiB parts (`0120`); durable
+    object bindings with a foreign `script_name` are refused at deploy time
+    (`0119`); `CELLD_NODE` is host-injected and its binding name is reserved
+    (`0131`).
+  - Telemetry: `OTEL_RESOURCE_ATTRIBUTES` feeds the OTLP resource, with
+    `service.version` now operator-owned and the build under `celld.version`
+    (`0132`); the handler traceparent is exposed through
+    `getCurrentTraceparent()` (`0133`); incoming spans carry HTTP method and
+    status (`0134`); `CELLD_OTEL_LOGS=bucket` splits the log sink from traces
+    (`0136`).
+  - New env knobs and their defaults: `CELLD_BACKGROUND_BUDGET_S` (default 30),
+    `CELLD_MAX_CELLS_PER_ISOLATE` (default 32), `CELLD_SQL_STATEMENT_MS`
+    (unset means unbounded), `CELLD_TMP_MAX_BYTES` (default 67108864, 64 MiB),
+    `CELLD_OTEL_LOGS` (unset means logs follow
+    traces), `OTEL_RESOURCE_ATTRIBUTES` (unset), `CELLD_DEV_STATE` (default
+    `PROJECT/.celld/dev`), `CELLD_NODE` (default generated and pinned to
+    `node-id` in the data dir).
 
 ## License
 
