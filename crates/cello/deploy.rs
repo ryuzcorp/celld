@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): idempotent content-tagged image create; tag-race tests run the fake engine through sh; deploy --sourcemap writes the bundle's external map; service binding targets validated at deploy; staged activation; deploy --sourcemap collects the no_bundle sibling map; staged invoke shares the version-ref parsing; deploy reads stay inside the project; deploy --read-root bounds bundling and container builds; durable object bindings with a foreign script_name are refused (upstream #312); image tars upload multipart (upstream #307); celld versions lists deployed versions (upstream #181); CELLD_NODE binding reservation (upstream #219).
+// Modified by ryuzcorp (ryuzcorp/celld): idempotent content-tagged image create; tag-race tests run the fake engine through sh; deploy --sourcemap writes the bundle's external map; service binding targets validated at deploy; staged activation; deploy --sourcemap collects the no_bundle sibling map; staged invoke shares the version-ref parsing; deploy reads stay inside the project; deploy --read-root bounds bundling and container builds; durable object bindings with a foreign script_name are refused (upstream #312); image tars upload multipart (upstream #307); celld versions lists deployed versions (upstream #181); CELLO_NODE binding reservation (upstream #219).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 // Deployment is an operator control-plane path outside the Actor execution
@@ -98,7 +98,7 @@ pub const RESERVED_CLASSES: &[&str] = &[D1_CLASS, WORKFLOW_CLASS, KV_CLASS, QUEU
 /// isolate that has one (see `__installLoaderEnv`). Dynamically loaded
 /// Workers carry no node in their config, so they receive no injection and
 /// their loader's props pass through untouched.
-pub const NODE_IDENTITY_ENV: &str = "CELLD_NODE";
+pub const NODE_IDENTITY_ENV: &str = "CELLO_NODE";
 
 /// The Durable Object class a script's workflow instances run as.
 ///
@@ -262,7 +262,7 @@ pub fn print_help() {
 USAGE:\n  celld deploy [PROJECT] --bucket [s3://|gs://|az://]NAME[/PREFIX] [OPTIONS]\n\n\
 PROJECT is a directory or a Wrangler config; it defaults to the working\n\
 directory, where celld looks for wrangler.jsonc or wrangler.json.\n\n\
-OPTIONS:\n  --sourcemap PATH       Write the Worker's source map to PATH: the bundled JS\n                         entry's external map, or the `no_bundle` entry's sibling\n                         `<entry>.map`; never wasm siblings. Asset-only and Python\n                         projects, and `no_bundle` entries without a sibling map,\n                         warn and write nothing. The deployed bytes are identical\n                         with or without it\n  --read-root DIR        A directory beyond the project that build inputs may\n                         come from: esbuild's inputs and `containers[].image`\n                         Dockerfiles with their build contexts. Repeatable\n  --config PATH          Same as passing PROJECT positionally\n  --bucket [s3://|gs://|az://]NAME[/PREFIX]\n                         Fleet bucket and prefix; defaults to CELLD_BUCKET.\n                         gs:// selects a Google Cloud Storage bucket, az://\n                         an Azure Blob Storage container with its account in\n                         AZURE_STORAGE_ACCOUNT_NAME; celld then rejects\n                         --endpoint and ignores --region\n  --endpoint URL         S3-compatible endpoint; defaults to S3_ENDPOINT\n  --region REGION        Storage region; defaults to AWS_REGION\n  --dry-run              Bundle and print the version without writing\n  --no-activate          Upload and validate without moving any pointer;\n                         the staged version serves only once `celld activate`\n                         names it\n  --json                 Print the deployment as one JSON object\n  -h, --help             Show this help\n\n\
+OPTIONS:\n  --sourcemap PATH       Write the Worker's source map to PATH: the bundled JS\n                         entry's external map, or the `no_bundle` entry's sibling\n                         `<entry>.map`; never wasm siblings. Asset-only and Python\n                         projects, and `no_bundle` entries without a sibling map,\n                         warn and write nothing. The deployed bytes are identical\n                         with or without it\n  --read-root DIR        A directory beyond the project that build inputs may\n                         come from: esbuild's inputs and `containers[].image`\n                         Dockerfiles with their build contexts. Repeatable\n  --config PATH          Same as passing PROJECT positionally\n  --bucket [s3://|gs://|az://]NAME[/PREFIX]\n                         Fleet bucket and prefix; defaults to CELLO_BUCKET.\n                         gs:// selects a Google Cloud Storage bucket, az://\n                         an Azure Blob Storage container with its account in\n                         AZURE_STORAGE_ACCOUNT_NAME; celld then rejects\n                         --endpoint and ignores --region\n  --endpoint URL         S3-compatible endpoint; defaults to S3_ENDPOINT\n  --region REGION        Storage region; defaults to AWS_REGION\n  --dry-run              Bundle and print the version without writing\n  --no-activate          Upload and validate without moving any pointer;\n                         the staged version serves only once `celld activate`\n                         names it\n  --json                 Print the deployment as one JSON object\n  -h, --help             Show this help\n\n\
 Credentials come from the standard AWS credential chain, from Google\n\
 Application Default Credentials for a gs:// bucket, or from an Azure storage\n\
 account key, managed identity, or workload identity for an az:// bucket.\n\n\
@@ -360,7 +360,7 @@ the loser heals what it converged toward the winner and fails with a re-run\n\
 error. A crashed writer's residue heals on the next activate, or a deploy\n\
 of the skewed script. Never run activate concurrently with another activate\n\
 or deploy.\n\n\
-OPTIONS:\n  --primary SCRIPT       The script ingress serves. Defaults to the serving\n                         primary, or to the one named script on a first deploy\n  --bucket [s3://|gs://|az://]NAME[/PREFIX]\n                         Fleet bucket and prefix; defaults to CELLD_BUCKET\n  --endpoint URL         S3-compatible endpoint; defaults to S3_ENDPOINT\n  --region REGION        Storage region; defaults to AWS_REGION\n  --json                 Print the activation as one JSON object\n  -h, --help             Show this help"
+OPTIONS:\n  --primary SCRIPT       The script ingress serves. Defaults to the serving\n                         primary, or to the one named script on a first deploy\n  --bucket [s3://|gs://|az://]NAME[/PREFIX]\n                         Fleet bucket and prefix; defaults to CELLO_BUCKET\n  --endpoint URL         S3-compatible endpoint; defaults to S3_ENDPOINT\n  --region REGION        Storage region; defaults to AWS_REGION\n  --json                 Print the activation as one JSON object\n  -h, --help             Show this help"
     ;
     let _ = crate::cli_output::Output::new(crate::cli_output::Format::Text).help(text);
 }
@@ -422,12 +422,12 @@ Each version is a `celld deploy --no-activate` upload that will never serve.\n\
 A version any pointer names is refused; anything else is inert, so removing\n\
 it is safe. Shared content-addressed objects (asset bodies, image tars) stay:\n\
 other versions reference them. Never run discard concurrently with activate\n\
-or deploy, and hold a superseded version past CELLD_DEPLOY_MAX_AGE_S with\n\
+or deploy, and hold a superseded version past CELLO_DEPLOY_MAX_AGE_S with\n\
 the replacement's adoption verified before discarding a rollback target.\n\
 A commit landing after the re-check names deleted code: adoption fails loudly\n\
 on the missing manifest, and re-deploying from the same source reproduces the\n\
 version for a re-activate.\n\n\
-OPTIONS:\n  --bucket [s3://|gs://|az://]NAME[/PREFIX]\n                         Fleet bucket and prefix; defaults to CELLD_BUCKET\n  --endpoint URL         S3-compatible endpoint; defaults to S3_ENDPOINT\n  --region REGION        Storage region; defaults to AWS_REGION\n  --json                 Print the discard as one JSON object\n  -h, --help             Show this help"
+OPTIONS:\n  --bucket [s3://|gs://|az://]NAME[/PREFIX]\n                         Fleet bucket and prefix; defaults to CELLO_BUCKET\n  --endpoint URL         S3-compatible endpoint; defaults to S3_ENDPOINT\n  --region REGION        Storage region; defaults to AWS_REGION\n  --json                 Print the discard as one JSON object\n  -h, --help             Show this help"
     ;
     let _ = crate::cli_output::Output::new(crate::cli_output::Format::Text).help(text);
 }
@@ -486,7 +486,7 @@ fleet-wide pointer names the serving generation; `celld activate SCRIPT=VERSION`
 moves back to an earlier version for rollback, and `celld discard\n\
 SCRIPT=VERSION` deletes a version no pointer names. This command lists what\n\
 is there, marking the serving versions `current`.\n\n\
-OPTIONS:\n  --bucket [s3://|gs://|az://]NAME[/PREFIX]\n                         Fleet bucket and prefix; defaults to CELLD_BUCKET\n  --endpoint URL         S3-compatible endpoint; defaults to S3_ENDPOINT\n  --region REGION        Storage region; defaults to AWS_REGION\n  --json                 Print one JSON object per version\n  -h, --help             Show this help"
+OPTIONS:\n  --bucket [s3://|gs://|az://]NAME[/PREFIX]\n                         Fleet bucket and prefix; defaults to CELLO_BUCKET\n  --endpoint URL         S3-compatible endpoint; defaults to S3_ENDPOINT\n  --region REGION        Storage region; defaults to AWS_REGION\n  --json                 Print one JSON object per version\n  -h, --help             Show this help"
     ;
     let _ = crate::cli_output::Output::new(crate::cli_output::Format::Text).help(text);
 }
@@ -924,7 +924,7 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
     // also fixes at linux/amd64; a machine that builds for itself, as
     // `celld dev` does, passes none.
     let platform = (!options.local_images).then(|| {
-        std::env::var("CELLD_CONTAINER_PLATFORM").unwrap_or_else(|_| "linux/amd64".to_string())
+        std::env::var("CELLO_CONTAINER_PLATFORM").unwrap_or_else(|_| "linux/amd64".to_string())
     });
     let images = project
         .containers
@@ -1201,7 +1201,7 @@ fn lexical_join(base: &Path, value: &str) -> PathBuf {
 }
 
 fn engine_cli() -> String {
-    std::env::var("CELLD_DOCKER").unwrap_or_else(|_| "docker".to_string())
+    std::env::var("CELLO_DOCKER").unwrap_or_else(|_| "docker".to_string())
 }
 
 /// Run the engine CLI: `cli` is the program and any leading arguments.
@@ -1696,7 +1696,7 @@ pub async fn activate(
     let commit: anyhow::Result<bool> = async {
         publish_activation_queues(bucket, activation_queues).await?;
         converge_carried_queues(bucket, &carried).await?;
-        if std::env::var("CELLD_TEST_ACTIVATE_ABORT").as_deref() == Ok("1") {
+        if std::env::var("CELLO_TEST_ACTIVATE_ABORT").as_deref() == Ok("1") {
             bail!("injected activate abort after convergence, before the fleet-pointer commit");
         }
         // The commit point: one pointer write, CASed on the opening
@@ -1713,7 +1713,7 @@ pub async fn activate(
                 && pointer.components.as_ref() == desired.components.as_ref()
         });
         if !unchanged {
-            if std::env::var("CELLD_TEST_DISCARD_MID_ACTIVATE").as_deref() == Ok("1") {
+            if std::env::var("CELLO_TEST_DISCARD_MID_ACTIVATE").as_deref() == Ok("1") {
                 // A discard that landed after the opening reads and
                 // before the commit: the manifest re-check below must
                 // refuse to commit a generation naming deleted code.
@@ -2304,7 +2304,7 @@ pub struct Discarded {
 /// re-activate. Never run `celld discard` concurrently with `celld
 /// activate` or `celld deploy` — the re-check reports the race, it
 /// cannot undo the delete — and hold a superseded version until
-/// draining nodes have moved past it (past `CELLD_DEPLOY_MAX_AGE_S`,
+/// draining nodes have moved past it (past `CELLO_DEPLOY_MAX_AGE_S`,
 /// with the replacement's adoption verified) before discarding a
 /// rollback target.
 pub async fn discard(bucket: &Bucket, scripts: &[VersionRef]) -> anyhow::Result<Discarded> {
@@ -2344,7 +2344,7 @@ pub async fn discard(bucket: &Bucket, scripts: &[VersionRef]) -> anyhow::Result<
             keys.len()
         );
         objects += gone.len();
-        if std::env::var("CELLD_TEST_DISCARD_RACE").as_deref() == Ok("1") {
+        if std::env::var("CELLO_TEST_DISCARD_RACE").as_deref() == Ok("1") {
             // A concurrent writer that moved the fleet pointer after the
             // pre-check: the re-check below must report it. Shaped as a
             // valid pointer naming another version, so post-delete reads
@@ -2816,7 +2816,7 @@ async fn commit_pointer(
     token: Option<&str>,
     command: &str,
 ) -> anyhow::Result<()> {
-    if std::env::var("CELLD_TEST_POINTER_RACE").as_deref() == Ok("1") {
+    if std::env::var("CELLO_TEST_POINTER_RACE").as_deref() == Ok("1") {
         // A concurrent writer that landed after the opening read: the
         // commit must reject against its stale token and leave this
         // rival generation in place. Shaped as a valid pointer naming
@@ -3725,7 +3725,7 @@ fn read_project(path: &Path, root: &Path, overrides: &VarOverrides) -> anyhow::R
     for binding in &bindings {
         let name = binding.get("name").and_then(Value::as_str).unwrap_or("");
         let kind = binding.get("type").and_then(Value::as_str).unwrap_or("");
-        // `CELLD_NODE` is the host-injected node identity every isolate's
+        // `CELLO_NODE` is the host-injected node identity every isolate's
         // `env` carries (denoland/celld#219). A binding of the same name
         // would be shadowed by it — or shadow it for readers that run
         // before the injection — so the name is refused loudly at deploy
@@ -4800,7 +4800,7 @@ fn run_esbuild(
     // node: builtins stay external. Wrangler polyfills them with unenv; celld
     // implements the workerd `nodejs_compat` subset itself, so the runtime
     // provides them.
-    let binary = std::env::var("CELLD_ESBUILD").unwrap_or_else(|_| "esbuild".to_string());
+    let binary = std::env::var("CELLO_ESBUILD").unwrap_or_else(|_| "esbuild".to_string());
     let outdir = tempfile::tempdir().context("create esbuild output directory")?;
     // The metafile lives apart from the output directory, whose files are
     // scanned for copied modules below: a `.json` copy rule must never pick
@@ -4832,7 +4832,7 @@ fn run_esbuild(
         bail!(
             "esbuild not found ({binary}).\n\
              `celld deploy` bundles with esbuild; install it and retry,\n\
-             or set CELLD_ESBUILD to its path."
+             or set CELLO_ESBUILD to its path."
         );
     };
     let readable: Vec<&Path> = bounds
@@ -4895,13 +4895,13 @@ fn run_esbuild(
             anyhow!(
                 "esbuild not found ({binary}).\n\
                      `celld deploy` bundles with esbuild; install it and retry,\n\
-                     or set CELLD_ESBUILD to its path."
+                     or set CELLO_ESBUILD to its path."
             )
         } else if error.kind() == std::io::ErrorKind::PermissionDenied && confinement.confines() {
             anyhow!(
                 "run esbuild {}: {error}. esbuild runs confined to reads of the \
                  project and its read roots; if this is a wrapper script, it cannot read its \
-                 interpreter, so point CELLD_ESBUILD at the self-contained \
+                 interpreter, so point CELLO_ESBUILD at the self-contained \
                  release binary.",
                 program.display()
             )
@@ -5301,14 +5301,14 @@ fn strip_jsonc(source: &str) -> String {
 
 #[cfg(all(test, cello_internal_tests))]
 mod deploy_contract {
-    include!(env!("CELLD_INTERNAL_DEPLOY_TESTS"));
+    include!(env!("CELLO_INTERNAL_DEPLOY_TESTS"));
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// `CELLD_NODE` names the node the Worker runs on, injected by the host
+    /// `CELLO_NODE` names the node the Worker runs on, injected by the host
     /// into every isolate's `env` (denoland/celld#219). A deployment binding
     /// of the same name would be shadowed by it, so `read_project` refuses
     /// the name loudly — from `vars`, from `.dev.vars`, and from any other
@@ -5334,9 +5334,9 @@ mod tests {
         project_with_vars(dir.path(), "\"REGION\": \"us-east-1\"");
         let config = dir.path().join("wrangler.json");
         read_project(&config, dir.path(), &VarOverrides::None).expect("an ordinary var must parse");
-        project_with_vars(dir.path(), "\"CELLD_NODE\": \"spoofed\"");
+        project_with_vars(dir.path(), "\"CELLO_NODE\": \"spoofed\"");
         match read_project(&config, dir.path(), &VarOverrides::None) {
-            Ok(_) => panic!("a CELLD_NODE var must be refused, not shadowed"),
+            Ok(_) => panic!("a CELLO_NODE var must be refused, not shadowed"),
             Err(error) => assert!(
                 format!("{error:?}").contains("reserved for the node's own identity"),
                 "the refusal must name the reservation: {error:?}"
@@ -5344,9 +5344,9 @@ mod tests {
         }
         project_with_vars(dir.path(), "");
         let mut dev_vars = BTreeMap::new();
-        dev_vars.insert("CELLD_NODE".to_string(), "spoofed".to_string());
+        dev_vars.insert("CELLO_NODE".to_string(), "spoofed".to_string());
         match read_project(&config, dir.path(), &VarOverrides::DevVars(dev_vars)) {
-            Ok(_) => panic!("a CELLD_NODE .dev.vars entry must be refused too"),
+            Ok(_) => panic!("a CELLO_NODE .dev.vars entry must be refused too"),
             Err(error) => assert!(
                 format!("{error:?}").contains("reserved for the node's own identity"),
                 "the refusal must name the reservation: {error:?}"
@@ -5354,7 +5354,7 @@ mod tests {
         }
     }
 
-    /// A `CELLD_NODE` entry in `.env`/`.env.local` is skipped with a warning,
+    /// A `CELLO_NODE` entry in `.env`/`.env.local` is skipped with a warning,
     /// not refused: dotenv files serve other tools too, and the `DotEnv`
     /// contract is "skipped", while the host value wins at runtime regardless
     /// (denoland/celld#219). Explicit `vars` and `.dev.vars` keep the hard
@@ -5375,10 +5375,10 @@ mod tests {
         .unwrap();
         let config = dir.path().join("wrangler.json");
         let mut entries = BTreeMap::new();
-        entries.insert("CELLD_NODE".to_string(), "spoofed".to_string());
+        entries.insert("CELLO_NODE".to_string(), "spoofed".to_string());
         entries.insert("REGION".to_string(), "us-east-1".to_string());
         let project = read_project(&config, dir.path(), &VarOverrides::DotEnv(entries))
-            .expect("a dotenv CELLD_NODE entry must be skipped, not refused");
+            .expect("a dotenv CELLO_NODE entry must be skipped, not refused");
         let names: Vec<&str> = project.metadata["bindings"]
             .as_array()
             .expect("bindings metadata")
@@ -5386,7 +5386,7 @@ mod tests {
             .filter_map(|binding| binding.get("name").and_then(Value::as_str))
             .collect();
         assert!(
-            !names.contains(&"CELLD_NODE"),
+            !names.contains(&"CELLO_NODE"),
             "the dotenv identity must not become a binding: {names:?}"
         );
         assert!(
@@ -5411,12 +5411,12 @@ mod tests {
         let cli = dir.join("fake-engine");
         let script = r#"#!/bin/sh
 if [ "$1" = "build" ]; then
-  echo 'CELLD_TEST_BUILT_ID'
+  echo 'CELLO_TEST_BUILT_ID'
 elif [ "$1" = "image" ]; then
-  if [ "$5" = 'CELLD_TEST_BUILT_ID' ]; then
-    echo 'CELLD_TEST_BUILT_CONTENT'
+  if [ "$5" = 'CELLO_TEST_BUILT_ID' ]; then
+    echo 'CELLO_TEST_BUILT_CONTENT'
   else
-    echo 'CELLD_TEST_TAGGED_CONTENT'
+    echo 'CELLO_TEST_TAGGED_CONTENT'
   fi
 elif [ "$1" = "tag" ]; then
   echo "failed to create an image $3 after deleting the existing one: AlreadyExists" >&2
@@ -5426,9 +5426,9 @@ else
   exit 99
 fi
 "#
-        .replace("CELLD_TEST_BUILT_ID", built_id)
-        .replace("CELLD_TEST_BUILT_CONTENT", built_content)
-        .replace("CELLD_TEST_TAGGED_CONTENT", tagged_content);
+        .replace("CELLO_TEST_BUILT_ID", built_id)
+        .replace("CELLO_TEST_BUILT_CONTENT", built_content)
+        .replace("CELLO_TEST_TAGGED_CONTENT", tagged_content);
         std::fs::write(&cli, script).unwrap();
         cli
     }
@@ -6057,7 +6057,7 @@ mod sourcemap_tests {
     }
 
     fn esbuild_available() -> bool {
-        let binary = std::env::var("CELLD_ESBUILD").unwrap_or_else(|_| "esbuild".to_string());
+        let binary = std::env::var("CELLO_ESBUILD").unwrap_or_else(|_| "esbuild".to_string());
         Command::new(binary)
             .arg("--version")
             .output()
@@ -7059,7 +7059,7 @@ mod sourcemap_tests {
     #[test]
     fn container_image_outside_the_project_is_refused_before_the_engine() {
         // The wired path: a config whose image escapes must fail naming the
-        // key, without any engine on PATH (no `CELLD_DOCKER` is set here).
+        // key, without any engine on PATH (no `CELLO_DOCKER` is set here).
         let project = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
         std::fs::write(outside.path().join("Dockerfile"), "FROM scratch\n").unwrap();

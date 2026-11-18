@@ -132,8 +132,8 @@ impl TestNode {
             .arg("0")
             .arg("--no-watch")
             .arg("--logs")
-            .env("CELLD_OTEL", otel)
-            .env("CELLD_OTEL_FLUSH_MS", "100")
+            .env("CELLO_OTEL", otel)
+            .env("CELLO_OTEL_FLUSH_MS", "100")
             .env("OTEL_SERVICE_NAME", "telemetry-http-probe")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());

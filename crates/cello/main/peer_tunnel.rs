@@ -855,7 +855,7 @@ pub(crate) fn response_stream(body: PooledResponseBody) -> HttpChunkStream {
 
 #[cfg(all(test, cello_internal_tests))]
 mod private_tests {
-    include!(env!("CELLD_CONFORMANCE_PEER_TUNNEL_TESTS"));
+    include!(env!("CELLO_CONFORMANCE_PEER_TUNNEL_TESTS"));
 }
 
 #[cfg(test)]

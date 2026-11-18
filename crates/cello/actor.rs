@@ -49,7 +49,7 @@ const HANDOFF_ALARM_COVERAGE_MS: u64 = 5_000;
 /// one accessor rather than duplicate the environment default.
 #[doc(hidden)]
 pub fn operation_deadline_ms() -> anyhow::Result<u64> {
-    crate::env_vars::positive_or("CELLD_OPERATION_DEADLINE_MS", DEFAULT_OPERATION_DEADLINE_MS)
+    crate::env_vars::positive_or("CELLO_OPERATION_DEADLINE_MS", DEFAULT_OPERATION_DEADLINE_MS)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -1344,7 +1344,7 @@ pub struct AppHandle {
     /// generation. This is the same operation deadline that bounds the
     /// decision core, so a shell retry cannot outlive its core operation.
     pub operation_deadline_ms: u64,
-    /// The fleet's operator token, when `CELLD_OPERATOR_TOKEN` is set. The
+    /// The fleet's operator token, when `CELLO_OPERATOR_TOKEN` is set. The
     /// internal listener's gate compares it in constant time; `None` is
     /// today's open listener. Cloned per connection, never logged.
     pub operator_token: Option<crate::operator_token::OperatorToken>,
@@ -2558,16 +2558,16 @@ impl Actor {
                 .unwrap_or_else(random_process_generation),
             Ownership::Memory(_) => random_process_generation(),
         };
-        let ttl_ms = crate::env_vars::positive_or("CELLD_TTL_MS", 10_000)?;
+        let ttl_ms = crate::env_vars::positive_or("CELLO_TTL_MS", 10_000)?;
         let operation_deadline_ms = operation_deadline_ms()?;
         let lease_spec = NodeLeaseSpec {
             // Startup has already resolved the environment and CLI settings
             // into this validated internal address. Reading the environment
-            // again would let CELLD_ADVERTISE override a later CLI option and
+            // again would let CELLO_ADVERTISE override a later CLI option and
             // publish an address that the bound listener did not validate.
             addr: advertise,
             peer_protocol: peer_auth::PROTOCOL_VERSION,
-            generation: std::env::var("CELLD_TEST_GENERATION").unwrap_or(process_generation),
+            generation: std::env::var("CELLO_TEST_GENERATION").unwrap_or(process_generation),
             resume_generation,
             ttl_ms,
         };
@@ -2589,18 +2589,18 @@ impl Actor {
                     peer_protocol: crate::peer_auth::PROTOCOL_VERSION,
                     operation_deadline_ms: Some(operation_deadline_ms),
                     owner_log_recovery_backoff_ms: crate::env_vars::positive_or(
-                        "CELLD_RECOVERY_RETRY_MS",
+                        "CELLO_RECOVERY_RETRY_MS",
                         DEFAULT_OWNER_LOG_RECOVERY_BACKOFF_MS,
                     )?,
                     owner_log_recovery_attempts: crate::env_vars::positive_or(
-                        "CELLD_RECOVERY_RETRIES",
+                        "CELLO_RECOVERY_RETRIES",
                         DEFAULT_OWNER_LOG_RECOVERY_ATTEMPTS,
                     )?,
-                    idle_evict_ms: crate::env_vars::positive::<u64>("CELLD_IDLE_EVICT_S")?
+                    idle_evict_ms: crate::env_vars::positive::<u64>("CELLO_IDLE_EVICT_S")?
                         .map(|seconds| seconds.saturating_mul(1_000)),
                     pressure: pressure_config_from_environment()?,
                     max_outbound_websockets: crate::env_vars::positive_or(
-                        "CELLD_MAX_OUTBOUND_WEBSOCKETS",
+                        "CELLO_MAX_OUTBOUND_WEBSOCKETS",
                         DEFAULT_MAX_OUTBOUND_WEBSOCKETS,
                     )?,
                     ownership_on_evict: match &ownership {
@@ -4476,4 +4476,4 @@ fn apply_core_event(state: &mut ActorState, event: Event) -> Vec<Effect> {
 }
 
 #[cfg(all(test, cello_internal_tests))]
-include!(env!("CELLD_INTERNAL_ACTOR_OBSERVERS"));
+include!(env!("CELLO_INTERNAL_ACTOR_OBSERVERS"));

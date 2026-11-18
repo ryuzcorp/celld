@@ -7,7 +7,7 @@
 #   1. starts a local RustFS container and creates <bucket> in it
 #      (bucket names must be lowercase; create accepts 200 or 409),
 #   2. starts a logging proxy in front of it and <nodes> celld nodes
-#      (CELLD_BIN, ports offset by OFF) pointed at the proxy,
+#      (CELLO_BIN, ports offset by OFF) pointed at the proxy,
 #   3. deploys the test app from app/,
 #   4. drives the workload, then runs count.py over the proxy log,
 #   5. kills its proxy and nodes and removes its container on exit (trap).
@@ -42,11 +42,11 @@ fi
 
 # Release builds only by default: a debug binary distorts batching and every
 # latency figure, and once made a release look 2x slower than `.10`.
-if [[ -z "${CELLD_BIN:-}" ]]; then
-  CELLD_BIN="$ROOT/target/release/cello"
-  [[ -x "$CELLD_BIN" ]] || CELLD_BIN="$HOME/.cargo-target/cello-wt-$(basename "$ROOT")/release/cello"
+if [[ -z "${CELLO_BIN:-}" ]]; then
+  CELLO_BIN="$ROOT/target/release/cello"
+  [[ -x "$CELLO_BIN" ]] || CELLO_BIN="$HOME/.cargo-target/cello-wt-$(basename "$ROOT")/release/cello"
 fi
-[[ -x "$CELLD_BIN" ]] || { echo "run.sh: no executable CELLD_BIN=$CELLD_BIN (cargo build --release -p cello first)" >&2; exit 1; }
+[[ -x "$CELLO_BIN" ]] || { echo "run.sh: no executable CELLO_BIN=$CELLO_BIN (cargo build --release -p cello first)" >&2; exit 1; }
 command -v esbuild >/dev/null || { echo "run.sh: esbuild not on PATH (needed by celld deploy)" >&2; exit 1; }
 command -v docker >/dev/null || { echo "run.sh: docker not on PATH" >&2; exit 1; }
 python3 -c "import boto3" 2>/dev/null || { echo "run.sh: python3 boto3 missing (pip install boto3)" >&2; exit 1; }
@@ -202,11 +202,11 @@ EOF
 
 NODE_ENV=(
   "S3_ENDPOINT=$PROXY_URL"
-  "CELLD_BUCKET=s3://$BUCKET"
+  "CELLO_BUCKET=s3://$BUCKET"
   "AWS_ACCESS_KEY_ID=$S3_USER"
   "AWS_SECRET_ACCESS_KEY=$S3_PASS"
   "AWS_REGION=$AWS_REGION"
-  "CELLD_DEPLOY_POLL_S=1"
+  "CELLO_DEPLOY_POLL_S=1"
 )
 for extra in "$@"; do
   [[ "$extra" == *=* ]] || { echo "run.sh: extra args must be ENV=VAL: $extra" >&2; exit 1; }
@@ -218,8 +218,8 @@ while [[ $i -lt $NODES ]]; do
   pub="$(node_pub "$i")"
   priv="$(node_priv "$i")"
   echo "== starting node $i (public 127.0.0.1:$pub internal 127.0.0.1:$priv)" >&2
-  env "${NODE_ENV[@]}" "CELLD_NODE=s3bench-$i" "CELLD_WATCH=$WORK/watch-$i" \
-    nohup "$CELLD_BIN" --bucket "s3://$BUCKET" --endpoint "$PROXY_URL" --region "$AWS_REGION" \
+  env "${NODE_ENV[@]}" "CELLO_NODE=s3bench-$i" "CELLO_WATCH=$WORK/watch-$i" \
+    nohup "$CELLO_BIN" --bucket "s3://$BUCKET" --endpoint "$PROXY_URL" --region "$AWS_REGION" \
       --listen "127.0.0.1:$pub" --internal-listen "127.0.0.1:$priv" \
       --advertise "127.0.0.1:$priv" >"$WORK/node-$i.log" 2>&1 &
   NODE_PIDS="$NODE_PIDS $!"
@@ -239,7 +239,7 @@ for pid in $NODE_PIDS; do
 done
 PUB0="$(node_pub 0)"
 echo "== deploying $APP" >&2
-env "${NODE_ENV[@]}" "$CELLD_BIN" deploy "$APP" \
+env "${NODE_ENV[@]}" "$CELLO_BIN" deploy "$APP" \
   --bucket "s3://$BUCKET" --endpoint "$PROXY_URL" --region "$AWS_REGION" >&2
 
 echo "== waiting for the deployment to serve" >&2

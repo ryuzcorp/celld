@@ -343,7 +343,7 @@ function kvService(host) {
         // protects the digest in memory, so the durable wake can reclaim it even
         // when this isolate remains resident.
         if (__kvLimits().failAfterBlobWrite) {
-          throw __kvError("CELLD_TEST_KV_FAIL_AFTER_BLOB_WRITE");
+          throw __kvError("CELLO_TEST_KV_FAIL_AFTER_BLOB_WRITE");
         }
         return { value: null, blobId: reference };
       } catch (error) {

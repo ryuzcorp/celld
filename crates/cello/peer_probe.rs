@@ -15,7 +15,7 @@ use std::sync::OnceLock;
 const PROBE_DOMAIN: &str = "cells-peer-probe-v1";
 const CHALLENGE_BYTES: usize = 32;
 const MAX_RESPONSE_BYTES: usize = 4096;
-pub(crate) const REEXEC_SIGNER_ENV: &str = "CELLD_REEXEC_PROBE_SIGNING_KEY";
+pub(crate) const REEXEC_SIGNER_ENV: &str = "CELLO_REEXEC_PROBE_SIGNING_KEY";
 static INSTALLED_SIGNER: OnceLock<PeerProbeSigner> = OnceLock::new();
 
 pub struct PeerProbeSigner {

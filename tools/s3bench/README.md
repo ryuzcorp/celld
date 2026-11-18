@@ -28,12 +28,12 @@ counts. `stored.py` reports the `cells/` objects and bytes left behind.
 
 ## Prerequisites
 
-- `cargo build --release -p cello` (or set `CELLD_BIN` to the binary),
+- `cargo build --release -p cello` (or set `CELLO_BIN` to the binary),
 - `esbuild` on `PATH` (needed by `celld deploy`),
 - `docker` (starts a `rustfs/rustfs` container, credentials via env),
 - `python3` with `boto3`.
 
-`run.sh` suspect env knobs: `CELLD_BIN`, `OFF` (port offset), `HOT=1`
+`run.sh` suspect env knobs: `CELLO_BIN`, `OFF` (port offset), `HOT=1`
 (hot-cell workload), `DELAY_MS` (proxy latency), `KEEP_WORK=1` (keep the
  work dir, which a successful run deletes). The driver prints `ok turns:`
  plus per-turn end-to-end latency
@@ -57,7 +57,7 @@ clients. A serial walk would keep at most one cell in flight and never batch.
 ~100–200 ms, so `DELAY_MS=100` gives realistic batching numbers.
 
 ```sh
-./run.sh s3bench-agent-1 1 200 60 10 60 120 CELLD_DURABILITY=bucket CELLD_IDLE_EVICT_S=30 CELLD_TTL_MS=60000
+./run.sh s3bench-agent-1 1 200 60 10 60 120 CELLO_DURABILITY=bucket CELLO_IDLE_EVICT_S=30 CELLO_TTL_MS=60000
 ```
 
 ## Hot workload
@@ -65,7 +65,7 @@ clients. A serial walk would keep at most one cell in flight and never batch.
 One hot cell, 16 concurrent writers, 40 ms store latency:
 
 ```sh
-HOT=1 DELAY_MS=40 ./run.sh s3bench-hot-1 1 16 15 0 0 10 CELLD_DURABILITY=bucket CELLD_TTL_MS=60000
+HOT=1 DELAY_MS=40 ./run.sh s3bench-hot-1 1 16 15 0 0 10 CELLO_DURABILITY=bucket CELLO_TTL_MS=60000
 ```
 
 ## Notes

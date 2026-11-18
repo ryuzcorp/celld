@@ -211,7 +211,7 @@ fn worker_vars_populate_process_env() {
 
 /// A dynamically loaded Worker's loader-supplied strings reach the handler's
 /// `env` and — under `nodejs_compat` — `process.env` alike, while the
-/// host-owned `CELLD_NODE` name never crosses into `process.env`
+/// host-owned `CELLO_NODE` name never crosses into `process.env`
 /// (denoland/celld#296).
 #[test]
 fn loaded_worker_env_populates_process_env() {
@@ -246,7 +246,7 @@ fn loaded_worker_env_populates_process_env() {
     assert_eq!(
         proc_node.get("type").and_then(|v| v.as_str()),
         Some("undefined"),
-        "CELLD_NODE must not cross into process.env: {body}"
+        "CELLO_NODE must not cross into process.env: {body}"
     );
     // At module scope too: the reserved name never crosses, at either time.
     let module_node = probe
@@ -255,7 +255,7 @@ fn loaded_worker_env_populates_process_env() {
     assert_eq!(
         module_node.get("type").and_then(|v| v.as_str()),
         Some("undefined"),
-        "CELLD_NODE must not cross into process.env at module scope: {body}"
+        "CELLO_NODE must not cross into process.env at module scope: {body}"
     );
     // Dangerous keys never cross either: `constructor` would shadow the
     // inherited member on `process.env`.

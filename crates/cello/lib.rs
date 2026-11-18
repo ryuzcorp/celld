@@ -16,11 +16,11 @@ pub use tokio_select::__asyncrt_select_support;
 pub mod actor;
 #[cfg(all(test, cello_internal_tests))]
 mod conformance_core_loop_tests {
-    include!(env!("CELLD_CONFORMANCE_CORE_LOOP_TESTS"));
+    include!(env!("CELLO_CONFORMANCE_CORE_LOOP_TESTS"));
 }
 #[cfg(all(test, cello_internal_tests))]
 mod conformance_facet_failure_tests {
-    include!(env!("CELLD_CONFORMANCE_FACET_FAILURE_TESTS"));
+    include!(env!("CELLO_CONFORMANCE_FACET_FAILURE_TESTS"));
 }
 pub mod assets;
 #[cfg(not(cello_internal_tests))]
@@ -33,11 +33,11 @@ pub mod asyncrt;
 #[cfg(cello_internal_tests)]
 #[allow(clippy::disallowed_methods, clippy::disallowed_types)]
 pub mod asyncrt {
-    include!(env!("CELLD_INTERNAL_ASYNCRT"));
+    include!(env!("CELLO_INTERNAL_ASYNCRT"));
 }
 #[cfg(all(test, cello_internal_tests))]
 mod asyncrt_contract_tests {
-    include!(env!("CELLD_INTERNAL_ASYNCRT_TESTS"));
+    include!(env!("CELLO_INTERNAL_ASYNCRT_TESTS"));
 }
 pub mod bucket;
 pub mod cell_cli;
@@ -62,7 +62,7 @@ pub mod env_vars;
 #[allow(clippy::disallowed_methods)]
 #[doc(hidden)]
 pub mod fault {
-    include!(env!("CELLD_INTERNAL_SQLITE_FAULT"));
+    include!(env!("CELLO_INTERNAL_SQLITE_FAULT"));
 }
 pub(crate) mod facet_streams;
 pub mod fleet;
@@ -115,84 +115,84 @@ pub mod ws_registry;
 
 #[cfg(all(test, cello_internal_tests))]
 mod composed_simulation {
-    include!(env!("CELLD_INTERNAL_COMPOSED_SIMULATION"));
+    include!(env!("CELLO_INTERNAL_COMPOSED_SIMULATION"));
 }
 
 #[cfg(all(test, cello_internal_tests))]
 mod simulation_reproduction {
-    include!(env!("CELLD_INTERNAL_SIMULATION_REPRODUCTION"));
+    include!(env!("CELLO_INTERNAL_SIMULATION_REPRODUCTION"));
 }
 
 #[cfg(all(test, cello_internal_tests))]
 mod token_lifecycle_tests {
-    include!(env!("CELLD_INTERNAL_TOKEN_PROBE"));
+    include!(env!("CELLO_INTERNAL_TOKEN_PROBE"));
 }
 
 #[cfg(all(test, cello_internal_tests))]
 mod conformance_world_tests {
-    include!(env!("CELLD_CONFORMANCE_WORLD_TESTS"));
+    include!(env!("CELLO_CONFORMANCE_WORLD_TESTS"));
 }
 
 #[cfg(all(test, cello_internal_tests))]
 #[allow(clippy::disallowed_methods)]
 mod conformance_world_s2_tests {
-    include!(env!("CELLD_CONFORMANCE_WORLD_S2_TESTS"));
+    include!(env!("CELLO_CONFORMANCE_WORLD_S2_TESTS"));
 }
 
 #[cfg(all(test, cello_internal_tests))]
 #[allow(clippy::disallowed_methods)]
 mod conformance_o3_oracle {
-    include!(env!("CELLD_CONFORMANCE_O3_ORACLE_TESTS"));
+    include!(env!("CELLO_CONFORMANCE_O3_ORACLE_TESTS"));
 }
 
 #[cfg(all(test, cello_internal_tests))]
 #[allow(clippy::disallowed_methods)]
 mod conformance_world_s5a_tests {
-    include!(env!("CELLD_CONFORMANCE_WORLD_S5A_TESTS"));
+    include!(env!("CELLO_CONFORMANCE_WORLD_S5A_TESTS"));
 }
 
 #[cfg(all(test, cello_internal_tests))]
 #[allow(clippy::disallowed_methods)]
 mod conformance_world_s5c_tests {
-    include!(env!("CELLD_CONFORMANCE_WORLD_S5C_TESTS"));
+    include!(env!("CELLO_CONFORMANCE_WORLD_S5C_TESTS"));
 }
 
 #[cfg(cello_internal_tests)]
 #[allow(clippy::disallowed_methods)]
 #[doc(hidden)]
 pub mod conformance_sim_store {
-    include!(env!("CELLD_CONFORMANCE_SIM_STORE_TESTS"));
+    include!(env!("CELLO_CONFORMANCE_SIM_STORE_TESTS"));
 }
 
 #[cfg(cello_internal_tests)]
 #[allow(clippy::disallowed_methods)]
 #[doc(hidden)]
 pub mod conformance_sim_cell_host {
-    include!(env!("CELLD_CONFORMANCE_SIM_CELL_HOST_TESTS"));
+    include!(env!("CELLO_CONFORMANCE_SIM_CELL_HOST_TESTS"));
 }
 
 #[cfg(all(test, cello_internal_tests))]
 #[allow(clippy::disallowed_methods)]
 pub(crate) mod conformance_world_s1_tests {
-    include!(env!("CELLD_CONFORMANCE_WORLD_S1_TESTS"));
+    include!(env!("CELLO_CONFORMANCE_WORLD_S1_TESTS"));
 }
 
 #[cfg(all(test, cello_internal_tests))]
 #[allow(clippy::disallowed_methods)]
 pub(crate) mod conformance_world_coverage {
-    include!(env!("CELLD_CONFORMANCE_WORLD_COVERAGE_TESTS"));
+    include!(env!("CELLO_CONFORMANCE_WORLD_COVERAGE_TESTS"));
 }
 
 #[cfg(all(test, cello_internal_tests))]
 #[allow(clippy::disallowed_methods)]
 mod conformance_world_s3_tests {
-    include!(env!("CELLD_CONFORMANCE_WORLD_S3_TESTS"));
+    include!(env!("CELLO_CONFORMANCE_WORLD_S3_TESTS"));
 }
 
 #[cfg(all(test, cello_internal_tests))]
 #[allow(clippy::disallowed_methods)]
 mod conformance_world_s5b_tests {
-    include!(env!("CELLD_CONFORMANCE_WORLD_S5B_TESTS"));
+    include!(env!("CELLO_CONFORMANCE_WORLD_S5B_TESTS"));
 }
 
 /// Completion token for a resident-isolate reservation made by the decision

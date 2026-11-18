@@ -6,7 +6,7 @@
 //! The internal listener serves the peer protocol and the operator API, and
 //! its security model assumes a trusted private network. A host that cannot
 //! give tenant code a network without a route to that listener sets
-//! `CELLD_OPERATOR_TOKEN` to the same value on every node of the fleet, and
+//! `CELLO_OPERATOR_TOKEN` to the same value on every node of the fleet, and
 //! every internal route then requires `Authorization: Bearer <token>`.
 //! There are no exempt routes: liveness and readiness probes use the public
 //! listener's `/.well-known/celld/health`, which this token does not guard.
@@ -26,7 +26,7 @@ use anyhow::{anyhow, Context};
 use subtle::ConstantTimeEq;
 
 /// The environment variable that carries the fleet's operator token.
-pub const ENV_VAR: &str = "CELLD_OPERATOR_TOKEN";
+pub const ENV_VAR: &str = "CELLO_OPERATOR_TOKEN";
 
 /// A parsed operator token. The bearer form is validated once, at parse, so
 /// attaching it to a request cannot fail and a token that could never match

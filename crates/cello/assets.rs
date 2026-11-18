@@ -163,13 +163,13 @@ impl AssetResolver {
         validate_index(&index, reference)?;
         let header_rules = parse_header_rules(index.config.headers.as_deref().unwrap_or(""))?;
         let redirect_rules = parse_redirect_rules(index.config.redirects.as_deref().unwrap_or(""))?;
-        let cache_root = std::env::var_os("CELLD_ASSET_CACHE_DIR")
+        let cache_root = std::env::var_os("CELLO_ASSET_CACHE_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(|| std::env::temp_dir().join("celld").join("asset-cache"));
         std::fs::create_dir_all(&cache_root)
             .with_context(|| format!("create asset cache directory {}", cache_root.display()))?;
         let cache_max_bytes =
-            crate::env_vars::with_default("CELLD_ASSET_CACHE_BYTES", DEFAULT_ASSET_CACHE_BYTES)?;
+            crate::env_vars::with_default("CELLO_ASSET_CACHE_BYTES", DEFAULT_ASSET_CACHE_BYTES)?;
         Ok(Self {
             inner: Arc::new(AssetResolverInner {
                 bucket: bucket.clone(),
@@ -1020,7 +1020,7 @@ fn strip_port(host: &str) -> &str {
 
 #[cfg(all(test, cello_internal_tests))]
 mod internal_tests {
-    include!(env!("CELLD_INTERNAL_ASSETS_TESTS"));
+    include!(env!("CELLO_INTERNAL_ASSETS_TESTS"));
 }
 
 fn route(index: &AssetIndex, path: &str, include_not_found: bool) -> Route {
@@ -1315,7 +1315,7 @@ fn cleanup_cache_files(root: &Path, limit: u64) -> anyhow::Result<()> {
 pub(crate) fn validate_asset_file_size(path: &str, bytes: u64, limit: u64) -> anyhow::Result<()> {
     if bytes > limit {
         return Err(anyhow!(
-            "asset {path:?} size ({bytes} bytes) exceeds CELLD_MAX_ASSET_FILE_BYTES ({limit} bytes)"
+            "asset {path:?} size ({bytes} bytes) exceeds CELLO_MAX_ASSET_FILE_BYTES ({limit} bytes)"
         ));
     }
     Ok(())

@@ -38,7 +38,7 @@ fn number_arg(scope: &mut v8::PinScope, args: &v8::FunctionCallbackArguments, in
 /// The scope this container op may address: the executing cell's own, or
 /// a throw. A `Container` forged with another cell's scope reaches this
 /// boundary and no further. Scopes the test fake serves
-/// (`CELLD_TEST_WAIT=1` only) bypass the check, because the conformance
+/// (`CELLO_TEST_WAIT=1` only) bypass the check, because the conformance
 /// suite drives them from stateless events with no executing cell.
 fn own_cell_container(
     scope: &mut v8::PinScope,
@@ -666,7 +666,7 @@ pub(super) fn op_container_exec_drop(
 }
 
 // ---- Test-only fake exec engine ------------------------------------------
-// `CELLD_TEST_WAIT=1` only (the exec-signal conformance suite): the test
+// `CELLO_TEST_WAIT=1` only (the exec-signal conformance suite): the test
 // environment has no container engine -- image resolution needs Docker,
 // so a fixture cannot even declare `containers[]` -- and this table
 // stands in for it beneath the real `Container.prototype.exec` path. A
@@ -757,7 +757,7 @@ impl Drop for TestExecWaitGuard {
 
 /// `__testexec_attach(scope)`; mark one scope as fake-running, so the
 /// real exec path runs against the fake table. Throws unless
-/// `CELLD_TEST_WAIT=1`.
+/// `CELLO_TEST_WAIT=1`.
 pub(super) fn op_testexec_attach(
     scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
@@ -778,7 +778,7 @@ pub(super) fn op_testexec_attach(
 }
 
 /// `__testexec_ids(scope)` -> JSON array of the scope's fake exec ids, in
-/// spawn order. Throws unless `CELLD_TEST_WAIT=1`.
+/// spawn order. Throws unless `CELLO_TEST_WAIT=1`.
 pub(super) fn op_testexec_ids(
     scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
@@ -802,7 +802,7 @@ pub(super) fn op_testexec_ids(
 
 /// `__testexec_exit(id, code)`; fire one fake exit, resolving its current
 /// subscribers and storing the code for late ones (first fire wins, like
-/// a stored engine exit code). Throws unless `CELLD_TEST_WAIT=1`.
+/// a stored engine exit code). Throws unless `CELLO_TEST_WAIT=1`.
 pub(super) fn op_testexec_exit(
     scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
@@ -831,7 +831,7 @@ pub(super) fn op_testexec_exit(
 }
 
 /// `__testexec_kills(id)` -> JSON array of the signals the fake process
-/// received, in order. Throws unless `CELLD_TEST_WAIT=1`.
+/// received, in order. Throws unless `CELLO_TEST_WAIT=1`.
 pub(super) fn op_testexec_kills(
     scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
@@ -851,7 +851,7 @@ pub(super) fn op_testexec_kills(
 
 /// `__testexec_kills_completed(id)` -> JSON array of the signals whose
 /// kill op ran to completion, in order. Throws unless
-/// `CELLD_TEST_WAIT=1`.
+/// `CELLO_TEST_WAIT=1`.
 pub(super) fn op_testexec_kills_completed(
     scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
@@ -870,7 +870,7 @@ pub(super) fn op_testexec_kills_completed(
 }
 
 /// `__testexec_closes(id)` -> the stdin closes dispatched on the fake
-/// process. Throws unless `CELLD_TEST_WAIT=1`.
+/// process. Throws unless `CELLO_TEST_WAIT=1`.
 pub(super) fn op_testexec_closes(
     scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
@@ -889,7 +889,7 @@ pub(super) fn op_testexec_closes(
 }
 
 /// `__testexec_closes_completed(id)` -> the stdin closes whose op ran to
-/// completion. Throws unless `CELLD_TEST_WAIT=1`.
+/// completion. Throws unless `CELLO_TEST_WAIT=1`.
 pub(super) fn op_testexec_closes_completed(
     scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
@@ -909,7 +909,7 @@ pub(super) fn op_testexec_closes_completed(
 
 /// `__testexec_signals(scope)` -> JSON array of the container signals
 /// dispatched on the scope, in order. Throws unless
-/// `CELLD_TEST_WAIT=1`.
+/// `CELLO_TEST_WAIT=1`.
 pub(super) fn op_testexec_signals(
     scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
@@ -928,7 +928,7 @@ pub(super) fn op_testexec_signals(
 
 /// `__testexec_signals_completed(scope)` -> JSON array of the container
 /// signals whose op ran to completion, in order. Throws unless
-/// `CELLD_TEST_WAIT=1`.
+/// `CELLO_TEST_WAIT=1`.
 pub(super) fn op_testexec_signals_completed(
     scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
@@ -946,7 +946,7 @@ pub(super) fn op_testexec_signals_completed(
 }
 
 /// `__testexec_params(id)` -> the params JSON the fake exec received.
-/// Throws unless `CELLD_TEST_WAIT=1`.
+/// Throws unless `CELLO_TEST_WAIT=1`.
 pub(super) fn op_testexec_params(
     scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
@@ -965,7 +965,7 @@ pub(super) fn op_testexec_params(
 
 /// `__testproc_spawn()` -> process id; a test-only in-memory exec process
 /// the test feeds itself through the real process table. Throws unless
-/// `CELLD_TEST_WAIT=1`.
+/// `CELLO_TEST_WAIT=1`.
 pub(super) fn op_testproc_spawn(
     scope: &mut v8::PinScope,
     _args: v8::FunctionCallbackArguments,
@@ -987,7 +987,7 @@ pub(super) fn op_testproc_spawn(
 }
 
 /// `__testproc_emit(id, which, bytes)`; push one chunk into a test-only
-/// in-memory exec pipe. Throws unless `CELLD_TEST_WAIT=1`.
+/// in-memory exec pipe. Throws unless `CELLO_TEST_WAIT=1`.
 pub(super) fn op_testproc_emit(
     scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
@@ -1013,7 +1013,7 @@ pub(super) fn op_testproc_emit(
 }
 
 /// `__testproc_eof(id, which)`; end one test-only in-memory exec pipe.
-/// Throws unless `CELLD_TEST_WAIT=1`.
+/// Throws unless `CELLO_TEST_WAIT=1`.
 pub(super) fn op_testproc_eof(
     scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,

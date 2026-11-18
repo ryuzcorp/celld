@@ -520,11 +520,11 @@ fn rpc_signals() -> &'static std::sync::Mutex<HashMap<RequestId, RpcSignalState>
 }
 
 /// Whether the test-only retained-wait ops exist. True only with
-/// `CELLD_TEST_WAIT=1` (the cross-event wait conformance suite); the ops
+/// `CELLO_TEST_WAIT=1` (the cross-event wait conformance suite); the ops
 /// throw otherwise, so production tenants cannot mint or fire waits.
 fn test_wait_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var("CELLD_TEST_WAIT").as_deref() == Ok("1"))
+    *ENABLED.get_or_init(|| std::env::var("CELLO_TEST_WAIT").as_deref() == Ok("1"))
 }
 
 /// One test-only retained wait: an unrefed native wait the harness holds
@@ -3289,12 +3289,12 @@ fn heap_share(isolate: &mut v8::Isolate, limit: usize) -> f64 {
 }
 
 fn v8_heap_limit_bytes() -> usize {
-    crate::env_vars::positive::<usize>("CELLD_V8_HEAP_LIMIT_MB")
-        .expect("validated CELLD_V8_HEAP_LIMIT_MB")
+    crate::env_vars::positive::<usize>("CELLO_V8_HEAP_LIMIT_MB")
+        .expect("validated CELLO_V8_HEAP_LIMIT_MB")
         .map(|megabytes| {
             megabytes
                 .checked_mul(1024 * 1024)
-                .expect("validated CELLD_V8_HEAP_LIMIT_MB range")
+                .expect("validated CELLO_V8_HEAP_LIMIT_MB range")
         })
         .unwrap_or(DEFAULT_V8_HEAP_LIMIT_BYTES)
 }
@@ -8145,10 +8145,10 @@ fn dynamic_worker_code_limit() -> usize {
     static LIMIT: OnceLock<usize> = OnceLock::new();
     *LIMIT.get_or_init(|| {
         crate::env_vars::positive_or(
-            "CELLD_MAX_DYNAMIC_WORKER_CODE_BYTES",
+            "CELLO_MAX_DYNAMIC_WORKER_CODE_BYTES",
             DEFAULT_MAX_DYNAMIC_WORKER_CODE_SIZE,
         )
-        .expect("validated CELLD_MAX_DYNAMIC_WORKER_CODE_BYTES")
+        .expect("validated CELLO_MAX_DYNAMIC_WORKER_CODE_BYTES")
     })
 }
 
@@ -9933,7 +9933,7 @@ fn op_rpc_signal_wait(
 }
 
 /// `__test_wait_enabled()` -> bool; whether this node defines the
-/// test-only retained-wait global. True only with `CELLD_TEST_WAIT=1`
+/// test-only retained-wait global. True only with `CELLO_TEST_WAIT=1`
 /// (the cross-event wait conformance suite); production isolates never
 /// define it, so tenant code cannot mint waits there.
 fn op_test_wait_enabled(
@@ -9949,7 +9949,7 @@ fn op_test_wait_enabled(
 /// container exec wait it stands in for: the subscription belongs to
 /// the subscribing event and dies with it, so a promise held across
 /// events needs a fresh subscription in each later event. Throws
-/// unless `CELLD_TEST_WAIT=1`.
+/// unless `CELLO_TEST_WAIT=1`.
 fn op_testwait_await(
     scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
@@ -10044,7 +10044,7 @@ impl Drop for TestWaitGuard {
 /// `__testwait_fire(id, value)`; fire one test-only retained wait,
 /// resolving its current subscribers and storing the value for late
 /// ones (first fire wins, like a cached exit code). Throws unless
-/// `CELLD_TEST_WAIT=1`.
+/// `CELLO_TEST_WAIT=1`.
 fn op_testwait_fire(
     scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
@@ -10456,7 +10456,7 @@ fn op_stub_handoff(
 }
 
 /// `__test_stub_stats_enabled()` -> bool; whether this node defines the
-/// test-only stub-stats global. True only with `CELLD_TEST_STUB_STATS=1`
+/// test-only stub-stats global. True only with `CELLO_TEST_STUB_STATS=1`
 /// in the node's process environment, which tenant code cannot set: the
 /// harness reads it once per isolate and leaves production isolates
 /// without the hook.
@@ -10889,8 +10889,8 @@ fn op_fetch(
         let m = reqwest::Method::from_bytes(method.as_bytes()).unwrap_or(reqwest::Method::GET);
         // a timeout bounds a black-hole host: the future settles (Err) instead
         // of parking run_loop forever — the hang the Drop guard can't catch.
-        let fetch_timeout = crate::env_vars::positive_or("CELLD_FETCH_TIMEOUT_S", 120)
-            .expect("validated CELLD_FETCH_TIMEOUT_S");
+        let fetch_timeout = crate::env_vars::positive_or("CELLO_FETCH_TIMEOUT_S", 120)
+            .expect("validated CELLO_FETCH_TIMEOUT_S");
         let mut rb = client
             .request(m, &url)
             .timeout(std::time::Duration::from_secs(fetch_timeout));
@@ -12537,7 +12537,7 @@ enum VfsNode {
 /// Default per-request `/tmp` byte cap: 64 MiB, the same ceiling the loader
 /// places on dynamic worker code. A request that strays past it is buggy or
 /// hostile either way, and a multi-tenant node cannot let one request pin
-/// gigabytes of host memory. Raised with `CELLD_TMP_MAX_BYTES` (bytes).
+/// gigabytes of host memory. Raised with `CELLO_TMP_MAX_BYTES` (bytes).
 const DEFAULT_TMP_MAX_BYTES: usize = 64 * 1024 * 1024;
 
 /// Fixed per-entry overhead charged alongside the path itself: the
@@ -12554,8 +12554,8 @@ fn entry_charge(path: &str) -> usize {
 fn tmp_max_bytes() -> usize {
     static LIMIT: OnceLock<usize> = OnceLock::new();
     *LIMIT.get_or_init(|| {
-        crate::env_vars::positive_or("CELLD_TMP_MAX_BYTES", DEFAULT_TMP_MAX_BYTES)
-            .expect("validated CELLD_TMP_MAX_BYTES")
+        crate::env_vars::positive_or("CELLO_TMP_MAX_BYTES", DEFAULT_TMP_MAX_BYTES)
+            .expect("validated CELLO_TMP_MAX_BYTES")
     })
 }
 
@@ -14064,7 +14064,7 @@ fn op_vfs_read_file(
 /// argument is true. Answers `""` on success and a Node error code
 /// otherwise — the same disjoint representation `op_vfs_mkdir` uses, so no
 /// JS object is allocated per written file. A write that would push the
-/// request past `CELLD_TMP_MAX_BYTES` answers `ENOSPC`.
+/// request past `CELLO_TMP_MAX_BYTES` answers `ENOSPC`.
 fn op_vfs_write_file(
     scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
@@ -14932,7 +14932,7 @@ pub fn init_engine_for_tests() {
 }
 
 #[cfg(cello_internal_tests)]
-include!(env!("CELLD_INTERNAL_JS_OBSERVERS"));
+include!(env!("CELLO_INTERNAL_JS_OBSERVERS"));
 
 #[cfg(test)]
 mod bundle_tree_tests {

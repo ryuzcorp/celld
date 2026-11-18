@@ -757,7 +757,7 @@ fn decode_attributes(encoded: &str) -> object_store::Result<Attributes> {
 
 #[cfg(all(test, cello_internal_tests))]
 mod internal_tests {
-    include!(env!("CELLD_INTERNAL_LOCAL_STORE_TESTS"));
+    include!(env!("CELLO_INTERNAL_LOCAL_STORE_TESTS"));
 }
 
 /// The [`Path`] a stored key came from. Every key is stored as

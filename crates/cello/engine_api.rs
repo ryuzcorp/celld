@@ -892,7 +892,7 @@ pub fn answer_ticket<T: GatedAnswer>(result: &Result<T>) -> Option<crate::actor:
 ///
 /// A count rather than a latch, so a test can prove the retry reaches
 /// success instead of only proving that it never proceeds. `debug_assertions`
-/// is the gate `CELLD_TEST_CELL_STARTUP_FAILURE` beside it already uses: the
+/// is the gate `CELLO_TEST_CELL_STARTUP_FAILURE` beside it already uses: the
 /// runtime matrix drives the debug binary, which no internal test cfg
 /// reaches, and a release build compiles neither.
 #[cfg(debug_assertions)]
@@ -903,7 +903,7 @@ pub(crate) fn injected_swap_release_failure() -> Option<anyhow::Error> {
     static REMAINING: std::sync::OnceLock<AtomicI64> = std::sync::OnceLock::new();
     let remaining = REMAINING.get_or_init(|| {
         AtomicI64::new(
-            std::env::var("CELLD_TEST_SWAP_RELEASE_FAILURES")
+            std::env::var("CELLO_TEST_SWAP_RELEASE_FAILURES")
                 .ok()
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(0),
@@ -948,24 +948,24 @@ pub(crate) fn facet_cell(root: &str, names: &[String]) -> String {
 /// caller learns the truth before it matters.
 pub fn admission_wait() -> std::time::Duration {
     // Not `env_usize`, which filters zero out — zero is meaningful here.
-    let ms = crate::env_vars::with_default("CELLD_ADMISSION_WAIT_MS", 1000u64)
-        .expect("validated CELLD_ADMISSION_WAIT_MS");
+    let ms = crate::env_vars::with_default("CELLO_ADMISSION_WAIT_MS", 1000u64)
+        .expect("validated CELLO_ADMISSION_WAIT_MS");
     std::time::Duration::from_millis(ms)
 }
 
-/// The JavaScript handler budget, `CELLD_HANDLER_BUDGET_S`.
+/// The JavaScript handler budget, `CELLO_HANDLER_BUDGET_S`.
 pub fn handler_budget() -> std::time::Duration {
     static BUDGET: OnceLock<std::time::Duration> = OnceLock::new();
     *BUDGET.get_or_init(|| {
         std::time::Duration::from_secs(
-            crate::env_vars::positive_or("CELLD_HANDLER_BUDGET_S", 300)
-                .expect("validated CELLD_HANDLER_BUDGET_S"),
+            crate::env_vars::positive_or("CELLO_HANDLER_BUDGET_S", 300)
+                .expect("validated CELLO_HANDLER_BUDGET_S"),
         )
     })
 }
 
 /// How long post-response work may keep its isolate (upstream #275):
-/// `CELLD_BACKGROUND_BUDGET_S`, 30 seconds by default, the Cloudflare
+/// `CELLO_BACKGROUND_BUDGET_S`, 30 seconds by default, the Cloudflare
 /// `waitUntil` limit. A handler that settles but leaves timers or
 /// `waitUntil` pending keeps its affiliation — and its isolate — until they
 /// finish; past this budget the driver ends the background work so a
@@ -980,8 +980,8 @@ pub fn background_budget() -> std::time::Duration {
     static BUDGET: OnceLock<std::time::Duration> = OnceLock::new();
     *BUDGET.get_or_init(|| {
         std::time::Duration::from_secs(
-            crate::env_vars::positive_or("CELLD_BACKGROUND_BUDGET_S", 30)
-                .expect("validated CELLD_BACKGROUND_BUDGET_S"),
+            crate::env_vars::positive_or("CELLO_BACKGROUND_BUDGET_S", 30)
+                .expect("validated CELLO_BACKGROUND_BUDGET_S"),
         )
     })
 }
@@ -1031,7 +1031,7 @@ mod background_budget_tests {
     #[test]
     fn default_matches_cloudflare_waituntil_limit() {
         // No override armed: the production default applies. (The suite
-        // never sets CELLD_BACKGROUND_BUDGET_S, so this pins the default.)
+        // never sets CELLO_BACKGROUND_BUDGET_S, so this pins the default.)
         assert_eq!(
             background_budget(),
             std::time::Duration::from_secs(30),

@@ -25,7 +25,7 @@ use std::process::Command;
 /// working directory. Either way it must be an executable regular file;
 /// `None` when nothing qualifies. The result is canonical, so the child,
 /// which starts in the project directory, executes exactly the file the
-/// Landlock rule names: a relative `PATH` entry or `CELLD_ESBUILD` can
+/// Landlock rule names: a relative `PATH` entry or `CELLO_ESBUILD` can
 /// never pick up a binary planted in the project.
 pub(super) fn locate_executable(program: &str) -> Option<PathBuf> {
     use std::os::unix::fs::PermissionsExt as _;

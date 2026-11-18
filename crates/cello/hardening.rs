@@ -4,7 +4,7 @@
 //! Process hardening the fork adds (patch 0053).
 //!
 //! A serving node holds its platform's credentials in its environment
-//! (`AWS_*`, `CELLD_DEPLOY_AWS_*`, `CELLD_OPERATOR_TOKEN`, tenant vars), and
+//! (`AWS_*`, `CELLO_DEPLOY_AWS_*`, `CELLO_OPERATOR_TOKEN`, tenant vars), and
 //! a fleet runs its nodes under a uid that tenant builds share while they
 //! run. A dumpable process lets any process of that uid read
 //! `/proc/<pid>/environ`, `/proc/<pid>/mem`, and `/proc/<pid>/maps`, so a
@@ -40,7 +40,7 @@
 /// Start a child of a serving process from an empty environment plus the
 /// variables an ordinary program needs to run: `PATH`, `HOME`, and
 /// `TMPDIR`. None of them authenticates; everything the serving process
-/// holds (`AWS_*`, `CELLD_DEPLOY_AWS_*`, `CELLD_OPERATOR_TOKEN`, tenant
+/// holds (`AWS_*`, `CELLO_DEPLOY_AWS_*`, `CELLO_OPERATOR_TOKEN`, tenant
 /// vars) stays out of the child, which `execve` makes dumpable again.
 pub fn minimal_child_environment(command: &mut std::process::Command) {
     command.env_clear();
@@ -85,7 +85,7 @@ mod tests {
 
     /// The child re-enters this test with the marker set, sets the flag,
     /// and reports what the kernel says.
-    const CHILD_ENV: &str = "CELLD_HARDENING_TEST_CHILD";
+    const CHILD_ENV: &str = "CELLO_HARDENING_TEST_CHILD";
     const TEST: &str = "hardening::tests::a_serving_child_is_not_dumpable";
 
     #[test]

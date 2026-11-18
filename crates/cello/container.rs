@@ -50,7 +50,7 @@ pub struct ContainerSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_instances: Option<u64>,
     /// The OCI runtime this class runs under, such as `runsc` (gVisor) for
-    /// untrusted code. Overrides the node's `CELLD_CONTAINER_RUNTIME` for
+    /// untrusted code. Overrides the node's `CELLO_CONTAINER_RUNTIME` for
     /// this class; `None` takes the node default. A node whose daemon does
     /// not have the runtime fails every start of the class, so the class
     /// runs only where its isolation is available. celld extends the
@@ -97,7 +97,7 @@ const DEFAULT_INSTANCE_TYPE: &str = "dev";
 /// Docker's embedded resolver at `127.0.0.11`, so a container under it
 /// cannot resolve a hostname though it reaches the Internet by address; a
 /// public resolver, which the fence permits, restores name resolution.
-/// `CELLD_CONTAINER_DNS` overrides this.
+/// `CELLO_CONTAINER_DNS` overrides this.
 const DEFAULT_CONTAINER_DNS: &[&str] = &["1.1.1.1", "1.0.0.1"];
 
 /// The memory a container of this instance type reserves on the node. A
@@ -190,16 +190,16 @@ const FENCE_REJECT_V6: &[(Ipv6Addr, u32)] = &[
     (Ipv6Addr::new(0xfc00, 0, 0, 0, 0, 0, 0, 0), 7),
 ];
 
-/// `CELLD_FENCE_NODE_NETNS`: `auto` cuts the node-netns exception into the
+/// `CELLO_FENCE_NODE_NETNS`: `auto` cuts the node-netns exception into the
 /// fence (see `fence_ruleset`); unset or `off` installs `FENCE_RULES`
 /// unchanged. Anything else fails the fence install, so no container
 /// starts on a node whose fence mode is misspelled.
-const FENCE_NODE_NETNS_ENV: &str = "CELLD_FENCE_NODE_NETNS";
-/// `CELLD_FENCE_NODE_ADDRS`: comma-separated IPs the exception covers
+const FENCE_NODE_NETNS_ENV: &str = "CELLO_FENCE_NODE_NETNS";
+/// `CELLO_FENCE_NODE_ADDRS`: comma-separated IPs the exception covers
 /// instead of the discovered addresses. Nodes sharing one engine install
 /// one shared table, so each must pin the same union of node addresses;
 /// the last install wins, and a union keeps every node's replies passing.
-const FENCE_NODE_ADDRS_ENV: &str = "CELLD_FENCE_NODE_ADDRS";
+const FENCE_NODE_ADDRS_ENV: &str = "CELLO_FENCE_NODE_ADDRS";
 
 /// The node-netns fence mode of this node.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -284,7 +284,7 @@ fn select_fence_node_addrs(candidates: impl IntoIterator<Item = IpAddr>) -> Vec<
     out
 }
 
-/// Parse `CELLD_FENCE_NODE_ADDRS`: comma-separated exact IPs. Anything that
+/// Parse `CELLO_FENCE_NODE_ADDRS`: comma-separated exact IPs. Anything that
 /// is not an IP — a hostname, a CIDR, a typo — fails the fence install
 /// outright, so a misspelled exception list never silently fences the wrong
 /// addresses. The survivors go through the same selection as discovered
@@ -343,7 +343,7 @@ fn discover_node_addrs() -> Vec<IpAddr> {
 /// Discovery needs the node's netns to be the engine host's own, which only
 /// a Linux node has: off Linux, `auto` without a pinned list installs the
 /// unchanged fence, and an operator with a remote engine pins
-/// `CELLD_FENCE_NODE_ADDRS` explicitly.
+/// `CELLO_FENCE_NODE_ADDRS` explicitly.
 #[cfg(not(target_os = "linux"))]
 fn discover_node_addrs() -> Vec<IpAddr> {
     tracing::warn!(
@@ -416,7 +416,7 @@ fn fence_ruleset(node_addrs: &[IpAddr]) -> String {
 }
 
 /// The ruleset `ensure_fence` installs: `FENCE_RULES` unless
-/// `CELLD_FENCE_NODE_NETNS=auto` cuts the node-netns exception. Every
+/// `CELLO_FENCE_NODE_NETNS=auto` cuts the node-netns exception. Every
 /// misconfiguration fails here, before any container starts: an unknown
 /// mode, an unreadable address list, or an unparseable entry all refuse the
 /// fence rather than install a surprising one.
@@ -445,7 +445,7 @@ fn fence_rules_for_install() -> anyhow::Result<String> {
 }
 
 /// The node addresses `auto` admits replies to, from the read of
-/// `CELLD_FENCE_NODE_ADDRS`: unset discovers them, a list pins them.
+/// `CELLO_FENCE_NODE_ADDRS`: unset discovers them, a list pins them.
 fn fence_node_addrs(value: Result<String, std::env::VarError>) -> anyhow::Result<Vec<IpAddr>> {
     match value {
         // Set but listing nothing is ambiguous — "discover" or "no
@@ -651,12 +651,12 @@ pub struct ContainerEngine {
 struct Config {
     node: String,
     bucket: Option<crate::bucket::Bucket>,
-    /// `CELLD_CONTAINER_RUNTIME`: the OCI runtime every container starts
+    /// `CELLO_CONTAINER_RUNTIME`: the OCI runtime every container starts
     /// under, such as `runsc` (gVisor) or `kata` (a VM). `None` is the
     /// daemon's default, which is `runc` unless the operator changed it. A
     /// class can override it, see `ContainerSpec::runtime`.
     runtime: Option<String>,
-    /// `CELLD_CONTAINER_DNS`: the resolvers a container gets, overriding
+    /// `CELLO_CONTAINER_DNS`: the resolvers a container gets, overriding
     /// `DEFAULT_CONTAINER_DNS`. Empty takes the default when a runtime is in
     /// use and the daemon's otherwise.
     dns: Vec<String>,
@@ -678,10 +678,10 @@ static FENCE_IMAGE: RwLock<Option<String>> = RwLock::new(None);
 static ENGINE: tokio::sync::OnceCell<Arc<ContainerEngine>> = tokio::sync::OnceCell::const_new();
 
 pub fn configure(node: String, bucket: Option<crate::bucket::Bucket>, data_dir: PathBuf) {
-    let runtime = std::env::var("CELLD_CONTAINER_RUNTIME")
+    let runtime = std::env::var("CELLO_CONTAINER_RUNTIME")
         .ok()
         .filter(|runtime| !runtime.is_empty());
-    let dns = std::env::var("CELLD_CONTAINER_DNS")
+    let dns = std::env::var("CELLO_CONTAINER_DNS")
         .unwrap_or_default()
         .split(',')
         .map(|resolver| resolver.trim().to_string())
@@ -1054,8 +1054,8 @@ impl ContainerEngine {
         let rules = fence_rules_for_install()?;
         let body = json!({
             "Image": image,
-            "Env": [format!("CELLD_NFT={rules}")],
-            "Cmd": ["sh", "-c", "printf '%s' \"$CELLD_NFT\" | nft -f -"],
+            "Env": [format!("CELLO_NFT={rules}")],
+            "Cmd": ["sh", "-c", "printf '%s' \"$CELLO_NFT\" | nft -f -"],
             "Labels": { "celld.node": self.node, "celld.fence": "1" },
             "HostConfig": { "NetworkMode": "host", "CapAdd": ["NET_ADMIN"] },
         });
@@ -1505,7 +1505,7 @@ impl ContainerEngine {
         // embedded resolver at `127.0.0.11`, and on a user bridge Docker
         // keeps that address in resolv.conf whatever `--dns` says, so the
         // file itself must name a reachable resolver. An operator who set
-        // `CELLD_CONTAINER_DNS` gets it for every container.
+        // `CELLO_CONTAINER_DNS` gets it for every container.
         let wants_resolver = runtime.is_some() || !self.dns.is_empty();
         if wants_resolver {
             if let Some(resolv) = &self.resolv_conf {
@@ -1954,7 +1954,7 @@ fn exec_resize_path(exec_id: &str, cols: u16, rows: u16) -> String {
 /// The env var that marks one exec's process for its kill: `exec()`
 /// sets it to `<id>;`, and the kill scan matches that exact entry. The
 /// trailing `;` keeps id 12 from matching id 123.
-const EXEC_ID_ENV: &str = "CELLD_EXEC_ID";
+const EXEC_ID_ENV: &str = "CELLO_EXEC_ID";
 
 /// The shell scan that signals one exec's process: every `/proc` entry
 /// whose environment carries the exec's marker gets the signal. `kill`
@@ -2554,7 +2554,7 @@ mod pty_tests {
         assert_eq!(body["Cmd"][0], serde_json::json!("sh"));
         assert_eq!(body["Cmd"][1], serde_json::json!("-c"));
         let script = body["Cmd"][2].as_str().expect("scan script");
-        assert!(script.contains("CELLD_EXEC_ID=12;"), "{script}");
+        assert!(script.contains("CELLO_EXEC_ID=12;"), "{script}");
         assert!(script.contains("kill -9 "), "{script}");
         assert!(body.get("User").is_none());
         assert_eq!(body["AttachStdin"], serde_json::json!(false));
@@ -3125,7 +3125,7 @@ mod kill_tests {
             env.iter().find_map(|entry| {
                 entry
                     .as_str()?
-                    .strip_prefix("CELLD_EXEC_ID=")
+                    .strip_prefix("CELLO_EXEC_ID=")
                     .map(str::to_string)
             })
         }) else {
@@ -3143,7 +3143,7 @@ mod kill_tests {
         else {
             return false;
         };
-        script.contains(&format!("CELLD_EXEC_ID={marker}")) && script.contains("-9")
+        script.contains(&format!("CELLO_EXEC_ID={marker}")) && script.contains("-9")
     }
 
     fn serve(stream: UnixStream, state: Arc<Mutex<MockState>>) {
@@ -3295,7 +3295,7 @@ mod kill_tests {
                     cmd: vec!["sleep".to_string(), "60".to_string()],
                     env: vec![
                         ("A".to_string(), "b".to_string()),
-                        ("CELLD_EXEC_ID".to_string(), "forged".to_string()),
+                        ("CELLO_EXEC_ID".to_string(), "forged".to_string()),
                     ],
                     cwd: None,
                     user: None,
@@ -3308,7 +3308,7 @@ mod kill_tests {
             .await
             .expect("exec sleep");
         // The exec create carries the marker (ours, not the forged one).
-        let marker = format!("CELLD_EXEC_ID={};", proc.id);
+        let marker = format!("CELLO_EXEC_ID={};", proc.id);
         {
             let state = mock.state.lock().unwrap();
             assert_eq!(state.exec_creates.len(), 1);
@@ -3403,7 +3403,7 @@ mod kill_tests {
                 env.iter().find_map(|entry| {
                     entry
                         .as_str()?
-                        .strip_prefix("CELLD_EXEC_ID=")
+                        .strip_prefix("CELLO_EXEC_ID=")
                         .map(str::to_string)
                 })
             })
@@ -3412,7 +3412,7 @@ mod kill_tests {
             .as_str()
             .expect("kill scan script");
         assert!(
-            script.contains(&format!("CELLD_EXEC_ID={marker}")),
+            script.contains(&format!("CELLO_EXEC_ID={marker}")),
             "{script}"
         );
         assert!(script.contains("-9"), "{script}");

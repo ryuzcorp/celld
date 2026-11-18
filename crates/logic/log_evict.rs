@@ -341,7 +341,7 @@ impl FollowerHealth {
     /// machinery's case). The cap is two thirds of the backstop and the
     /// floor yields to it, so the deadline stays strictly below the
     /// backstop for every supported override — a reduced backstop
-    /// (`CELLD_LOG_EVICT_BACKSTOP_MS` under the floor) must not let
+    /// (`CELLO_LOG_EVICT_BACKSTOP_MS` under the floor) must not let
     /// eviction, the expensive remedy, fire before the cheap one. A
     /// backstop under 2 ms caps the deadline at zero, which the lane reads
     /// as "no hedge": eviction is then the only remedy, by that policy.

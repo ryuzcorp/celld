@@ -59,6 +59,6 @@ The ordinary celld L0 writer still emits the older frame representation. The
 v0.5.2 encoder and compactor emit exact block files. Celld contains a
 node-wide scheduler that publishes additive L1 files, and the scheduler is on
 by default. Every takeover target must have the dual decoder before the first
-L1 publication, so a mixed fleet must set `CELLD_LTX_COMPACTION=0` until all
+L1 publication, so a mixed fleet must set `CELLO_LTX_COMPACTION=0` until all
 nodes can read block files. The same reader-first requirement applies to a
 later L0 writer switch.

@@ -1526,7 +1526,7 @@ fn emit_websocket_connection_timing(
 // ledger exact while delivery is not, so frame-level observation is required.
 #[cfg(all(test, cello_internal_tests))]
 mod socket_cancel_private {
-    include!(env!("CELLD_CONFORMANCE_SOCKET_CANCEL_TESTS"));
+    include!(env!("CELLO_CONFORMANCE_SOCKET_CANCEL_TESTS"));
 }
 
 #[cfg(test)]

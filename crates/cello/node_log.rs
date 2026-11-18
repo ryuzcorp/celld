@@ -1,7 +1,7 @@
 // Modified by ryuzcorp (ryuzcorp/celld): operator token for the internal listener; list_page resume is a cursor; ported from meln1k/celld: seal a dead lease that never opened a log (01522b3); seal_absent_log regression tests; lone-node repair backoff; bucket-posture group commit: bucket-session record encoding + old-reader interop tests (0059); bucket-posture group commit: bucket executor without ensemble (0060); bucket-posture group commit: successor fold of bucket bundles (0063); bucket-posture group commit: bucket-session drain, per-cell seal, bundle GC without ensemble, linger holds only while the dirty set is shared (0064); bucket-posture group commit: lone-cell-per-cell vs shared-bundle executor tests, and idle bucket sessions skip empty bundle-GC scans (0071); stale-target 409 proves the member gone in recovery (upstream #273); tail reads stream under a progress timeout (upstream #250); deleted sessions with surviving objects declare loss (upstream #245); same-ensemble degrade resumes the epoch (upstream #268); fragment GC collects record-less sessions (upstream #259).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
-//! v0 of the in-fleet replicated log tier (`CELLD_DURABILITY=fleet`).
+//! v0 of the in-fleet replicated log tier (`CELLO_DURABILITY=fleet`).
 //!
 //! Each node streams the per-cell L0 LTX segments it has captured but not
 //! yet uploaded to a small follower ensemble over the signed peer
@@ -519,18 +519,18 @@ fn mono_us() -> u64 {
 pub fn eviction_policy_from_env() -> anyhow::Result<cello_logic::log_evict::EvictionPolicy> {
     let default = cello_logic::log_evict::EvictionPolicy::default();
     Ok(cello_logic::log_evict::EvictionPolicy {
-        budget_ms: crate::env_vars::with_default("CELLD_LOG_EVICT_BUDGET_MS", default.budget_ms)?,
+        budget_ms: crate::env_vars::with_default("CELLO_LOG_EVICT_BUDGET_MS", default.budget_ms)?,
         sibling_factor: default.sibling_factor,
         sustain_ms: crate::env_vars::with_default(
-            "CELLD_LOG_EVICT_SUSTAIN_MS",
+            "CELLO_LOG_EVICT_SUSTAIN_MS",
             default.sustain_ms,
         )?,
         backstop_ms: crate::env_vars::with_default(
-            "CELLD_LOG_EVICT_BACKSTOP_MS",
+            "CELLO_LOG_EVICT_BACKSTOP_MS",
             default.backstop_ms,
         )?,
         quarantine_ms: crate::env_vars::with_default(
-            "CELLD_LOG_EVICT_QUARANTINE_MS",
+            "CELLO_LOG_EVICT_QUARANTINE_MS",
             default.quarantine_ms,
         )?,
         min_swap_interval_ms: default.min_swap_interval_ms,
@@ -2820,7 +2820,7 @@ impl Drop for OutstandingRound {
 /// contiguous acked end its follower reports, the watermark is the minimum
 /// across members, and admission is bounded per lane by appends and bytes,
 /// so a slow member becomes bounded backpressure instead of unbounded
-/// queueing. `CELLD_LOG_WINDOW=0` (the default) disables the stream and
+/// queueing. `CELLO_LOG_WINDOW=0` (the default) disables the stream and
 /// the ship loop keeps today's round bound.
 #[doc(hidden)]
 pub struct StreamWindow {
@@ -2948,7 +2948,7 @@ pub struct FleetShipper {
     /// timings feed it from each lane worker, and it outlives this shipper
     /// so quarantine survives the swap.
     policy: Arc<cello_logic::log_evict::EvictionPolicy>,
-    /// The stream window, when `CELLD_LOG_WINDOW` enables it. `None` keeps
+    /// The stream window, when `CELLO_LOG_WINDOW` enables it. `None` keeps
     /// the round-bounded ship loop unchanged.
     stream: Option<Arc<StreamWindow>>,
 }
@@ -3086,7 +3086,7 @@ async fn post_append_to(
 }
 
 /// How the lane arms its hedge deadline. `Fixed` is the lab override
-/// (`CELLD_LOG_HEDGE_MS`; 0 disables hedging); `Adaptive` derives the
+/// (`CELLO_LOG_HEDGE_MS`; 0 disables hedging); `Adaptive` derives the
 /// deadline from the follower-health ledger per arming, so the deadline
 /// tracks the fleet's measured honest tail instead of a constant that a
 /// loaded fleet's tail can cross (the log-hedge-deadline design).
@@ -7065,7 +7065,7 @@ impl NodeLogManager {
         self.health.lock().unwrap().reset();
         // An unset override selects the adaptive deadline; a set value is
         // the lab's fixed override, and 0 disables hedging entirely.
-        let hedge = match crate::env_vars::optional::<u64>("CELLD_LOG_HEDGE_MS")
+        let hedge = match crate::env_vars::optional::<u64>("CELLO_LOG_HEDGE_MS")
             .ok()
             .flatten()
         {
@@ -7081,13 +7081,13 @@ impl NodeLogManager {
             return Ok(MaintainOutcome::Other);
         }
         // The stream window (the stream-window design): a nonzero
-        // CELLD_LOG_WINDOW is the appends-per-lane bound and takes over the
+        // CELLO_LOG_WINDOW is the appends-per-lane bound and takes over the
         // ship loop's depth; zero keeps the round pipeline unchanged.
-        let window = crate::env_vars::optional::<u64>("CELLD_LOG_WINDOW")
+        let window = crate::env_vars::optional::<u64>("CELLO_LOG_WINDOW")
             .ok()
             .flatten()
             .unwrap_or(0);
-        let byte_cap = crate::env_vars::optional::<u64>("CELLD_LOG_WINDOW_BYTES")
+        let byte_cap = crate::env_vars::optional::<u64>("CELLO_LOG_WINDOW_BYTES")
             .ok()
             .flatten()
             .unwrap_or(8 * 1024 * 1024);
@@ -7095,14 +7095,14 @@ impl NodeLogManager {
             .then(|| Arc::new(StreamWindow::new(window, byte_cap.max(1), members.len())));
         // The ordered stream transport (the ordered-transport design)
         // ships dark: an unset or "http" value keeps the one-shot lanes.
-        let stream_transport = crate::env_vars::value("CELLD_LOG_TRANSPORT")
+        let stream_transport = crate::env_vars::value("CELLO_LOG_TRANSPORT")
             .ok()
             .flatten()
             .is_some_and(|value| value == "stream");
         let pipeline = if window > 0 {
             window as usize
         } else {
-            crate::env_vars::positive_or("CELLD_LOG_PIPELINE", 4_usize).unwrap_or(4)
+            crate::env_vars::positive_or("CELLO_LOG_PIPELINE", 4_usize).unwrap_or(4)
         };
         let mut lanes = Vec::with_capacity(members.len());
         for (index, member) in members.iter().enumerate() {
@@ -7445,7 +7445,7 @@ impl NodeLogManager {
 
     /// The maintenance pass of epoch GC (denoland/celld#240): for each root
     /// cell this node holds, delete the epochs below its restore chain's
-    /// base. Off unless `CELLD_LTX_RETENTION_SECS` is positive. A facet stream is
+    /// base. Off unless `CELLO_LTX_RETENTION_SECS` is positive. A facet stream is
     /// skipped: it has no ownership record, its epochs are a sparse subset of
     /// its root's, and its own chain base is usually far below the root's.
     /// A per-cell failure does not stop the pass.
@@ -8509,7 +8509,7 @@ impl NodeLogManager {
 }
 
 #[cfg(all(test, cello_internal_tests))]
-include!(env!("CELLD_INTERNAL_NODE_LOG_OBSERVERS"));
+include!(env!("CELLO_INTERNAL_NODE_LOG_OBSERVERS"));
 
 #[cfg(test)]
 mod seal_absent_log_tests {

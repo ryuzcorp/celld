@@ -83,7 +83,7 @@ impl TestNode {
             // One stateless isolate, so concurrent requests share the
             // fixture's module state (its isolate-once shared setup) the
             // way suspended requests pile onto one isolate in production.
-            .env("CELLD_MAX_STATELESS_ISOLATES", "1")
+            .env("CELLO_MAX_STATELESS_ISOLATES", "1")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()

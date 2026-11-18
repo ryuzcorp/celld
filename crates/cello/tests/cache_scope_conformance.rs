@@ -10,7 +10,7 @@
 // not apply to it.
 #![allow(clippy::disallowed_methods)]
 
-//! Conformance for `CELLD_CACHE_SCOPE`: which entries a cache op
+//! Conformance for `CELLO_CACHE_SCOPE`: which entries a cache op
 //! addresses — one script's, or the serving deployment's.
 //!
 //! - `cache_deployment_scope_shares`: with the deployment scope, the app
@@ -366,7 +366,7 @@ fn boot_node(envs: &[(&str, &str)]) -> (tempfile::TempDir, TestNode) {
 
 #[test]
 fn cache_deployment_scope_shares() {
-    let (_dir, node) = boot_node(&[("CELLD_CACHE_SCOPE", "deployment")]);
+    let (_dir, node) = boot_node(&[("CELLO_CACHE_SCOPE", "deployment")]);
 
     // The app puts, the probe matches: one entry, two scripts.
     put(&node, &[("key", "s1"), ("body", "shared-app")]);
@@ -426,7 +426,7 @@ fn cache_deployment_scope_shares() {
 
 #[test]
 fn cache_script_scope_isolates_by_default() {
-    // No CELLD_CACHE_SCOPE: today's per-script entries, unchanged.
+    // No CELLO_CACHE_SCOPE: today's per-script entries, unchanged.
     let (_dir, node) = boot_node(&[]);
 
     put(&node, &[("key", "iso1"), ("body", "secret-app")]);
@@ -462,8 +462,8 @@ fn cache_script_scope_isolates_by_default() {
 fn cache_deployment_scope_isolates_other_deployments() {
     // A different fleet — a second node on its own bucket — never sees
     // the first deployment's entries, even in deployment scope.
-    let (_dir_a, node_a) = boot_node(&[("CELLD_CACHE_SCOPE", "deployment")]);
-    let (_dir_b, node_b) = boot_node(&[("CELLD_CACHE_SCOPE", "deployment")]);
+    let (_dir_a, node_a) = boot_node(&[("CELLO_CACHE_SCOPE", "deployment")]);
+    let (_dir_b, node_b) = boot_node(&[("CELLO_CACHE_SCOPE", "deployment")]);
     put(&node_a, &[("key", "fleet"), ("body", "fleet-a")]);
     matched(&node_a, &[("key", "fleet")]);
     missed(&node_b, &[("key", "fleet")]);
@@ -485,8 +485,8 @@ fn cache_deployment_scope_isolates_other_deployments() {
     let node = TestNode::boot(
         &app_project,
         &[
-            ("CELLD_CACHE_SCOPE", "deployment"),
-            ("CELLD_DEPLOY_POLL_S", "1"),
+            ("CELLO_CACHE_SCOPE", "deployment"),
+            ("CELLO_DEPLOY_POLL_S", "1"),
         ],
     );
     let marker = get_json(&node, "/marker");
@@ -542,7 +542,7 @@ fn cache_scope_rejects_garbage() {
         .arg("0")
         .arg("--no-watch")
         .arg("--logs")
-        .env("CELLD_CACHE_SCOPE", "zone")
+        .env("CELLO_CACHE_SCOPE", "zone")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -574,7 +574,7 @@ fn cache_scope_rejects_garbage() {
         "the node announced a listener before refusing the scope: {errors}"
     );
     assert!(
-        errors.contains("CELLD_CACHE_SCOPE must be script or deployment"),
+        errors.contains("CELLO_CACHE_SCOPE must be script or deployment"),
         "stderr names the bad scope: {errors}"
     );
 }

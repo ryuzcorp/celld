@@ -6,7 +6,7 @@
 // injected clock/filesystem/async rules do not apply to it.
 #![allow(clippy::disallowed_methods)]
 
-//! Conformance for `CELLD_OPERATOR_TOKEN`: when the variable is set, every
+//! Conformance for `CELLO_OPERATOR_TOKEN`: when the variable is set, every
 //! route on the internal listener requires `Authorization: Bearer <token>`
 //! and answers 401 without it; when it is set but empty, the node refuses
 //! to start.
@@ -230,7 +230,7 @@ fn poll_until(
 #[test]
 fn operator_token_gates_every_internal_route_class() {
     let fixture = copy_fixture("gated");
-    let node = TestNode::boot_with_env(fixture.path(), "gated", &[("CELLD_OPERATOR_TOKEN", TOKEN)]);
+    let node = TestNode::boot_with_env(fixture.path(), "gated", &[("CELLO_OPERATOR_TOKEN", TOKEN)]);
 
     // Operator state: unauthenticated and wrong-token callers get 401, the
     // right token gets the node state.
@@ -330,7 +330,7 @@ fn empty_operator_token_refuses_to_start() {
         .arg("0")
         .arg("--no-watch")
         .arg("--clean")
-        .env("CELLD_OPERATOR_TOKEN", "")
+        .env("CELLO_OPERATOR_TOKEN", "")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -370,7 +370,7 @@ fn empty_operator_token_refuses_to_start() {
     let start = Instant::now();
     let output = loop {
         let text = captured.lock().expect("stderr lock").join("\n");
-        if text.contains("CELLD_OPERATOR_TOKEN") {
+        if text.contains("CELLO_OPERATOR_TOKEN") {
             break text;
         }
         if start.elapsed() > Duration::from_secs(10) {
@@ -379,7 +379,7 @@ fn empty_operator_token_refuses_to_start() {
         std::thread::sleep(Duration::from_millis(50));
     };
     assert!(
-        output.contains("CELLD_OPERATOR_TOKEN"),
+        output.contains("CELLO_OPERATOR_TOKEN"),
         "the refusal must name the variable: {output:?}"
     );
 }

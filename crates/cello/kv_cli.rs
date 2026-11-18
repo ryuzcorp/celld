@@ -573,7 +573,7 @@ impl Action {
 
 #[cfg(all(test, cello_internal_tests))]
 mod kv_cli_contract {
-    include!(env!("CELLD_INTERNAL_KV_CLI_TESTS"));
+    include!(env!("CELLO_INTERNAL_KV_CLI_TESTS"));
 }
 
 enum Action {

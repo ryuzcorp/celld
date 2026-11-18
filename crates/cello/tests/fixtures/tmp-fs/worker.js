@@ -292,7 +292,7 @@ export default {
       case "/health":
         // Cheap boot-probe route: the harness polls `/health` for a 200,
         // and every unmapped path otherwise runs the write-heavy root
-        // fixture, which a small `CELLD_TMP_MAX_BYTES` would refuse.
+        // fixture, which a small `CELLO_TMP_MAX_BYTES` would refuse.
         return Response.json({ ok: true });
       case "/cap-write":
         return Response.json(capWrite(url));

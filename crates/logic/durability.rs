@@ -32,7 +32,7 @@ pub struct ProofWait {
     /// The durability ticket the write took. A capture whose `capture_seq`
     /// reaches it covers this write.
     pub ticket: u64,
-    /// The budget for one proof, in ms (`CELLD_LTX_DURABILITY_TIMEOUT_SECS`).
+    /// The budget for one proof, in ms (`CELLO_LTX_DURABILITY_TIMEOUT_SECS`).
     pub budget_ms: u64,
 }
 

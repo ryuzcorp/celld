@@ -15,7 +15,7 @@
 //! calls. The carrier must stay open until the sender closes it: a
 //! signal-carrying exec the sender never aborts exits normally with no
 //! kill, while a real abort still kills it. The node boots with
-//! `CELLD_TEST_WAIT=1`, which defines the test-only fake exec engine the
+//! `CELLO_TEST_WAIT=1`, which defines the test-only fake exec engine the
 //! fixture drives beneath the real `Container.prototype.exec` path.
 //!
 //! One `celld dev` per test boots the fixture; there are no fixed sleeps:
@@ -67,7 +67,7 @@ impl TestNode {
             .arg("0")
             .arg("--no-watch")
             .arg("--logs")
-            .env("CELLD_TEST_WAIT", "1")
+            .env("CELLO_TEST_WAIT", "1")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()

@@ -88,7 +88,7 @@ export default {
       if (t === 'health') return { ok: true };
       const test = globalThis.__celldTestExecForTestOnly;
       if (test === undefined) {
-        throw new Error('test exec hooks missing (boot without CELLD_TEST_WAIT=1?)');
+        throw new Error('test exec hooks missing (boot without CELLO_TEST_WAIT=1?)');
       }
       const stub = env.CARRIER_DO.get(env.CARRIER_DO.idFromName(scope));
       switch (t) {

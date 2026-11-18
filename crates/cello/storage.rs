@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): D1 export; D1 export hardening; D1 batch tests; D1 export sequence scoping; binding-forgery enforcement; per-connection SQLite page-cache budget (CELLD_SQLITE_CACHE_KB); 0.5.1 facet-image import repair (upstream #292); broken-SQL scopes restart the cell (upstream #291); per-statement SQL time bound (upstream #274).
+// Modified by ryuzcorp (ryuzcorp/celld): D1 export; D1 export hardening; D1 batch tests; D1 export sequence scoping; binding-forgery enforcement; per-connection SQLite page-cache budget (CELLO_SQLITE_CACHE_KB); 0.5.1 facet-image import repair (upstream #292); broken-SQL scopes restart the cell (upstream #291); per-statement SQL time bound (upstream #274).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 // This is V8-thread SQLite plumbing outside the Actor execution domain.
@@ -312,7 +312,7 @@ fn sql_critical_errors<T>(f: impl FnOnce(&RefCell<HashMap<String, String>>) -> T
 const SQL_STATEMENT_CACHE_MAX_SIZE: usize = 128 * 1024;
 
 /// The stock SQLite page-cache ceiling, in KiB, `finish_open()` keeps unless
-/// `CELLD_SQLITE_CACHE_KB` says otherwise. A negative `cache_size` counts
+/// `CELLO_SQLITE_CACHE_KB` says otherwise. A negative `cache_size` counts
 /// KiB, not pages, so one knob sets the budget in KiB directly. One
 /// connection serves one resident cell, so the stock 2 MiB multiplies by
 /// residency; the audit measured ~176 KiB of glibc use per active cell, most
@@ -320,11 +320,11 @@ const SQL_STATEMENT_CACHE_MAX_SIZE: usize = 128 * 1024;
 const SQLITE_CACHE_DEFAULT_KB: u64 = 2000;
 
 /// The per-connection SQLite page-cache budget in KiB. Reads
-/// `CELLD_SQLITE_CACHE_KB` on every open so tests can set it; an unset value
+/// `CELLO_SQLITE_CACHE_KB` on every open so tests can set it; an unset value
 /// keeps the stock ceiling. Startup validation rejects a non-positive
 /// value, so this falls back to the default instead of failing the open.
 pub fn sqlite_cache_kb() -> u64 {
-    crate::env_vars::positive_or("CELLD_SQLITE_CACHE_KB", SQLITE_CACHE_DEFAULT_KB)
+    crate::env_vars::positive_or("CELLO_SQLITE_CACHE_KB", SQLITE_CACHE_DEFAULT_KB)
         .unwrap_or(SQLITE_CACHE_DEFAULT_KB)
 }
 
@@ -511,11 +511,11 @@ fn as_user_sql<T>(callback: impl FnOnce() -> T) -> T {
 }
 
 /// The per-statement bound for application SQL, or `None` when the operator
-/// left `CELLD_SQL_STATEMENT_MS` unset (unbounded, the historical behavior).
+/// left `CELLO_SQL_STATEMENT_MS` unset (unbounded, the historical behavior).
 /// Read fresh on every statement so tests and operators observe the current
 /// value; startup already rejects non-positive values.
 fn statement_timeout() -> Option<std::time::Duration> {
-    crate::env_vars::optional::<u64>("CELLD_SQL_STATEMENT_MS")
+    crate::env_vars::optional::<u64>("CELLO_SQL_STATEMENT_MS")
         .ok()
         .flatten()
         .map(std::time::Duration::from_millis)
@@ -620,7 +620,7 @@ fn statement_timed_out() -> bool {
 /// statements intact.
 fn statement_timeout_error(armed_ms: Option<u128>) -> String {
     format!(
-        "statement exceeded CELLD_SQL_STATEMENT_MS ({}ms); the statement \
+        "statement exceeded CELLO_SQL_STATEMENT_MS ({}ms); the statement \
          was interrupted and its effects rolled back",
         armed_ms.unwrap_or(0)
     )
@@ -633,7 +633,7 @@ fn statement_timeout_error(armed_ms: Option<u128>) -> String {
 /// cannot trust it and retry a non-idempotent write.
 fn statement_timeout_error_after_write(armed_ms: Option<u128>) -> String {
     format!(
-        "statement exceeded CELLD_SQL_STATEMENT_MS ({}ms); the cursor expired \
+        "statement exceeded CELLO_SQL_STATEMENT_MS ({}ms); the cursor expired \
          after its write began and its effects were not rolled back",
         armed_ms.unwrap_or(0)
     )
@@ -670,7 +670,7 @@ fn valid_sql_boolean(value: &str) -> bool {
 
 #[cfg(all(test, cello_internal_tests))]
 mod internal_tests {
-    include!(env!("CELLD_INTERNAL_STORAGE_TESTS"));
+    include!(env!("CELLO_INTERNAL_STORAGE_TESTS"));
 }
 
 fn valid_sql_i32(value: &str) -> bool {
@@ -5975,7 +5975,7 @@ pub fn bump_alarm_with_policy(scope: &str, now_ms: i64, counts_against_limit: bo
 }
 
 #[cfg(cello_internal_tests)]
-include!(env!("CELLD_INTERNAL_STORAGE_OBSERVERS"));
+include!(env!("CELLO_INTERNAL_STORAGE_OBSERVERS"));
 
 #[cfg(test)]
 mod d1_test_db {
@@ -6063,23 +6063,23 @@ mod sqlite_cache_tests {
         .expect("cell is open")
     }
 
-    /// `finish_open` applies `CELLD_SQLITE_CACHE_KB` as a negative
+    /// `finish_open` applies `CELLO_SQLITE_CACHE_KB` as a negative
     /// `cache_size` (KiB, not pages), and an unset knob keeps the stock
     /// -2000 ceiling, so the default changes nothing at merge. Revert the
     /// pragma and the first assertion reads -2000. One test, not two: the
     /// knob is process-global and parallel tests would race it.
     #[test]
     fn open_applies_the_configured_page_cache() {
-        let previous = std::env::var("CELLD_SQLITE_CACHE_KB").ok();
-        std::env::set_var("CELLD_SQLITE_CACHE_KB", "512");
+        let previous = std::env::var("CELLO_SQLITE_CACHE_KB").ok();
+        std::env::set_var("CELLO_SQLITE_CACHE_KB", "512");
         let configured = TestDb::open("page-cache");
         assert_eq!(cache_size_of(&configured), -512);
-        std::env::remove_var("CELLD_SQLITE_CACHE_KB");
+        std::env::remove_var("CELLO_SQLITE_CACHE_KB");
         let stock = TestDb::open("page-cache-default");
         assert_eq!(cache_size_of(&stock), -2000);
         match previous {
-            Some(value) => std::env::set_var("CELLD_SQLITE_CACHE_KB", value),
-            None => std::env::remove_var("CELLD_SQLITE_CACHE_KB"),
+            Some(value) => std::env::set_var("CELLO_SQLITE_CACHE_KB", value),
+            None => std::env::remove_var("CELLO_SQLITE_CACHE_KB"),
         }
     }
 }
@@ -7449,19 +7449,19 @@ mod statement_timeout_tests {
         SELECT count(*) FROM c";
 
     fn with_statement_timeout_ms(ms: &str) -> Option<std::ffi::OsString> {
-        let previous = std::env::var_os("CELLD_SQL_STATEMENT_MS");
-        std::env::set_var("CELLD_SQL_STATEMENT_MS", ms);
+        let previous = std::env::var_os("CELLO_SQL_STATEMENT_MS");
+        std::env::set_var("CELLO_SQL_STATEMENT_MS", ms);
         previous
     }
 
     fn restore_statement_timeout(previous: Option<std::ffi::OsString>) {
         match previous {
-            Some(value) => std::env::set_var("CELLD_SQL_STATEMENT_MS", value),
-            None => std::env::remove_var("CELLD_SQL_STATEMENT_MS"),
+            Some(value) => std::env::set_var("CELLO_SQL_STATEMENT_MS", value),
+            None => std::env::remove_var("CELLO_SQL_STATEMENT_MS"),
         }
     }
 
-    /// A statement past `CELLD_SQL_STATEMENT_MS` fails with a catchable
+    /// A statement past `CELLO_SQL_STATEMENT_MS` fails with a catchable
     /// timeout naming the knob, its effects roll back, and the cell keeps
     /// serving afterwards (denoland/celld#274).
     #[test]
@@ -7478,7 +7478,7 @@ mod statement_timeout_tests {
         let error =
             sql_exec(&db.scope, SLOW_CTE, &[]).expect_err("the CTE must not finish inside 200ms");
         assert!(
-            error.contains("CELLD_SQL_STATEMENT_MS"),
+            error.contains("CELLO_SQL_STATEMENT_MS"),
             "the timeout must be catchable and name the knob, got: {error}"
         );
         // The timed-out statement's effects rolled back and the cell is
@@ -7518,7 +7518,7 @@ mod statement_timeout_tests {
                 Ok((None, _)) => break,
                 Err(error) => {
                     assert!(
-                        error.contains("CELLD_SQL_STATEMENT_MS"),
+                        error.contains("CELLO_SQL_STATEMENT_MS"),
                         "cursor timeout must name the knob, got: {error}"
                     );
                     timed_out = true;
@@ -7575,7 +7575,7 @@ mod statement_timeout_tests {
         )
         .expect_err("a spent budget rejects without stepping");
         assert!(
-            error.contains("CELLD_SQL_STATEMENT_MS (60000ms)"),
+            error.contains("CELLO_SQL_STATEMENT_MS (60000ms)"),
             "the rejection must name the armed budget, got: {error}"
         );
         // The spent start checked a cached statement out; rejecting must not
@@ -7609,7 +7609,7 @@ mod statement_timeout_tests {
         let error = sql_exec(&db.scope, "SELECT * FROM no_such_table", &[])
             .expect_err("a missing table must fail");
         assert!(
-            !error.contains("CELLD_SQL_STATEMENT_MS"),
+            !error.contains("CELLO_SQL_STATEMENT_MS"),
             "an unarmed error must not be rewritten as a timeout, got: {error}"
         );
     }
@@ -7628,7 +7628,7 @@ mod statement_timeout_tests {
         let spent = Some(std::time::Instant::now() - std::time::Duration::from_secs(1));
         // The knob changes before the start: the rejection must still name
         // the 60000ms budget the call was armed with.
-        std::env::set_var("CELLD_SQL_STATEMENT_MS", "200");
+        std::env::set_var("CELLO_SQL_STATEMENT_MS", "200");
         let error = sql_cursor_start_values_with_deadline(
             &db.scope,
             "SELECT x FROM t",
@@ -7638,11 +7638,11 @@ mod statement_timeout_tests {
         )
         .expect_err("a spent budget rejects without stepping");
         assert!(
-            error.contains("CELLD_SQL_STATEMENT_MS (60000ms)"),
+            error.contains("CELLO_SQL_STATEMENT_MS (60000ms)"),
             "the rejection must name the armed 60000ms, got: {error}"
         );
         // The knob goes away entirely: same expectation, no fresh read.
-        std::env::remove_var("CELLD_SQL_STATEMENT_MS");
+        std::env::remove_var("CELLO_SQL_STATEMENT_MS");
         let error = sql_cursor_start_values_with_deadline(
             &db.scope,
             "SELECT x FROM t",
@@ -7652,7 +7652,7 @@ mod statement_timeout_tests {
         )
         .expect_err("a spent budget rejects without stepping");
         assert!(
-            error.contains("CELLD_SQL_STATEMENT_MS (60000ms)"),
+            error.contains("CELLO_SQL_STATEMENT_MS (60000ms)"),
             "the rejection must name the armed 60000ms, got: {error}"
         );
         restore_statement_timeout(previous);
@@ -7660,7 +7660,7 @@ mod statement_timeout_tests {
 
     /// A timeout flag left set by an armed run must not rewrite a later
     /// unarmed error: with the knob unset, a failing statement reports its
-    /// own error, not `CELLD_SQL_STATEMENT_MS` (denoland/celld#274).
+    /// own error, not `CELLO_SQL_STATEMENT_MS` (denoland/celld#274).
     #[test]
     fn unarmed_error_after_timeout_is_not_retimed() {
         let _env = ENV_SERIAL.lock().expect("env lock");
@@ -7669,7 +7669,7 @@ mod statement_timeout_tests {
         let error =
             sql_exec(&db.scope, SLOW_CTE, &[]).expect_err("the CTE must not finish inside 200ms");
         assert!(
-            error.contains("CELLD_SQL_STATEMENT_MS"),
+            error.contains("CELLO_SQL_STATEMENT_MS"),
             "the armed run must time out, got: {error}"
         );
         // The knob goes away mid-process (as the suite itself does): the
@@ -7679,7 +7679,7 @@ mod statement_timeout_tests {
         let error = sql_exec(&db.scope, "SELECT * FROM no_such_table", &[])
             .expect_err("a missing table must fail");
         assert!(
-            !error.contains("CELLD_SQL_STATEMENT_MS"),
+            !error.contains("CELLO_SQL_STATEMENT_MS"),
             "an unarmed error must not be rewritten as a timeout, got: {error}"
         );
         assert!(
@@ -7717,7 +7717,7 @@ mod statement_timeout_tests {
         expire_cursor_for_test(cursor);
         let error = sql_cursor_next(cursor).expect_err("the expired budget fails fast");
         assert!(
-            error.contains("CELLD_SQL_STATEMENT_MS"),
+            error.contains("CELLO_SQL_STATEMENT_MS"),
             "the expiry must name the knob, got: {error}"
         );
         assert!(

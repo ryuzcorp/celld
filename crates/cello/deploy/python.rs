@@ -551,16 +551,16 @@ fn sentinel_bytes(loader: &[u8]) -> anyhow::Result<Vec<u8>> {
 }
 
 /// Where verified runtime files are kept between builds.
-/// `CELLD_PYTHON_RUNTIME_DIR` selects a directory; a directory that already
+/// `CELLO_PYTHON_RUNTIME_DIR` selects a directory; a directory that already
 /// holds the verified files lets a build run offline.
 fn runtime_directory() -> anyhow::Result<PathBuf> {
-    if let Some(directory) = std::env::var_os("CELLD_PYTHON_RUNTIME_DIR") {
+    if let Some(directory) = std::env::var_os("CELLO_PYTHON_RUNTIME_DIR") {
         return Ok(PathBuf::from(directory));
     }
     let cache = std::env::var_os("XDG_CACHE_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
-        .ok_or_else(|| anyhow!("set CELLD_PYTHON_RUNTIME_DIR to cache the Python runtime"))?;
+        .ok_or_else(|| anyhow!("set CELLO_PYTHON_RUNTIME_DIR to cache the Python runtime"))?;
     Ok(cache
         .join("celld")
         .join(format!("pyodide-{PYODIDE_VERSION}")))
@@ -643,7 +643,7 @@ fn download_from(
                 let hint = || {
                     format!(
                         "download {url}; to build offline, place the Pyodide \
-                         {PYODIDE_VERSION} files in CELLD_PYTHON_RUNTIME_DIR"
+                         {PYODIDE_VERSION} files in CELLO_PYTHON_RUNTIME_DIR"
                     )
                 };
                 let mut response = client
@@ -670,7 +670,7 @@ fn download_from(
 }
 
 fn run_esbuild(directory: &Path) -> anyhow::Result<()> {
-    let binary = std::env::var("CELLD_ESBUILD").unwrap_or_else(|_| "esbuild".to_string());
+    let binary = std::env::var("CELLO_ESBUILD").unwrap_or_else(|_| "esbuild".to_string());
     let mut command = Command::new(&binary);
     // Same as the Worker bundle: `celld dev` may run this from its serving
     // supervisor, and esbuild needs none of the environment it would
@@ -703,7 +703,7 @@ fn run_esbuild(directory: &Path) -> anyhow::Result<()> {
         .output()
         .map_err(|error| {
             if error.kind() == std::io::ErrorKind::NotFound {
-                anyhow!("esbuild not found ({binary}); install it or set CELLD_ESBUILD")
+                anyhow!("esbuild not found ({binary}); install it or set CELLO_ESBUILD")
             } else {
                 anyhow!("run esbuild: {error}")
             }
@@ -719,7 +719,7 @@ fn run_esbuild(directory: &Path) -> anyhow::Result<()> {
 
 #[cfg(all(test, cello_internal_tests))]
 mod internal_tests {
-    include!(env!("CELLD_INTERNAL_PYTHON_DEPLOY_TESTS"));
+    include!(env!("CELLO_INTERNAL_PYTHON_DEPLOY_TESTS"));
 }
 
 #[cfg(test)]

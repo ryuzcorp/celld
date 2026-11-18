@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): ctx.container.images; clone() of streaming and disturbed bodies; __celld$do on the service-binding RPC path; container exec pty/resize; cross-isolate RPC stubs and streams; container exec AbortSignal; test-only fake kill completion; exec reads survive their subscribing event; context end aborts finished uploads; tenant egress policy; D1 export; D1 export operator gate; D1 batch; test-only fake close/signal completion; binding-forgery enforcement; Queue/KV operator fetch gate; Queue/KV stub-RPC allowlists; Queue DLQ host-op forward; Queue send/DLQ cell-side validation; trusted-RPC target pin; Queue operator internal re-checks; receiver-held RPC streams.; dropped timer ops fire their callback early so sleepers settle (upstream #317); unrefed AbortSignal.timeout timer (upstream #306); loader-fetch 101 webSocket join (upstream #305); nodejs process.env population (upstream #296); writable request /tmp files (upstream #280); Worker WebSocket close codes (upstream #279); Symbol.dispose on plain RPC results (upstream #260); workflow alarm forgets budget-orphaned drives (upstream #299); env.CELLD_NODE host-wins re-assertion on loader env (upstream #219); getCurrentTraceparent handler trace context (upstream #313).
+// Modified by ryuzcorp (ryuzcorp/celld): ctx.container.images; clone() of streaming and disturbed bodies; __celld$do on the service-binding RPC path; container exec pty/resize; cross-isolate RPC stubs and streams; container exec AbortSignal; test-only fake kill completion; exec reads survive their subscribing event; context end aborts finished uploads; tenant egress policy; D1 export; D1 export operator gate; D1 batch; test-only fake close/signal completion; binding-forgery enforcement; Queue/KV operator fetch gate; Queue/KV stub-RPC allowlists; Queue DLQ host-op forward; Queue send/DLQ cell-side validation; trusted-RPC target pin; Queue operator internal re-checks; receiver-held RPC streams.; dropped timer ops fire their callback early so sleepers settle (upstream #317); unrefed AbortSignal.timeout timer (upstream #306); loader-fetch 101 webSocket join (upstream #305); nodejs process.env population (upstream #296); writable request /tmp files (upstream #280); Worker WebSocket close codes (upstream #279); Symbol.dispose on plain RPC results (upstream #260); workflow alarm forgets budget-orphaned drives (upstream #299); env.CELLO_NODE host-wins re-assertion on loader env (upstream #219); getCurrentTraceparent handler trace context (upstream #313).
 // The DO object model and the Cloudflare-compatible runtime surface, run
 // once per isolate by `js.rs::install_harness` after the Web-API prelude.
 // Lived as a 4,000-line raw string inside js.rs until 2026-07-29; it is a
@@ -714,7 +714,7 @@ const __dataUrlResponse = (url) => {
   });
 };
 // Must match the host's `egress::FETCH_REFUSAL_MARKER` exactly.
-const __EGRESS_REFUSAL_MARKER = "CELLD_EGRESS_REFUSED:";
+const __EGRESS_REFUSAL_MARKER = "CELLO_EGRESS_REFUSED:";
 globalThis.fetch = async (input, init) => {
   const rawUrl = typeof input === "string" ? input : input?.url;
   if (typeof rawUrl === "string" && rawUrl.startsWith("data:")) {
@@ -1447,7 +1447,7 @@ class SqlCursor {
       if (__heap_limit_excessively_exceeded())
         throw new Error(
           "the isolate is over its V8 heap limit, so it stopped " +
-          "materializing a result set (see CELLD_V8_HEAP_LIMIT_MB)");
+          "materializing a result set (see CELLO_V8_HEAP_LIMIT_MB)");
     }
   }
   one() {
@@ -3005,7 +3005,7 @@ class DurableObjectState {
     if (__heap_over_admission_share())
       throw new Error(
         "the isolate is near its V8 heap limit, so it refused a " +
-        "WebSocket (see CELLD_V8_HEAP_LIMIT_MB)");
+        "WebSocket (see CELLO_V8_HEAP_LIMIT_MB)");
     const acceptedTags = Array.from(tags, String);
     __ws_accept(ws._id, this._scope, JSON.stringify(acceptedTags));
     ws._target = { id: ws._id, scope: this._scope };
@@ -6213,7 +6213,7 @@ const __storedBytes = (value, error) => {
 };
 // Test-only: write a pre-gate 0x01 envelope with an arbitrary tree, so
 // the upgrade path (old rows grant nothing) is exercisable. Defined only
-// on nodes booted with CELLD_TEST_WAIT=1, like the other test-only
+// on nodes booted with CELLO_TEST_WAIT=1, like the other test-only
 // globals; production isolates never define it (H4). Planting 0x01 is
 // safe by construction -- those rows decode as plain data.
 if (__test_wait_enabled())
@@ -7033,7 +7033,7 @@ __celld.__disposeHostStub = async (scope, hostId) => {
 // entries, host mappings, live caller handles, sender pumps, and live
 // invocation contexts held by THIS isolate. Counts only -- ids never
 // surface. The global exists only
-// on nodes booted with CELLD_TEST_STUB_STATS=1 (the conformance suites);
+// on nodes booted with CELLO_TEST_STUB_STATS=1 (the conformance suites);
 // production isolates never define it, so tenant code cannot probe
 // neighbor-invocation liveness on a shared heap. The fixture tolerates
 // its absence and reports { unavailable: true }.
@@ -7058,7 +7058,7 @@ if (__test_stub_stats_enabled())
 // across native-event retirements (standing in for a container exec
 // wait, which needs an engine the test environment has not got), and
 // `fire` resolves it. Defined only on nodes booted with
-// CELLD_TEST_WAIT=1 (the cross-event wait conformance suite).
+// CELLO_TEST_WAIT=1 (the cross-event wait conformance suite).
 if (__test_wait_enabled())
   globalThis.__celldTestWaitForTestOnly = {
     makeWait(id) {
@@ -7071,7 +7071,7 @@ if (__test_wait_enabled())
 // `Container.prototype.exec` (validation, the already-aborted refusal,
 // param building, and the process abort wiring) against the fake exec
 // table beneath the ops. Defined only on nodes booted with
-// CELLD_TEST_WAIT=1 (the exec-signal conformance suite).
+// CELLO_TEST_WAIT=1 (the exec-signal conformance suite).
 if (__test_wait_enabled())
   globalThis.__celldTestExecForTestOnly = {
     attach(scope) { __testexec_attach(scope); },
@@ -7103,7 +7103,7 @@ if (__test_wait_enabled())
 // entry, `emit`/`eof` feed its pipes, and `stream` is the production
 // exec output stream, so a test drives the real cross-event read path
 // where no container engine exists. Defined only on nodes booted with
-// CELLD_TEST_WAIT=1 (the cross-event conformance suites).
+// CELLO_TEST_WAIT=1 (the cross-event conformance suites).
 if (__test_wait_enabled())
   globalThis.__celldTestProcForTestOnly = {
     spawn() { return __testproc_spawn(); },
@@ -13157,7 +13157,7 @@ const __fsWriteData = (data, encoding) => {
 };
 // Only `/tmp` is writable; the host answers `""` on success and a Node
 // error code otherwise, so the syscall name is the only thing added here.
-// A write that would push the request past `CELLD_TMP_MAX_BYTES` fails with
+// A write that would push the request past `CELLO_TMP_MAX_BYTES` fails with
 // `ENOSPC`. `writeFile` truncates (`"w"`) unless an append flag (`"a"`)
 // appends like `appendFile`; an exclusive flag (`"x"`) fails with `EEXIST`
 // when the path already exists, as Node's `O_EXCL` does. The tree has no

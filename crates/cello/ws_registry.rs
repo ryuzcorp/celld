@@ -471,7 +471,7 @@ impl WsPullReceiver {
 
 #[cfg(all(test, cello_internal_tests))]
 mod input_queue_private {
-    include!(env!("CELLD_INTERNAL_WEBSOCKET_TESTS"));
+    include!(env!("CELLO_INTERNAL_WEBSOCKET_TESTS"));
 }
 
 /// One socket's inbound queue. Shared so an op can await it without holding

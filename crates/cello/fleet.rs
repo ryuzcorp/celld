@@ -258,7 +258,7 @@ pub fn bucket_client_with_credentials(
 }
 
 /// The serving node's bucket: [`bucket_client_with_credentials`] plus the
-/// deployment read client when `CELLD_DEPLOY_AWS_*` is set (patch 0052).
+/// deployment read client when `CELLO_DEPLOY_AWS_*` is set (patch 0052).
 ///
 /// Only the long-running node calls this. The operator commands — `celld
 /// deploy`, `activate`, `discard`, and the rest — open through
@@ -302,7 +302,7 @@ fn serving_bucket_client(
     if control_plane || managed.is_some() {
         anyhow::ensure!(
             credentials.is_none(),
-            "CELLD_DEPLOY_AWS_* is not supported on a control-plane node: its deploy \
+            "CELLO_DEPLOY_AWS_* is not supported on a control-plane node: its deploy \
              agent publishes deploy/ and deploy-blobs/ through this node's bucket \
              (managed storage or BYO alike), and a read-only deployment credential \
              would refuse those writes"
@@ -738,7 +738,7 @@ pub(crate) fn resolve_storage_location(
 
 #[cfg(all(test, cello_internal_tests))]
 mod internal_tests {
-    include!(env!("CELLD_INTERNAL_FLEET_TESTS"));
+    include!(env!("CELLO_INTERNAL_FLEET_TESTS"));
 }
 
 pub async fn run_deploy(arguments: Vec<String>) -> anyhow::Result<()> {
@@ -754,7 +754,7 @@ pub async fn run_deploy(arguments: Vec<String>) -> anyhow::Result<()> {
     if !options.dry_run && options.bucket.is_none() {
         bail!(
             "celld deploy requires --bucket s3://NAME, gs://NAME or az://CONTAINER \
-             (or CELLD_BUCKET)"
+             (or CELLO_BUCKET)"
         );
     }
     let built = deploy::build(&options)?;
@@ -833,7 +833,7 @@ pub async fn run_activate(arguments: Vec<String>) -> anyhow::Result<()> {
     if options.bucket.is_none() {
         bail!(
             "celld activate requires --bucket s3://NAME, gs://NAME or az://CONTAINER \
-             (or CELLD_BUCKET)"
+             (or CELLO_BUCKET)"
         );
     }
     let bucket = options.bucket.expect("validated activation bucket");
@@ -877,7 +877,7 @@ pub async fn run_discard(arguments: Vec<String>) -> anyhow::Result<()> {
     if options.bucket.is_none() {
         bail!(
             "celld discard requires --bucket s3://NAME, gs://NAME or az://CONTAINER \
-             (or CELLD_BUCKET)"
+             (or CELLO_BUCKET)"
         );
     }
     let bucket = options.bucket.expect("validated discard bucket");
@@ -913,7 +913,7 @@ pub async fn run_versions(arguments: Vec<String>) -> anyhow::Result<()> {
     if options.bucket.is_none() {
         bail!(
             "celld versions requires --bucket s3://NAME, gs://NAME or az://CONTAINER \
-             (or CELLD_BUCKET)"
+             (or CELLO_BUCKET)"
         );
     }
     let bucket = options.bucket.expect("validated versions bucket");

@@ -70,7 +70,7 @@ fn restart_with_rotated_credentials() -> ! {
         .args(std::env::args_os().skip(1))
         .env(crate::peer_probe::REEXEC_SIGNER_ENV, signer);
     if let Some(node) = REEXEC_NODE_SESSION_ID.get() {
-        command.env("CELLD_NODE", node);
+        command.env("CELLO_NODE", node);
     }
     // `execve` resets PR_SET_DUMPABLE, so the exec'd process sets it again
     // from `main` with these same arguments (`hardening`, patch 0053).
@@ -919,8 +919,8 @@ async fn presence_session(
         "node session connected to the Managed Control Plane"
     );
     let heartbeat_period = Duration::from_millis(
-        crate::env_vars::with_default("CELLD_PRESENCE_HEARTBEAT_MS", 30_000)
-            .expect("validated CELLD_PRESENCE_HEARTBEAT_MS"),
+        crate::env_vars::with_default("CELLO_PRESENCE_HEARTBEAT_MS", 30_000)
+            .expect("validated CELLO_PRESENCE_HEARTBEAT_MS"),
     );
     pump_presence(
         socket,
@@ -2503,16 +2503,16 @@ async fn wait_for_approval(
 
 fn options_from_env() -> anyhow::Result<ConnectOptions> {
     Ok(ConnectOptions {
-        control_url: std::env::var("CELLD_CONTROL_URL")
+        control_url: std::env::var("CELLO_CONTROL_URL")
             .unwrap_or_else(|_| DEFAULT_CONTROL_URL.to_string()),
-        environment: std::env::var("CELLD_ENV").unwrap_or_else(|_| DEFAULT_ENVIRONMENT.to_string()),
+        environment: std::env::var("CELLO_ENV").unwrap_or_else(|_| DEFAULT_ENVIRONMENT.to_string()),
         force: false,
         byo_storage: None,
     })
 }
 
 fn config_path() -> anyhow::Result<PathBuf> {
-    let base = if let Some(path) = std::env::var_os("CELLD_CONFIG_DIR") {
+    let base = if let Some(path) = std::env::var_os("CELLO_CONFIG_DIR") {
         PathBuf::from(path)
     } else if let Some(path) = std::env::var_os("XDG_CONFIG_HOME") {
         PathBuf::from(path).join("celld")
@@ -2802,7 +2802,7 @@ fn validate_environment(value: &str) -> anyhow::Result<()> {
 }
 
 fn instance_name() -> String {
-    std::env::var("CELLD_INSTANCE_NAME").unwrap_or_else(|_| machine_hostname())
+    std::env::var("CELLO_INSTANCE_NAME").unwrap_or_else(|_| machine_hostname())
 }
 
 fn machine_hostname() -> String {

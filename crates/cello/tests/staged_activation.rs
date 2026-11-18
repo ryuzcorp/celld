@@ -46,7 +46,7 @@ fn block_on<F: std::future::Future>(future: F) -> F::Output {
     rt().block_on(future)
 }
 
-/// Run one future with a `CELLD_TEST_*` fault knob set. The block lock is
+/// Run one future with a `CELLO_TEST_*` fault knob set. The block lock is
 /// held across the set, the run, and the unset, so no sibling test in
 /// this binary can observe the knob.
 fn block_on_with_env<F: std::future::Future>(key: &str, future: F) -> F::Output {
@@ -962,7 +962,7 @@ fn activate_commits_last() {
     let before = fleet.fleet_pointer_body();
 
     let error = block_on_with_env(
-        "CELLD_TEST_ACTIVATE_ABORT",
+        "CELLO_TEST_ACTIVATE_ABORT",
         cello::deploy::activate(
             &fleet.bucket,
             &[version_ref("staged-consumer", &v2.version)],
@@ -1006,7 +1006,7 @@ fn activate_loses_race_to_concurrent_writer() {
     let two = two_generations();
     let fleet = &two.fleet;
     let error = block_on_with_env(
-        "CELLD_TEST_POINTER_RACE",
+        "CELLO_TEST_POINTER_RACE",
         cello::deploy::activate(
             &fleet.bucket,
             &[
@@ -1073,7 +1073,7 @@ fn deploy_loses_race_to_concurrent_writer() {
     let app_v2 = Fleet::build(&app);
 
     let error = block_on_with_env(
-        "CELLD_TEST_POINTER_RACE",
+        "CELLO_TEST_POINTER_RACE",
         cello::deploy::write(&fleet.bucket, &app_v2),
     )
     .expect_err("stale deploy rejects");
@@ -1525,7 +1525,7 @@ fn aborted_activate_leaves_nothing_visible_and_rerun_converges() {
     let fleet = &two.fleet;
     let before = fleet.fleet_pointer_body();
     block_on_with_env(
-        "CELLD_TEST_ACTIVATE_ABORT",
+        "CELLO_TEST_ACTIVATE_ABORT",
         cello::deploy::activate(
             &fleet.bucket,
             &[
@@ -1703,7 +1703,7 @@ fn discard_detects_a_pointer_move_during_delete() {
     let two = two_generations();
     let fleet = &two.fleet;
     let error = block_on_with_env(
-        "CELLD_TEST_DISCARD_RACE",
+        "CELLO_TEST_DISCARD_RACE",
         cello::deploy::discard(&fleet.bucket, &[version_ref("staged-app", &two.app_v2)]),
     )
     .expect_err("pointer move is reported");
@@ -1744,7 +1744,7 @@ fn activate_loser_heals_its_queue_attachments() {
         .expect("stage consumer v2");
 
     let error = block_on_with_env(
-        "CELLD_TEST_POINTER_RACE",
+        "CELLO_TEST_POINTER_RACE",
         cello::deploy::activate(
             &fleet.bucket,
             &[version_ref("staged-consumer", &v2.version)],
@@ -1789,7 +1789,7 @@ fn deploy_loser_heals_the_serving_generation() {
     let v2 = Fleet::build(&consumer);
 
     let error = block_on_with_env(
-        "CELLD_TEST_POINTER_RACE",
+        "CELLO_TEST_POINTER_RACE",
         cello::deploy::write(&fleet.bucket, &v2),
     )
     .expect_err("stale deploy rejects");
@@ -1901,7 +1901,7 @@ fn activate_refuses_a_staged_manifest_that_vanished_mid_activate() {
     let fleet = &two.fleet;
     let before = fleet.fleet_pointer_body();
     let error = block_on_with_env(
-        "CELLD_TEST_DISCARD_MID_ACTIVATE",
+        "CELLO_TEST_DISCARD_MID_ACTIVATE",
         cello::deploy::activate(
             &fleet.bucket,
             &[

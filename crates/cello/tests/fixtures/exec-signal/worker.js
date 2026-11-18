@@ -27,7 +27,7 @@ export default {
       if (t === 'health') return { ok: true };
       const test = globalThis.__celldTestExecForTestOnly;
       if (test === undefined)
-        throw new Error('test exec hooks missing (boot without CELLD_TEST_WAIT=1?)');
+        throw new Error('test exec hooks missing (boot without CELLO_TEST_WAIT=1?)');
       // A fresh scope per request, so fake processes never leak across cases.
       const scope = `exec-signal:${t}:${nextScope++}`;
       test.attach(scope);

@@ -13,7 +13,7 @@ const probe = (read) => {
 
 // A dynamically loaded child: its strings arrive through the loader env,
 // not through deployment vars, and must still reach `process.env` under
-// `nodejs_compat` (upstream #296). `CELLD_NODE` rides along to prove the
+// `nodejs_compat` (upstream #296). `CELLO_NODE` rides along to prove the
 // host-owned name never crosses into `process.env`.
 const CHILD = `const MODULE_SCOPE = (() => {
   const snapshot = (name) => {
@@ -26,7 +26,7 @@ const CHILD = `const MODULE_SCOPE = (() => {
   };
   // Runs while the module evaluates: loader strings must already sit in
   // process.env here, not only once the handler runs.
-  return { feature: snapshot("FEATURE"), node: snapshot("CELLD_NODE") };
+  return { feature: snapshot("FEATURE"), node: snapshot("CELLO_NODE") };
 })();
 export default {
   fetch(request, env) {
@@ -42,8 +42,8 @@ export default {
       handlerEnv: read(() => env.FEATURE),
       procEnv: read(() => globalThis.process.env.FEATURE),
       moduleScopeFeature: MODULE_SCOPE.feature,
-      handlerNode: read(() => env.CELLD_NODE),
-      procNode: read(() => globalThis.process.env.CELLD_NODE),
+      handlerNode: read(() => env.CELLO_NODE),
+      procNode: read(() => globalThis.process.env.CELLO_NODE),
       moduleScopeNode: MODULE_SCOPE.node,
     });
   },
@@ -57,7 +57,7 @@ export default {
         compatibilityFlags: ["nodejs_compat"],
         mainModule: "child.js",
         modules: { "child.js": CHILD },
-        env: { FEATURE: "1", CELLD_NODE: "spoofed" },
+        env: { FEATURE: "1", CELLO_NODE: "spoofed" },
       }));
       return child.getEntrypoint().fetch(request);
     }

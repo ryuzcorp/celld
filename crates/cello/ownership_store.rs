@@ -1094,7 +1094,7 @@ impl BucketOwnership {
 
 #[cfg(all(test, cello_internal_tests))]
 mod internal_tests {
-    include!(env!("CELLD_INTERNAL_OWNERSHIP_STORE_TESTS"));
+    include!(env!("CELLO_INTERNAL_OWNERSHIP_STORE_TESTS"));
 }
 
 impl BucketOwnership {
@@ -1167,7 +1167,7 @@ fn lease_request_logging_on() -> bool {
 ///
 /// The target is off under the default `info` filter, and
 /// `RUST_LOG=celld=info,store=debug` turns it on. A dedicated target rather
-/// than a `CELLD_*` variable keeps the switch on the mechanism operators
+/// than a `CELLO_*` variable keeps the switch on the mechanism operators
 /// already use for the `timing` target, so this adds no configuration surface.
 fn log_lease_request(
     event: &'static str,

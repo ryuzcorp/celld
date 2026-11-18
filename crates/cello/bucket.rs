@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): R2 startAfter compares decoded keys; listing pages carry walk-ordered rows; staged activation; separate CELLD_DEPLOY_AWS_* credentials for deployment-artifact reads; bucket-posture group commit: inject a store for GC-quiet tests (0071); conditional-write verdict keeps the 409 conflict kind (upstream #239); multipart byte upload for GB image tars (upstream #307); conditional-write retry on transient OperationAborted conflicts (upstream #283).
+// Modified by ryuzcorp (ryuzcorp/celld): R2 startAfter compares decoded keys; listing pages carry walk-ordered rows; staged activation; separate CELLO_DEPLOY_AWS_* credentials for deployment-artifact reads; bucket-posture group commit: inject a store for GC-quiet tests (0071); conditional-write verdict keeps the 409 conflict kind (upstream #239); multipart byte upload for GB image tars (upstream #307); conditional-write retry on transient OperationAborted conflicts (upstream #283).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! The engine's single object-store client: the `object_store` crate
@@ -64,7 +64,7 @@ use std::time::Duration;
 
 #[cfg(all(test, cello_internal_tests))]
 mod internal_tests {
-    include!(env!("CELLD_INTERNAL_BUCKET_TESTS"));
+    include!(env!("CELLO_INTERNAL_BUCKET_TESTS"));
 }
 
 /// The stored form of an empty blob key segment. See [`Bucket::blob_path`].
@@ -206,7 +206,7 @@ pub struct Bucket {
     /// place that knows where in the bucket a fleet lives.
     pub prefix: String,
     /// The deployment artifacts (`deploy/`, `deploy-blobs/`) read with a
-    /// separate credential when `CELLD_DEPLOY_AWS_*` is set: a node then
+    /// separate credential when `CELLO_DEPLOY_AWS_*` is set: a node then
     /// holds a credential that can read a deployment but never publish one
     /// (`0052`). `None` keeps one credential for everything, as upstream.
     read_deploy: Option<Arc<Bucket>>,
@@ -770,7 +770,7 @@ impl Bucket {
     /// observable in black-box storage traces.
     ///
     /// This is the publishing client and nothing else: it never attaches a
-    /// deployment read client, so `CELLD_DEPLOY_AWS_*` in the environment of
+    /// deployment read client, so `CELLO_DEPLOY_AWS_*` in the environment of
     /// a `deploy`/`activate`/`discard` invocation cannot turn its writes
     /// into reads that the deployment credential is not granted. The
     /// serving node adds that client with [`Self::with_deploy_read`].
@@ -796,7 +796,7 @@ impl Bucket {
     }
 
     /// Give deployment-artifact reads their own credential when the process
-    /// carries one (`CELLD_DEPLOY_AWS_ACCESS_KEY_ID`, `..._SECRET_ACCESS_KEY`,
+    /// carries one (`CELLO_DEPLOY_AWS_ACCESS_KEY_ID`, `..._SECRET_ACCESS_KEY`,
     /// optional `..._SESSION_TOKEN`). A node started this way holds a
     /// credential that can read `deploy/` and `deploy-blobs/` but cannot
     /// publish a deployment; everything else keeps the ordinary `AWS_*`
@@ -837,7 +837,7 @@ impl Bucket {
         };
         anyhow::ensure!(
             self.backend == StorageBackend::S3,
-            "CELLD_DEPLOY_AWS_* needs an s3:// bucket; a {}:// bucket authenticates with \
+            "CELLO_DEPLOY_AWS_* needs an s3:// bucket; a {}:// bucket authenticates with \
              its own credential chain",
             self.scheme()
         );
@@ -860,7 +860,7 @@ impl Bucket {
     /// Attach the client that serves deployment artifacts. The tests use it
     /// to pair two independent stores without touching the process
     /// environment; [`Self::with_deploy_read`] builds it from
-    /// `CELLD_DEPLOY_AWS_*`.
+    /// `CELLO_DEPLOY_AWS_*`.
     pub(crate) fn with_read_deploy(mut self, deploy: Bucket) -> Bucket {
         self.read_deploy = Some(Arc::new(deploy));
         self
@@ -2022,7 +2022,7 @@ impl Bucket {
     ///
     /// The page is `probe/`, the namespace a node writes at startup, not the
     /// whole bucket prefix: a credential granted over individual prefixes
-    /// (`CELLD_DEPLOY_AWS_*`, outer's split fleet grants) cannot list their
+    /// (`CELLO_DEPLOY_AWS_*`, outer's split fleet grants) cannot list their
     /// parent, and listing the parent would fail a credential that is in
     /// fact valid for everything the caller does.
     pub async fn validate(&self) -> anyhow::Result<()> {
@@ -3177,7 +3177,7 @@ mod r2_list_tests {
     }
 }
 
-/// With `CELLD_DEPLOY_AWS_*` set, the deployment artifacts (`deploy/`,
+/// With `CELLO_DEPLOY_AWS_*` set, the deployment artifacts (`deploy/`,
 /// `deploy-blobs/`) are served by a second client holding that credential.
 /// Two independent stores stand in for two credentials: a deployment
 /// object must land only in the deployment store, an ordinary object only

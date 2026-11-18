@@ -9,7 +9,7 @@
 #![allow(clippy::disallowed_methods)]
 
 //! Eviction conformance for the per-node Workers Cache API: under a small
-//! `CELLD_CACHE_MAX_BYTES` the store evicts least-recently-used entries.
+//! `CELLO_CACHE_MAX_BYTES` the store evicts least-recently-used entries.
 //!
 //! A separate binary from `cache_conformance` because the harness installs
 //! its async runtime handle exactly once per process. See that file for the
@@ -289,7 +289,7 @@ fn cache_eviction_conformance() {
     copy_dir(&fixture_dir().join("app"), &app_project);
     copy_dir(&fixture_dir().join("probe"), &probe_src);
     preseed_probe(&app_project, &probe_src);
-    let node = TestNode::boot(&app_project, &[("CELLD_CACHE_MAX_BYTES", "6000")]);
+    let node = TestNode::boot(&app_project, &[("CELLO_CACHE_MAX_BYTES", "6000")]);
 
     let evicted = get_json(
         &node,

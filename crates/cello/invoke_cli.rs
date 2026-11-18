@@ -15,7 +15,7 @@
 //!
 //! Like `celld d1 execute`, it finds a live node through the bucket's node
 //! leases and signs the request with the fleet secret; the node also
-//! requires the operator token when `CELLD_OPERATOR_TOKEN` is set. The
+//! requires the operator token when `CELLO_OPERATOR_TOKEN` is set. The
 //! request runs to completion server-side even if this command stops
 //! waiting: stopping the wait cannot leave a half-applied migration
 //! behind, but it also cannot report the answer, so a timeout means

@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): per-process cgroup memory scope; C-trim threshold 8 MiB with CELLD_C_TRIM_MB knob and trim_due predicate.
+// Modified by ryuzcorp (ryuzcorp/celld): per-process cgroup memory scope; C-trim threshold 8 MiB with CELLO_C_TRIM_MB knob and trim_due predicate.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! What the process holds, and how much of that a cell actually holds.
@@ -26,7 +26,7 @@ pub struct Sample {
 /// container, each in its own cgroup leaf with its own `memory.max`, the
 /// root charge trips every node's pressure gate at once; `self` reads the
 /// process's own cgroup v2 leaf instead, so each node sheds against its own
-/// cap. Set with `CELLD_MEMORY_SCOPE`.
+/// cap. Set with `CELLO_MEMORY_SCOPE`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum MemoryScope {
     /// Measure the container-root cgroup.
@@ -38,17 +38,17 @@ pub enum MemoryScope {
 }
 
 impl MemoryScope {
-    /// Read `CELLD_MEMORY_SCOPE`: `container` (the default) or `self`.
+    /// Read `CELLO_MEMORY_SCOPE`: `container` (the default) or `self`.
     /// Anything else is an operator typo and fails, so a misspelled scope
     /// cannot silently measure the wrong cgroup.
     pub fn from_environment() -> anyhow::Result<Self> {
-        match std::env::var("CELLD_MEMORY_SCOPE") {
+        match std::env::var("CELLO_MEMORY_SCOPE") {
             Err(_) => Ok(Self::Container),
             Ok(value) => match value.trim() {
                 "container" => Ok(Self::Container),
                 "self" => Ok(Self::OwnLeaf),
                 other => Err(anyhow::anyhow!(
-                    "CELLD_MEMORY_SCOPE must be `container` or `self`, not `{other}`"
+                    "CELLO_MEMORY_SCOPE must be `container` or `self`, not `{other}`"
                 )),
             },
         }
@@ -102,7 +102,7 @@ fn scope() -> MemoryScope {
         MemoryScope::from_environment().unwrap_or_else(|error| {
             tracing::warn!(
                 %error,
-                "measuring the container cgroup until the operator fixes CELLD_MEMORY_SCOPE"
+                "measuring the container cgroup until the operator fixes CELLO_MEMORY_SCOPE"
             );
             MemoryScope::Container
         })
@@ -216,7 +216,7 @@ fn warn_self_scope_fallback(reason: &str) {
     if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
         tracing::warn!(
             reason,
-            "CELLD_MEMORY_SCOPE=self falls back to the container cgroup"
+            "CELLO_MEMORY_SCOPE=self falls back to the container cgroup"
         );
     }
 }
@@ -258,8 +258,8 @@ fn cgroup_memory_from_stat(current_bytes: u64, stat: &str, inactive_key: &str) -
 
 /// The active memory-cgroup limit. `None` means that no finite cgroup limit is
 /// readable, so the caller must use the host memory size. Under
-/// `CELLD_MEMORY_SCOPE=self` this is the process leaf's `memory.max`, so an
-/// unset `CELLD_MAX_RSS_MB` defaults the shed threshold to a share of the
+/// `CELLO_MEMORY_SCOPE=self` this is the process leaf's `memory.max`, so an
+/// unset `CELLO_MAX_RSS_MB` defaults the shed threshold to a share of the
 /// leaf instead of the container.
 #[cfg(target_os = "linux")]
 pub(crate) fn cgroup_limit_bytes() -> Option<u64> {
@@ -450,21 +450,21 @@ pub fn libc_malloc_stats() -> Option<LibcMallocStats> {
 /// worth running for the churn of ordinary requests; 8 MiB is about two
 /// dozen evicted cells' storage caches, so a node hibernating cells trims
 /// within seconds of the first batch and a busy node with nothing freed
-/// never does. `CELLD_C_TRIM_MB` overrides the default.
+/// never does. `CELLO_C_TRIM_MB` overrides the default.
 const C_HEAP_TRIM_DEFAULT_MB: u64 = 8;
 
-/// The C-trim growth threshold in bytes. Reads `CELLD_C_TRIM_MB` on every
+/// The C-trim growth threshold in bytes. Reads `CELLO_C_TRIM_MB` on every
 /// call so tests can set it; an unset or invalid value keeps the default. A
 /// per-tick read cannot fail startup, so invalid input falls back instead of
 /// erroring.
 pub fn c_heap_trim_threshold_bytes() -> u64 {
     mb_to_bytes(
-        crate::env_vars::positive_or("CELLD_C_TRIM_MB", C_HEAP_TRIM_DEFAULT_MB)
+        crate::env_vars::positive_or("CELLO_C_TRIM_MB", C_HEAP_TRIM_DEFAULT_MB)
             .unwrap_or(C_HEAP_TRIM_DEFAULT_MB),
     )
 }
 
-/// Mebibytes to bytes, saturating: an absurd `CELLD_C_TRIM_MB` means "never
+/// Mebibytes to bytes, saturating: an absurd `CELLO_C_TRIM_MB` means "never
 /// trim", not a shift that wraps to a tiny threshold and trims every tick.
 fn mb_to_bytes(mb: u64) -> u64 {
     mb.saturating_mul(1 << 20)
@@ -583,7 +583,7 @@ pub fn tune_allocator() {
 
 #[cfg(all(test, cello_internal_tests))]
 mod internal_tests {
-    include!(env!("CELLD_INTERNAL_MEMORY_TESTS"));
+    include!(env!("CELLO_INTERNAL_MEMORY_TESTS"));
 }
 
 #[cfg(all(test, target_os = "linux"))]
@@ -650,30 +650,30 @@ mod scope_tests {
     fn scope_parses_known_values() {
         // The only test that touches the process environment, so no other
         // test can observe the values it sets.
-        let previous = std::env::var_os("CELLD_MEMORY_SCOPE");
+        let previous = std::env::var_os("CELLO_MEMORY_SCOPE");
         let restore = || {
             if let Some(value) = previous.as_deref() {
-                std::env::set_var("CELLD_MEMORY_SCOPE", value);
+                std::env::set_var("CELLO_MEMORY_SCOPE", value);
             } else {
-                std::env::remove_var("CELLD_MEMORY_SCOPE");
+                std::env::remove_var("CELLO_MEMORY_SCOPE");
             }
         };
-        std::env::remove_var("CELLD_MEMORY_SCOPE");
+        std::env::remove_var("CELLO_MEMORY_SCOPE");
         assert_eq!(
             MemoryScope::from_environment().expect("unset means container"),
             MemoryScope::Container
         );
-        std::env::set_var("CELLD_MEMORY_SCOPE", "container");
+        std::env::set_var("CELLO_MEMORY_SCOPE", "container");
         assert_eq!(
             MemoryScope::from_environment().expect("container parses"),
             MemoryScope::Container
         );
-        std::env::set_var("CELLD_MEMORY_SCOPE", "self");
+        std::env::set_var("CELLO_MEMORY_SCOPE", "self");
         assert_eq!(
             MemoryScope::from_environment().expect("self parses"),
             MemoryScope::OwnLeaf
         );
-        std::env::set_var("CELLD_MEMORY_SCOPE", "leaf");
+        std::env::set_var("CELLO_MEMORY_SCOPE", "leaf");
         assert!(
             MemoryScope::from_environment().is_err(),
             "an unknown scope must fail, not silently measure the container"

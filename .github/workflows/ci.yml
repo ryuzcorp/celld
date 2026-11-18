@@ -1,5 +1,5 @@
 # Cello: upstream denoland/celld plus our patches, one commit per
-# patch (see docs/). Upstream's own
+# patch (process: https://cello.ryuz.eu/contributing). Upstream's own
 # Dockerfile builds the tree, so its full test suite and clippy run in the
 # image's `test` stage on every build.
 #
