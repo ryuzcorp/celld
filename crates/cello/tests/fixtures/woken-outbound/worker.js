@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): woken-continuation outbound regression fixture (upstream #258). Apache-2.0.
+// Modified by Ryuz Corp (Cello): woken-continuation outbound regression fixture (upstream #258). Apache-2.0.
 import { DurableObject } from 'cloudflare:workers';
 
 // Async work started by one request, woken by another: the continuation

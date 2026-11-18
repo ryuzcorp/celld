@@ -1,6 +1,6 @@
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 //
-// Modified by ryuzcorp (ryuzcorp/celld): per-node Workers Cache API store; deployment cache scope.
+// Modified by Ryuz Corp (Cello): per-node Workers Cache API store; deployment cache scope.
 // Apache-2.0.
 
 //! The process-local backing store for the Workers Cache API.

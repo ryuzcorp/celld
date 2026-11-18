@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): shared-fetch waiter conformance (upstream #316). Apache-2.0.
+// Modified by Ryuz Corp (Cello): shared-fetch waiter conformance (upstream #316). Apache-2.0.
 
 // A black-box runner, not node code: it boots the real `cello dev` binary,
 // awaits one request's shared subrequest from a second request that then

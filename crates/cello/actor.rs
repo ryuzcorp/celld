@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): cross-isolate RPC stubs and streams; operator token for the internal listener; Workers Cache pressure shedding; ported from meln1k/cello: report wake coverage after maintenance (e6cb9a3); staged invoke reads the deploy bucket; pass the renewal readback authority bound through (upstream #264); storage-poisoned activity restarts the runtime (upstream #291).
+// Modified by Ryuz Corp (Cello): cross-isolate RPC stubs and streams; operator token for the internal listener; Workers Cache pressure shedding; ported from meln1k/cello: report wake coverage after maintenance (e6cb9a3); staged invoke reads the deploy bucket; pass the renewal readback authority bound through (upstream #264); storage-poisoned activity restarts the runtime (upstream #291).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! The serial lifecycle executor and its shell-side request drivers.

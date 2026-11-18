@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): node:url file URL helpers (upstream #280).
+// Modified by Ryuz Corp (Cello): node:url file URL helpers (upstream #280).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 // node:url for cello: `pathToFileURL`/`fileURLToPath` plus the WHATWG URL

@@ -1,5 +1,5 @@
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
-// Modified by ryuzcorp (ryuzcorp/celld): deploy --sourcemap writes the bundle's external map; deploy reads stay inside the project.
+// Modified by Ryuz Corp (Cello): deploy --sourcemap writes the bundle's external map; deploy reads stay inside the project.
 
 //! The build path for a Worker whose `main` is a `.py` file.
 //!

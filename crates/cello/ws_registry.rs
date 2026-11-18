@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): WebSocket ownership and join tokens; isolate-join senders for loaded-worker 101s (upstream #305). Apache-2.0.
+// Modified by Ryuz Corp (Cello): WebSocket ownership and join tokens; isolate-join senders for loaded-worker 101s (upstream #305). Apache-2.0.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! The WebSocket registry: the sockets an instance holds, the frames waiting

@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): abort/drain conformance fixture. Apache-2.0.
+// Modified by Ryuz Corp (Cello): abort/drain conformance fixture. Apache-2.0.
 import { DurableObject, RpcStub, WorkerEntrypoint } from 'cloudflare:workers';
 
 const J = (o, st = 200) => Response.json(o, { status: st });

@@ -1,6 +1,6 @@
-// Modified by ryuzcorp (ryuzcorp/celld): operator token for the internal listener; `cello dev --port 0` assigns an ephemeral port; staged activation; deploy --read-root option; non-dumpable serving process; local state path helper for d1 --local (upstream #272); dev --state with marker-guarded clean (upstream #302).
+// Modified by Ryuz Corp (Cello): operator token for the internal listener; `cello dev --port 0` assigns an ephemeral port; staged activation; deploy --read-root option; non-dumpable serving process; local state path helper for d1 --local (upstream #272); dev --state with marker-guarded clean (upstream #302).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
-// Modified by ryuzcorp (ryuzcorp/celld): deploy --sourcemap writes the bundle's external map.
+// Modified by Ryuz Corp (Cello): deploy --sourcemap writes the bundle's external map.
 
 //! The local application stack behind `cello dev`.
 //!

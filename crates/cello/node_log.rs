@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): operator token for the internal listener; list_page resume is a cursor; ported from meln1k/cello: seal a dead lease that never opened a log (01522b3); seal_absent_log regression tests; lone-node repair backoff; bucket-posture group commit: bucket-session record encoding + old-reader interop tests (0059); bucket-posture group commit: bucket executor without ensemble (0060); bucket-posture group commit: successor fold of bucket bundles (0063); bucket-posture group commit: bucket-session drain, per-cell seal, bundle GC without ensemble, linger holds only while the dirty set is shared (0064); bucket-posture group commit: lone-cell-per-cell vs shared-bundle executor tests, and idle bucket sessions skip empty bundle-GC scans (0071); stale-target 409 proves the member gone in recovery (upstream #273); tail reads stream under a progress timeout (upstream #250); deleted sessions with surviving objects declare loss (upstream #245); same-ensemble degrade resumes the epoch (upstream #268); fragment GC collects record-less sessions (upstream #259).
+// Modified by Ryuz Corp (Cello): operator token for the internal listener; list_page resume is a cursor; ported from meln1k/cello: seal a dead lease that never opened a log (01522b3); seal_absent_log regression tests; lone-node repair backoff; bucket-posture group commit: bucket-session record encoding + old-reader interop tests (0059); bucket-posture group commit: bucket executor without ensemble (0060); bucket-posture group commit: successor fold of bucket bundles (0063); bucket-posture group commit: bucket-session drain, per-cell seal, bundle GC without ensemble, linger holds only while the dirty set is shared (0064); bucket-posture group commit: lone-cell-per-cell vs shared-bundle executor tests, and idle bucket sessions skip empty bundle-GC scans (0071); stale-target 409 proves the member gone in recovery (upstream #273); tail reads stream under a progress timeout (upstream #250); deleted sessions with surviving objects declare loss (upstream #245); same-ensemble degrade resumes the epoch (upstream #268); fragment GC collects record-less sessions (upstream #259).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! v0 of the in-fleet replicated log tier (`CELLO_DURABILITY=fleet`).
@@ -113,6 +113,11 @@ pub type LogStreamIo = Box<dyn LogStreamDuplex>;
 /// leader payloads are JSON `AppendResp`s, answered strictly in arrival
 /// order. The cap bounds a corrupt or hostile length prefix.
 const STREAM_FRAME_CAP: usize = 64 * 1024 * 1024;
+
+/// The upgrade value the leader and follower exchange to open a peer
+/// log-tail stream. Frozen node-to-node wire identifier: mixed-version
+/// fleets negotiate this while they upgrade. See `rename-frozen.md`.
+pub const LOG_STREAM_UPGRADE: &str = "celld-log-stream";
 
 #[doc(hidden)]
 pub async fn read_frame<R>(io: &mut R) -> anyhow::Result<Option<Vec<u8>>>
@@ -2710,7 +2715,7 @@ impl LogTransport for SignedPeerTransport {
             let builder = client
                 .post(format!("http://{addr}{path}"))
                 .header(hyper::header::CONNECTION, "upgrade")
-                .header(hyper::header::UPGRADE, "celld-log-stream");
+                .header(hyper::header::UPGRADE, LOG_STREAM_UPGRADE);
             let request = self.auth.sign(builder, "POST", path, &[], node)?;
             let request = crate::operator_token::authenticate(request)?;
             let response = request.send().await?;

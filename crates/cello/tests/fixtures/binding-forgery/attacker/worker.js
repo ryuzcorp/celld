@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): binding-forgery conformance fixture; WebSocket and TCP socket ownership. Apache-2.0.
+// Modified by Ryuz Corp (Cello): binding-forgery conformance fixture; WebSocket and TCP socket ownership. Apache-2.0.
 import { DurableObject, WorkflowEntrypoint } from 'cloudflare:workers';
 
 const J = (o, st = 200) => Response.json(o, { status: st });

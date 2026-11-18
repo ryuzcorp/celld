@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): per-node Cache API fixture. Apache-2.0.
+// Modified by Ryuz Corp (Cello): per-node Cache API fixture. Apache-2.0.
 import { WorkerEntrypoint } from 'cloudflare:workers';
 
 // The second script on the node. It answers over the service binding,

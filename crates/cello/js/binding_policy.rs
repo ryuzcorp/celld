@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): binding-forgery enforcement. Apache-2.0.
+// Modified by Ryuz Corp (Cello): binding-forgery enforcement. Apache-2.0.
 
 //! Who a host op answers: the calling script's declared bindings.
 //!

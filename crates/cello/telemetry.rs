@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): parse OTEL_RESOURCE_ATTRIBUTES into the OTLP resource (upstream #314); incoming spans carry HTTP method (upstream #285); split logs from traces via CELLO_OTEL_LOGS (upstream #153).
+// Modified by Ryuz Corp (Cello): parse OTEL_RESOURCE_ATTRIBUTES into the OTLP resource (upstream #314); incoming spans carry HTTP method (upstream #285); split logs from traces via CELLO_OTEL_LOGS (upstream #153).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 // Telemetry is observational and does not affect Actor decisions.
@@ -42,6 +42,13 @@ pub const LOG_BODY_CAP: usize = 8 * 1024;
 /// The schema is not frozen. Stamped on every object so a reader knows
 /// what contract the columns follow; the DuckDB page documents it.
 const SCHEMA_VERSION: &str = "v0-unstable";
+
+/// User-metadata keys stamped on every telemetry batch object in the bucket.
+/// Frozen: old batches must keep decoding under new binaries, so these
+/// spellings never change. See `rename-frozen.md`. (The OTLP resource
+/// attributes such as `cello.version` are a different surface and do rename.)
+pub(crate) const RETENTION_META_KEY: &str = "celld-retention";
+pub(crate) const SCHEMA_META_KEY: &str = "celld-schema";
 
 /// Queue between the hot path and the pump; a full queue sheds, counted.
 /// The pump drains continuously and the size trigger bounds its batch, so
@@ -915,8 +922,8 @@ impl SinkRuntime {
                     }
                 };
                 let meta = [
-                    ("cello-retention", retention.as_str()),
-                    ("cello-schema", SCHEMA_VERSION),
+                    (RETENTION_META_KEY, retention.as_str()),
+                    (SCHEMA_META_KEY, SCHEMA_VERSION),
                 ];
                 for (prefix, bytes) in [(TRACES_PREFIX, span_bytes), (LOGS_PREFIX, log_bytes)] {
                     let Some(bytes) = bytes else { continue };
@@ -1481,6 +1488,15 @@ pub fn encode_logs(logs: &[Log], node: &str, region: &str) -> anyhow::Result<Vec
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The batch object user-metadata keys are frozen: old telemetry batches
+    /// in the bucket must keep their schema tag under new binaries. See
+    /// `rename-frozen.md`. Never rename these without a migration.
+    #[test]
+    fn batch_object_metadata_keys_stay_frozen() {
+        assert_eq!(RETENTION_META_KEY, "celld-retention");
+        assert_eq!(SCHEMA_META_KEY, "celld-schema");
+    }
 
     #[test]
     fn resource_attributes_parse_leniently() {

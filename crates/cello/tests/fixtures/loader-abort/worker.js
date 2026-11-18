@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): loader abort fixture (upstream #281). Apache-2.0.
+// Modified by Ryuz Corp (Cello): loader abort fixture (upstream #281). Apache-2.0.
 const PROVIDER = "http://127.0.0.1:__PROVIDER_PORT__";
 
 const CHILD = `export default {

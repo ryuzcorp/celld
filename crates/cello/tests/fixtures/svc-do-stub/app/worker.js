@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): R7 service-RPC DO-stub fixture. Apache-2.0.
+// Modified by Ryuz Corp (Cello): R7 service-RPC DO-stub fixture. Apache-2.0.
 import { DurableObject, RpcTarget } from 'cloudflare:workers';
 
 class AppCap extends RpcTarget {

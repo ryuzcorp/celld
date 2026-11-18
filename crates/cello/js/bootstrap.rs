@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): facet adoption drops the restored flag (upstream #292); nodejs process.env population (upstream #296); env.CELLO_NODE node identity (upstream #219).
+// Modified by Ryuz Corp (Cello): facet adoption drops the restored flag (upstream #292); nodejs process.env population (upstream #296); env.CELLO_NODE node identity (upstream #219).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! Isolate bootstrap: what a fresh context needs before user code runs.

@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): staged invoke serves one operator request from staged versions. Apache-2.0.
+// Modified by Ryuz Corp (Cello): staged invoke serves one operator request from staged versions. Apache-2.0.
 
 //! Operator-only HTTP invocation of staged script versions.
 //!

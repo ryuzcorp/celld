@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): AES-KW fixture (upstream #295). Apache-2.0.
+// Modified by Ryuz Corp (Cello): AES-KW fixture (upstream #295). Apache-2.0.
 const hex = (s) => Uint8Array.from(s.match(/../g), (b) => parseInt(b, 16));
 const toHex = (buf) =>
   [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, "0")).join("");

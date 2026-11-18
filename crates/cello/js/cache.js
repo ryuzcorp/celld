@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): per-node Cache API store.
+// Modified by Ryuz Corp (Cello): per-node Cache API store.
 // The Workers Cache API over a per-node in-memory store.
 //
 // `caches.default` and every `caches.open(name)` namespace share one

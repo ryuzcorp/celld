@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): reaction-aware request resources; binding-forgery enforcement.
+// Modified by Ryuz Corp (Cello): reaction-aware request resources; binding-forgery enforcement.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! The V8 surface over `crate::storage`: key-value, SQL, and the value

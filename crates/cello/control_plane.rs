@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): tenant egress policy; staged activation; non-dumpable serving process.
+// Modified by Ryuz Corp (Cello): tenant egress policy; staged activation; non-dumpable serving process.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 // Managed control-plane sessions execute outside the Actor execution domain.

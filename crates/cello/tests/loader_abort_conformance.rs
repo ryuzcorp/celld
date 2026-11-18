@@ -1,6 +1,6 @@
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 //
-// Modified by ryuzcorp (ryuzcorp/celld): loader abort propagation regression test (upstream #281).
+// Modified by Ryuz Corp (Cello): loader abort propagation regression test (upstream #281).
 
 // A black-box runner, not node code: it boots the binary, copies fixtures,
 // serves a hanging provider over loopback, and polls TCP with wall-clock

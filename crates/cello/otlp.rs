@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): honor OTEL_RESOURCE_ATTRIBUTES in the OTLP resource; report cello's build as cello.version (upstream #314); export incoming HTTP method (upstream #285).
+// Modified by Ryuz Corp (Cello): honor OTEL_RESOURCE_ATTRIBUTES in the OTLP resource; report cello's build as cello.version (upstream #314); export incoming HTTP method (upstream #285).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! OTLP/HTTP protobuf encoding for the telemetry sink, by hand.

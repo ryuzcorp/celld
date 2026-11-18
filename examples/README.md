@@ -1,4 +1,4 @@
-<!-- Modified by ryuzcorp (ryuzcorp/celld): Workers Cache API example. -->
+<!-- Modified by Ryuz Corp (Cello): Workers Cache API example. -->
 # Examples
 
 These small Wrangler projects demonstrate the Workers platform that `Cello`

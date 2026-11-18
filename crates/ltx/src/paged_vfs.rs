@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): O(1) hydration count (upstream #270).
+// Modified by Ryuz Corp (Cello): O(1) hydration count (upstream #270).
 //! paged_vfs.rs — a SQLite VFS that faults main-db pages in from the bucket.
 //!
 //! The fault-in model of paged restore. The main db is a real local file

@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): AES-KW import/generate/wrap/unwrap + symmetric JWK import/export (upstream #295); raw EC key import/export (upstream #271).
+// Modified by Ryuz Corp (Cello): AES-KW import/generate/wrap/unwrap + symmetric JWK import/export (upstream #295); raw EC key import/export (upstream #271).
 // Web Crypto implementation for the embedded runtime.
 //
 // The common WebCrypto paths use typed-array host ops.

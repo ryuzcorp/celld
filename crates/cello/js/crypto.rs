@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): node:crypto scrypt; AES-KW key wrap/unwrap (upstream #295); raw EC key import/export (upstream #271).
+// Modified by Ryuz Corp (Cello): node:crypto scrypt; AES-KW key wrap/unwrap (upstream #295); raw EC key import/export (upstream #271).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! Web Crypto and node:crypto: the key formats and the primitives.

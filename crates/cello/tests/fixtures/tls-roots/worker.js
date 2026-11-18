@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): private-CA TLS fixture (upstream #230). Apache-2.0.
+// Modified by Ryuz Corp (Cello): private-CA TLS fixture (upstream #230). Apache-2.0.
 import { connect } from "cloudflare:sockets";
 
 const readAll = async (readable) => {

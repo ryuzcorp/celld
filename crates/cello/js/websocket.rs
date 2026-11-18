@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): reaction-aware request resources; unrefed websocket bind wait; binding-forgery enforcement; WebSocket ownership; post-response DO dial keeps its cell scope (upstream #254).
+// Modified by Ryuz Corp (Cello): reaction-aware request resources; unrefed websocket bind wait; binding-forgery enforcement; WebSocket ownership; post-response DO dial keeps its cell scope (upstream #254).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! WebSockets inside the isolate: the registry, the ops JS calls, and the

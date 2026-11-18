@@ -1,6 +1,6 @@
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 //
-// Modified by ryuzcorp (ryuzcorp/celld): retired-event attribution test; cancelled-request shared-work regression tests (upstream #317); shared-promise attribution regression test (upstream #316); trailing-handoff rejection test (upstream #309); refused-handoff settlement test (upstream #207); answered waitUntil retirement test (upstream #289); background-clock re-arm test (upstream #275). Apache-2.0.
+// Modified by Ryuz Corp (Cello): retired-event attribution test; cancelled-request shared-work regression tests (upstream #317); shared-promise attribution regression test (upstream #316); trailing-handoff rejection test (upstream #309); refused-handoff settlement test (upstream #207); answered waitUntil retirement test (upstream #289); background-clock re-arm test (upstream #275). Apache-2.0.
 
 // A white-box driver test, not node code: it builds a Worker in-process and
 // runs its turns directly, so the execution boundary's injected

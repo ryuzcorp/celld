@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): RPC disposal fixture (upstream #260). Apache-2.0.
+// Modified by Ryuz Corp (Cello): RPC disposal fixture (upstream #260). Apache-2.0.
 import { WorkerEntrypoint } from "cloudflare:workers";
 
 export class ExampleService extends WorkerEntrypoint {

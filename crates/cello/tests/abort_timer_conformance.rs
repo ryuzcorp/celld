@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): abort-cleared timer conformance (upstream #309). Apache-2.0.
+// Modified by Ryuz Corp (Cello): abort-cleared timer conformance (upstream #309). Apache-2.0.
 
 // A black-box runner, not node code: it boots the real `cello dev` binary,
 // aborts a background loop's sleep from another request, and asserts the

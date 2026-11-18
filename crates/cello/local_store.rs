@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): staged activation; dev-store single-writer group commit (upstream #310); covering listing index with prefix-bounded LIST (upstream #265).
+// Modified by Ryuz Corp (Cello): staged activation; dev-store single-writer group commit (upstream #310); covering listing index with prefix-bounded LIST (upstream #265).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! The persistent object store for `cello dev`.

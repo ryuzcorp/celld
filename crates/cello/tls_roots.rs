@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): shared TLS trust roots (Mozilla plus OS store/SSL_CERT_FILE) for worker sockets and tenant fetch (upstream #230).
+// Modified by Ryuz Corp (Cello): shared TLS trust roots (Mozilla plus OS store/SSL_CERT_FILE) for worker sockets and tenant fetch (upstream #230).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! The trust roots for every outbound TLS client cello builds for tenant

@@ -1,18 +1,20 @@
-celld
-Copyright 2026 Deno Land Inc.
+Cello
+Copyright 2026 Ryuz Corp.
 
-celld is licensed under the Apache License 2.0; see LICENSE. Code adapted
+Based on celld, Copyright 2026 Deno Land Inc.
+
+Cello is licensed under the Apache License 2.0; see LICENSE. Code adapted
 from Tokio is under the MIT License; see the header of
-crates/celld/tokio_select.rs.
+crates/cello/tokio_select.rs.
 
 Third-party software
 --------------------
 
-celld uses lol_html, Cloudflare's HTML rewriting library (BSD-3-Clause,
+Cello uses lol_html, Cloudflare's HTML rewriting library (BSD-3-Clause,
 https://github.com/cloudflare/lol-html), to implement the HTMLRewriter
 API. lol_html depends on the following crates from the Servo project,
 which are licensed under the Mozilla Public License 2.0
-(https://mozilla.org/MPL/2.0/). celld binaries include them unmodified;
+(https://mozilla.org/MPL/2.0/). Cello binaries include them unmodified;
 cssparser-macros runs only at build time. Their source code is available
 at:
 

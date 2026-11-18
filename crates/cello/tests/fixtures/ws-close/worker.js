@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): server-initiated close fixture (upstream #279). Apache-2.0.
+// Modified by Ryuz Corp (Cello): server-initiated close fixture (upstream #279). Apache-2.0.
 export default {
   async fetch(req) {
     const url = new URL(req.url);

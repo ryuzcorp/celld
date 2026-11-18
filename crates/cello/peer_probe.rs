@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): operator token for the internal listener.
+// Modified by Ryuz Corp (Cello): operator token for the internal listener.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 // Peer probing is a real-wire diagnostic outside the Actor execution domain.

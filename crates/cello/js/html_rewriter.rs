@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): reaction-aware request resources.
+// Modified by Ryuz Corp (Cello): reaction-aware request resources.
 //! HTMLRewriter host ops over the `lol_html` crate — the same parser
 //! Workerd embeds.
 //!

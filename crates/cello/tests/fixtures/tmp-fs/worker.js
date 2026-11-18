@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): writable /tmp + node:url fixture (upstream #280). Apache-2.0.
+// Modified by Ryuz Corp (Cello): writable /tmp + node:url fixture (upstream #280). Apache-2.0.
 import fs from "node:fs/promises";
 import {
   accessSync,

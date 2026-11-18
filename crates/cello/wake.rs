@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): the due scan reports the next upcoming minute and the scanner wakes for it (upstream #308).
+// Modified by Ryuz Corp (Cello): the due scan reports the next upcoming minute and the scanner wakes for it (upstream #308).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! Immutable alarm discovery publications and restart-safe reclamation.

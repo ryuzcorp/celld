@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): runtime-isolate host fixture; Queue pollution-gate probes. Apache-2.0.
+// Modified by Ryuz Corp (Cello): runtime-isolate host fixture; Queue pollution-gate probes. Apache-2.0.
 // The first script in the fleet: its module top level overrides the shared
 // primordials that the runtime cells' gates and data paths use, then answers
 // /health and forwards every /v/* probe to the second script over a service

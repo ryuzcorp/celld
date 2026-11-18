@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): retiring-generation regression test (upstream #275).
+// Modified by Ryuz Corp (Cello): retiring-generation regression test (upstream #275).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 // A black-box runner, not node code: it boots the binary, stages a second

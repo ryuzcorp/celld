@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): shared Tokio runtime for node-booting unit tests.
+// Modified by Ryuz Corp (Cello): shared Tokio runtime for node-booting unit tests.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 // This module owns the ambient production primitives which the boundary lint

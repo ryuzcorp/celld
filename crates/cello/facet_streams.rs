@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): facet open answers the database path only (upstream #292).
+// Modified by Ryuz Corp (Cello): facet open answers the database path only (upstream #292).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! The replication streams of Durable Object facets, shared by both engines.

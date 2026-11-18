@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): process.env probe fixture (upstream #296). Apache-2.0.
+// Modified by Ryuz Corp (Cello): process.env probe fixture (upstream #296). Apache-2.0.
 import nodeProcess from "node:process";
 import { env as namedEnv } from "node:process";
 

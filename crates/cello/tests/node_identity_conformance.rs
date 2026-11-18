@@ -1,6 +1,6 @@
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 //
-// Modified by ryuzcorp (ryuzcorp/celld): node identity on env (upstream #219).
+// Modified by Ryuz Corp (Cello): node identity on env (upstream #219).
 
 // A black-box runner, not node code: it boots the real `cello dev` binary
 // and polls TCP with wall-clock deadlines, so the execution boundary's

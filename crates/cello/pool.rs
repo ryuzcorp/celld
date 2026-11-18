@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): cross-isolate RPC stubs and streams; worker-less residency for registry tests; receiver-held stream lifetime.
+// Modified by Ryuz Corp (Cello): cross-isolate RPC stubs and streams; worker-less residency for registry tests; receiver-held stream lifetime.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 // Isolate admission and deadlines are in the V8 arm outside the Actor execution

@@ -1,5 +1,5 @@
-// Modified by ryuzcorp (ryuzcorp/celld): per-round fence credit (0062).
-// Modified by ryuzcorp (ryuzcorp/celld): ported from meln1k/cello: seal a dead lease that never opened a log (01522b3); lone-node repair backoff schedule; bucket-posture group commit: bucket session flavour, loss/witness predicates (0059).
+// Modified by Ryuz Corp (Cello): per-round fence credit (0062).
+// Modified by Ryuz Corp (Cello): ported from meln1k/cello: seal a dead lease that never opened a log (01522b3); lone-node repair backoff schedule; bucket-posture group commit: bucket session flavour, loss/witness predicates (0059).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! Decision core for the in-fleet replicated log tier (design stage; not
@@ -446,7 +446,7 @@ pub fn bundle_credit_allowed(record: Option<&LogRecord>, epoch: Epoch) -> bool {
 /// fence read credits only when issued strictly after the proof it follows.
 /// `read_seq <= proof_seq` names a read that can predate the proof — or the
 /// takeover the proof raced — so it proves nothing and never credits.
-// Modified by ryuzcorp (ryuzcorp/celld): per-round fence credit (0062).
+// Modified by Ryuz Corp (Cello): per-round fence credit (0062).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ProofThenRead {
     /// Completion marker of the round's bundle PUT (the proof).
@@ -466,7 +466,7 @@ impl ProofThenRead {
 /// entry is the cell's ownership record (`cells/<cell>/own.json` today, one
 /// shard object per shard once ownership shards land); the shape is the same
 /// either way, so the credit path does not change when the backend does.
-// Modified by ryuzcorp (ryuzcorp/celld): per-round fence credit (0062).
+// Modified by Ryuz Corp (Cello): per-round fence credit (0062).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RoundFenceOutcome {
     /// The entry exists and names this owner at this cell epoch.
@@ -484,7 +484,7 @@ pub enum RoundFenceOutcome {
 /// `own.json` reads issued after the bundle PUT; ownership shards back it
 /// with one shard read per shard afterwards. The predicate only sees
 /// outcomes, so swapping the backend touches no credit logic.
-// Modified by ryuzcorp (ryuzcorp/celld): per-round fence credit (0062).
+// Modified by Ryuz Corp (Cello): per-round fence credit (0062).
 pub trait RoundFence {
     /// The fence outcome for `cell`: its entry, or why there is none.
     fn entry(&self, cell: &str) -> RoundFenceOutcome;
@@ -493,7 +493,7 @@ pub trait RoundFence {
 /// Map-backed fences for tests and callers that already hold the round's
 /// entries. A cell with no entry reads as `Missing`, like a 404 from the
 /// bucket: absent is a verdict, not a gap.
-// Modified by ryuzcorp (ryuzcorp/celld): per-round fence credit (0062).
+// Modified by Ryuz Corp (Cello): per-round fence credit (0062).
 impl RoundFence for BTreeMap<CellId, RoundFenceOutcome> {
     fn entry(&self, cell: &str) -> RoundFenceOutcome {
         self.get(cell)
@@ -505,7 +505,7 @@ impl RoundFence for BTreeMap<CellId, RoundFenceOutcome> {
 /// Per-cell credit verdict for one flush round. `Credit` acknowledges the
 /// cell's covered writes; `Uncredited` fails their gates exactly like a
 /// failed ownership read today — never a blind ack, never a hang.
-// Modified by ryuzcorp (ryuzcorp/celld): per-round fence credit (0062).
+// Modified by Ryuz Corp (Cello): per-round fence credit (0062).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CellCredit {
     Credit,
@@ -523,7 +523,7 @@ impl CellCredit {
 /// round's bundle PUT must still name this node at this cell epoch. Pair
 /// with the session-record arm ([`bundle_credit_allowed`]); see
 /// [`round_cell_credit`].
-// Modified by ryuzcorp (ryuzcorp/celld): per-round fence credit (0062).
+// Modified by Ryuz Corp (Cello): per-round fence credit (0062).
 pub fn fence_cell_credit(
     node: &str,
     cell_epoch: Epoch,
@@ -551,7 +551,7 @@ pub fn fence_cell_credit(
 /// read after the PUT — refuses its round. Either arm refuses, and a refused
 /// cell's gates fail rather than hang. Proof-then-read ordering is part of
 /// the verdict: a fence read issued at or before the proof never credits.
-// Modified by ryuzcorp (ryuzcorp/celld): per-round fence credit (0062).
+// Modified by Ryuz Corp (Cello): per-round fence credit (0062).
 pub fn round_cell_credit(
     record: Option<&LogRecord>,
     shipper_epoch: Epoch,
@@ -570,7 +570,7 @@ pub fn round_cell_credit(
 /// fence reader. Mixed rounds stay mixed: a bumped cell goes uncredited
 /// while its intact neighbours credit, and the executor fails only the
 /// uncredited cells' gates.
-// Modified by ryuzcorp (ryuzcorp/celld): per-round fence credit (0062).
+// Modified by Ryuz Corp (Cello): per-round fence credit (0062).
 pub fn round_credit(
     record: Option<&LogRecord>,
     shipper_epoch: Epoch,
@@ -601,7 +601,7 @@ pub fn round_credit(
 /// gate. The executor computes `credit` with [`round_cell_credit`] (both
 /// arms, proof-then-read ordering included) and the gate settles only the
 /// gates this round's proof captured — positions at or below `cover`.
-// Modified by ryuzcorp (ryuzcorp/celld): per-round fence credit (0062).
+// Modified by Ryuz Corp (Cello): per-round fence credit (0062).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FenceCellSettlement {
     /// The cell the fence entry was read for.
@@ -621,7 +621,7 @@ pub struct FenceCellSettlement {
 /// `order` witnesses that. An unordered round (read issued at or before the
 /// proof) settles nothing as credited: covered gates fail instead, so a
 /// read that predates the proof is never accepted.
-// Modified by ryuzcorp (ryuzcorp/celld): per-round fence credit (0062).
+// Modified by Ryuz Corp (Cello): per-round fence credit (0062).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FenceRoundSettlement {
     /// The proof-then-read ordering witness for this round.

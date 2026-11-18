@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): cross-isolate RPC stubs and streams; trusted cell RPC; facet open answers the database path only (upstream #292).
+// Modified by Ryuz Corp (Cello): cross-isolate RPC stubs and streams; trusted cell RPC; facet open answers the database path only (upstream #292).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! The channels a cell runtime uses to hand work to the host: one request

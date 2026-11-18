@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): retired-continuation resume regression fixture (upstream #277). Apache-2.0.
+// Modified by Ryuz Corp (Cello): retired-continuation resume regression fixture (upstream #277). Apache-2.0.
 export class Repro {
   constructor(state) {
     this.state = state;

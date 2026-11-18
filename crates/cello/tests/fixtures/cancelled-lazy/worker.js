@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): cancelled-request lazy-init regression fixture (upstream #294). Apache-2.0.
+// Modified by Ryuz Corp (Cello): cancelled-request lazy-init regression fixture (upstream #294). Apache-2.0.
 import { DurableObject } from 'cloudflare:workers';
 
 // Lazily started work shared by every later request to the object: the

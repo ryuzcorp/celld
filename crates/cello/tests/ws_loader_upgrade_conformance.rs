@@ -1,6 +1,6 @@
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 //
-// Modified by ryuzcorp (ryuzcorp/celld): loader 101 upgrade regression test (upstream #305).
+// Modified by Ryuz Corp (Cello): loader 101 upgrade regression test (upstream #305).
 
 // A black-box runner, not node code: it boots the binary, copies fixtures,
 // and speaks raw WebSocket framing over TCP with wall-clock deadlines.

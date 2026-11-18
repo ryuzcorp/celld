@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): Queue DLQ forward/redrive conformance; deploy --read-root option; ephemeral-port boot (0077). Apache-2.0.
+// Modified by Ryuz Corp (Cello): Queue DLQ forward/redrive conformance; deploy --read-root option; ephemeral-port boot (0077). Apache-2.0.
 
 // A black-box runner, not node code: it boots the binary, copies fixtures,
 // reads the cells' SQLite files, and polls TCP with wall-clock deadlines,

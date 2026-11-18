@@ -1,6 +1,6 @@
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 //
-// Modified by ryuzcorp (ryuzcorp/celld): workflow budget-expiry continuation (upstream #299).
+// Modified by Ryuz Corp (Cello): workflow budget-expiry continuation (upstream #299).
 
 // A black-box runner, not node code: it boots the real `cello dev` binary
 // and polls TCP with wall-clock deadlines, so the execution boundary's

@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): deployment cache scope fixture. Apache-2.0.
+// Modified by Ryuz Corp (Cello): deployment cache scope fixture. Apache-2.0.
 import { WorkerEntrypoint } from 'cloudflare:workers';
 
 // The second script on the node. It answers over the service binding, so

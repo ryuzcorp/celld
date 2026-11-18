@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): D1 export operator-gate fixture; Queue/KV operator fetch gate; Queue/KV stub-RPC allowlists; Queue DLQ RPC refusal; Queue send cell-side validation; KV prototype-safe operator lookup. Apache-2.0.
+// Modified by Ryuz Corp (Cello): D1 export operator-gate fixture; Queue/KV operator fetch gate; Queue/KV stub-RPC allowlists; Queue DLQ RPC refusal; Queue send cell-side validation; KV prototype-safe operator lookup. Apache-2.0.
 // A Worker with its own D1 binding probes the operator-only surface: stub RPC
 // `__d1Export`/`__d1Migrate` and the `fetch` export/migrate/exec-rows branches
 // must refuse, while the binding's own query/batch/exec and the fetch query

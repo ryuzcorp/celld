@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): D1 concurrent-call fixture; cross-request attribution fixtures. Apache-2.0.
+// Modified by Ryuz Corp (Cello): D1 concurrent-call fixture; cross-request attribution fixtures. Apache-2.0.
 //
 // Conformance fixture for concurrent D1 calls from a Worker. Each route
 // drives one shape: sequential calls, concurrent calls within one request,

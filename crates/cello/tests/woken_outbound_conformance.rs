@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): woken-continuation outbound conformance (upstream #258). Apache-2.0.
+// Modified by Ryuz Corp (Cello): woken-continuation outbound conformance (upstream #258). Apache-2.0.
 
 // A black-box runner, not node code: it boots the real `cello dev` binary
 // and drives the issue's self-vs-woken outbound dance, so the execution

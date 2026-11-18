@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): loader sibling-imports fixture (upstream #304). Apache-2.0.
+// Modified by Ryuz Corp (Cello): loader sibling-imports fixture (upstream #304). Apache-2.0.
 const MAIN = `import { WorkerEntrypoint } from "cloudflare:workers";
 import { probe } from "./lib.js";
 export default class extends WorkerEntrypoint { fetch() { return Response.json(probe()); } }`;

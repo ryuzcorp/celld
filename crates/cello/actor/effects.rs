@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): bound the renewal lease readback to half the remaining authority (upstream #264); report lease CAS conflicts distinctly (upstream #239).
+// Modified by Ryuz Corp (Cello): bound the renewal lease readback to half the remaining authority (upstream #264); report lease CAS conflicts distinctly (upstream #239).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! Effect dispatch keeps ordinary work off the core's lease timer thread.

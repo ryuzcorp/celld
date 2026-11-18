@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): shared-fetch waiter regression fixture (upstream #316). Apache-2.0.
+// Modified by Ryuz Corp (Cello): shared-fetch waiter regression fixture (upstream #316). Apache-2.0.
 
 // B awaits A's shared subrequest, then arms its own timer/fetch: the
 // waiter's next op must belong to the waiter's driver, not to the entry

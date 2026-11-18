@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): loader external stubs from the union of main + sibling imports (upstream #304); node:process eager global (upstream #296); node:url lazy module (upstream #280).
+// Modified by Ryuz Corp (Cello): loader external stubs from the union of main + sibling imports (upstream #304); node:process eager global (upstream #296); node:url lazy module (upstream #280).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! ES module resolution and compilation.

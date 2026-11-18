@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): cross-isolate RPC
+// Modified by Ryuz Corp (Cello): cross-isolate RPC
 // stubs and streams; response bodies across events. Apache-2.0.
 //
 // Conformance fixture for cross-isolate Durable Object RPC stubs and byte

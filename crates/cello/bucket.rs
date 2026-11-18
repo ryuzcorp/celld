@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): R2 startAfter compares decoded keys; listing pages carry walk-ordered rows; staged activation; separate CELLO_DEPLOY_AWS_* credentials for deployment-artifact reads; bucket-posture group commit: inject a store for GC-quiet tests (0071); conditional-write verdict keeps the 409 conflict kind (upstream #239); multipart byte upload for GB image tars (upstream #307); conditional-write retry on transient OperationAborted conflicts (upstream #283).
+// Modified by Ryuz Corp (Cello): R2 startAfter compares decoded keys; listing pages carry walk-ordered rows; staged activation; separate CELLO_DEPLOY_AWS_* credentials for deployment-artifact reads; bucket-posture group commit: inject a store for GC-quiet tests (0071); conditional-write verdict keeps the 409 conflict kind (upstream #239); multipart byte upload for GB image tars (upstream #307); conditional-write retry on transient OperationAborted conflicts (upstream #283).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! The engine's single object-store client: the `object_store` crate
@@ -160,7 +160,7 @@ impl StorageBackend {
     ///
     /// Azure Blob Storage requires a metadata name to be a C# identifier,
     /// and it refuses the whole write with `400 InvalidMetadata` when a name
-    /// holds a hyphen. cello names such as `cello-r2` failed every R2 write
+    /// holds a hyphen. celld names such as `celld-r2` failed every R2 write
     /// and lost every telemetry batch on an `az://` bucket
     /// (denoland/celld#209). Azure therefore gets an underscore for each
     /// hyphen, and [`BlobAttributes::metadata_value`] reads either spelling.

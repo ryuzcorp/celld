@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): WebSocket ownership; isolate pipe for loaded-worker 101 joins (upstream #305). Apache-2.0.
+// Modified by Ryuz Corp (Cello): WebSocket ownership; isolate pipe for loaded-worker 101 joins (upstream #305). Apache-2.0.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! WebSockets on the ingress: accepting them, proxying them to the owner,

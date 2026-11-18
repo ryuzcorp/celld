@@ -1,6 +1,6 @@
-// Modified by ryuzcorp (ryuzcorp/celld): round-level fence settlement (0062); renewal lease readback carries the authority bound (upstream #264); first alarm-deadline expiry only marks the firing (upstream #256); same-guard retry on lease conflicts (upstream #239); storage-poisoned runtimes restart on their own generation (upstream #291); failed start disarms the restored alarm (upstream #276); dead-owner takeovers look up fleet capacity when full (upstream #263).
-// Modified by ryuzcorp (ryuzcorp/celld): ported from meln1k/cello: coordination-core fixes (ea471ee, e46a685, 6d61462, 18d3bf9, 9d4c163, 468b456, 01522b3, b026226, 65fdb13); shared bucket-posture ownership reads across concurrent gates (0056).
-// Modified by ryuzcorp (ryuzcorp/celld): MergeTree-style lazy handoff policy (0078).
+// Modified by Ryuz Corp (Cello): round-level fence settlement (0062); renewal lease readback carries the authority bound (upstream #264); first alarm-deadline expiry only marks the firing (upstream #256); same-guard retry on lease conflicts (upstream #239); storage-poisoned runtimes restart on their own generation (upstream #291); failed start disarms the restored alarm (upstream #276); dead-owner takeovers look up fleet capacity when full (upstream #263).
+// Modified by Ryuz Corp (Cello): ported from meln1k/cello: coordination-core fixes (ea471ee, e46a685, 6d61462, 18d3bf9, 9d4c163, 468b456, 01522b3, b026226, 65fdb13); shared bucket-posture ownership reads across concurrent gates (0056).
+// Modified by Ryuz Corp (Cello): MergeTree-style lazy handoff policy (0078).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! Clean-sheet cello decision core.

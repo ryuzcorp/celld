@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): KV operator fetch gate; prototype-safe operator lookup. Apache-2.0.
+// Modified by Ryuz Corp (Cello): KV operator fetch gate; prototype-safe operator lookup. Apache-2.0.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 // The KV service, shared by both engines: the namespace cell (the server) and

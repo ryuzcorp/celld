@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): bucket-posture group commit: bundle switch defaults off (0075); unclean-restart prune of live-named epochs (upstream #290).
+// Modified by Ryuz Corp (Cello): bucket-posture group commit: bundle switch defaults off (0075); unclean-restart prune of live-named epochs (upstream #290).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! The node's replication engine behind one engine-neutral handle.

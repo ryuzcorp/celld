@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): AbortSignal.timeout admission fixture (upstream #306). Apache-2.0.
+// Modified by Ryuz Corp (Cello): AbortSignal.timeout admission fixture (upstream #306). Apache-2.0.
 import { DurableObject } from "cloudflare:workers";
 
 export class Probe extends DurableObject {

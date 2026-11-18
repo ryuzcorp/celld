@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): retired-continuation resume conformance (upstream #277). Apache-2.0.
+// Modified by Ryuz Corp (Cello): retired-continuation resume conformance (upstream #277). Apache-2.0.
 
 // A black-box runner, not node code: it boots the real `cello dev` binary
 // and drives the issue's constructor-started task loop, so the execution

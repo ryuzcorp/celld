@@ -1,6 +1,6 @@
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 //
-// Modified by ryuzcorp (ryuzcorp/celld): cross-isolate RPC
+// Modified by Ryuz Corp (Cello): cross-isolate RPC
 // stubs and streams. Apache-2.0.
 
 //! The host-side RPC stub table: live JS capabilities a Durable Object

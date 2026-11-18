@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): staged invoke operator command; invoke --header-env. Apache-2.0.
+// Modified by Ryuz Corp (Cello): staged invoke operator command; invoke --header-env. Apache-2.0.
 
 // Operator commands read operator-owned host paths and file descriptors.
 #![allow(clippy::disallowed_methods)]

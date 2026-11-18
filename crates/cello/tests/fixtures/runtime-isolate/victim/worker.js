@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): runtime-isolate victim fixture; Queue pollution-gate probes. Apache-2.0.
+// Modified by Ryuz Corp (Cello): runtime-isolate victim fixture; Queue pollution-gate probes. Apache-2.0.
 // The second script in the fleet: holds D1/KV/Queue bindings and probes both
 // their data paths and the operator-only surface. Its own top level is clean;
 // the first script's top level overrides shared primordials, so every probe

@@ -1,5 +1,5 @@
-// Modified by ryuzcorp (ryuzcorp/celld): ported from meln1k/cello: 51 code probes on the core's rare branches (b026226); shared bucket-posture ownership reads across concurrent gates (0056).
-// Modified by ryuzcorp (ryuzcorp/celld): round-level fence settlement (0062).
+// Modified by Ryuz Corp (Cello): ported from meln1k/cello: 51 code probes on the core's rare branches (b026226); shared bucket-posture ownership reads across concurrent gates (0056).
+// Modified by Ryuz Corp (Cello): round-level fence settlement (0062).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! The output gate: one choke point every egress passes through.
@@ -467,7 +467,7 @@ impl State {
     /// read issued before the proof is never accepted. Gates above a cell's
     /// cover, on another cell, or on another epoch are untouched: a later
     /// proof still owes them their own read.
-    /// Modified by ryuzcorp (ryuzcorp/celld): round-level fence settlement (0062).
+    /// Modified by Ryuz Corp (Cello): round-level fence settlement (0062).
     pub(crate) fn fence_round_verified(
         &mut self,
         round: &FenceRoundSettlement,
