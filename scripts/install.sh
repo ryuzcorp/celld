@@ -14,6 +14,7 @@
 #   CELLO_INSTALL_DIR   install here (default: /usr/local/bin when writable
 #                       or run as root, else ~/.local/bin)
 #   CELLO_DOWNLOAD_BASE override the download base URL (tests only).
+#   CELLO_API_BASE      override the GitHub API base URL (tests only).
 #
 # Integrity vs provenance: the SHA256SUMS check below proves the tarball
 # arrived intact, not who built it. For provenance, verify the SLSA
@@ -63,30 +64,45 @@ latest_stable_tag() {
   printf '%s' "$tag"
 }
 
-# Newest prerelease: first release in the API list flagged prerelease.
+# Newest prerelease: first release in the API list flagged prerelease,
+# paging through results until one is found or the pages run out.
 latest_prerelease_tag() {
-  json="$(curl -fsSL --proto '=https' --proto-redir '=https' \
-    "https://api.github.com/repos/$REPO/releases?per_page=50")" \
-    || die "could not resolve the latest prerelease"
-  if command -v jq >/dev/null 2>&1; then
-    tag="$(printf '%s' "$json" | jq -r \
-      '[.[] | select(.prerelease == true) | .tag_name] | first // empty')"
-  else
-    tag="$(printf '%s' "$json" | tr ',' '\n' | awk -F'"' '
-      $2 == "tag_name" { tag = $4 }
-      $2 == "prerelease" {
-        line = $0; sub(/.*: */, "", line); sub(/[^a-z].*/, "", line)
-        if (line == "true" && tag != "") { print tag; exit }
-        tag = ""
-      }')"
-  fi
-  [ -n "$tag" ] || die "no prerelease found"
-  printf '%s' "$tag"
+  api_base="${CELLO_API_BASE:-https://api.github.com}"
+  page=1
+  while :; do
+    page_url="$api_base/repos/$REPO/releases?per_page=100&page=$page"
+    assert_safe_url "$page_url"
+    json="$(api_get "$page_url")" \
+      || die "could not resolve the latest prerelease"
+    if command -v jq >/dev/null 2>&1; then
+      tag="$(printf '%s' "$json" | jq -r \
+        '[.[] | select(.prerelease == true) | .tag_name] | first // empty' || true)"
+      count="$(printf '%s' "$json" | jq -r \
+        'if type == "array" then length else 0 end' || true)"
+    else
+      tag="$(printf '%s' "$json" | tr ',' '\n' | awk -F'"' '
+        $2 == "tag_name" { tag = $4 }
+        $2 == "prerelease" {
+          line = $0; sub(/.*: */, "", line); sub(/[^a-z].*/, "", line)
+          if (line == "true" && tag != "") { print tag; exit }
+          tag = ""
+        }')"
+      count="$(printf '%s' "$json" | grep -o '"tag_name"' | wc -l)"
+      count="$(printf '%s' "$count" | tr -d '[:space:]')"
+    fi
+    if [ -n "$tag" ]; then
+      printf '%s' "$tag"
+      return 0
+    fi
+    [ "${count:-0}" -gt 0 ] || break
+    page=$((page + 1))
+  done
+  die "no prerelease found"
 }
 
 # Download a URL to a file. https-only, with --proto guards; plain http is
-# accepted solely for anchored-localhost test overrides (enforced by the
-# caller through the base check in main).
+# accepted solely for anchored-localhost test overrides (enforced by
+# assert_safe_url before fetch is called).
 fetch() {
   out="$1"
   url="$2"
@@ -96,6 +112,70 @@ fetch() {
     *)
       curl -fsSL -o "$out" "$url" ;;
   esac
+}
+# Fetch an API URL to stdout. https-only, with --proto guards; plain http
+# is accepted solely for anchored-localhost test overrides (enforced by
+# assert_safe_url before any call).
+api_get() {
+  case "$1" in
+    https://*)
+      curl -fsSL --proto '=https' --proto-redir '=https' "$1" ;;
+    *)
+      curl -fsSL "$1" ;;
+  esac
+}
+
+# Exact loopback authority with an optional numeric port; userinfo
+# (`user@host`) is never loopback.
+is_loopback_authority() {
+  case "$1" in
+    *@*) return 1 ;;
+  esac
+  case "$1" in
+    '['*']'*)
+      host="${1%%]*}]"
+      tail="${1#*]}"
+      [ "$host" = "[::1]" ] || return 1
+      case "$tail" in
+        "") port="" ;;
+        :*) port="${tail#:}" ;;
+        *) return 1 ;;
+      esac
+      ;;
+    *)
+      case "$1" in
+        *:*) host="${1%%:*}"; port="${1#*:}" ;;
+        *) host="$1"; port="" ;;
+      esac
+      case "$host" in
+        localhost | 127.0.0.1) ;;
+        *) return 1 ;;
+      esac
+      ;;
+  esac
+  case "$port" in
+    "") return 0 ;;
+    *[!0-9]*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+# https only; plain http is accepted solely for anchored test overrides
+# ($CELLO_DOWNLOAD_BASE / $CELLO_API_BASE, tests only) whose authority is
+# exactly loopback with an optional numeric port.
+assert_safe_url() {
+  case "$1" in
+    https://*) return 0 ;;
+    http://*) ;;
+    *) die "refusing to download over insecure http: $1" ;;
+  esac
+  rest="${1#http://}"
+  authority="${rest%%/*}"
+  authority="${authority%%\?*}"
+  authority="${authority%%\#*}"
+  is_loopback_authority "$authority" &&
+    [ -n "${CELLO_DOWNLOAD_BASE:-}${CELLO_API_BASE:-}" ] ||
+    die "refusing to download over insecure http: $1"
 }
 
 main() {
@@ -145,7 +225,7 @@ main() {
       die "refusing: invalid version: $version" ;;
   esac
   printf '%s' "$version" | grep -Eq \
-    '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$' \
+    '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$' \
     || die "refusing: invalid version: $version"
 
   # --- download -----------------------------------------------------------
@@ -154,18 +234,7 @@ main() {
   else
     base="https://github.com/$REPO/releases/download/$tag"
   fi
-  # https only; plain http is accepted solely for anchored-localhost
-  # test overrides (exact host, optional port/path — never a prefix of a
-  # longer name such as localhost.evil.com).
-  case "$base" in
-    https://*) ;;
-    http://localhost | http://localhost:* | http://localhost/* | \
-      http://127.0.0.1 | http://127.0.0.1:* | http://127.0.0.1/* | \
-      'http://[::1]' | 'http://[::1]:'* | 'http://[::1]/'*)
-      [ -n "${CELLO_DOWNLOAD_BASE:-}" ] \
-        || die "refusing to download over insecure http: $base" ;;
-    *) die "refusing to download over insecure http: $base" ;;
-  esac
+  assert_safe_url "$base"
 
   tarball="$APP-$version-linux-$arch.tar.gz"
 
