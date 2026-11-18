@@ -1,5 +1,5 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 456 690" role="img" aria-labelledby="assetsFlowTitle assetsFlowDesc">
-  <title id="assetsFlowTitle">How celld decides between an asset and the Worker</title>
+  <title id="assetsFlowTitle">How Cello decides between an asset and the Worker</title>
   <desc id="assetsFlowDesc">A request reaches a node and passes down a column of tests. A method other
 than GET or HEAD leaves at once and the Worker answers. A path that
 run_worker_first matches also leaves, and no asset lookup happens. The

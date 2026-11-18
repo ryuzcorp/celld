@@ -1,16 +1,16 @@
 # Workflows
 
 A Workflow is a durable function that runs as a named sequence of steps,
-sleeps, and events. celld runs each instance as a cell. Read the
+sleeps, and events. Cello runs each instance as a cell. Read the
 [Cloudflare Workflows documentation](https://developers.cloudflare.com/workflows/build/workers-api/)
 for the API.
 
 ## Example
 
-The [Workflow example](../../examples/workflow) fetches a document and stores
+The [Workflow example](https://github.com/ryuzcorp/cello/tree/main/examples/workflow) fetches a document and stores
 the result of a durable step.
 
-<!-- celld-example: workflow -->
+<!-- cello-example: workflow -->
 
 ## API
 
@@ -29,7 +29,7 @@ the result of a durable step.
 
 ## Replay
 
-Each time an instance makes progress, celld calls `run()` again from the first
+Each time an instance makes progress, Cello calls `run()` again from the first
 line. A finished step returns its stored result and does not run its callback
 again. All code outside a step callback therefore runs again on every replay.
 Put each subrequest, each side effect, and each value that must stay stable
@@ -39,12 +39,12 @@ require. A step whose result did not commit before a node failure runs again,
 so a step callback must tolerate a second attempt.
 
 `run()` can await work that is not a step, but a replay cannot resume that
-await. celld fails the instance when such work keeps `run()` pending for 60
+await. Cello fails the instance when such work keeps `run()` pending for 60
 seconds while no step runs or waits.
 
 ## Handler budget
 
-An instance whose steps sum past `CELLD_HANDLER_BUDGET_S` does not stall:
+An instance whose steps sum past `CELLO_HANDLER_BUDGET_S` does not stall:
 each alarm-handler drive runs what fits in the budget, the expired handler
 counts as a failed attempt that does not consume the alarm retry limit, and
 the retried alarm replays the ledger and continues where the expired drive
@@ -60,18 +60,18 @@ cannot move the deadline. `status()` reports `waiting` for all three.
 
 A waiting instance holds no isolate. Its cell hibernates when the next deadline
 is further away than the near-alarm residency window. That window is one hour,
-and `CELLD_ALARM_RESIDENT_MS` changes it.
+and `CELLO_ALARM_RESIDENT_MS` changes it.
 
 `step.do()` uses the Cloudflare retry defaults when the call supplies no
 `retries` object: 5 retries, a delay of 10 seconds, exponential backoff, and a
 timeout of 10 minutes for one attempt.
 
-celld sets no limit on the number of concurrent instances. Fleet memory and the
+Cello sets no limit on the number of concurrent instances. Fleet memory and the
 resident-cell cap bound it.
 
 ## Differences from Cloudflare
 
-- celld retains a successful or failed instance for 30 days by default. Each
+- Cello retains a successful or failed instance for 30 days by default. Each
   duration in the `retention` option can be at most 30 days.
 - `locationHint` accepts the Cloudflare values, but fleet ownership selects the
   cell location.

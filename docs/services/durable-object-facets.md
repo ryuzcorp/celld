@@ -9,15 +9,15 @@ for the standard API.
 
 ## Example
 
-The [facets example](../../examples/facets) creates a facet from a class that a
+The [facets example](https://github.com/ryuzcorp/cello/tree/main/examples/facets) creates a facet from a class that a
 Worker Loader provides.
 
-<!-- celld-example: facets -->
+<!-- cello-example: facets -->
 
 ## API
 
 - `ctx.facets.get(name, callback)` returns a stub for the named facet. The
-  callback returns `{ class, id }`, and celld runs it only to start the facet.
+  callback returns `{ class, id }`, and Cello runs it only to start the facet.
 - `worker.getDurableObjectClass("App")` on a Worker Loader binding, or
   `ctx.exports.App`, supplies the `class`.
 - `ctx.exports.App({ props })` creates a class handle with startup properties.
@@ -38,14 +38,14 @@ callback runs again at the next call.
 
 As in workerd, a facet write commits in the database of the facet, so a
 rollback of a root transaction does not undo a facet call inside it. A facet
-and its root object therefore never commit atomically. celld holds an outbound
+and its root object therefore never commit atomically. Cello holds an outbound
 effect of a facet, and the reply of a facet call, until the facet stream proves
 the writes of that call. The effect also passes the output gate of the root
 cell.
 
 ## Starting and addressing a facet
 
-`ctx.facets.get(name, callback)` returns a stub, and celld runs the callback
+`ctx.facets.get(name, callback)` returns a stub, and Cello runs the callback
 only when the facet is not already running. The callback returns a `class` and
 an optional `id`. The `class` comes from
 `worker.getDurableObjectClass("App")` on a Worker Loader binding, or from
@@ -86,11 +86,11 @@ A facet can accept a WebSocket: its `fetch()` returns a `101` response with the
 client end of a `WebSocketPair`, and the root object returns that response. The
 facet can call `accept()` on the server end or pass it to
 `ctx.acceptWebSocket()`. A facet can also open a WebSocket with
-`new WebSocket(url)` or with an `Upgrade: websocket` fetch. celld delivers the
+`new WebSocket(url)` or with an `Upgrade: websocket` fetch. Cello delivers the
 events of each such socket to the facet, not to the root object. Socket output
 waits for the facet stream and passes the output gate of the root cell.
 
-A facet socket does not hibernate, because celld cannot start a facet again
+A facet socket does not hibernate, because Cello cannot start a facet again
 without its root object. A socket that the facet accepts or opens keeps the root
 cell resident until it closes. The client end of a `101` response from another
 Durable Object does not. `getWebSockets()` returns the sockets of that facet.
@@ -106,7 +106,7 @@ closes it with `1011`.
 - A Durable Object binding cannot supply a facet class. A class with a storage
   migration cannot supply one either, because `ctx.exports` holds that class as
   a namespace.
-- Each facet has a separate SQLite database, which celld replicates as a
+- Each facet has a separate SQLite database, which Cello replicates as a
   separate stream under the bucket prefix of the root Durable Object.
 - A facet cannot set an alarm. `storage.setAlarm()` throws inside a facet, so
   the root object must hold the schedule.

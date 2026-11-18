@@ -1,0 +1,79 @@
+# Docs site: Blume build on PRs touching the docs, the README or the
+# installer, and deploy to GitHub Pages on push to main.
+# Site: https://cello.ryuz.eu (custom domain; Pages source is
+# GitHub Actions, DNS is set by the owner). Build output also carries
+# scripts/install.sh as /install.sh and a CNAME, so the domain sticks.
+name: docs
+
+on:
+  pull_request:
+    paths:
+      - docs/**
+      - README.md
+      - scripts/install.sh
+      - blume.config.ts
+      - package.json
+      - package-lock.json
+  push:
+    branches: [main]
+    paths:
+      - docs/**
+      - README.md
+      - scripts/install.sh
+      - blume.config.ts
+      - package.json
+      - package-lock.json
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: docs-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    name: Build the site
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm run validate
+      - run: npm run build
+      - name: Ship the installer and the domain with the site
+        run: |
+          set -euo pipefail
+          cp scripts/install.sh dist/install.sh
+          printf 'cello.ryuz.eu' > dist/CNAME
+      - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5
+        with:
+          path: dist
+          include-hidden-files: true
+
+  deploy:
+    if: github.event_name == 'push'
+    name: Deploy to Pages
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5

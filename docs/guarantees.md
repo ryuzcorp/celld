@@ -1,8 +1,8 @@
-<!-- Modified by ryuzcorp (ryuzcorp/celld): bucket-posture group commit docs: bundle switch opt-in (0075); fleet ops: stable node ids, witness grace, loss record, lease conflict retries, alarm deadline, wake timing (upstream #244, #273, #264, #256, #250, #249, #245, #239, #268, #308). -->
-# What celld guarantees
+<!-- Modified by Ryuz Corp (Cello): bucket-posture group commit docs: bundle switch opt-in (0075); fleet ops: stable node ids, witness grace, loss record, lease conflict retries, alarm deadline, wake timing (upstream #244, #273, #264, #256, #250, #249, #245, #239, #268, #308). -->
+# What Cello guarantees
 
-celld makes two promises. Exactly one node serves a cell at a time, so two
-machines never write the same database. celld does not acknowledge a write
+Cello makes two promises. Exactly one node serves a cell at a time, so two
+machines never write the same database. Cello does not acknowledge a write
 until the write survives a failure, so an acknowledged write is never lost. Both
 promises require a bucket with working conditional writes and ranged reads, and
 a supervisor that restarts the process.
@@ -16,7 +16,7 @@ a supervisor that restarts the process.
   write.
 - Ranged reads: a read must return the requested byte range and the bytes from
   that range.
-- For epoch GC (`CELLD_LTX_RETENTION_SECS`) only, list-after-write consistency:
+- For epoch GC (`CELLO_LTX_RETENTION_SECS`) only, list-after-write consistency:
   a listing after a successful write must include the written object. Amazon
   S3, Cloudflare R2, Google Cloud Storage, and Azure Blob Storage provide it. A
   Tigris Global or Dual-region bucket provides it only in the region of the
@@ -46,14 +46,14 @@ not apply `If-Match` to a PUT. For an `az://` bucket, the NAME is the container.
 
 ## The storage test
 
-`celld diagnose` sends four conditional writes to the bucket:
+`cello diagnose` sends four conditional writes to the bucket:
 
 ```
 ok bucket conditional write (create, reject-create, update, reject-stale)
 ```
 
 Two of the four must fail; if the store accepts either, the command exits with
-an error that names the store. Use `celld diagnose --read-only` with a
+an error that names the store. Use `cello diagnose --read-only` with a
 credential that cannot write.
 
 Each node runs the same writes before it serves, then reads a range of a second
@@ -64,23 +64,23 @@ can end. The node stops immediately when a required conditional write or ranged
 read is unsupported, when the store ignores a condition or the `Range` header,
 or when it returns a wrong range or wrong bytes.
 
-A process that stops mid-test can leave a small object under `probe/`; celld
+A process that stops mid-test can leave a small object under `probe/`; Cello
 never reads it.
 
-celld reserves `probe/`, `cells/`, `nodes/`, `node-cells/`, `fleet/`, `deploy/`,
+Cello reserves `probe/`, `cells/`, `nodes/`, `node-cells/`, `fleet/`, `deploy/`,
 `deploy-blobs/`, `log/`, `wake/`, and `telemetry/`, and deletes objects under
 some of them. An application must not write under any of them.
 
 An operator must not delete, expire, or overwrite an object under these
-prefixes, except under `probe/` and `telemetry/`. celld reads these objects to
-fence and restore cells, and celld deletes the objects that it no longer needs.
+prefixes, except under `probe/` and `telemetry/`. Cello reads these objects to
+fence and restore cells, and Cello deletes the objects that it no longer needs.
 A bucket lifecycle rule therefore must not select an object under another
 reserved prefix. With a key prefix, each reserved prefix follows the key prefix,
 for example `PREFIX/telemetry/`.
 
 ## The supervisor
 
-Run celld under a supervisor that restarts the process, such as systemd, Docker
+Run Cello under a supervisor that restarts the process, such as systemd, Docker
 with a restart policy, or Kubernetes. A node that loses its lease fences itself
 and exits, and without a restart the fleet loses that capacity. The supervisor
 must restart without an attempt limit and wait at least one lease lifetime
@@ -96,19 +96,19 @@ create when no record exists, or a compare-and-swap on an existing record, so
 two nodes cannot acquire the same cell. Every activation, a takeover or a local
 wake, advances the epoch, so an epoch never has two writers.
 
-The record is `cells/<cell>/own.json`. celld never deletes it, and it must stay
+The record is `cells/<cell>/own.json`. Cello never deletes it, and it must stay
 in the bucket for the life of the cell. A missing record next to LTX under
 `cells/<cell>/ltx/` means that the record was lost, for example to a lifecycle
-rule. celld then refuses to acquire the cell, because a new record at epoch 1
+rule. Cello then refuses to acquire the cell, because a new record at epoch 1
 would start it with an empty database. Each request that must read the record,
 to acquire the cell or to find its owner, fails, and the node writes
-`celld ownership record lost` to stderr. The node then refuses the cell for 10
+`cello ownership record lost` to stderr. The node then refuses the cell for 10
 seconds without a bucket request, so it writes the line at most once in that
 interval. A node that still serves the cell keeps serving it and keeps writing
 LTX until it stops. That node cannot acknowledge a write that a bucket proof
 covers, because the record no longer names it, so the write fails and the node
-writes `celld output gate` to stderr. With `CELLD_DURABILITY=bucket`, every
-write takes a bucket proof. celld detects the loss only from LTX under
+writes `cello output gate` to stderr. With `CELLO_DURABILITY=bucket`, every
+write takes a bucket proof. Cello detects the loss only from LTX under
 `cells/<cell>/ltx/`. A new cell can keep its first writes in a node bundle under
 `log/` until the tiering path drains them, so a loss before that drain starts
 the cell empty.
@@ -117,13 +117,13 @@ To restore the cell, first stop each node that served the cell with SIGTERM, not
 with `POST /shutdown?handoff=preserve`. A preserved restart resumes its cells
 without a read of the record, so the node keeps serving the cell. No peer can
 acquire the cell, so its handoff cannot complete: the stop can take the whole
-`CELLD_SHUTDOWN_TOTAL_MS` and log `shutdown_handoff_stalled`.
+`CELLO_SHUTDOWN_TOTAL_MS` and log `shutdown_handoff_stalled`.
 
 A stopped process can still hold acknowledged writes in its node log, outside
 the per-cell prefixes, so wait until that log is recovered. A new process with
-the same `CELLD_NODE` recovers it during startup, so the log is recovered when
-that process reports healthy. Without the same `CELLD_NODE`, a running node
-with `CELLD_DURABILITY=fleet`, the default, recovers it after the lease of the
+the same `CELLO_NODE` recovers it during startup, so the log is recovered when
+that process reports healthy. Without the same `CELLO_NODE`, a running node
+with `CELLO_DURABILITY=fleet`, the default, recovers it after the lease of the
 stopped process expires. In that case, wait until `nodes/<node>.json` of the
 stopped process is absent, has no `log` object, or shows `"state": "sealed"` in
 it. A stop that logs `node-log close: sealed epoch` has already sealed its log.
@@ -188,7 +188,7 @@ before the source write is durable; a raw TCP connect, write, TLS upgrade, or
 shutdown; and each chunk of a streamed body. A client therefore cannot act on a
 value that a crash can still lose.
 
-After a bucket proof, celld reads the ownership record once and acknowledges
+After a bucket proof, Cello reads the ownership record once and acknowledges
 only if it still names this node at this epoch. Concurrent writes on one cell
 share that read: a write whose proof lands while a read is in flight joins it
 when its position is at or below the position of the write that issued the
@@ -204,12 +204,12 @@ The check reads the record instead of a clock, so a paused process or a skewed
 clock cannot pass it.
 
 In bucket posture the node groups writes when the operator opts in: with
-`CELLD_BUCKET_BUNDLES=1`, once per flush round it writes one
+`CELLO_BUCKET_BUNDLES=1`, once per flush round it writes one
 shared bundle object (`log/<node>/<generation>/bundle/`) carrying every dirty
 cell's new rows, and that single PUT is the bucket proof for every row it
 carries — instead of one upload per write. The default uploads per-cell as
 before; the ownership read
-above still answers every acknowledgement, and `CELLD_BUCKET_BUNDLE_LINGER_MS`
+above still answers every acknowledgement, and `CELLO_BUCKET_BUNDLE_LINGER_MS`
 holds a round open only while more than one cell is dirty, so a lone dirty
 cell never waits.
 
@@ -220,13 +220,13 @@ cannot complete another fleet proof.
 
 An unfinished SQL write cursor can return rows before SQLite commits. Outside an
 explicit transaction, the application must consume those rows before output or
-`storage.sync()`; celld rejects output while a write cursor is unfinished.
+`storage.sync()`; Cello rejects output while a write cursor is unfinished.
 
 ### The ensemble needs two nodes
 
 A node never counts itself as a follower, and one follower is enough, therefore
-a fleet needs two running celld nodes before any node can complete a fleet
-proof. `CELLD_DURABILITY=fleet` is the default, so a one-node fleet requests the
+a fleet needs two running Cello nodes before any node can complete a fleet
+proof. `CELLO_DURABILITY=fleet` is the default, so a one-node fleet requests the
 fleet posture and does not get it.
 
 A node recruits up to two followers, so a fleet of three or more nodes holds
@@ -250,7 +250,7 @@ once).
 
 ### The takeover recovery gate
 
-In fleet mode, celld can acknowledge a write before its bucket upload completes.
+In fleet mode, Cello can acknowledge a write before its bucket upload completes.
 Each process session therefore creates a conditional node-log record before its
 first fleet-durable acknowledgement.
 
@@ -313,9 +313,9 @@ Recovery of a large dead node can take minutes. It reads retained bundles in
 windows of at most 512 MiB and uploads and releases each window before the next,
 so memory does not grow with the session; a cell with rows in several windows
 receives one object per window. A failed or timed-out attempt does not fail
-waiting requests: the cell retries with a backoff (`CELLD_RECOVERY_RETRY_MS`,
+waiting requests: the cell retries with a backoff (`CELLO_RECOVERY_RETRY_MS`,
 default 1000), and the requests fail with a resolve error only after
-`CELLD_RECOVERY_RETRIES` (default 240) attempts.
+`CELLO_RECOVERY_RETRIES` (default 240) attempts.
 
 ### Bucket-posture bundle proofs
 
@@ -353,12 +353,12 @@ does not end exactly at that cut is not part of the chain. A legacy
 A paged cell reads no chain up front. It opens over a sparse local file, reads
 each page from the objects on first use, and fills the rest in the background; a
 filled cell reads only its local file. A chain smaller than
-`CELLD_LTX_PAGED_MIN_MB` is downloaded whole.
+`CELLO_LTX_PAGED_MIN_MB` is downloaded whole.
 
 ### Epoch GC
 
-When `CELLD_LTX_RETENTION_SECS` is positive, the owner of a cell deletes the
-epoch prefixes that no restore reads, in both `CELLD_DURABILITY` modes:
+When `CELLO_LTX_RETENTION_SECS` is positive, the owner of a cell deletes the
+epoch prefixes that no restore reads, in both `CELLO_DURABILITY` modes:
 
 1. It builds the chain over every epoch prefix and continues only when the
    newest epoch is its own. Its first object is then in the listing, so a later
@@ -383,7 +383,7 @@ restores, so no write past the cut can be acknowledged.
 ### Self-fencing
 
 Each node holds a lease in the bucket with an expiry, renewed after one third of
-the lifetime (`CELLD_TTL_MS`, default 10000 ms). A failed renewal is retried
+the lifetime (`CELLO_TTL_MS`, default 10000 ms). A failed renewal is retried
 while the published expiry has not passed. Each attempt is bounded so one hung
 store request cannot eat the whole remaining authority: a renewal CAS, and the
 readback that follows a contested renewal, each run at most half the remaining
@@ -405,7 +405,7 @@ When the expiry passes, the node fences itself: it stops each active cell and
 fails every incomplete request. It also fences at once when its lease record is
 gone or no longer matches what it published. The fence writes nothing; peers
 already read the lease as dead or replaced and acquire the cells through the
-ownership records. celld checks the published expiry on every routed request,
+ownership records. Cello checks the published expiry on every routed request,
 so a request is safe even before the fence runs.
 
 An ingress checks a cached remote route against the observed lease deadline on
@@ -424,7 +424,7 @@ cannot prove who wrote the record). The fenced state is terminal: only a restart
 returns the node, through the normal cold-activation path. The
 [testing page](testing.md) shows the kill tests for this path.
 
-`RUST_LOG=celld=info,store=debug` logs a `node_lease_read` or `node_lease_write`
+`RUST_LOG=cello=info,store=debug` logs a `node_lease_read` or `node_lease_write`
 event for each store request against the node's own lease record, with an
 `outcome` of `found`, `missing`, `applied`, `rejected`, or `error`. An `error`
 carries the store failure in an `error` field; a `found` carries the record's
@@ -435,7 +435,7 @@ filters.
 ### Stable node identities
 
 Every process session answers peer requests under its node id, and recovery
-addresses members by the id in their lease. An explicit `CELLD_NODE` is that
+addresses members by the id in their lease. An explicit `CELLO_NODE` is that
 id. Without one, the node pins a generated id to `node-id` in its data
 directory (beside the follower `peerlog`) on first boot and reuses it across
 restarts; an explicit value is recorded there too. A pin that cannot be read
@@ -493,7 +493,7 @@ content against the record.
 ## Alarm discovery and the wake format
 
 SQLite stores the alarm deadline, consumption, retry state, and installation
-identity. An alarm hint only makes celld read SQLite; it never authorizes a
+identity. An alarm hint only makes Cello read SQLite; it never authorizes a
 handler to run.
 
 Each committed installation has an object under `wake/entries/`, identified by
@@ -511,13 +511,13 @@ publications do not block an alarm response.
 Each cleanup pass lists at most 128 objects and processes at most eight cells
 concurrently, continuing the listing on the next pass and restarting after the
 last page. A failed DELETE or a late PUT can need another full scan. The
-interval defaults to 60 seconds; `CELLD_WAKER_TICK_MS` sets it and the due-scan
+interval defaults to 60 seconds; `CELLO_WAKER_TICK_MS` sets it and the due-scan
 interval. A large inventory can take many intervals, and each extra node can
 repeat the same reads and deletes. Each due-scan pass also wakes for the next
 not-yet-due alarm minute when it lands before the next tick, so a persisted
 alarm fires on schedule after a restart instead of waiting out the 60 s scan.
 
-A firing alarm that outlives the operation deadline (`CELLD_OPERATION_DEADLINE_MS`,
+A firing alarm that outlives the operation deadline (`CELLO_OPERATION_DEADLINE_MS`,
 default 15000 ms) is still running, not failed: the first expiry only marks
 the firing, and the running copy settles the alarm when it answers, so the
 first expiry never dispatches a duplicate. A second expiry with the op still
