@@ -1,29 +1,32 @@
-# Publish ryuzcorp/celld images from annotated tags. A tag
-# `v<version>-ryuzcorp.<n>` on a `ryuzcorp/v<version>` line branch publishes the
-# multi-arch image `ghcr.io/ryuzcorp/celld:<version>-ryuzcorp.<n>`;
-# consumers pin it by digest (see FORK.md).
+# Publish Cello images and release tarballs from annotated tags. A tag
+# `v<semver>` (e.g. `v0.1.0`, `v0.2.0-beta.1`) publishes the multi-arch
+# image `ghcr.io/ryuzcorp/cello:<version>` plus the `cello-<version>-linux-<arch>`
+# release tarballs copied out of the pushed per-arch images, so the
+# tarball bytes provably equal the tested image contents.
 #
-#   `verify`   the tag names a `<version>`/`<n>` pair, the tree's
-#              Cargo.toml agrees on `<version>`, the upstream `v<version>`
-#              tag exists and is an ancestor of the tagged commit, and the
-#              tagged commit is the current tip of the matching
-#              `ryuzcorp/v<version>` branch (tags on old or bare-upstream
-#              commits are refused)
-#   `push`     per architecture: refuse an already-published tag (only
-#              a confirmed "not found" lets it publish), then run the
-#              Dockerfile's test stage and push the arch image
-#   `publish`  stitch the multi-arch tag, attest SLSA provenance for
-#              the index digest (each arch build also records
-#              provenance and an SBOM), and print the index digest,
-#              the Dockerfile pin lines, and the attestation verify
-#              command to the step summary
+#   `verify`   the tag is annotated, names a valid semver whose version
+#              exactly matches `crates/cello/Cargo.toml`, and points at a
+#              commit on `main` (reachable from `origin/main`)
+#   `push`     per architecture: refuse an already-published `<version>`
+#              (only a confirmed "not found" lets it publish), then run
+#              the Dockerfile's test stage, push the arch image, record
+#              its digest, and package the matching release tarball by
+#              copying the binary and license files out of that digest
+#   `publish`  stitch the multi-arch tags from this run's validated arch
+#              digests (`<version>` and `beta` always; `<major>.<minor>`
+#              and `latest` for non-prereleases only), create the GitHub
+#              Release with the tarballs and SHA256SUMS, attest SLSA
+#              provenance for the index digest and the files (each arch
+#              build also records provenance and an SBOM), and print the
+#              index digest and the attestation verify commands to the
+#              step summary
 #
-# A level that is already published is never overwritten: cut a new tag.
+# A published `<version>` is never overwritten: cut a new tag.
 name: publish
 
 on:
   push:
-    tags: [v*-ryuzcorp.*]
+    tags: ["v*"]
 
 permissions:
   contents: read
@@ -39,25 +42,33 @@ jobs:
     timeout-minutes: 10
     permissions:
       contents: read
+    outputs:
+      version: ${{ steps.parse.outputs.version }}
+      prerelease: ${{ steps.parse.outputs.prerelease }}
+      minor-tag: ${{ steps.parse.outputs.minor-tag }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
           fetch-depth: 0
           fetch-tags: true
-      - name: Check the tag against its line branch
+      - name: Check the tag against the tree and main
+        id: parse
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          # The tag names the release: v<version>-ryuzcorp.<n>.
-          if [[ ${GITHUB_REF_NAME} =~ ^v([0-9]+\.[0-9]+\.[0-9]+)-ryuzcorp\.([1-9][0-9]*)$ ]]; then
-            base="${BASH_REMATCH[1]}"
+          # The tag names the release: v<semver> (stable or prerelease).
+          semver='(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(\-((0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)(\.(0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*))*))?(\+([0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*))?'
+          if [[ ${GITHUB_REF_NAME} =~ ^v${semver}$ ]]; then
+            version="${GITHUB_REF_NAME#v}"
+            major="${BASH_REMATCH[1]}"
+            minor="${BASH_REMATCH[2]}"
           else
-            echo "refusing tag $GITHUB_REF_NAME: want v<version>-ryuzcorp.<n>" >&2
+            echo "refusing tag $GITHUB_REF_NAME: want v<semver>" >&2
             exit 1
           fi
-          # A release is an annotated tag (tagger + message, FORK.md). Asked
+          # A release is an annotated tag (tagger + message). Asked
           # of the API rather than the checkout, whose tag refs may not keep
           # the tag object.
           kind=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$GITHUB_REF_NAME" --jq .object.type)
@@ -66,43 +77,31 @@ jobs:
             exit 1
           fi
           sha=$(git rev-parse "refs/tags/$GITHUB_REF_NAME^{commit}")
-          # The tree must agree it is this line's version.
-          version=$(awk '/^\[package\]/{p=1;next} /^\[/{p=0} p&&/^version = "/{gsub(/"/,"");print $3;exit}' crates/celld/Cargo.toml)
-          if [ "$version" != "$base" ]; then
-            echo "refusing tag $GITHUB_REF_NAME: Cargo.toml says $version" >&2
+          # The tree must agree it is this version.
+          cargo_version=$(awk '/^\[package\]/{p=1;next} /^\[/{p=0} p&&/^version = "/{gsub(/"/,"");print $3;exit}' crates/cello/Cargo.toml)
+          if [ "$cargo_version" != "$version" ]; then
+            echo "refusing tag $GITHUB_REF_NAME: crates/cello/Cargo.toml says $cargo_version" >&2
             exit 1
           fi
-          # The upstream tag the line branch builds on must exist on
-          # origin: its commit becomes the now.ryuzcorp.celld.upstream
-          # label, and it must be an ancestor of the tagged commit, so
-          # a moved upstream tag cannot lie in the provenance label.
-          if ! upstream=$(git rev-parse "refs/tags/v$base^{commit}" 2>/dev/null); then
-            echo "refusing tag $GITHUB_REF_NAME: no upstream v$base tag on origin (mirror it first)" >&2
-            exit 1
-          fi
-          if ! git merge-base --is-ancestor "$upstream" "$sha"; then
-            echo "refusing tag $GITHUB_REF_NAME: upstream v$base ($upstream) is not an ancestor of $sha" >&2
-            exit 1
-          fi
-          # The tagged commit must sit on the matching line branch, so a
-          # tag on main or on another line can never publish this name.
-          if ! git fetch --quiet origin "ryuzcorp/v$base"; then
-            echo "refusing tag $GITHUB_REF_NAME: no ryuzcorp/v$base branch" >&2
-            exit 1
-          fi
+          # The tagged commit must sit on main, so a tag on a side
+          # branch can never publish this name.
+          git fetch --quiet origin main
           if ! git merge-base --is-ancestor "$sha" FETCH_HEAD; then
-            echo "refusing tag $GITHUB_REF_NAME: $sha is not on ryuzcorp/v$base" >&2
+            echo "refusing tag $GITHUB_REF_NAME: $sha is not on origin/main" >&2
             exit 1
           fi
-          # The tagged commit must be the line tip at publish time, so a
-          # tag on an old or bare-upstream commit can never publish a
-          # stale image under this trusted name.
-          tip=$(git rev-parse FETCH_HEAD^{commit})
-          if [ "$sha" != "$tip" ]; then
-            echo "refusing tag $GITHUB_REF_NAME: $sha is not the tip of ryuzcorp/v$base ($tip); tag the line tip" >&2
-            exit 1
+          # SemVer build metadata (+...) is not a prerelease.
+          core="${version%%+*}"
+          prerelease="false"
+          if [[ $core == *-* ]]; then
+            prerelease="true"
           fi
-          echo "tag $GITHUB_REF_NAME is $sha, the tip of ryuzcorp/v$base"
+          {
+            echo "version=$version"
+            echo "prerelease=$prerelease"
+            echo "minor-tag=$major.$minor"
+          } >> "$GITHUB_OUTPUT"
+          echo "tag $GITHUB_REF_NAME is $sha on origin/main (prerelease: $prerelease)"
 
   push:
     name: Test, build and push (${{ matrix.suffix }})
@@ -133,51 +132,92 @@ jobs:
           printf '%s' "$GHCR_TOKEN" |
             docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
       - name: Test, build and push
+        id: build
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
         run: |
           set -euo pipefail
-          tag="${GITHUB_REF_NAME#v}"
-          base="${tag%-ryuzcorp.*}"
-          if [[ ! $tag =~ ^[0-9]+\.[0-9]+\.[0-9]+-ryuzcorp\.[1-9][0-9]*$ ]]; then
-            echo "refusing unexpected tag $GITHUB_REF_NAME" >&2
-            exit 1
-          fi
-          image="ghcr.io/ryuzcorp/celld"
+          image="ghcr.io/ryuzcorp/cello"
           sha=$(git rev-parse "refs/tags/$GITHUB_REF_NAME^{commit}")
-          upstream=$(git rev-parse "refs/tags/v$base^{commit}")
-          # Only a confirmed "not found" lets a level publish: any other
-          # inspect failure (auth, registry outage) stops the run.
-          if found=$(docker buildx imagetools inspect "$image:$tag" 2>&1); then
-            echo "$image:$tag is already published; cut a new tag" >&2
+          # Only a confirmed "not found" lets a version publish: any other
+          # inspect failure (auth, registry outage) stops the run, and a
+          # published <version> is never overwritten.
+          if found=$(docker buildx imagetools inspect "$image:$VERSION" 2>&1); then
+            echo "$image:$VERSION is already published; cut a new tag" >&2
             exit 1
           elif ! grep -qiE 'not found|manifest unknown' <<<"$found"; then
-            echo "cannot tell whether $image:$tag is published:" >&2
+            echo "cannot tell whether $image:$VERSION is published:" >&2
             echo "$found" >&2
             exit 1
           fi
+          command -v jq >/dev/null 2>&1 || { echo "refusing: jq is required" >&2; exit 1; }
           cache="$image:buildcache-${{ matrix.suffix }}"
           docker buildx build \
             --platform "${{ matrix.platform }}" \
-            --build-arg "CELLD_COMMIT=$sha" \
-            --build-arg "CELLD_VERSION=$tag" \
-            --label "org.opencontainers.image.source=https://github.com/ryuzcorp/celld" \
-            --label "org.opencontainers.image.version=$tag" \
+            --build-arg "CELLO_COMMIT=$sha" \
+            --build-arg "CELLO_VERSION=$VERSION" \
+            --label "org.opencontainers.image.source=https://github.com/ryuzcorp/cello" \
+            --label "org.opencontainers.image.version=$VERSION" \
             --label "org.opencontainers.image.revision=$sha" \
-            --label "now.ryuzcorp.celld.upstream=$upstream" \
             --provenance=mode=max \
             --sbom=true \
             --cache-from "type=registry,ref=$cache" \
             --cache-to "type=registry,ref=$cache,mode=max" \
-            --tag "$image:$tag-${{ matrix.suffix }}" \
+            --tag "$image:$VERSION-${{ matrix.suffix }}" \
+            --metadata-file /tmp/cello-metadata.json \
             --push \
             .
+          # Pin the package step to this run's pushed digest, not the tag,
+          # so the tarball cannot pick up anything pushed under the tag later.
+          digest=$(jq -r '.containerimage.digest // empty' /tmp/cello-metadata.json)
+          hex="${digest#sha256:}"
+          case "$digest" in sha256:*) ;; *) echo "refusing: bad arch digest: $digest" >&2; exit 1 ;; esac
+          [ "${#hex}" -eq 64 ] || { echo "refusing: bad arch digest: $digest" >&2; exit 1; }
+          case "$hex" in *[!0-9a-f]*) echo "refusing: bad arch digest: $digest" >&2; exit 1 ;; esac
+          echo "arch-digest=$digest" >> "$GITHUB_OUTPUT"
+          # The publish job stitches the index from this digest (via the
+          # uploaded artifact), not from the arch tag.
+          mkdir -p dist
+          printf '%s' "$digest" > "dist/arch-digest-${{ matrix.suffix }}.txt"
+      # The tarball is copied out of this run's pushed arch image (by digest),
+      # so its bytes provably equal the tested image contents (no second build).
+      - name: Package the release tarball
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+          ARCH_DIGEST: ${{ steps.build.outputs.arch-digest }}
+        run: |
+          set -euo pipefail
+          image="ghcr.io/ryuzcorp/cello"
+          case "$ARCH_DIGEST" in sha256:*) ;; *) echo "refusing: bad arch digest" >&2; exit 1 ;; esac
+          ref="$image@$ARCH_DIGEST"
+          rm -rf stage
+          mkdir -p stage dist
+          ctr=$(docker create --platform "${{ matrix.platform }}" "$ref")
+          trap 'docker rm "$ctr" >/dev/null' EXIT
+          docker cp "$ctr:/usr/local/bin/cello" stage/cello
+          docker cp "$ctr:/usr/share/doc/cello/LICENSE" stage/LICENSE
+          docker cp "$ctr:/usr/share/doc/cello/NOTICE" stage/NOTICE
+          tarball="cello-$VERSION-linux-${{ matrix.suffix }}.tar.gz"
+          tar -czf "dist/$tarball" -C stage cello LICENSE NOTICE
+          (cd dist && sha256sum "$tarball" > "SHA256SUMS-${{ matrix.suffix }}")
+          cat "dist/SHA256SUMS-${{ matrix.suffix }}"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-${{ matrix.suffix }}
+          if-no-files-found: error
+          retention-days: 1
+          path: |
+            dist/cello-*.tar.gz
+            dist/SHA256SUMS-${{ matrix.suffix }}
+            dist/arch-digest-${{ matrix.suffix }}.txt
 
   publish:
-    name: Publish multi-arch image
-    needs: push
+    name: Publish image, release and attestations
+    needs: [verify, push]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
-      contents: read
+      contents: write
       packages: write
       id-token: write
       attestations: write
@@ -188,37 +228,109 @@ jobs:
         run: |
           printf '%s' "$GHCR_TOKEN" |
             docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: dist
       - name: Publish
         id: publish
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+          PRERELEASE: ${{ needs.verify.outputs.prerelease }}
+          MINOR_TAG: ${{ needs.verify.outputs.minor-tag }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          tag="${GITHUB_REF_NAME#v}"
-          if [[ ! $tag =~ ^[0-9]+\.[0-9]+\.[0-9]+-ryuzcorp\.[1-9][0-9]*$ ]]; then
-            echo "refusing unexpected tag $GITHUB_REF_NAME" >&2
+          image="ghcr.io/ryuzcorp/cello"
+          # One SHA256SUMS for the release, verified before upload.
+          cat dist/SHA256SUMS-* > dist/SHA256SUMS
+          rm dist/SHA256SUMS-amd64 dist/SHA256SUMS-arm64
+          (cd dist && sha256sum -c SHA256SUMS)
+          # Refuse before tagging anything: a published <version> is never
+          # overwritten, and neither is its GitHub Release.
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            echo "refusing: release $GITHUB_REF_NAME already exists; cut a new tag" >&2
             exit 1
           fi
-          image="ghcr.io/ryuzcorp/celld"
-          docker buildx imagetools create --tag "$image:$tag" \
-            "$image:$tag-amd64" "$image:$tag-arm64"
-          digest=$(docker buildx imagetools inspect "$image:$tag" \
+          # Stitch the index from this run's arch digests (validated below),
+          # never from the arch tags, so nothing pushed under those tags
+          # later can slip into the release.
+          amd_digest=$(cat dist/arch-digest-amd64.txt)
+          arm_digest=$(cat dist/arch-digest-arm64.txt)
+          for digest in "$amd_digest" "$arm_digest"; do
+            hex="${digest#sha256:}"
+            case "$digest" in sha256:*) ;; *) echo "refusing: bad arch digest: $digest" >&2; exit 1 ;; esac
+            [ "${#hex}" -eq 64 ] || { echo "refusing: bad arch digest: $digest" >&2; exit 1; }
+            case "$hex" in *[!0-9a-f]*) echo "refusing: bad arch digest: $digest" >&2; exit 1 ;; esac
+          done
+          # <version> and beta always; <major>.<minor> and latest for
+          # non-prereleases only. latest moves only on stable releases,
+          # beta on every release including prereleases.
+          tags=("$VERSION" "beta")
+          if [ "$PRERELEASE" != "true" ]; then
+            tags+=("$MINOR_TAG" "latest")
+          fi
+          for tag in "${tags[@]}"; do
+            docker buildx imagetools create --tag "$image:$tag" \
+              "$image@$amd_digest" "$image@$arm_digest"
+          done
+          digest=$(docker buildx imagetools inspect "$image:$VERSION" \
             --format '{{json .Manifest.Digest}}' | tr -d '"')
+          # The digest feeds attestations and release notes: enforce its shape.
+          hex="${digest#sha256:}"
+          case "$digest" in sha256:*) ;; *) echo "refusing: bad digest: $digest" >&2; exit 1 ;; esac
+          [ "${#hex}" -eq 64 ] || { echo "refusing: bad digest: $digest" >&2; exit 1; }
+          case "$hex" in *[!0-9a-f]*) echo "refusing: bad digest: $digest" >&2; exit 1 ;; esac
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          # The GitHub Release for this tag: prereleases are marked
+          # prerelease (existence was already refused above, before tagging).
+          args=()
+          if [ "$PRERELEASE" = "true" ]; then
+            args+=(--prerelease)
+          fi
           {
-            echo "## celld $tag"
-            echo "index digest: \`$digest\`"
-            echo "Pin lines for the consumer Dockerfile:"
-            echo '```dockerfile'
-            echo "ARG CELLD_VERSION=$tag"
-            echo "ARG CELLD_DIGEST=$digest"
+            echo "## Cello $VERSION"
+            echo
+            echo "Image: \`$image:$VERSION\` (\`$digest\`)"
+            echo "Full changelog: https://cello.ryuz.eu/changelog"
+            echo
+            echo "Install on Linux (amd64/arm64):"
+            echo '```sh'
+            echo "curl -fsSL https://cello.ryuz.eu/install.sh | sh"
             echo '```'
+            echo
+            echo "Verify provenance (needs gh):"
+            echo '```sh'
+            echo "gh attestation verify oci://$image@$digest --repo ryuzcorp/cello"
+            echo "gh attestation verify cello-$VERSION-linux-amd64.tar.gz --repo ryuzcorp/cello"
+            echo '```'
+          } > notes.md
+          gh release create "$GITHUB_REF_NAME" --title "Cello $VERSION" \
+            --notes-file notes.md "${args[@]}" \
+            dist/cello-*.tar.gz dist/SHA256SUMS
+          {
+            echo "## cello $VERSION"
+            echo "index digest: \`$digest\`"
+            for tag in "${tags[@]}"; do
+              echo "published \`$image:$tag\`"
+            done
             echo "Verify the SLSA provenance attestation:"
             echo '```'
-            echo "gh attestation verify oci://$image@$digest --repo ryuzcorp/celld"
+            echo "gh attestation verify oci://$image@$digest --repo ryuzcorp/cello"
+            echo '```'
+            echo "Verify a release tarball attestation:"
+            echo '```'
+            echo "gh attestation verify dist/cello-$VERSION-linux-amd64.tar.gz --repo ryuzcorp/cello"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
       - name: Attest image provenance
         uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
         with:
-          subject-name: ghcr.io/ryuzcorp/celld
+          subject-name: ghcr.io/ryuzcorp/cello
           subject-digest: ${{ steps.publish.outputs.digest }}
           push-to-registry: true
+      - name: Attest release files
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-path: dist/cello-*.tar.gz, dist/SHA256SUMS
