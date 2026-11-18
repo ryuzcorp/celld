@@ -206,12 +206,35 @@ const REMOVED_PREFIX: (&str, &str) = (
     "set `vars` in the Wrangler config, or `.dev.vars` for `cello dev`",
 );
 
+/// The pre-rename `CELLD_*` family. Cello 0.1.0 renamed every `CELLD_*`
+/// variable to `CELLO_*` with no fallback: a node started with e.g.
+/// `CELLD_OPERATOR_TOKEN` set would otherwise run with no operator token
+/// and leave the internal listener open with nothing in the log. Fail
+/// closed and name the new spelling. This check runs inside `validate`,
+/// which every process entry point (node, `cello dev`, operator CLIs)
+/// calls before serving anything.
+const RENAMED_PREFIX: (&str, &str) = ("CELLD_", "CELLO_");
+
 /// Validate every typed production variable before the runtime starts.
 ///
 /// Some consumers cache a value or read it from a synchronous callback, so
 /// they cannot return a configuration error at the point of use. This pass
 /// makes those reads infallible without giving malformed values a default.
 pub fn validate() -> anyhow::Result<()> {
+    // The renamed prefix first: a stale `CELLD_*` setting is the most likely
+    // operator error after an upgrade, and everything below would silently
+    // ignore it.
+    let (old_prefix, new_prefix) = RENAMED_PREFIX;
+    if let Some(name) = std::env::vars_os().find_map(|(name, _)| {
+        let name = name.to_string_lossy().into_owned();
+        name.starts_with(old_prefix).then_some(name)
+    }) {
+        let renamed = format!("{new_prefix}{}", &name[old_prefix.len()..]);
+        bail!(
+            "{name} was renamed to {renamed} and is no longer read; \
+             refusing to start rather than running with silently ignored configuration"
+        );
+    }
     // Each entry carries its own empty-value rule, because whether `NAME=` was
     // inert is a property of the reader that went away and not of removal.
     for removed in REMOVED {
@@ -543,5 +566,31 @@ mod deploy_credential_tests {
         ])
         .unwrap();
         assert_eq!(parsed, None);
+    }
+}
+
+/// The stale-prefix refusal. Fails before the `RENAMED_PREFIX` check exists
+/// (`validate` returns `Ok` and the stale setting is silently ignored).
+#[cfg(test)]
+mod renamed_prefix_tests {
+    use super::*;
+
+    #[test]
+    fn stale_celld_setting_refuses_to_start_and_names_the_cello_spelling() {
+        std::env::set_var("CELLD_OPERATOR_TOKEN", "stale");
+        let result = validate();
+        std::env::remove_var("CELLD_OPERATOR_TOKEN");
+        let message = result
+            .expect_err("a stale CELLD_* setting must refuse to start")
+            .to_string();
+        assert!(
+            message.contains("CELLD_OPERATOR_TOKEN was renamed to CELLO_OPERATOR_TOKEN"),
+            "refusal must name the new spelling, got: {message}"
+        );
+    }
+
+    #[test]
+    fn clean_environment_still_validates() {
+        assert!(validate().is_ok());
     }
 }
