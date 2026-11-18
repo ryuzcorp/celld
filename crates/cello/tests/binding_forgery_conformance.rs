@@ -111,7 +111,7 @@ impl TestNode {
         Self::boot_with_env(attacker_project, true)
     }
 
-    /// `with_test_hooks` boots with `CELLD_TEST_WAIT=1` (test-only globals
+    /// `with_test_hooks` boots with `CELLO_TEST_WAIT=1` (test-only globals
     /// like the plant hook defined) or without it (shipping shape, the
     /// plant hook absent).
     fn boot_with_env(attacker_project: &Path, with_test_hooks: bool) -> Self {
@@ -126,7 +126,7 @@ impl TestNode {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         if with_test_hooks {
-            command.env("CELLD_TEST_WAIT", "1");
+            command.env("CELLO_TEST_WAIT", "1");
         }
         let mut child = command.spawn().expect("spawn celld dev");
         let mut stdout = child.stdout.take().expect("piped stdout");

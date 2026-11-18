@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): validate CELLD_MEMORY_SCOPE; CELLD_CACHE_MAX_BYTES validation; tenant egress policy; CELLD_CACHE_SCOPE validation; CELLD_DEPLOY_AWS_* validation; CELLD_SQLITE_CACHE_KB validation; CELLD_C_TRIM_MB validation; CELLD_BUCKET_BUNDLES startup validation (0070); CELLD_BUCKET_BUNDLES defaults off (0075); CELLD_TMP_MAX_BYTES validation (upstream #280); CELLD_SQL_STATEMENT_MS validation (upstream #274); CELLD_MAX_CELLS_PER_ISOLATE validation (upstream #278).
+// Modified by ryuzcorp (ryuzcorp/celld): validate CELLO_MEMORY_SCOPE; CELLO_CACHE_MAX_BYTES validation; tenant egress policy; CELLO_CACHE_SCOPE validation; CELLO_DEPLOY_AWS_* validation; CELLO_SQLITE_CACHE_KB validation; CELLO_C_TRIM_MB validation; CELLO_BUCKET_BUNDLES startup validation (0070); CELLO_BUCKET_BUNDLES defaults off (0075); CELLO_TMP_MAX_BYTES validation (upstream #280); CELLO_SQL_STATEMENT_MS validation (upstream #274); CELLO_MAX_CELLS_PER_ISOLATE validation (upstream #278).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! Strict runtime environment parsing.
@@ -20,7 +20,7 @@ pub fn max_asset_file_bytes() -> anyhow::Result<u64> {
     static LIMIT: std::sync::OnceLock<Result<u64, String>> = std::sync::OnceLock::new();
     LIMIT
         .get_or_init(|| {
-            positive_or("CELLD_MAX_ASSET_FILE_BYTES", 25 * 1024 * 1024)
+            positive_or("CELLO_MAX_ASSET_FILE_BYTES", 25 * 1024 * 1024)
                 .map_err(|error| error.to_string())
         })
         .as_ref()
@@ -82,127 +82,127 @@ struct Removed {
 
 const REMOVED: &[Removed] = &[
     Removed {
-        name: "CELLD_TEST_OTEL_SWEEP_MS",
+        name: "CELLO_TEST_OTEL_SWEEP_MS",
         replacement: "remove this setting; celld manages the telemetry retention cadence",
         empty_was_inert: false,
     },
     Removed {
-        name: "CELLD_OTEL_SINK",
-        replacement: "set CELLD_OTEL=1 for the fleet bucket or CELLD_OTEL=<collector URL> for OTLP",
+        name: "CELLO_OTEL_SINK",
+        replacement: "set CELLO_OTEL=1 for the fleet bucket or CELLO_OTEL=<collector URL> for OTLP",
         empty_was_inert: false,
     },
     Removed {
-        name: "CELLD_AI_BINDING",
+        name: "CELLO_AI_BINDING",
         replacement: "remove this setting; call the AI provider from application code",
         empty_was_inert: false,
     },
     Removed {
-        name: "CELLD_AI_URL",
+        name: "CELLO_AI_URL",
         replacement: "remove this setting; call the AI provider from application code",
         empty_was_inert: false,
     },
     Removed {
-        name: "CELLD_PACED_HANDOFF",
+        name: "CELLO_PACED_HANDOFF",
         replacement:
-            "remove this setting; celld hands off ownership within CELLD_SHUTDOWN_TOTAL_MS",
+            "remove this setting; celld hands off ownership within CELLO_SHUTDOWN_TOTAL_MS",
         empty_was_inert: false,
     },
     Removed {
-        name: "CELLD_LOG_GROUP_COMMIT_MS",
+        name: "CELLO_LOG_GROUP_COMMIT_MS",
         replacement: "remove this setting; celld uses its built-in Queue batching policy",
         empty_was_inert: false,
     },
     Removed {
-        name: "CELLD_QUEUE_PRODUCER_GROUP_MS",
+        name: "CELLO_QUEUE_PRODUCER_GROUP_MS",
         replacement: "remove this setting; celld uses its built-in Queue batching policy",
         empty_was_inert: false,
     },
     Removed {
-        name: "CELLD_LOG_BUNDLE",
+        name: "CELLO_LOG_BUNDLE",
         replacement: "remove this setting; fleet durability uses bundled tiering",
         empty_was_inert: false,
     },
     Removed {
-        name: "CELLD_PRESENCE_SHADOW",
+        name: "CELLO_PRESENCE_SHADOW",
         replacement:
             "remove this setting; managed presence no longer compares a shadow lease report",
         empty_was_inert: false,
     },
     Removed {
-        name: "CELLD_STORAGE_PROBE",
+        name: "CELLO_STORAGE_PROBE",
         replacement: "remove this setting; celld checks the storage contract before serving",
         empty_was_inert: false,
     },
     Removed {
-        name: "CELLD_EVICTIONS",
+        name: "CELLO_EVICTIONS",
         replacement: "remove this setting; celld uses its built-in scheduling limits",
         empty_was_inert: false,
     },
     Removed {
-        name: "CELLD_LOG_CAPTURE_WORKERS",
+        name: "CELLO_LOG_CAPTURE_WORKERS",
         replacement: "remove this setting; celld uses its built-in scheduling limits",
         empty_was_inert: false,
     },
     Removed {
-        name: "CELLD_REBALANCE_BATCH_CELLS",
+        name: "CELLO_REBALANCE_BATCH_CELLS",
         replacement: "remove this setting; celld uses its built-in scheduling limits",
         empty_was_inert: false,
     },
     Removed {
-        name: "CELLD_CLOUD_RESTART_ON_DEPLOY",
+        name: "CELLO_CLOUD_RESTART_ON_DEPLOY",
         replacement: "remove this setting; managed deployments are adopted in place",
         empty_was_inert: false,
     },
     Removed {
-        name: "CELLD_OUTPUT_GATE",
+        name: "CELLO_OUTPUT_GATE",
         replacement: "remove this setting; celld always waits for durability proof",
         empty_was_inert: false,
     },
     Removed {
-        name: "CELLD_DRAIN_TOKEN_WAIT_MS",
-        replacement: "set only CELLD_SHUTDOWN_TOTAL_MS; celld derives the drain-token wait",
+        name: "CELLO_DRAIN_TOKEN_WAIT_MS",
+        replacement: "set only CELLO_SHUTDOWN_TOTAL_MS; celld derives the drain-token wait",
         // Zero disabled the token wait, and an empty value failed parsing.
         empty_was_inert: false,
     },
     Removed {
-        name: "CELLD_SHUTDOWN_DRAIN_MS",
+        name: "CELLO_SHUTDOWN_DRAIN_MS",
         replacement:
-            "set only CELLD_SHUTDOWN_TOTAL_MS; celld derives the handoff no-progress interval",
+            "set only CELLO_SHUTDOWN_TOTAL_MS; celld derives the handoff no-progress interval",
         empty_was_inert: false,
     },
     Removed {
-        name: "CELLD_MAX_LOADED_WORKERS",
+        name: "CELLO_MAX_LOADED_WORKERS",
         replacement: "remove this setting; celld manages Dynamic Worker admission",
         // Even an empty value failed in the old typed reader. Refuse it rather
         // than silently changing the operator's configured admission policy.
         empty_was_inert: false,
     },
     Removed {
-        name: "CELLD_WORKER_LOADER",
+        name: "CELLO_WORKER_LOADER",
         replacement: "declare `worker_loaders` in the project config",
         // The reader this replaced was
-        // `var("CELLD_WORKER_LOADER").ok().filter(|name| !name.is_empty())`, so
+        // `var("CELLO_WORKER_LOADER").ok().filter(|name| !name.is_empty())`, so
         // an empty value never bound a loader. A deployment system that
         // templates every known name to an empty string must not lose an
         // upgrade on a node that never used the feature.
         empty_was_inert: true,
     },
     Removed {
-        name: "CELLD_VARS_FILE",
+        name: "CELLO_VARS_FILE",
         replacement: "set `vars` in the Wrangler config, or `.dev.vars` for `celld dev`",
-        // The former reader used the path verbatim, so `CELLD_VARS_FILE=`
+        // The former reader used the path verbatim, so `CELLO_VARS_FILE=`
         // selected an empty path and failed instead of doing nothing. An
         // operator must therefore delete the empty setting.
         empty_was_inert: false,
     },
 ];
 
-/// The removed `CELLD_VAR_<NAME>` family. It is a prefix and not a name, so
+/// The removed `CELLO_VAR_<NAME>` family. It is a prefix and not a name, so
 /// the table above cannot hold it: celld never knew which names an operator
 /// used. A node started with any of them would run with no override at all,
 /// which reads inside a Worker as a missing secret with nothing in the log.
 const REMOVED_PREFIX: (&str, &str) = (
-    "CELLD_VAR_",
+    "CELLO_VAR_",
     "set `vars` in the Wrangler config, or `.dev.vars` for `celld dev`",
 );
 
@@ -232,118 +232,118 @@ pub fn validate() -> anyhow::Result<()> {
     }
 
     for name in [
-        "CELLD_CLOUD",
-        "CELLD_LTX_COMPACTION",
-        "CELLD_LTX_PAGED",
-        "CELLD_TRUST_FORWARDED_HEADERS",
-        "CELLD_UNSAFE_PUBLIC_ADVERTISE",
+        "CELLO_CLOUD",
+        "CELLO_LTX_COMPACTION",
+        "CELLO_LTX_PAGED",
+        "CELLO_TRUST_FORWARDED_HEADERS",
+        "CELLO_UNSAFE_PUBLIC_ADVERTISE",
     ] {
         flag(name, false)?;
     }
 
     // Off by default: only an explicit `1` enables. `flag` rejects anything
     // else at startup, so the per-flush read never sees garbage.
-    flag("CELLD_BUCKET_BUNDLES", false)?;
+    flag("CELLO_BUCKET_BUNDLES", false)?;
 
     for name in [
-        "CELLD_ACTIVATIONS",
-        "CELLD_C_TRIM_MB",
-        "CELLD_DEPLOY_POLL_S",
-        "CELLD_FETCH_TIMEOUT_S",
-        "CELLD_HANDLER_BUDGET_S",
-        "CELLD_IDLE_EVICT_S",
-        "CELLD_LOG_PIPELINE",
-        "CELLD_LTX_COMPACTIONS",
-        "CELLD_LTX_COMPACTION_MIN_TXIDS",
-        "CELLD_LTX_DURABILITY_TIMEOUT_SECS",
-        "CELLD_MAX_CELL_REQUESTS",
-        "CELLD_MAX_ASSET_FILE_BYTES",
-        "CELLD_MAX_OUTBOUND_WEBSOCKETS",
-        "CELLD_MAX_REQUEST_BODY_BYTES",
-        "CELLD_MAX_REQUESTS",
-        "CELLD_RECOVERY_RETRY_MS",
-        "CELLD_RECOVERY_RETRIES",
-        "CELLD_MAX_STATELESS_ISOLATES",
-        "CELLD_OPERATION_DEADLINE_MS",
-        "CELLD_SQL_STATEMENT_MS",
-        "CELLD_PLACEMENT_WEIGHT",
-        "CELLD_RELEASES",
-        "CELLD_SQLITE_CACHE_KB",
-        "CELLD_TOKIO_THREADS",
-        "CELLD_TTL_MS",
-        "CELLD_TMP_MAX_BYTES",
-        "CELLD_WAKER_TICK_MS",
+        "CELLO_ACTIVATIONS",
+        "CELLO_C_TRIM_MB",
+        "CELLO_DEPLOY_POLL_S",
+        "CELLO_FETCH_TIMEOUT_S",
+        "CELLO_HANDLER_BUDGET_S",
+        "CELLO_IDLE_EVICT_S",
+        "CELLO_LOG_PIPELINE",
+        "CELLO_LTX_COMPACTIONS",
+        "CELLO_LTX_COMPACTION_MIN_TXIDS",
+        "CELLO_LTX_DURABILITY_TIMEOUT_SECS",
+        "CELLO_MAX_CELL_REQUESTS",
+        "CELLO_MAX_ASSET_FILE_BYTES",
+        "CELLO_MAX_OUTBOUND_WEBSOCKETS",
+        "CELLO_MAX_REQUEST_BODY_BYTES",
+        "CELLO_MAX_REQUESTS",
+        "CELLO_RECOVERY_RETRY_MS",
+        "CELLO_RECOVERY_RETRIES",
+        "CELLO_MAX_STATELESS_ISOLATES",
+        "CELLO_OPERATION_DEADLINE_MS",
+        "CELLO_SQL_STATEMENT_MS",
+        "CELLO_PLACEMENT_WEIGHT",
+        "CELLO_RELEASES",
+        "CELLO_SQLITE_CACHE_KB",
+        "CELLO_TOKIO_THREADS",
+        "CELLO_TTL_MS",
+        "CELLO_TMP_MAX_BYTES",
+        "CELLO_WAKER_TICK_MS",
     ] {
         positive::<u64>(name)?;
     }
 
     for name in [
-        "CELLD_ADMISSION_WAIT_MS",
-        "CELLD_ALARM_RESIDENT_MS",
-        "CELLD_ASSET_CACHE_BYTES",
-        "CELLD_CACHE_MAX_BYTES",
-        "CELLD_DEPLOY_MAX_AGE_S",
-        "CELLD_LOCAL_CACHE_MAX_BYTES",
-        "CELLD_LTX_TRUNCATE_PAGES",
-        "CELLD_LTX_RETENTION_SECS",
-        "CELLD_LOG_HEDGE_MS",
-        "CELLD_LOG_WINDOW",
-        "CELLD_LOG_WINDOW_BYTES",
-        "CELLD_MAX_RESIDENT_CELLS",
-        "CELLD_MAX_RSS_MB",
-        "CELLD_READY_FLEET_GATE_MS",
-        "CELLD_REBALANCE_INTERVAL_MS",
+        "CELLO_ADMISSION_WAIT_MS",
+        "CELLO_ALARM_RESIDENT_MS",
+        "CELLO_ASSET_CACHE_BYTES",
+        "CELLO_CACHE_MAX_BYTES",
+        "CELLO_DEPLOY_MAX_AGE_S",
+        "CELLO_LOCAL_CACHE_MAX_BYTES",
+        "CELLO_LTX_TRUNCATE_PAGES",
+        "CELLO_LTX_RETENTION_SECS",
+        "CELLO_LOG_HEDGE_MS",
+        "CELLO_LOG_WINDOW",
+        "CELLO_LOG_WINDOW_BYTES",
+        "CELLO_MAX_RESIDENT_CELLS",
+        "CELLO_MAX_RSS_MB",
+        "CELLO_READY_FLEET_GATE_MS",
+        "CELLO_REBALANCE_INTERVAL_MS",
     ] {
         optional::<u64>(name)?;
     }
 
     shutdown_timing()?;
 
-    positive::<usize>("CELLD_MAX_DYNAMIC_WORKER_CODE_BYTES")?;
-    positive::<usize>("CELLD_MAX_CELLS_PER_ISOLATE")?;
+    positive::<usize>("CELLO_MAX_DYNAMIC_WORKER_CODE_BYTES")?;
+    positive::<usize>("CELLO_MAX_CELLS_PER_ISOLATE")?;
 
-    if let Some(value) = optional::<u64>("CELLD_PRESENCE_HEARTBEAT_MS")? {
+    if let Some(value) = optional::<u64>("CELLO_PRESENCE_HEARTBEAT_MS")? {
         if !(50..=30_000).contains(&value) {
-            bail!("CELLD_PRESENCE_HEARTBEAT_MS must be between 50 and 30000, not {value}");
+            bail!("CELLO_PRESENCE_HEARTBEAT_MS must be between 50 and 30000, not {value}");
         }
     }
 
-    if let Some(megabytes) = positive::<usize>("CELLD_V8_HEAP_LIMIT_MB")? {
+    if let Some(megabytes) = positive::<usize>("CELLO_V8_HEAP_LIMIT_MB")? {
         if megabytes.checked_mul(1024 * 1024).is_none() {
-            bail!("CELLD_V8_HEAP_LIMIT_MB is too large: {megabytes}");
+            bail!("CELLO_V8_HEAP_LIMIT_MB is too large: {megabytes}");
         }
     }
 
-    if let Some(value) = value("CELLD_LOG_TRANSPORT")? {
+    if let Some(value) = value("CELLO_LOG_TRANSPORT")? {
         if !matches!(value.as_str(), "http" | "stream") {
-            bail!("CELLD_LOG_TRANSPORT must be http or stream, not {value:?}");
+            bail!("CELLO_LOG_TRANSPORT must be http or stream, not {value:?}");
         }
     }
 
     // The tenant egress policy refuses to boot on invalid values: an
-    // operator who misspells CELLD_EGRESS opted into a policy, and
+    // operator who misspells CELLO_EGRESS opted into a policy, and
     // silently running open (or closed) would betray that intent.
     if let Err(error) = crate::egress::EgressPolicy::from_env() {
         bail!("{error}");
     }
 
-    if let Some(value) = value("CELLD_PRESSURE_OWNERSHIP")? {
+    if let Some(value) = value("CELLO_PRESSURE_OWNERSHIP")? {
         if !matches!(value.as_str(), "release" | "sticky") {
-            bail!("CELLD_PRESSURE_OWNERSHIP must be release or sticky, not {value:?}");
+            bail!("CELLO_PRESSURE_OWNERSHIP must be release or sticky, not {value:?}");
         }
     }
-    if let Some(value) = value("CELLD_MEMORY_SCOPE")? {
+    if let Some(value) = value("CELLO_MEMORY_SCOPE")? {
         if !matches!(value.as_str(), "container" | "self") {
-            bail!("CELLD_MEMORY_SCOPE must be container or self, not {value:?}");
+            bail!("CELLO_MEMORY_SCOPE must be container or self, not {value:?}");
         }
     }
-    if let Some(value) = value("CELLD_CACHE_SCOPE")? {
+    if let Some(value) = value("CELLO_CACHE_SCOPE")? {
         if !matches!(value.as_str(), "script" | "deployment") {
-            bail!("CELLD_CACHE_SCOPE must be script or deployment, not {value:?}");
+            bail!("CELLO_CACHE_SCOPE must be script or deployment, not {value:?}");
         }
     }
-    if let Some(node) = value("CELLD_NODE")? {
-        crate::machine::validate_node_name(&node).map_err(|error| anyhow!("CELLD_NODE {error}"))?;
+    if let Some(node) = value("CELLO_NODE")? {
+        crate::machine::validate_node_name(&node).map_err(|error| anyhow!("CELLO_NODE {error}"))?;
     }
     // All-or-nothing, so a node never reads a deployment with a partial
     // credential pair (see `deploy_credentials`).
@@ -356,7 +356,7 @@ pub fn validate() -> anyhow::Result<()> {
 /// no-progress interval is five eighths, with a one-millisecond minimum.
 /// The process deadline still caps every shutdown phase and progress reset.
 pub fn shutdown_timing() -> anyhow::Result<ShutdownTiming> {
-    let total_ms = positive("CELLD_SHUTDOWN_TOTAL_MS")?.unwrap_or(DEFAULT_SHUTDOWN_TOTAL_MS);
+    let total_ms = positive("CELLO_SHUTDOWN_TOTAL_MS")?.unwrap_or(DEFAULT_SHUTDOWN_TOTAL_MS);
     Ok(ShutdownTiming::from_total_ms(total_ms))
 }
 
@@ -379,20 +379,20 @@ fn deploy_credentials_from(
     get: impl Fn(&str) -> anyhow::Result<Option<String>>,
 ) -> anyhow::Result<Option<(String, String, Option<String>)>> {
     let get = |name: &str| get(name).map(|value| value.filter(|value| !value.is_empty()));
-    let access_key_id = get("CELLD_DEPLOY_AWS_ACCESS_KEY_ID")?;
-    let secret_access_key = get("CELLD_DEPLOY_AWS_SECRET_ACCESS_KEY")?;
-    let session_token = get("CELLD_DEPLOY_AWS_SESSION_TOKEN")?;
+    let access_key_id = get("CELLO_DEPLOY_AWS_ACCESS_KEY_ID")?;
+    let secret_access_key = get("CELLO_DEPLOY_AWS_SECRET_ACCESS_KEY")?;
+    let session_token = get("CELLO_DEPLOY_AWS_SESSION_TOKEN")?;
     match (access_key_id, secret_access_key) {
         (None, None) if session_token.is_none() => Ok(None),
         (None, None) => bail!(
-            "CELLD_DEPLOY_AWS_SESSION_TOKEN needs CELLD_DEPLOY_AWS_ACCESS_KEY_ID and \
-             CELLD_DEPLOY_AWS_SECRET_ACCESS_KEY"
+            "CELLO_DEPLOY_AWS_SESSION_TOKEN needs CELLO_DEPLOY_AWS_ACCESS_KEY_ID and \
+             CELLO_DEPLOY_AWS_SECRET_ACCESS_KEY"
         ),
         (Some(_), None) => bail!(
-            "CELLD_DEPLOY_AWS_ACCESS_KEY_ID is set without CELLD_DEPLOY_AWS_SECRET_ACCESS_KEY"
+            "CELLO_DEPLOY_AWS_ACCESS_KEY_ID is set without CELLO_DEPLOY_AWS_SECRET_ACCESS_KEY"
         ),
         (None, Some(_)) => bail!(
-            "CELLD_DEPLOY_AWS_SECRET_ACCESS_KEY is set without CELLD_DEPLOY_AWS_ACCESS_KEY_ID"
+            "CELLO_DEPLOY_AWS_SECRET_ACCESS_KEY is set without CELLO_DEPLOY_AWS_ACCESS_KEY_ID"
         ),
         (Some(access_key_id), Some(secret_access_key)) => {
             Ok(Some((access_key_id, secret_access_key, session_token)))
@@ -503,8 +503,8 @@ mod deploy_credential_tests {
     #[test]
     fn the_pair_rides_together() {
         let parsed = parse(&[
-            ("CELLD_DEPLOY_AWS_ACCESS_KEY_ID", "id"),
-            ("CELLD_DEPLOY_AWS_SECRET_ACCESS_KEY", "secret"),
+            ("CELLO_DEPLOY_AWS_ACCESS_KEY_ID", "id"),
+            ("CELLO_DEPLOY_AWS_SECRET_ACCESS_KEY", "secret"),
         ])
         .unwrap();
         assert_eq!(parsed, Some(("id".into(), "secret".into(), None)));
@@ -513,9 +513,9 @@ mod deploy_credential_tests {
     #[test]
     fn the_session_token_rides_with_the_pair() {
         let parsed = parse(&[
-            ("CELLD_DEPLOY_AWS_ACCESS_KEY_ID", "id"),
-            ("CELLD_DEPLOY_AWS_SECRET_ACCESS_KEY", "secret"),
-            ("CELLD_DEPLOY_AWS_SESSION_TOKEN", "token"),
+            ("CELLO_DEPLOY_AWS_ACCESS_KEY_ID", "id"),
+            ("CELLO_DEPLOY_AWS_SECRET_ACCESS_KEY", "secret"),
+            ("CELLO_DEPLOY_AWS_SESSION_TOKEN", "token"),
         ])
         .unwrap();
         assert_eq!(
@@ -527,9 +527,9 @@ mod deploy_credential_tests {
     #[test]
     fn a_partial_pair_is_a_configuration_error() {
         for pairs in [
-            vec![("CELLD_DEPLOY_AWS_ACCESS_KEY_ID", "id")],
-            vec![("CELLD_DEPLOY_AWS_SECRET_ACCESS_KEY", "secret")],
-            vec![("CELLD_DEPLOY_AWS_SESSION_TOKEN", "token")],
+            vec![("CELLO_DEPLOY_AWS_ACCESS_KEY_ID", "id")],
+            vec![("CELLO_DEPLOY_AWS_SECRET_ACCESS_KEY", "secret")],
+            vec![("CELLO_DEPLOY_AWS_SESSION_TOKEN", "token")],
         ] {
             assert!(parse(&pairs).is_err(), "{pairs:?} must not parse");
         }
@@ -538,8 +538,8 @@ mod deploy_credential_tests {
     #[test]
     fn an_empty_value_is_unset() {
         let parsed = parse(&[
-            ("CELLD_DEPLOY_AWS_ACCESS_KEY_ID", ""),
-            ("CELLD_DEPLOY_AWS_SECRET_ACCESS_KEY", ""),
+            ("CELLO_DEPLOY_AWS_ACCESS_KEY_ID", ""),
+            ("CELLO_DEPLOY_AWS_SECRET_ACCESS_KEY", ""),
         ])
         .unwrap();
         assert_eq!(parsed, None);

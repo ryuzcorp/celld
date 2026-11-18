@@ -58,7 +58,7 @@ pub(crate) fn blob_key(bucket_name: &str, key: &str) -> String {
 /// The fleet bucket, or the error every op answers without one.
 pub(crate) fn store() -> Result<&'static Bucket, String> {
     R2_STORE.get().ok_or_else(|| {
-        "R2 bindings need a fleet bucket: start celld with --bucket (or CELLD_BUCKET)".to_string()
+        "R2 bindings need a fleet bucket: start celld with --bucket (or CELLO_BUCKET)".to_string()
     })
 }
 

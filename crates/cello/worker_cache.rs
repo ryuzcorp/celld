@@ -18,15 +18,15 @@
 //!
 //! - Isolation: the key starts with a scope the host read from isolate
 //!   state, never from script input, so no script can name another scope's
-//!   entries. `CELLD_CACHE_SCOPE=script` (the default) scopes by script
+//!   entries. `CELLO_CACHE_SCOPE=script` (the default) scopes by script
 //!   name: a node serves one fleet from one process, which makes the
-//!   script name the whole tenant boundary. `CELLD_CACHE_SCOPE=deployment`
+//!   script name the whole tenant boundary. `CELLO_CACHE_SCOPE=deployment`
 //!   scopes by the serving deployment's identity instead, so every script
 //!   of the deployment shares one `caches.default` and one set of
 //!   `caches.open(name)` namespaces, like one Cloudflare zone — and every
 //!   script of the deployment can read, overwrite, and purge every other
 //!   script's entries, which is why the scope is opt-in.
-//! - Memory: each scope is capped by `CELLD_CACHE_MAX_BYTES` (64 MiB by
+//! - Memory: each scope is capped by `CELLO_CACHE_MAX_BYTES` (64 MiB by
 //!   default, 0 disables the cache) with least-recently-used eviction, and
 //!   one entry can never exceed `MAX_ENTRY_BYTES`. Every byte an entry
 //!   accounts is measured from the stored key, headers, and body plus a
@@ -40,7 +40,7 @@ use std::sync::{Mutex, OnceLock};
 
 /// Default process-wide cache size: large enough for API responses, small
 /// enough to never surprise an operator. Overridden by
-/// `CELLD_CACHE_MAX_BYTES`.
+/// `CELLO_CACHE_MAX_BYTES`.
 pub const DEFAULT_MAX_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Largest single entry, body plus headers plus key. An entry above this
@@ -71,7 +71,7 @@ const HEADER_OVERHEAD_BYTES: u64 = 96;
 pub fn max_bytes() -> u64 {
     static LIMIT: OnceLock<Result<u64, String>> = OnceLock::new();
     LIMIT
-        .get_or_init(|| parse_max_bytes(std::env::var("CELLD_CACHE_MAX_BYTES").ok()))
+        .get_or_init(|| parse_max_bytes(std::env::var("CELLO_CACHE_MAX_BYTES").ok()))
         .as_ref()
         .copied()
         .unwrap_or_else(|error| panic!("{error}"))
@@ -83,11 +83,11 @@ fn parse_max_bytes(value: Option<String>) -> Result<u64, String> {
     };
     value
         .parse::<u64>()
-        .map_err(|error| format!("CELLD_CACHE_MAX_BYTES has invalid value {value:?}: {error}"))
+        .map_err(|error| format!("CELLO_CACHE_MAX_BYTES has invalid value {value:?}: {error}"))
 }
 
 /// Which entries a cache op addresses: one script's, or the serving
-/// deployment's. Read from `CELLD_CACHE_SCOPE`, resolved once per process.
+/// deployment's. Read from `CELLO_CACHE_SCOPE`, resolved once per process.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CacheScope {
     Script,
@@ -102,7 +102,7 @@ pub enum CacheScope {
 pub fn cache_scope() -> CacheScope {
     static SCOPE: OnceLock<Result<CacheScope, String>> = OnceLock::new();
     SCOPE
-        .get_or_init(|| parse_cache_scope(std::env::var("CELLD_CACHE_SCOPE").ok()))
+        .get_or_init(|| parse_cache_scope(std::env::var("CELLO_CACHE_SCOPE").ok()))
         .as_ref()
         .copied()
         .unwrap_or_else(|error| panic!("{error}"))
@@ -116,7 +116,7 @@ fn parse_cache_scope(value: Option<String>) -> Result<CacheScope, String> {
         "script" => Ok(CacheScope::Script),
         "deployment" => Ok(CacheScope::Deployment),
         _ => Err(format!(
-            "CELLD_CACHE_SCOPE must be script or deployment, not {value:?}"
+            "CELLO_CACHE_SCOPE must be script or deployment, not {value:?}"
         )),
     }
 }
@@ -885,7 +885,7 @@ fn parse_ranges(header: &str, len: u64) -> RangeOutcome {
 /// deployment — the fleet's bucket identity plus the serving deployment's
 /// identity. Script scope keeps today's single node budget with per-script
 /// entry keys, byte for byte; each deployment scope carries its own
-/// `CELLD_CACHE_MAX_BYTES` budget and recency, so one deployment's writes
+/// `CELLO_CACHE_MAX_BYTES` budget and recency, so one deployment's writes
 /// never evict another's and a drained deployment's entries leave with it
 /// (see `purge_deployment_scope`).
 struct Store {

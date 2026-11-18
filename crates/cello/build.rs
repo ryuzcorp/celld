@@ -1,9 +1,9 @@
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
-// Modified by ryuzcorp (ryuzcorp/celld): bake CELLD_VERSION into the binary for --version.
+// Modified by ryuzcorp (ryuzcorp/celld): bake CELLO_VERSION into the binary for --version.
 
-//! Bake the full build version into `CELLD_VERSION` for `version::version`.
+//! Bake the full build version into `CELLO_VERSION` for `version::version`.
 //!
-//! Release builds set `CELLD_VERSION` (`<version>-ryuzcorp.<n>`, and
+//! Release builds set `CELLO_VERSION` (`<version>-ryuzcorp.<n>`, and
 //! `<version>-ryuzcorp.ci` in CI); a plain `cargo build` leaves it unset
 //! and the binary reports the crate version instead.
 
@@ -12,9 +12,9 @@ fn main() {
     // through an explicit stdout handle instead.
     let mut stdout = std::io::stdout();
     use std::io::Write as _;
-    writeln!(stdout, "cargo:rerun-if-env-changed=CELLD_VERSION")
+    writeln!(stdout, "cargo:rerun-if-env-changed=CELLO_VERSION")
         .expect("write the rerun directive");
-    let version = std::env::var("CELLD_VERSION")
+    let version = std::env::var("CELLO_VERSION")
         .ok()
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| {
@@ -29,7 +29,7 @@ fn main() {
                 .bytes()
                 .all(|byte| byte.is_ascii_alphanumeric()
                     || matches!(byte, b'.' | b'-' | b'+' | b'_')),
-        "CELLD_VERSION must contain only [0-9A-Za-z._+-], got {version:?}"
+        "CELLO_VERSION must contain only [0-9A-Za-z._+-], got {version:?}"
     );
-    writeln!(stdout, "cargo:rustc-env=CELLD_VERSION={version}").expect("write the version");
+    writeln!(stdout, "cargo:rustc-env=CELLO_VERSION={version}").expect("write the version");
 }

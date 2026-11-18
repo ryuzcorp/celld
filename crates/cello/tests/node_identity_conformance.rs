@@ -7,10 +7,10 @@
 // injected clock/filesystem/async rules do not apply to it.
 #![allow(clippy::disallowed_methods)]
 
-//! A bundle learns the name of the node it runs on through `env.CELLD_NODE`
+//! A bundle learns the name of the node it runs on through `env.CELLO_NODE`
 //! (denoland/celld#219): the host injects its own identity after every
 //! deployment binding, and deployments cannot bind the name. The node boots
-//! with an explicit `CELLD_NODE`, serves the fixture Worker, and the Worker
+//! with an explicit `CELLO_NODE`, serves the fixture Worker, and the Worker
 //! echoes the value back.
 
 mod common;
@@ -64,10 +64,10 @@ impl TestNode {
             // `RUST_LOG=error` would suppress the lease records boot waits
             // for. Pin the filter the default path already uses.
             .env("RUST_LOG", "info")
-            // An ambient `CELLD_DEV_STATE` would pull the child's state out
+            // An ambient `CELLO_DEV_STATE` would pull the child's state out
             // of the temporary project and leave `objects.sqlite3` behind.
             // Drop it so the child keeps the normal project-local state.
-            .env_remove("CELLD_DEV_STATE")
+            .env_remove("CELLO_DEV_STATE")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         let mut child = command.spawn().expect("spawn celld dev");
@@ -94,7 +94,7 @@ impl TestNode {
             let public = announced(&announced_lines, "celld listening on ")?;
             // The serving child logs its lease attempts with its own node
             // name (`node=<name>`); the supervisor names the child
-            // `dev-<project hash>` through `CELLD_NODE`, so the two agree.
+            // `dev-<project hash>` through `CELLO_NODE`, so the two agree.
             let node_name = announced_lines
                 .lock()
                 .expect("announce lock")
@@ -188,6 +188,6 @@ fn worker_reads_its_node_name_from_env() {
     assert_eq!(
         reply["node"],
         node.node_name.as_str(),
-        "env.CELLD_NODE must name the serving node: {reply}"
+        "env.CELLO_NODE must name the serving node: {reply}"
     );
 }

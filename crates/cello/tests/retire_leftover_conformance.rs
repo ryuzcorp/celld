@@ -92,8 +92,8 @@ impl TestNode {
             .env("NO_COLOR", "1")
             // Seconds, not the 30 s default: the test watches one budget
             // pass, not a production ceiling.
-            .env("CELLD_BACKGROUND_BUDGET_S", "5")
-            .env("CELLD_OPERATOR_TOKEN", TOKEN)
+            .env("CELLO_BACKGROUND_BUDGET_S", "5")
+            .env("CELLO_OPERATOR_TOKEN", TOKEN)
             .arg(project)
             .arg("--port")
             .arg("0")

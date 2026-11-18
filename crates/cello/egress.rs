@@ -9,14 +9,14 @@
 
 //! Tenant egress policy: which addresses Worker code may dial.
 //!
-//! `CELLD_EGRESS=open` (the default) preserves today's behavior: Worker
+//! `CELLO_EGRESS=open` (the default) preserves today's behavior: Worker
 //! `fetch()`, `connect()` sockets, and outbound WebSockets may reach any
-//! address. `CELLD_EGRESS=public` refuses dials to every non-public
+//! address. `CELLO_EGRESS=public` refuses dials to every non-public
 //! address: loopback, private (RFC 1918), link-local, carrier-grade NAT
 //! (RFC 6598), IPv6 unique-local, unspecified, multicast, reserved
 //! (`240.0.0.0/4`), the IPv4-mapped and transition-embedded (NAT64, 6to4,
 //! Teredo, IPv4-compatible) forms of those, and the cloud metadata
-//! address. `CELLD_EGRESS_ALLOW` lists operator-permitted exceptions as
+//! address. `CELLO_EGRESS_ALLOW` lists operator-permitted exceptions as
 //! comma-separated CIDRs (any port) or `host:port` pairs (that host on
 //! that port only), for example the object store endpoint a deployment
 //! keeps on a private address.
@@ -81,7 +81,7 @@ use std::time::{Duration, Instant};
 
 /// Prefix on every fetch refusal the host hands to JavaScript. The
 /// harness strips it and raises `TypeError`; nothing else may emit it.
-pub const FETCH_REFUSAL_MARKER: &str = "CELLD_EGRESS_REFUSED:";
+pub const FETCH_REFUSAL_MARKER: &str = "CELLO_EGRESS_REFUSED:";
 
 /// How long a hostname resolution is shared between the pre-send check
 /// and the reqwest resolver: long enough that one fetch resolves once,
@@ -96,7 +96,7 @@ const RESOLUTION_TTL: Duration = Duration::from_secs(5);
 /// re-resolution.
 const RESOLUTION_CACHE_CAP: usize = 1024;
 
-/// `CELLD_EGRESS`: the tenant egress mode.
+/// `CELLO_EGRESS`: the tenant egress mode.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EgressMode {
     /// Workers may dial anything. Today's behavior, and the default.
@@ -106,7 +106,7 @@ pub enum EgressMode {
     Public,
 }
 
-/// One `CELLD_EGRESS_ALLOW` entry.
+/// One `CELLO_EGRESS_ALLOW` entry.
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum AllowEntry {
     /// A subnet (or bare IP, which parses as a host route): any port.
@@ -162,7 +162,7 @@ impl EgressMode {
             "open" => Ok(EgressMode::Open),
             "public" => Ok(EgressMode::Public),
             other => Err(format!(
-                "CELLD_EGRESS must be `open` or `public`, not {other:?}"
+                "CELLO_EGRESS must be `open` or `public`, not {other:?}"
             )),
         }
     }
@@ -266,7 +266,7 @@ fn parse_allow_list(value: &str) -> Result<Vec<AllowEntry>, String> {
             let entry = entry.trim();
             if entry.is_empty() {
                 return Err(
-                    "CELLD_EGRESS_ALLOW has an empty entry; remove the stray comma".to_string(),
+                    "CELLO_EGRESS_ALLOW has an empty entry; remove the stray comma".to_string(),
                 );
             }
             parse_allow_entry(entry)
@@ -275,20 +275,20 @@ fn parse_allow_list(value: &str) -> Result<Vec<AllowEntry>, String> {
 }
 
 impl EgressPolicy {
-    /// Parse the policy from the environment. Unset `CELLD_EGRESS` means
-    /// `open`; unset or empty `CELLD_EGRESS_ALLOW` means no exceptions.
+    /// Parse the policy from the environment. Unset `CELLO_EGRESS` means
+    /// `open`; unset or empty `CELLO_EGRESS_ALLOW` means no exceptions.
     /// Startup validation refuses to boot on an invalid value, so a
     /// runtime parse failure here means validation was skipped.
     pub fn from_env() -> Result<Self, String> {
-        let mode = match std::env::var("CELLD_EGRESS") {
+        let mode = match std::env::var("CELLO_EGRESS") {
             Ok(value) => Some(value),
             Err(std::env::VarError::NotPresent) => None,
-            Err(error) => return Err(format!("read CELLD_EGRESS: {error}")),
+            Err(error) => return Err(format!("read CELLO_EGRESS: {error}")),
         };
-        let allow = match std::env::var("CELLD_EGRESS_ALLOW") {
+        let allow = match std::env::var("CELLO_EGRESS_ALLOW") {
             Ok(value) => Some(value),
             Err(std::env::VarError::NotPresent) => None,
-            Err(error) => return Err(format!("read CELLD_EGRESS_ALLOW: {error}")),
+            Err(error) => return Err(format!("read CELLO_EGRESS_ALLOW: {error}")),
         };
         Self::from_values(mode.as_deref(), allow.as_deref())
     }
@@ -320,7 +320,7 @@ impl EgressPolicy {
                 Err(error) => {
                     tracing::error!(
                         error = %error,
-                        "invalid egress configuration; failing closed to CELLD_EGRESS=public"
+                        "invalid egress configuration; failing closed to CELLO_EGRESS=public"
                     );
                     closed_policy()
                 }
@@ -351,13 +351,13 @@ impl std::fmt::Display for EgressRefusal {
         {
             write!(
                 f,
-                "egress policy refused {}: {}; CELLD_EGRESS=public",
+                "egress policy refused {}: {}; CELLO_EGRESS=public",
                 self.ip, self.reason
             )
         } else {
             write!(
                 f,
-                "egress policy refused {} ({}): {}; CELLD_EGRESS=public",
+                "egress policy refused {} ({}): {}; CELLO_EGRESS=public",
                 self.host, self.ip, self.reason
             )
         }
@@ -1326,7 +1326,7 @@ mod tests {
     #[test]
     fn policy_values_default_to_open_with_no_exceptions() {
         // The values, not the process environment: no test in this
-        // binary mutates `CELLD_EGRESS`/`CELLD_EGRESS_ALLOW`, so parallel
+        // binary mutates `CELLO_EGRESS`/`CELLO_EGRESS_ALLOW`, so parallel
         // tests cannot observe each other's configuration.
         let policy = EgressPolicy::from_values(None, None).unwrap();
         assert!(policy.is_open());
@@ -1635,7 +1635,7 @@ mod tests {
             panic!("all-private hostnames must be refused");
         };
         assert!(refusal.to_string().contains("egress-denied-1.test"));
-        assert!(refusal.to_string().contains("CELLD_EGRESS=public"));
+        assert!(refusal.to_string().contains("CELLO_EGRESS=public"));
         clear_test_dns("egress-denied-1.test");
     }
 
@@ -1812,7 +1812,7 @@ mod tests {
         };
         assert_eq!(
             literal.to_string(),
-            "egress policy refused 10.0.0.1: private addresses are blocked; CELLD_EGRESS=public"
+            "egress policy refused 10.0.0.1: private addresses are blocked; CELLO_EGRESS=public"
         );
         let named = EgressRefusal {
             host: "evil.example".to_string(),

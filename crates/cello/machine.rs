@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): validate CELLD_MEMORY_SCOPE; pin the node-session id in the data dir (upstream #249).
+// Modified by ryuzcorp (ryuzcorp/celld): validate CELLO_MEMORY_SCOPE; pin the node-session id in the data dir (upstream #249).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! What the process can learn about where it is running.
@@ -26,7 +26,7 @@ pub(crate) fn validate_node_name(node: &str) -> anyhow::Result<()> {
 /// id across restarts (upstream #249).
 pub const NODE_ID_FILE: &str = "node-id";
 
-/// Resolve the node-session id: an explicit `CELLD_NODE` wins outright and
+/// Resolve the node-session id: an explicit `CELLO_NODE` wins outright and
 /// is recorded for the next boot; otherwise reuse the id the data directory
 /// already pins, generating and pinning one on first boot. The pin lives
 /// beside the follower fragments, so the id and the disks it recovers share
@@ -155,12 +155,12 @@ pub fn random_process_generation() -> String {
 }
 
 /// Watermarks from celld's public environment contract.
-/// `CELLD_PRESSURE_OWNERSHIP`: `release` (the default) or `sticky`.
+/// `CELLO_PRESSURE_OWNERSHIP`: `release` (the default) or `sticky`.
 /// The lease lifetime, as the capacity listing needs it to decide which node
 /// records are stale enough to skip reading. Same variable and default the
 /// lease itself uses.
 /// Concurrent outbound WebSockets one cell may hold
-/// (`CELLD_MAX_OUTBOUND_WEBSOCKETS`).
+/// (`CELLO_MAX_OUTBOUND_WEBSOCKETS`).
 pub const DEFAULT_MAX_OUTBOUND_WEBSOCKETS: usize = 32;
 
 /// Backoff between dead-owner log recovery retries. One second keeps a
@@ -183,24 +183,24 @@ pub const DEFAULT_LOCAL_CACHE_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 pub const PEER_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
 pub fn lease_ttl_ms_from_environment() -> u64 {
-    crate::env_vars::positive_or("CELLD_TTL_MS", 10_000).expect("validated CELLD_TTL_MS")
+    crate::env_vars::positive_or("CELLO_TTL_MS", 10_000).expect("validated CELLO_TTL_MS")
 }
 
 pub fn ownership_on_evict_from_environment() -> anyhow::Result<OwnershipOnEvict> {
-    match std::env::var("CELLD_PRESSURE_OWNERSHIP") {
+    match std::env::var("CELLO_PRESSURE_OWNERSHIP") {
         Err(_) => Ok(OwnershipOnEvict::Release),
         Ok(value) => match value.trim() {
             "release" => Ok(OwnershipOnEvict::Release),
             "sticky" => Ok(OwnershipOnEvict::Sticky),
             other => Err(anyhow::anyhow!(
-                "CELLD_PRESSURE_OWNERSHIP must be `release` or `sticky`, not `{other}`"
+                "CELLO_PRESSURE_OWNERSHIP must be `release` or `sticky`, not `{other}`"
             )),
         },
     }
 }
 
 /// Total memory this process may use: the cgroup limit when one applies
-/// (containers; the process leaf's under `CELLD_MEMORY_SCOPE=self`), the
+/// (containers; the process leaf's under `CELLO_MEMORY_SCOPE=self`), the
 /// machine otherwise.
 #[cfg(target_os = "linux")]
 #[allow(clippy::disallowed_methods)] // cgroup and `/proc` files describe the host.
@@ -241,7 +241,7 @@ fn total_memory_bytes() -> Option<u64> {
 }
 
 pub fn pressure_config_from_environment() -> anyhow::Result<cello_logic::pressure::PressureConfig> {
-    // Residency is a hard cap (`CELLD_MAX_RESIDENT_CELLS` -> `Config::max_resident`),
+    // Residency is a hard cap (`CELLO_MAX_RESIDENT_CELLS` -> `Config::max_resident`),
     // enforced at admission -- not a pressure watermark, so it is not built here.
     // Memory shedding is on by default: a node that runs into its memory ceiling
     // must give cells back, not be killed. The arithmetic lives in the core;
@@ -252,13 +252,13 @@ pub fn pressure_config_from_environment() -> anyhow::Result<cello_logic::pressur
     crate::memory::MemoryScope::from_environment()?;
     let config = cello_logic::pressure::PressureConfig::from_limits(
         total_memory_bytes(),
-        crate::env_vars::optional::<u64>("CELLD_MAX_RSS_MB")?,
+        crate::env_vars::optional::<u64>("CELLO_MAX_RSS_MB")?,
     );
     if config.ceiling_above_cap() {
         tracing::warn!(
             high_bytes = config.high_bytes,
             rss_hard_bytes = config.rss_hard_bytes,
-            "CELLD_MAX_RSS_MB is at or above the absolute cap, so the node \
+            "CELLO_MAX_RSS_MB is at or above the absolute cap, so the node \
              decides on its complete cgroup charge or RSS fallback"
         );
     }
@@ -267,7 +267,7 @@ pub fn pressure_config_from_environment() -> anyhow::Result<cello_logic::pressur
 
 pub fn local_cache_max_bytes_from_environment() -> anyhow::Result<Option<u64>> {
     let bytes = crate::env_vars::with_default(
-        "CELLD_LOCAL_CACHE_MAX_BYTES",
+        "CELLO_LOCAL_CACHE_MAX_BYTES",
         DEFAULT_LOCAL_CACHE_MAX_BYTES,
     )?;
     Ok((bytes > 0).then_some(bytes))
@@ -275,7 +275,7 @@ pub fn local_cache_max_bytes_from_environment() -> anyhow::Result<Option<u64>> {
 
 #[cfg(all(test, cello_internal_tests))]
 mod internal_tests {
-    include!(env!("CELLD_INTERNAL_MACHINE_TESTS"));
+    include!(env!("CELLO_INTERNAL_MACHINE_TESTS"));
 }
 
 #[cfg(test)]
@@ -283,7 +283,7 @@ mod internal_tests {
 mod node_id_tests {
     use super::*;
 
-    /// An explicit CELLD_NODE wins and is recorded for the next boot.
+    /// An explicit CELLO_NODE wins and is recorded for the next boot.
     #[test]
     fn explicit_id_wins_and_is_recorded() {
         let dir = tempfile::tempdir().expect("test dir");

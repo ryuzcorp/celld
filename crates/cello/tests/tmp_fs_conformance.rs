@@ -66,7 +66,7 @@ impl TestNode {
     }
 
     /// Boot with extra process environment, so a test can set a knob such
-    /// as `CELLD_TMP_MAX_BYTES` for the node under test.
+    /// as `CELLO_TMP_MAX_BYTES` for the node under test.
     fn boot_with_env(app_project: &Path, extra_env: &[(&str, &str)]) -> Self {
         let mut command = Command::new(cello_binary());
         for (key, value) in extra_env {
@@ -340,7 +340,7 @@ fn tmp_cap_rejects_over_cap_writes_with_enospc() {
     let fixture = fixture_dir();
     let project = fixture_tempdir("celld-tmp-cap-");
     copy_dir(&fixture, project.path());
-    let node = TestNode::boot_with_env(project.path(), &[("CELLD_TMP_MAX_BYTES", "256")]);
+    let node = TestNode::boot_with_env(project.path(), &[("CELLO_TMP_MAX_BYTES", "256")]);
 
     let out = get_json(&node.public, "/cap-write?bytes=16");
     let body = out.to_string();
@@ -366,7 +366,7 @@ fn tmp_cap_counts_overwrites_and_appends() {
     let fixture = fixture_dir();
     let project = fixture_tempdir("celld-tmp-cap-");
     copy_dir(&fixture, project.path());
-    let node = TestNode::boot_with_env(project.path(), &[("CELLD_TMP_MAX_BYTES", "256")]);
+    let node = TestNode::boot_with_env(project.path(), &[("CELLO_TMP_MAX_BYTES", "256")]);
 
     let out = get_json(&node.public, "/cap-overwrite");
     let body = out.to_string();
@@ -390,7 +390,7 @@ fn tmp_stream_applies_cap_as_data_arrives() {
     let fixture = fixture_dir();
     let project = fixture_tempdir("celld-tmp-cap-");
     copy_dir(&fixture, project.path());
-    let node = TestNode::boot_with_env(project.path(), &[("CELLD_TMP_MAX_BYTES", "256")]);
+    let node = TestNode::boot_with_env(project.path(), &[("CELLO_TMP_MAX_BYTES", "256")]);
 
     let out = get_json(&node.public, "/cap-stream?bytes=32");
     let body = out.to_string();
@@ -462,7 +462,7 @@ fn tmp_cap_counts_empty_files() {
     let fixture = fixture_dir();
     let project = fixture_tempdir("celld-tmp-cap-");
     copy_dir(&fixture, project.path());
-    let node = TestNode::boot_with_env(project.path(), &[("CELLD_TMP_MAX_BYTES", "256")]);
+    let node = TestNode::boot_with_env(project.path(), &[("CELLO_TMP_MAX_BYTES", "256")]);
 
     // Zero-byte files still cost an entry charge: 100 empties exceed 256.
     let out = get_json(&node.public, "/many-empty?n=100");
@@ -480,7 +480,7 @@ fn tmp_cap_counts_long_paths() {
     let fixture = fixture_dir();
     let project = fixture_tempdir("celld-tmp-cap-");
     copy_dir(&fixture, project.path());
-    let node = TestNode::boot_with_env(project.path(), &[("CELLD_TMP_MAX_BYTES", "256")]);
+    let node = TestNode::boot_with_env(project.path(), &[("CELLO_TMP_MAX_BYTES", "256")]);
 
     let out = get_json(&node.public, "/long-path?len=2000");
     let body = out.to_string();
@@ -493,7 +493,7 @@ fn tmp_cap_counts_directories() {
     let fixture = fixture_dir();
     let project = fixture_tempdir("celld-tmp-cap-");
     copy_dir(&fixture, project.path());
-    let node = TestNode::boot_with_env(project.path(), &[("CELLD_TMP_MAX_BYTES", "256")]);
+    let node = TestNode::boot_with_env(project.path(), &[("CELLO_TMP_MAX_BYTES", "256")]);
 
     let out = get_json(&node.public, "/many-dirs?n=50");
     let body = out.to_string();
@@ -515,7 +515,7 @@ fn tmp_oversize_write_fails_enospc() {
     let fixture = fixture_dir();
     let project = fixture_tempdir("celld-tmp-cap-");
     copy_dir(&fixture, project.path());
-    let node = TestNode::boot_with_env(project.path(), &[("CELLD_TMP_MAX_BYTES", "256")]);
+    let node = TestNode::boot_with_env(project.path(), &[("CELLO_TMP_MAX_BYTES", "256")]);
 
     let out = get_json(&node.public, "/big-write?bytes=8388608");
     let body = out.to_string();

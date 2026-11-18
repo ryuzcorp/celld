@@ -88,10 +88,10 @@ pub fn nudge(reload: &ReloadSender) {
 
 /// How often a node re-reads the pointer without a nudge. For a standalone
 /// node this is the deploy latency; for a managed node it is the backstop
-/// behind the push. `CELLD_DEPLOY_POLL_S`, default 30.
+/// behind the push. `CELLO_DEPLOY_POLL_S`, default 30.
 pub fn poll_interval() -> std::time::Duration {
-    let seconds = crate::env_vars::positive_or("CELLD_DEPLOY_POLL_S", 30u64)
-        .expect("validated CELLD_DEPLOY_POLL_S");
+    let seconds = crate::env_vars::positive_or("CELLO_DEPLOY_POLL_S", 30u64)
+        .expect("validated CELLO_DEPLOY_POLL_S");
     std::time::Duration::from_secs(seconds)
 }
 
@@ -99,11 +99,11 @@ pub fn poll_interval() -> std::time::Duration {
 /// the node adopts a new one, before its swap is forced: its activity
 /// cancelled and its regular WebSockets closed with 1012. Zero forces every
 /// resident cell at the flip, which is what a Cloudflare deployment does.
-/// `CELLD_DEPLOY_MAX_AGE_S`, default 60.
+/// `CELLO_DEPLOY_MAX_AGE_S`, default 60.
 pub fn max_age() -> std::time::Duration {
     // Not `positive_or`: zero is meaningful here.
-    let seconds = crate::env_vars::with_default("CELLD_DEPLOY_MAX_AGE_S", 60u64)
-        .expect("validated CELLD_DEPLOY_MAX_AGE_S");
+    let seconds = crate::env_vars::with_default("CELLO_DEPLOY_MAX_AGE_S", 60u64)
+        .expect("validated CELLO_DEPLOY_MAX_AGE_S");
     std::time::Duration::from_secs(seconds)
 }
 

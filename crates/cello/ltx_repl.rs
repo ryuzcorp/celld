@@ -654,19 +654,19 @@ pub struct CompactionConfig {
 pub(crate) struct LtxConfig {
     /// How old the newest object of a superseded epoch must be before epoch
     /// GC deletes the epoch, or `None` when epoch GC is off
-    /// (`CELLD_LTX_RETENTION_SECS`, unset or `0`). `Some(0)` is on with no
+    /// (`CELLO_LTX_RETENTION_SECS`, unset or `0`). `Some(0)` is on with no
     /// grace, a value the environment cannot express.
     pub(crate) epoch_gc_grace_ms: Option<u64>,
     /// Bytes per second a paged cell hydrates in the background, 0 for none
-    /// (`CELLD_LTX_HYDRATE_MBPS`).
+    /// (`CELLO_LTX_HYDRATE_MBPS`).
     pub(crate) hydrate_bytes_per_s: u64,
-    /// The operator's switch for paged restore (`CELLD_LTX_PAGED`).
+    /// The operator's switch for paged restore (`CELLO_LTX_PAGED`).
     pub(crate) paged_restore: bool,
     /// The chain size, in bytes, from which a restore pages instead of
-    /// cloning (`CELLD_LTX_PAGED_MIN_MB`).
+    /// cloning (`CELLO_LTX_PAGED_MIN_MB`).
     pub(crate) paged_min_bytes: u64,
     /// The TRUNCATE checkpoint threshold of a non-Queue cell, 0 to disable
-    /// truncation (`CELLD_LTX_TRUNCATE_PAGES`).
+    /// truncation (`CELLO_LTX_TRUNCATE_PAGES`).
     pub(crate) truncate_pages: u32,
 }
 
@@ -683,34 +683,34 @@ impl LtxConfig {
     /// An unreadable or unparsable value falls back to the default instead
     /// of failing construction. `env_vars::validate` rejects some of these
     /// values at startup, but not all of them: it does not check
-    /// `CELLD_LTX_HYDRATE_MBPS` or `CELLD_LTX_PAGED_MIN_MB`, and it checks
-    /// `CELLD_LTX_TRUNCATE_PAGES` as a `u64`. A production node can
+    /// `CELLO_LTX_HYDRATE_MBPS` or `CELLO_LTX_PAGED_MIN_MB`, and it checks
+    /// `CELLO_LTX_TRUNCATE_PAGES` as a `u64`. A production node can
     /// therefore reach a fallback.
     fn from_lookup(lookup: impl Fn(&str) -> anyhow::Result<Option<String>>) -> Self {
         let optional_u64 = |name: &str| {
             lookup(name).and_then(|value| crate::env_vars::parse_optional::<u64>(name, value))
         };
         Self {
-            epoch_gc_grace_ms: optional_u64("CELLD_LTX_RETENTION_SECS")
+            epoch_gc_grace_ms: optional_u64("CELLO_LTX_RETENTION_SECS")
                 .unwrap_or(None)
                 .filter(|secs| *secs > 0)
                 .map(|secs| secs.saturating_mul(1000)),
-            hydrate_bytes_per_s: optional_u64("CELLD_LTX_HYDRATE_MBPS")
+            hydrate_bytes_per_s: optional_u64("CELLO_LTX_HYDRATE_MBPS")
                 .unwrap_or(None)
                 .unwrap_or(DEFAULT_HYDRATE_MBPS)
                 .saturating_mul(1 << 20),
-            paged_restore: lookup("CELLD_LTX_PAGED")
+            paged_restore: lookup("CELLO_LTX_PAGED")
                 .and_then(|value| {
-                    crate::env_vars::parse_flag("CELLD_LTX_PAGED", value.as_deref(), true)
+                    crate::env_vars::parse_flag("CELLO_LTX_PAGED", value.as_deref(), true)
                 })
                 .unwrap_or(true),
-            paged_min_bytes: optional_u64("CELLD_LTX_PAGED_MIN_MB")
+            paged_min_bytes: optional_u64("CELLO_LTX_PAGED_MIN_MB")
                 .unwrap_or(None)
                 .unwrap_or(DEFAULT_PAGED_MIN_MB)
                 .saturating_mul(1 << 20),
-            truncate_pages: lookup("CELLD_LTX_TRUNCATE_PAGES")
+            truncate_pages: lookup("CELLO_LTX_TRUNCATE_PAGES")
                 .and_then(|value| {
-                    crate::env_vars::parse_optional::<u32>("CELLD_LTX_TRUNCATE_PAGES", value)
+                    crate::env_vars::parse_optional::<u32>("CELLO_LTX_TRUNCATE_PAGES", value)
                 })
                 .ok()
                 .flatten()
@@ -1035,7 +1035,7 @@ fn credit_percell_upload(handle: &Cell, txid: u64) {
     handle.durable_txid.fetch_max(txid, Ordering::SeqCst);
 }
 /// Whether the operator enabled bucket-posture bundles: off by default, and
-/// only an explicit `CELLD_BUCKET_BUNDLES=1` enables it. The format-3 fleet
+/// only an explicit `CELLO_BUCKET_BUNDLES=1` enables it. The format-3 fleet
 /// gate still governs (see `bucket_bundles_enabled`). Pure value helper
 /// keeps tests deterministic without touching the process environment;
 /// startup rejects any other value before a flush can read it
@@ -1046,15 +1046,15 @@ fn bucket_bundles_env_value(value: Option<&str>) -> bool {
 
 /// Production read of the operator switch, per flush (not per process).
 pub(crate) fn bucket_bundles_env_on() -> bool {
-    bucket_bundles_env_value(std::env::var("CELLD_BUCKET_BUNDLES").ok().as_deref())
+    bucket_bundles_env_value(std::env::var("CELLO_BUCKET_BUNDLES").ok().as_deref())
 }
 
-/// The longest linger `CELLD_BUCKET_BUNDLE_LINGER_MS` accepts: one bucket round
+/// The longest linger `CELLO_BUCKET_BUNDLE_LINGER_MS` accepts: one bucket round
 /// trip's worth of extra ack latency is the point of the knob, and anything near
 /// the durability timeout would only turn into failed writes.
 const BUCKET_BUNDLE_LINGER_MAX_MS: u64 = 1_000;
 
-/// Parse `CELLD_BUCKET_BUNDLE_LINGER_MS`: absent, empty or unparsable is 0 (no
+/// Parse `CELLO_BUCKET_BUNDLE_LINGER_MS`: absent, empty or unparsable is 0 (no
 /// linger), and values above the cap clamp to it.
 fn bucket_bundle_linger_value(value: Option<&str>) -> Duration {
     let ms = value
@@ -1066,7 +1066,7 @@ fn bucket_bundle_linger_value(value: Option<&str>) -> Duration {
 
 fn bucket_bundle_linger() -> Duration {
     bucket_bundle_linger_value(
-        std::env::var("CELLD_BUCKET_BUNDLE_LINGER_MS")
+        std::env::var("CELLO_BUCKET_BUNDLE_LINGER_MS")
             .ok()
             .as_deref(),
     )
@@ -1232,7 +1232,7 @@ const SNAPSHOT_BYTES_PER_MS: u64 = 8 * 1024;
 /// write burst (a large upload landing in one cell) can legitimately need
 /// more than one capture+upload cycle to prove; on a slow or busy store a
 /// fixed 10s fences the cell out from under an active request, so operators
-/// can raise it via `CELLD_LTX_DURABILITY_TIMEOUT_SECS`.
+/// can raise it via `CELLO_LTX_DURABILITY_TIMEOUT_SECS`.
 const DEFAULT_DURABILITY_TIMEOUT_SECS: u64 = 10;
 
 /// The TRUNCATE checkpoint threshold, in pages. Chosen from a measured
@@ -1454,33 +1454,33 @@ pub struct LtxRepl {
     compaction_min_bytes: u64,
     /// Restore a taken-over cell by paging its pages in on demand (a fault-in
     /// SQLite VFS) instead of downloading the whole chain, and continue its
-    /// chain from the cut. On unless `CELLD_LTX_PAGED=0`.
+    /// chain from the cut. On unless `CELLO_LTX_PAGED=0`.
     paged_restore: AtomicBool,
     /// Whether every live lease in the fleet reads a paged epoch
     /// (`cello_logic::format::PAGED_FORMAT`). Off until the fleet sampler has
     /// seen every lease at that minimum, so a node in a rolling update clones
     /// the way the old release does instead of writing an epoch the old
-    /// release cannot restore. `CELLD_LTX_PAGED` is the operator's switch;
+    /// release cannot restore. `CELLO_LTX_PAGED` is the operator's switch;
     /// this one is the fleet's.
     paged_fleet: AtomicBool,
     /// Whether every live lease reads bucket-posture bundle proofs
     /// (`cello_logic::format::BUCKET_BUNDLES_FORMAT`). Off until the first
     /// fleet sample (mirrors the paged gate): a failed or missing sample
     /// closes it. The per-flush bundle path additionally requires the
-    /// operator switch (opt-in; `CELLD_BUCKET_BUNDLES=1` enables it),
+    /// operator switch (opt-in; `CELLO_BUCKET_BUNDLES=1` enables it),
     /// see `bucket_bundles_enabled`.
     bucket_bundles_fleet: AtomicBool,
-    /// Test-only override for the `CELLD_BUCKET_BUNDLES` leg, so deterministic
+    /// Test-only override for the `CELLO_BUCKET_BUNDLES` leg, so deterministic
     /// tests do not mutate the process environment. `None` (production) reads
     /// the env per flush; `Some(on)` forces the answer.
     #[cfg(test)]
     bucket_env_override: Mutex<Option<bool>>,
     /// The chain size, in bytes, from which a restore pages instead of
-    /// cloning (`CELLD_LTX_PAGED_MIN_MB`). Below it the clone is cheaper:
+    /// cloning (`CELLO_LTX_PAGED_MIN_MB`). Below it the clone is cheaper:
     /// one download the node can afford, no fault path, no hydration.
     paged_min_bytes: AtomicU64,
     /// Bytes per second a paged cell hydrates in the background, 0 for none
-    /// (`CELLD_LTX_HYDRATE_MBPS`). A hydrated cell reads only its file.
+    /// (`CELLO_LTX_HYDRATE_MBPS`). A hydrated cell reads only its file.
     hydrate_bytes_per_s: u64,
     /// One paged cell hydrates at a time: a node with several whales pages
     /// them all and fills them in turn.
@@ -1552,7 +1552,7 @@ pub struct LtxRepl {
     retired_marks: Mutex<BTreeMap<String, (Option<u64>, u64)>>,
     /// How old the newest object of a superseded epoch must be before epoch
     /// GC deletes the epoch, or `None` when epoch GC is off
-    /// (`CELLD_LTX_RETENTION_SECS`, unset or `0`). Deletion is off by default:
+    /// (`CELLO_LTX_RETENTION_SECS`, unset or `0`). Deletion is off by default:
     /// turning it on is the operator's decision, not a side effect of an
     /// upgrade.
     epoch_gc_grace_ms: Option<u64>,
@@ -1560,7 +1560,7 @@ pub struct LtxRepl {
     /// shrink the WAL FILE, so after every periodic restart the capture's
     /// tail read spans the stale high-water region — ~350 KB per sync on
     /// the fleet ledger at the upstream threshold. `DEFAULT_TRUNCATE_PAGES`
-    /// unless `CELLD_LTX_TRUNCATE_PAGES` overrides it; 0 disables
+    /// unless `CELLO_LTX_TRUNCATE_PAGES` overrides it; 0 disables
     /// truncation (the upstream behavior). Queue cells always disable it
     /// because each truncate boundary emits a full image of their unbounded
     /// backlog.
@@ -1709,11 +1709,11 @@ impl LtxRepl {
         // The tiering flush interval: with a healthy shipper, at most one
         // upload per cell per interval; it is simultaneously the bucket lag
         // budget. 0 disables pacing.
-        let flush_ms = crate::env_vars::with_default("CELLD_LOG_FLUSH_MS", 2000)? as u64;
+        let flush_ms = crate::env_vars::with_default("CELLO_LOG_FLUSH_MS", 2000)? as u64;
         // Saturating: an absurd seconds value must clamp, not wrap through
         // `as_millis() as u64` into a short deadline.
         let durability_timeout_ms = crate::env_vars::positive_or(
-            "CELLD_LTX_DURABILITY_TIMEOUT_SECS",
+            "CELLO_LTX_DURABILITY_TIMEOUT_SECS",
             DEFAULT_DURABILITY_TIMEOUT_SECS,
         )?
         .saturating_mul(1_000);
@@ -2297,7 +2297,7 @@ impl LtxRepl {
     /// Folds a cloned activation's durable rows into its first L1 object, the
     /// opener that epoch GC waits for. Under bundled tiering a write reaches
     /// only the node's bundles, and the first per-cell object is otherwise
-    /// the threshold fold (`CELLD_LTX_COMPACTION_MIN_TXIDS`) or a handoff
+    /// the threshold fold (`CELLO_LTX_COMPACTION_MIN_TXIDS`) or a handoff
     /// snapshot. A cell with fewer writes per activation then never lists
     /// its opener and never deletes a superseded epoch; the 2026-09-30 GCE
     /// run measured that. The fold opens at TXID 1, so it makes the owner's
@@ -3122,7 +3122,7 @@ impl LtxRepl {
     /// The runtime opens the actor's connection through it; a plain open of a
     /// paged cell's sparse database file reads holes as data.
     /// Fills a paged cell's file in the background, a run per step at
-    /// `CELLD_LTX_HYDRATE_MBPS`, one cell at a time per node, until the cut
+    /// `CELLO_LTX_HYDRATE_MBPS`, one cell at a time per node, until the cut
     /// is complete or the cell closes. Steps fault through the VFS's own
     /// read path, so hydration is foreground faulting at a pace.
     fn spawn_hydration(
@@ -3242,7 +3242,7 @@ impl LtxRepl {
     /// the caller logs a transition once. Off until the first sample, mirroring
     /// the paged gate: a failed or missing sample closes it. The per-flush path
     /// additionally requires the operator switch (opt-in;
-    /// `CELLD_BUCKET_BUNDLES=1` enables it), see `bucket_bundles_enabled`.
+    /// `CELLO_BUCKET_BUNDLES=1` enables it), see `bucket_bundles_enabled`.
     pub fn set_bucket_bundles_fleet(&self, ready: bool) -> bool {
         self.bucket_bundles_fleet.swap(ready, Ordering::Relaxed)
     }
@@ -3255,7 +3255,7 @@ impl LtxRepl {
 
     /// Whether this flush may write bucket-posture bundles: the fleet gate
     /// (set by the sampler, off until the first sample) AND the operator switch
-    /// (opt-in; `CELLD_BUCKET_BUNDLES=1` enables it). Re-checked per
+    /// (opt-in; `CELLO_BUCKET_BUNDLES=1` enables it). Re-checked per
     /// flush, not per process: when the gate closes, the node falls back at once
     /// to per-cell L0 uploads for new writes. Already-credited bundle rows stay
     /// covered by the existing drain and GC paths.
@@ -3272,7 +3272,7 @@ impl LtxRepl {
 
     /// Test override for the operator switch, so deterministic tests do not touch
     /// the process environment. `Some(on)` forces the env leg; `None` restores the
-    /// real `CELLD_BUCKET_BUNDLES` read.
+    /// real `CELLO_BUCKET_BUNDLES` read.
     #[cfg(test)]
     pub fn set_bucket_bundles_env_override_for_test(&self, on: Option<bool>) {
         *self.bucket_env_override.lock().unwrap() = on;
@@ -5459,24 +5459,24 @@ fn compaction_config_from_env() -> anyhow::Result<Option<CompactionConfig>> {
     // On by default. A mixed fleet must set `0` until every node can read
     // v0.5.2 block objects. An old reader cannot take over a cell after its
     // first L1 publication.
-    let enabled = crate::env_vars::flag("CELLD_LTX_COMPACTION", true)?;
+    let enabled = crate::env_vars::flag("CELLO_LTX_COMPACTION", true)?;
     if !enabled {
         return Ok(None);
     }
 
-    let min_txids = crate::env_vars::with_default("CELLD_LTX_COMPACTION_MIN_TXIDS", 256)?;
-    let min_mb: u64 = crate::env_vars::with_default("CELLD_LTX_COMPACTION_MIN_MB", 32)?;
-    let concurrency = crate::env_vars::with_default("CELLD_LTX_COMPACTIONS", 2)?;
+    let min_txids = crate::env_vars::with_default("CELLO_LTX_COMPACTION_MIN_TXIDS", 256)?;
+    let min_mb: u64 = crate::env_vars::with_default("CELLO_LTX_COMPACTION_MIN_MB", 32)?;
+    let concurrency = crate::env_vars::with_default("CELLO_LTX_COMPACTIONS", 2)?;
     anyhow::ensure!(
         min_mb > 0 && min_mb << 20 <= COMPACTION_MAX_INPUT_BYTES,
-        "CELLD_LTX_COMPACTION_MIN_MB must be between 1 and {}",
+        "CELLO_LTX_COMPACTION_MIN_MB must be between 1 and {}",
         COMPACTION_MAX_INPUT_BYTES >> 20
     );
     anyhow::ensure!(
         min_txids >= 2,
-        "CELLD_LTX_COMPACTION_MIN_TXIDS must be at least 2"
+        "CELLO_LTX_COMPACTION_MIN_TXIDS must be at least 2"
     );
-    anyhow::ensure!(concurrency > 0, "CELLD_LTX_COMPACTIONS must be positive");
+    anyhow::ensure!(concurrency > 0, "CELLO_LTX_COMPACTIONS must be positive");
     Ok(Some(CompactionConfig {
         min_txids: min_txids as u64,
         min_bytes: min_mb << 20,
@@ -5653,7 +5653,7 @@ async fn bundle_loop(
     // when dirty and no PUT is in flight, accumulating while one is in flight
     // and flushing again as soon as it completes. The loop awaits each PUT, so
     // writes arriving mid-PUT are captured by the next iteration — batching
-    // grows with load. An optional linger (`CELLD_BUCKET_BUNDLE_LINGER_MS`,
+    // grows with load. An optional linger (`CELLO_BUCKET_BUNDLE_LINGER_MS`,
     // default 0) holds a shared round open that long after the first dirty
     // wake — but only while batching can help: a lone dirty cell has nothing
     // to batch with, so it flushes at once instead of paying the full linger
@@ -8489,7 +8489,7 @@ mod bucket_bundles_tests {
         owner.join().await;
     }
     /// The operator switch is OFF by default; only an explicit
-    /// `CELLD_BUCKET_BUNDLES=1` enables it. The format-3 fleet gate still
+    /// `CELLO_BUCKET_BUNDLES=1` enables it. The format-3 fleet gate still
     /// governs (see `bucket_gate_stays_closed_until_the_first_sample`).
     /// Fail-before: `!matches!(Some("1"))` enables with no env set.
     #[test]
@@ -8624,4 +8624,4 @@ mod bucket_bundles_tests {
 }
 
 #[cfg(cello_internal_tests)]
-include!(env!("CELLD_INTERNAL_LTX_REPL_OBSERVERS"));
+include!(env!("CELLO_INTERNAL_LTX_REPL_OBSERVERS"));

@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): parse OTEL_RESOURCE_ATTRIBUTES into the OTLP resource (upstream #314); incoming spans carry HTTP method (upstream #285); split logs from traces via CELLD_OTEL_LOGS (upstream #153).
+// Modified by ryuzcorp (ryuzcorp/celld): parse OTEL_RESOURCE_ATTRIBUTES into the OTLP resource (upstream #314); incoming spans carry HTTP method (upstream #285); split logs from traces via CELLO_OTEL_LOGS (upstream #153).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 // Telemetry is observational and does not affect Actor decisions.
@@ -87,7 +87,7 @@ pub enum SinkChoice {
 }
 
 /// Where log records go when the operator splits them from traces
-/// (`CELLD_OTEL_LOGS`, denoland/celld#153). Traces always follow
+/// (`CELLO_OTEL_LOGS`, denoland/celld#153). Traces always follow
 /// [`SinkChoice`]; only the logs signal can take a separate path, so a fleet
 /// can point its collector at traces while its logs land in the bucket.
 #[derive(Debug, Clone, PartialEq)]
@@ -95,7 +95,7 @@ pub enum LogsSink {
     /// Logs follow the traces sink — the historical behavior.
     Follow,
     /// Logs go to the bucket as Parquet, whatever the traces sink is.
-    /// The node refuses to start without a bucket, like `CELLD_OTEL=1`.
+    /// The node refuses to start without a bucket, like `CELLO_OTEL=1`.
     Bucket,
     /// Logs are dropped; only traces export.
     Drop,
@@ -104,7 +104,7 @@ pub enum LogsSink {
 #[derive(Debug)]
 pub struct Config {
     pub sink: SinkChoice,
-    /// `CELLD_OTEL_BUCKET`, same endpoint/region/credentials as the
+    /// `CELLO_OTEL_BUCKET`, same endpoint/region/credentials as the
     /// fleet bucket. `None` means the fleet bucket itself.
     pub bucket_override: Option<String>,
     pub otlp_headers: Vec<(String, String)>,
@@ -128,7 +128,7 @@ pub struct Config {
 }
 
 impl Config {
-    /// `None` when `CELLD_OTEL` is unset or `0` — the default, and the
+    /// `None` when `CELLO_OTEL` is unset or `0` — the default, and the
     /// only zero-cost state.
     pub fn from_env() -> anyhow::Result<Option<Config>> {
         Self::from_lookup(crate::env_vars::value)
@@ -138,7 +138,7 @@ impl Config {
     pub fn from_lookup(
         get: impl Fn(&str) -> anyhow::Result<Option<String>>,
     ) -> anyhow::Result<Option<Config>> {
-        let sink = match get("CELLD_OTEL")?.as_deref() {
+        let sink = match get("CELLO_OTEL")?.as_deref() {
             None | Some("0") => None,
             Some("1") => Some(SinkChoice::Bucket),
             Some(value) => {
@@ -150,7 +150,7 @@ impl Config {
                             && url.query().is_none()
                             && url.fragment().is_none()
                     })
-                    .ok_or_else(|| anyhow!("CELLD_OTEL must be 0, 1, or an HTTP(S) collector base URL, not {value:?}"))?;
+                    .ok_or_else(|| anyhow!("CELLO_OTEL must be 0, 1, or an HTTP(S) collector base URL, not {value:?}"))?;
                 Some(SinkChoice::Otlp {
                     endpoint: endpoint.as_str().trim_end_matches('/').to_string(),
                 })
@@ -177,12 +177,12 @@ impl Config {
             None => resource_service_name(&resource_input).unwrap_or_else(|| "celld".to_string()),
         };
         let resource_attrs = parse_resource_attributes(&resource_input);
-        let logs_sink = match get("CELLD_OTEL_LOGS")?.as_deref() {
+        let logs_sink = match get("CELLO_OTEL_LOGS")?.as_deref() {
             None => LogsSink::Follow,
             Some("bucket") => LogsSink::Bucket,
             Some("0") => LogsSink::Drop,
             Some(other) => {
-                bail!("CELLD_OTEL_LOGS must be bucket or 0, not {other:?}")
+                bail!("CELLO_OTEL_LOGS must be bucket or 0, not {other:?}")
             }
         };
         // Per the otel spec: a `parentbased_*` sampler defers to the
@@ -208,7 +208,7 @@ impl Config {
             }
             other => bail!("unsupported OTEL_TRACES_SAMPLER {other:?}"),
         };
-        let retention = match get("CELLD_OTEL_RETENTION")?.as_deref() {
+        let retention = match get("CELLO_OTEL_RETENTION")?.as_deref() {
             None => Retention::Days(30),
             Some("none") => Retention::None,
             Some(value) => {
@@ -217,23 +217,23 @@ impl Config {
                     .and_then(|days| days.parse::<u32>().ok())
                     .filter(|days| *days > 0)
                     .ok_or_else(|| {
-                        anyhow!("CELLD_OTEL_RETENTION must be <n>d or none: {value:?}")
+                        anyhow!("CELLO_OTEL_RETENTION must be <n>d or none: {value:?}")
                     })?;
                 Retention::Days(days)
             }
         };
         let flush = crate::env_vars::parse_positive::<u64>(
-            "CELLD_OTEL_FLUSH_MS",
-            get("CELLD_OTEL_FLUSH_MS")?,
+            "CELLO_OTEL_FLUSH_MS",
+            get("CELLO_OTEL_FLUSH_MS")?,
         )?
         .map(Duration::from_millis)
         .unwrap_or(Duration::from_secs(300));
         let flush_bytes = crate::env_vars::parse_positive::<usize>(
-            "CELLD_OTEL_FLUSH_BYTES",
-            get("CELLD_OTEL_FLUSH_BYTES")?,
+            "CELLO_OTEL_FLUSH_BYTES",
+            get("CELLO_OTEL_FLUSH_BYTES")?,
         )?
         .unwrap_or(5 * 1024 * 1024);
-        let bucket_override = get("CELLD_OTEL_BUCKET")?;
+        let bucket_override = get("CELLO_OTEL_BUCKET")?;
         Ok(sink.map(|sink| Config {
             sink,
             bucket_override,
@@ -760,7 +760,7 @@ pub fn init(
         let Some(bucket) = bucket.clone() else {
             anyhow::bail!(
                 "{what} but this node has no bucket; the bucket sink needs \
-                 one (CELLD_BUCKET)"
+                 one (CELLO_BUCKET)"
             );
         };
         Ok(SinkRuntime::Bucket {
@@ -805,7 +805,7 @@ pub fn init(
             tracing::info!("telemetry logs to the bucket while traces follow the traces sink");
             Some(bucket_sink(
                 &bucket,
-                "CELLD_OTEL_LOGS=bucket",
+                "CELLO_OTEL_LOGS=bucket",
                 &config.retention.label(),
             )?)
         }
@@ -971,7 +971,7 @@ impl SinkRuntime {
 }
 
 /// Flush one batch to the traces sink and the logs sink separately. Split by
-/// `CELLD_OTEL_LOGS`, together otherwise (the same sink twice, each side
+/// `CELLO_OTEL_LOGS`, together otherwise (the same sink twice, each side
 /// carrying only its own signal). A dropped logs sink discards its signal
 /// here, after the same batching, so a collector-only fleet never buffers
 /// log records it will not send.
@@ -1103,7 +1103,7 @@ fn otlp_backoff(attempt: u32) -> Duration {
 mod telemetry_contract {
     use super::*;
 
-    include!(env!("CELLD_INTERNAL_TELEMETRY_TESTS"));
+    include!(env!("CELLO_INTERNAL_TELEMETRY_TESTS"));
 }
 
 /// A `spawn_blocking` result unwrapped honestly: the panic and the
@@ -1535,7 +1535,7 @@ mod tests {
     #[test]
     fn lookup_prefers_resource_service_name_over_the_default() {
         let config = config_with(&[
-            ("CELLD_OTEL", "http://127.0.0.1:4318"),
+            ("CELLO_OTEL", "http://127.0.0.1:4318"),
             ("OTEL_RESOURCE_ATTRIBUTES", "service.name=payments"),
         ])
         .expect("valid config")
@@ -1551,14 +1551,14 @@ mod tests {
         // Explicit OTEL_SERVICE_NAME still wins, and the default survives
         // when neither source names a service.
         let config = config_with(&[
-            ("CELLD_OTEL", "http://127.0.0.1:4318"),
+            ("CELLO_OTEL", "http://127.0.0.1:4318"),
             ("OTEL_SERVICE_NAME", "explicit"),
             ("OTEL_RESOURCE_ATTRIBUTES", "service.name=payments"),
         ])
         .expect("valid config")
         .expect("telemetry on");
         assert_eq!(config.service, "explicit");
-        let config = config_with(&[("CELLD_OTEL", "http://127.0.0.1:4318")])
+        let config = config_with(&[("CELLO_OTEL", "http://127.0.0.1:4318")])
             .expect("valid config")
             .expect("telemetry on");
         assert_eq!(config.service, "celld");
@@ -1575,23 +1575,23 @@ mod tests {
 
     #[test]
     fn lookup_parses_the_logs_sink() {
-        let config = config_with(&[("CELLD_OTEL", "http://127.0.0.1:4318")])
+        let config = config_with(&[("CELLO_OTEL", "http://127.0.0.1:4318")])
             .expect("valid config")
             .expect("telemetry on");
         assert_eq!(config.logs_sink, LogsSink::Follow);
         for (value, expected) in [("bucket", LogsSink::Bucket), ("0", LogsSink::Drop)] {
             let config = config_with(&[
-                ("CELLD_OTEL", "http://127.0.0.1:4318"),
-                ("CELLD_OTEL_LOGS", value),
+                ("CELLO_OTEL", "http://127.0.0.1:4318"),
+                ("CELLO_OTEL_LOGS", value),
             ])
             .expect("valid config")
             .expect("telemetry on");
-            assert_eq!(config.logs_sink, expected, "CELLD_OTEL_LOGS={value}");
+            assert_eq!(config.logs_sink, expected, "CELLO_OTEL_LOGS={value}");
         }
         assert!(
             config_with(&[
-                ("CELLD_OTEL", "http://127.0.0.1:4318"),
-                ("CELLD_OTEL_LOGS", "collector"),
+                ("CELLO_OTEL", "http://127.0.0.1:4318"),
+                ("CELLO_OTEL_LOGS", "collector"),
             ])
             .is_err(),
             "an unknown logs sink must fail startup, not silently follow"
@@ -1661,7 +1661,7 @@ mod tests {
     fn lookup_threads_service_name_and_resource_attributes() {
         use std::collections::HashMap;
         let env: HashMap<String, String> = [
-            ("CELLD_OTEL", "http://127.0.0.1:4318"),
+            ("CELLO_OTEL", "http://127.0.0.1:4318"),
             ("OTEL_SERVICE_NAME", "trace-probe"),
             (
                 "OTEL_RESOURCE_ATTRIBUTES",

@@ -3819,7 +3819,7 @@ use cli::{action_from_process, print_help, Action};
 
 #[cfg(all(test, cello_internal_tests))]
 fn shutdown_accept_failure_test_action() -> Action {
-    let listen = std::env::var("CELLD_DRAIN_ACCEPT_FAILURE_LISTEN")
+    let listen = std::env::var("CELLO_DRAIN_ACCEPT_FAILURE_LISTEN")
         .map(cello::startup::Listen::Explicit)
         .unwrap_or(cello::startup::Listen::LoopbackEphemeral);
     Action::Run(cli::Settings {
@@ -3914,7 +3914,7 @@ fn main() -> anyhow::Result<()> {
     cello::runtime::init_v8();
     let mut builder = tokio::runtime::Builder::new_multi_thread();
     builder.enable_all();
-    if let Some(workers) = cello::env_vars::positive::<usize>("CELLD_TOKIO_THREADS")? {
+    if let Some(workers) = cello::env_vars::positive::<usize>("CELLO_TOKIO_THREADS")? {
         builder.worker_threads(workers);
     }
     builder
@@ -3926,7 +3926,7 @@ fn main() -> anyhow::Result<()> {
 /// environment, so a serving process can be made non-dumpable first.
 fn resolved_action() -> anyhow::Result<Action> {
     #[cfg(all(test, cello_internal_tests))]
-    if std::env::var_os("CELLD_DRAIN_ACCEPT_FAILURE_CHILD").is_some() {
+    if std::env::var_os("CELLO_DRAIN_ACCEPT_FAILURE_CHILD").is_some() {
         return Ok(shutdown_accept_failure_test_action());
     }
     action_from_process()
@@ -3938,7 +3938,7 @@ async fn async_main(
 ) -> anyhow::Result<()> {
     #[cfg(all(test, cello_internal_tests))]
     let shutdown_accept_failure_test_active =
-        std::env::var_os("CELLD_DRAIN_ACCEPT_FAILURE_CHILD").is_some();
+        std::env::var_os("CELLO_DRAIN_ACCEPT_FAILURE_CHILD").is_some();
     let host_runtime = tokio::runtime::Handle::current();
     cello::asyncrt::set_host_handle(host_runtime.clone());
     // Docker and journald can stop consuming the process pipe during a log
@@ -4105,7 +4105,7 @@ async fn async_main(
     // boot instead of serving a node the operator believes is guarded.
     // Absent is today's open internal listener.
     let operator_token = cello::operator_token::from_env()?;
-    // Operators need the applied worker count to verify CELLD_TOKIO_THREADS;
+    // Operators need the applied worker count to verify CELLO_TOKIO_THREADS;
     // a count of process threads also includes unrelated, lazily started
     // thread pools, so it cannot stand in for this value.
     tracing::info!(
@@ -4114,22 +4114,22 @@ async fn async_main(
         "host runtime initialized"
     );
     cello::startup::raise_file_limit();
-    let max_resident = cello::env_vars::optional("CELLD_MAX_RESIDENT_CELLS")?
+    let max_resident = cello::env_vars::optional("CELLO_MAX_RESIDENT_CELLS")?
         // celld has no resident ceiling unless the operator configures one.
         // The clean-sheet prototype originally defaulted to eight, which
         // introduced eviction churn in otherwise unconstrained workloads and
         // made cancellation semantics depend on cold-reactivation latency.
         .unwrap_or(usize::MAX);
     let max_request_body_bytes = cello::env_vars::positive_or(
-        "CELLD_MAX_REQUEST_BODY_BYTES",
+        "CELLO_MAX_REQUEST_BODY_BYTES",
         DEFAULT_MAX_REQUEST_BODY_BYTES,
     )?;
     anyhow::ensure!(
         max_request_body_bytes <= DEFAULT_MAX_REQUEST_BODY_BYTES,
-        "CELLD_MAX_REQUEST_BODY_BYTES cannot exceed {DEFAULT_MAX_REQUEST_BODY_BYTES}"
+        "CELLO_MAX_REQUEST_BODY_BYTES cannot exceed {DEFAULT_MAX_REQUEST_BODY_BYTES}"
     );
     let local_cache_max_bytes = local_cache_max_bytes_from_environment()?;
-    let fail_publish_once = std::env::var_os("CELLD_TEST_FAIL_PUBLISH_ONCE").is_some();
+    let fail_publish_once = std::env::var_os("CELLO_TEST_FAIL_PUBLISH_ONCE").is_some();
     let ingress = cello::startup::bind_ingress_listener(&settings.listen).await?;
     let internal =
         cello::startup::bind_internal_listener(&cello::startup::InternalListenerSettings {
@@ -4221,11 +4221,11 @@ async fn async_main(
     // The data directory comes first: the node-session id is pinned beside
     // the follower fragments it recovers, so a restart answers for its
     // predecessor instead of minting a stranger (upstream #249).
-    let data_dir = std::env::var_os("CELLD_TEST_DATA_DIR")
-        .or_else(|| std::env::var_os("CELLD_WATCH"))
+    let data_dir = std::env::var_os("CELLO_TEST_DATA_DIR")
+        .or_else(|| std::env::var_os("CELLO_WATCH"))
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| std::env::temp_dir().join(format!("celld-{}", std::process::id())));
-    let node = cello::machine::resolve_node_session_id(std::env::var("CELLD_NODE").ok(), &data_dir);
+    let node = cello::machine::resolve_node_session_id(std::env::var("CELLO_NODE").ok(), &data_dir);
     let clean_reload_node = node.clone();
     cello::control_plane::install_reexec_node_session_id(&node)?;
     let probe_public_key = cello::peer_probe::install_signer()?;
@@ -4233,20 +4233,20 @@ async fn async_main(
     // derived from the thread count but far above it. See
     // `machine::default_max_activations` for the measurements.
     let max_activations =
-        cello::env_vars::positive::<usize>("CELLD_ACTIVATIONS")?.unwrap_or_else(|| {
+        cello::env_vars::positive::<usize>("CELLO_ACTIVATIONS")?.unwrap_or_else(|| {
             cello::machine::default_max_activations(
                 std::thread::available_parallelism()
                     .map(usize::from)
                     .unwrap_or(1),
             )
         });
-    let placement_weight = cello::env_vars::positive::<u64>("CELLD_PLACEMENT_WEIGHT")?
+    let placement_weight = cello::env_vars::positive::<u64>("CELLO_PLACEMENT_WEIGHT")?
         .unwrap_or_else(|| {
             std::thread::available_parallelism()
                 .map(|cpus| cpus.get() as u64)
                 .unwrap_or(1)
         });
-    let rebalance_interval_ms = cello::env_vars::optional::<u64>("CELLD_REBALANCE_INTERVAL_MS")?
+    let rebalance_interval_ms = cello::env_vars::optional::<u64>("CELLO_REBALANCE_INTERVAL_MS")?
         .unwrap_or(DEFAULT_REBALANCE_INTERVAL_MS);
     // The shared fleet sample's interval: the balancing interval, or the
     // format gate's when balancing is off. Every reader of the sample, the
@@ -4256,7 +4256,7 @@ async fn async_main(
     } else {
         FORMAT_GATE_SAMPLE_MS
     };
-    let max_releases = cello::env_vars::positive::<usize>("CELLD_RELEASES")?
+    let max_releases = cello::env_vars::positive::<usize>("CELLO_RELEASES")?
         .unwrap_or(DEFAULT_MAX_CONCURRENT_RELEASES);
     let mut deploy_agent = None;
     // The channel `POST /reload` and a managed notification nudge the pointer
@@ -4352,16 +4352,16 @@ async fn async_main(
                 wake_scan,
                 deploy_bucket,
             )
-        } else if let Ok(script_path) = std::env::var("CELLD_TEST_SCRIPT_PATH") {
+        } else if let Ok(script_path) = std::env::var("CELLO_TEST_SCRIPT_PATH") {
             let source = std::fs::read_to_string(&script_path)?;
-            let do_classes = std::env::var("CELLD_TEST_DO_CLASSES")
+            let do_classes = std::env::var("CELLO_TEST_DO_CLASSES")
                 .unwrap_or_default()
                 .split(',')
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .map(str::to_string)
                 .collect();
-            let bindings = std::env::var("CELLD_TEST_DO_BINDINGS")
+            let bindings = std::env::var("CELLO_TEST_DO_BINDINGS")
                 .unwrap_or_default()
                 .split(',')
                 .filter_map(|value| value.split_once('='))
@@ -4370,17 +4370,17 @@ async fn async_main(
                 .collect();
             // `BINDING=database` pairs, the local-script equivalent of
             // `d1_databases` in a deployed project.
-            let d1_bindings: Vec<(String, String)> = std::env::var("CELLD_TEST_D1_BINDINGS")
+            let d1_bindings: Vec<(String, String)> = std::env::var("CELLO_TEST_D1_BINDINGS")
                 .unwrap_or_default()
                 .split(',')
                 .filter_map(|value| value.split_once('='))
                 .map(|(name, database)| (name.trim().to_string(), database.trim().to_string()))
                 .filter(|(name, database)| !name.is_empty() && !database.is_empty())
                 .collect();
-            // `BINDING=namespace-id`, the `CELLD_TEST_D1_BINDINGS` shape. Day one,
+            // `BINDING=namespace-id`, the `CELLO_TEST_D1_BINDINGS` shape. Day one,
             // for the reason D1's and Workflows' equivalents landed on day one:
             // every runtime test needs it.
-            let kv_bindings: Vec<(String, String)> = std::env::var("CELLD_LOCAL_KV_BINDINGS")
+            let kv_bindings: Vec<(String, String)> = std::env::var("CELLO_LOCAL_KV_BINDINGS")
                 .unwrap_or_default()
                 .split(',')
                 .filter_map(|value| value.split_once('='))
@@ -4390,7 +4390,7 @@ async fn async_main(
             // `BINDING=queue`, the local-script equivalent of one Wrangler Queue
             // producer. A local binding has no configuration object for a default
             // delay, so it uses the Queue default of zero.
-            let queue_bindings: Vec<QueueBinding> = std::env::var("CELLD_LOCAL_QUEUE_BINDINGS")
+            let queue_bindings: Vec<QueueBinding> = std::env::var("CELLO_LOCAL_QUEUE_BINDINGS")
                 .unwrap_or_default()
                 .split(',')
                 .filter_map(|value| value.split_once('='))
@@ -4411,7 +4411,7 @@ async fn async_main(
             }
             // `BINDING=bucket` pairs, the local-script equivalent of
             // `r2_buckets` in a deployed project.
-            let r2_bindings: Vec<(String, String)> = std::env::var("CELLD_TEST_R2_BINDINGS")
+            let r2_bindings: Vec<(String, String)> = std::env::var("CELLO_TEST_R2_BINDINGS")
                 .unwrap_or_default()
                 .split(',')
                 .filter_map(|value| value.split_once('='))
@@ -4429,7 +4429,7 @@ async fn async_main(
                 do_classes.push(cello::deploy::QUEUE_CLASS.to_string());
             }
             let workflow_bindings: Vec<WorkflowBinding> =
-                std::env::var("CELLD_LOCAL_WORKFLOW_BINDINGS")
+                std::env::var("CELLO_LOCAL_WORKFLOW_BINDINGS")
                     .unwrap_or_default()
                     .split(',')
                     .filter_map(|value| {
@@ -4449,12 +4449,12 @@ async fn async_main(
                     .collect();
             // Resolved before the config is built, because the reserved workflow
             // class is script-scoped and `do_classes` has to carry the scoped name.
-            let script_name = std::env::var("CELLD_TEST_SCRIPT_NAME")
+            let script_name = std::env::var("CELLO_TEST_SCRIPT_NAME")
                 .unwrap_or_else(|_| "celld-local".to_string());
             if !workflow_bindings.is_empty() {
                 do_classes.push(cello::deploy::workflow_class(&script_name));
             }
-            let crons: Vec<String> = std::env::var("CELLD_TEST_CRONS")
+            let crons: Vec<String> = std::env::var("CELLO_TEST_CRONS")
                 .unwrap_or_default()
                 .split(';')
                 .map(str::trim)
@@ -4520,13 +4520,13 @@ async fn async_main(
                     prefix: script_path.clone(),
                     asset_binding: None,
                     // A bare script has no wrangler config, so this names the
-                    // loaders the way `CELLD_TEST_DO_CLASSES` names a class:
+                    // loaders the way `CELLO_TEST_DO_CLASSES` names a class:
                     // a comma-separated list, because a config can declare
                     // more than one loader. It is the local-script equivalent
                     // of `worker_loaders`, and not a production switch: a
                     // deployed project reaches a loader only through its own
                     // config.
-                    loader_bindings: std::env::var("CELLD_TEST_WORKER_LOADER")
+                    loader_bindings: std::env::var("CELLO_TEST_WORKER_LOADER")
                         .unwrap_or_default()
                         .split(',')
                         .map(str::trim)
@@ -4587,15 +4587,15 @@ async fn async_main(
             (None, ownership, peer_key, None, None)
         };
     if let Some(config) = &telemetry_config {
-        // Either signal can demand the bucket: traces via `CELLD_OTEL=1`,
-        // logs via `CELLD_OTEL_LOGS=bucket` under any traces sink.
+        // Either signal can demand the bucket: traces via `CELLO_OTEL=1`,
+        // logs via `CELLO_OTEL_LOGS=bucket` under any traces sink.
         let sink_bucket = match (&config.sink, &config.logs_sink) {
             (cello::telemetry::SinkChoice::Bucket, _) | (_, cello::telemetry::LogsSink::Bucket) => {
                 if settings.bucket.is_none() {
                     anyhow::bail!(
-                        "CELLD_OTEL=1 or CELLD_OTEL_LOGS=bucket but this node has no bucket; the \
-                         bucket sink needs one (CELLD_BUCKET), or choose \
-                         CELLD_OTEL=http://collector:4318"
+                        "CELLO_OTEL=1 or CELLO_OTEL_LOGS=bucket but this node has no bucket; the \
+                         bucket sink needs one (CELLO_BUCKET), or choose \
+                         CELLO_OTEL=http://collector:4318"
                     );
                 }
                 // Its own client even for the fleet bucket: each open is its
@@ -4702,7 +4702,7 @@ async fn async_main(
         drain_pins,
         trust_forwarded_headers: settings.trust_forwarded_headers,
         max_outbound_websockets: cello::env_vars::positive_or(
-            "CELLD_MAX_OUTBOUND_WEBSOCKETS",
+            "CELLO_MAX_OUTBOUND_WEBSOCKETS",
             DEFAULT_MAX_OUTBOUND_WEBSOCKETS,
         )?,
         max_request_body_bytes,
@@ -4719,12 +4719,12 @@ async fn async_main(
     // requires the explicit fleet posture.
     // Fleet is the default: without a healthy follower, writes need bucket
     // proof. Maintenance recruits up to two followers; one healthy follower
-    // is sufficient for fleet proof. CELLD_DURABILITY=bucket always requires
+    // is sufficient for fleet proof. CELLO_DURABILITY=bucket always requires
     // bucket proof, including when peers are available.
-    let durability = std::env::var("CELLD_DURABILITY").unwrap_or_else(|_| "fleet".into());
+    let durability = std::env::var("CELLO_DURABILITY").unwrap_or_else(|_| "fleet".into());
     anyhow::ensure!(
         matches!(durability.as_str(), "bucket" | "fleet"),
-        "CELLD_DURABILITY must be `bucket` or `fleet`"
+        "CELLO_DURABILITY must be `bucket` or `fleet`"
     );
     let mut durability_owner = DurabilityOwnerSelection::new(follower.clone());
     if let Ownership::Bucket(bucket_ownership) = &actor.ownership {
@@ -4935,13 +4935,13 @@ async fn async_main(
 
     // The fleet-aware first-readiness gate: withhold the first health 200
     // until no donor is mid-handoff and every live peer publishes successor
-    // capacity. CELLD_READY_FLEET_GATE_MS bounds the silent wait before celld
+    // capacity. CELLO_READY_FLEET_GATE_MS bounds the silent wait before celld
     // reports the blocking condition, but it cannot make an unsafe fleet
     // ready. Orchestrators key rollout advance on readiness, so a fail-open
     // deadline would erase the only signal that prevents another donor. The
     // gate is one-shot: once open, fleet state never demotes readiness, and a
     // gated node still serves its owned cells through peers.
-    let ready_gate_ms: u64 = cello::env_vars::with_default("CELLD_READY_FLEET_GATE_MS", 120_000)?;
+    let ready_gate_ms: u64 = cello::env_vars::with_default("CELLO_READY_FLEET_GATE_MS", 120_000)?;
     match (&ready_ownership, ready_gate_ms) {
         (Some(ownership), gate_ms) if gate_ms > 0 => {
             let ownership = ownership.clone();
@@ -5087,7 +5087,7 @@ async fn async_main(
                     // first sample (a failed tick publishes an empty view, which closes
                     // it), re-checked per flush via `bucket_bundles_enabled`, which
                     // additionally requires the operator switch (opt-in;
-                    // `CELLD_BUCKET_BUNDLES=1` enables it). When the gate closes,
+                    // `CELLO_BUCKET_BUNDLES=1` enables it). When the gate closes,
                     // the node falls back at once to per-cell L0 uploads for new writes.
                     let bundle_open = bucket_posture
                         && cello_logic::format::bucket_bundles_allowed(&peers, view_ms);
@@ -5193,7 +5193,7 @@ async fn async_main(
         // hint for a cell this node already serves is ignored, and one for a
         // cell with a live owner elsewhere resolves to that owner rather
         // than stealing it.
-        let tick_ms = cello::env_vars::positive::<u64>("CELLD_WAKER_TICK_MS")?.unwrap_or(60_000);
+        let tick_ms = cello::env_vars::positive::<u64>("CELLO_WAKER_TICK_MS")?.unwrap_or(60_000);
         cello::asyncrt::spawn(cello::wake::run_periodic(
             client,
             ownership,
@@ -6223,7 +6223,7 @@ fn forwarder_response_stream(
 
 #[cfg(all(test, cello_internal_tests))]
 mod durability_lifecycle_private {
-    include!(env!("CELLD_CONFORMANCE_MAIN_DURABILITY_TESTS"));
+    include!(env!("CELLO_CONFORMANCE_MAIN_DURABILITY_TESTS"));
 }
 
 /// Wire-level proof that the seal/tail route marks a stale-target 409

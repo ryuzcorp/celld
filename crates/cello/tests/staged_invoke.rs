@@ -120,7 +120,7 @@ impl TestNode {
             .arg("--no-watch")
             .arg("--logs");
         if let Some(token) = token {
-            command.env("CELLD_OPERATOR_TOKEN", token);
+            command.env("CELLO_OPERATOR_TOKEN", token);
         }
         for (key, value) in env {
             command.env(key, value);
@@ -1069,7 +1069,7 @@ fn hung_background_work_fails_the_invoke() {
         &fleet.project,
         "settle",
         Some(TOKEN),
-        &[("CELLD_HANDLER_BUDGET_S", "5")],
+        &[("CELLO_HANDLER_BUDGET_S", "5")],
     );
     let signer = fleet.store.signer("settle");
     let app_v2 = fleet.store.stage(&fleet.app_v2);

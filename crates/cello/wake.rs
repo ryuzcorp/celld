@@ -26,8 +26,8 @@ use tracing::warn;
 pub fn resident_ms() -> i64 {
     static MS: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
     *MS.get_or_init(|| {
-        crate::env_vars::with_default("CELLD_ALARM_RESIDENT_MS", 3_600_000)
-            .expect("validated CELLD_ALARM_RESIDENT_MS")
+        crate::env_vars::with_default("CELLO_ALARM_RESIDENT_MS", 3_600_000)
+            .expect("validated CELLO_ALARM_RESIDENT_MS")
     })
 }
 

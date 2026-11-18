@@ -24,7 +24,7 @@
 //! fresh send arms the alarm that drives it, which covers the forward
 //! and accept in the redrive direction — the marking query is untouched
 //! by this change. One `celld dev` boots the app fixture with
-//! `CELLD_TEST_DATA_DIR` pinned, so the cell databases are addressable.
+//! `CELLO_TEST_DATA_DIR` pinned, so the cell databases are addressable.
 //! There are no fixed sleeps: every wait polls an observable condition
 //! with a deadline, and the server guard kills the child on every exit
 //! path.
@@ -132,7 +132,7 @@ impl TestNode {
             .arg("0")
             .arg("--no-watch")
             .arg("--logs")
-            .env("CELLD_TEST_DATA_DIR", data_dir)
+            .env("CELLO_TEST_DATA_DIR", data_dir)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()

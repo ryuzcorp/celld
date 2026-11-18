@@ -78,7 +78,7 @@ impl DevState {
         }
     }
 
-    /// An explicit state directory, from `--state` or `CELLD_DEV_STATE`.
+    /// An explicit state directory, from `--state` or `CELLO_DEV_STATE`.
     /// Unlike `for_project` this names an arbitrary directory, so only
     /// the marker authorizes a delete — even when the path happens to end
     /// in `.celld/dev`.
@@ -90,21 +90,21 @@ impl DevState {
     }
 
     /// The state directory for one project: the `--state` flag wins, then
-    /// `CELLD_DEV_STATE`, then `PROJECT/.celld/dev`. Operator commands
+    /// `CELLO_DEV_STATE`, then `PROJECT/.celld/dev`. Operator commands
     /// (`d1 --local`) take the same `--state` flag and resolve through this
     /// too, so they follow the override.
     pub(crate) fn resolve(project: &Path, flag: Option<PathBuf>) -> Self {
         Self::resolve_with(
             project,
             flag,
-            std::env::var_os("CELLD_DEV_STATE").map(PathBuf::from),
+            std::env::var_os("CELLO_DEV_STATE").map(PathBuf::from),
         )
     }
 
     fn resolve_with(project: &Path, flag: Option<PathBuf>, env: Option<PathBuf>) -> Self {
         // An empty or whitespace-only flag or variable is unset, not a
         // directory — mirroring the fleet resolver's `trim().is_empty()`
-        // check, so `CELLD_DEV_STATE=" "` cannot adopt a directory named
+        // check, so `CELLO_DEV_STATE=" "` cannot adopt a directory named
         // `" "`.
         let is_unset = |dir: &PathBuf| dir.to_string_lossy().trim().is_empty();
         match flag
@@ -120,9 +120,9 @@ impl DevState {
     /// commands that reach the `celld dev` node through it (`d1 --local`).
     /// Pure path math: the caller decides what a missing file means.
     /// `state` is the command's `--state` flag, so the operator command
-    /// resolves exactly like `celld dev`: the flag, then `CELLD_DEV_STATE`,
+    /// resolves exactly like `celld dev`: the flag, then `CELLO_DEV_STATE`,
     /// then `PROJECT/.celld/dev`. `environment` is the lookup
-    /// `CELLD_DEV_STATE` resolves through, so tests pass an empty one
+    /// `CELLO_DEV_STATE` resolves through, so tests pass an empty one
     /// instead of inheriting the developer's shell.
     pub(crate) fn database_for_project(
         project: &Path,
@@ -132,7 +132,7 @@ impl DevState {
         Self::resolve_with(
             project,
             state,
-            environment("CELLD_DEV_STATE").map(PathBuf::from),
+            environment("CELLO_DEV_STATE").map(PathBuf::from),
         )
         .path
         .join("objects.sqlite3")
@@ -487,7 +487,7 @@ fn ignored_project_path(
 
 #[cfg(all(test, cello_internal_tests))]
 mod dev_contract {
-    include!(env!("CELLD_INTERNAL_DEV_TESTS"));
+    include!(env!("CELLO_INTERNAL_DEV_TESTS"));
 }
 
 struct ShutdownSignals {
@@ -533,7 +533,7 @@ pub fn print_help() -> anyhow::Result<()> {
 USAGE:\n  celld dev [PROJECT] [--host IP] [--port PORT] [--logs] [--no-watch] [--clean] [--state DIR]\n\n\
 PROJECT is a directory or a Wrangler config. It defaults to the current\n\
 directory. celld stores all local state in PROJECT/.celld/dev — or in DIR\n\
-when --state (or CELLD_DEV_STATE) names one, keeping the state outside the\n\
+when --state (or CELLO_DEV_STATE) names one, keeping the state outside the\n\
 source tree — and it keeps that state across a restart. A configuration\n\
 change does not migrate the state, so a cell can keep a value that the new\n\
 configuration rejects. Use --clean to start from an empty local state;\n\
@@ -542,7 +542,7 @@ A .dev.vars file beside the config supplies Worker variables in dotenv form,\n\
 as for wrangler dev. Without one, .env and then .env.local supply them, and\n\
 an entry of these files that cannot be a binding is skipped with a warning.\n\
 The entries override the vars of the config.\n\n\
-OPTIONS:\n  --host IP              Worker listener host (default: 127.0.0.1)\n  --port PORT            Worker listener port (default: {DEFAULT_PORT}; 0 assigns an ephemeral port)\n  --clean                Delete the local state before the server starts\n  --state DIR            Keep local state in DIR instead of PROJECT/.celld/dev\n                         (CELLD_DEV_STATE sets the same); --clean removes DIR\n                         only when celld created it\n  --logs                 Show the node warning and information logs\n  --no-watch             Do not rebuild when a project file changes\n  --watch-ignore PATTERN Ignore a project-relative glob; repeat as needed\n  -h, --help             Show this help"
+OPTIONS:\n  --host IP              Worker listener host (default: 127.0.0.1)\n  --port PORT            Worker listener port (default: {DEFAULT_PORT}; 0 assigns an ephemeral port)\n  --clean                Delete the local state before the server starts\n  --state DIR            Keep local state in DIR instead of PROJECT/.celld/dev\n                         (CELLO_DEV_STATE sets the same); --clean removes DIR\n                         only when celld created it\n  --logs                 Show the node warning and information logs\n  --no-watch             Do not rebuild when a project file changes\n  --watch-ignore PATTERN Ignore a project-relative glob; repeat as needed\n  -h, --help             Show this help"
         ),
     )
 }
@@ -943,14 +943,14 @@ async fn start_node(
     for variable in [
         "AWS_DEFAULT_REGION",
         "AWS_REGION",
-        "CELLD_ADDR",
-        "CELLD_ADVERTISE",
-        "CELLD_BUCKET",
-        "CELLD_CLOUD",
-        "CELLD_INTERNAL_ADDR",
-        "CELLD_TEST_BUCKET",
-        "CELLD_TRUST_FORWARDED_HEADERS",
-        "CELLD_UNSAFE_PUBLIC_ADVERTISE",
+        "CELLO_ADDR",
+        "CELLO_ADVERTISE",
+        "CELLO_BUCKET",
+        "CELLO_CLOUD",
+        "CELLO_INTERNAL_ADDR",
+        "CELLO_TEST_BUCKET",
+        "CELLO_TRUST_FORWARDED_HEADERS",
+        "CELLO_UNSAFE_PUBLIC_ADVERTISE",
         "S3_ENDPOINT",
     ] {
         command.env_remove(variable);
@@ -965,9 +965,9 @@ async fn start_node(
             "--internal-listen",
             "127.0.0.1:0",
         ])
-        .env("CELLD_INTERNAL_DEV_STORE", &store.database)
-        .env("CELLD_WATCH", state.join("runtime"))
-        .env("CELLD_NODE", format!("dev-{}", &project_hash[..12]))
+        .env("CELLO_INTERNAL_DEV_STORE", &store.database)
+        .env("CELLO_WATCH", state.join("runtime"))
+        .env("CELLO_NODE", format!("dev-{}", &project_hash[..12]))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit());

@@ -317,7 +317,7 @@ fn rpc_stub_conformance() {
     let fixture = copy_fixture("flow");
     // The JS-side drain asserts below read the test-only stats hook, so
     // the node boots with it enabled.
-    let node = TestNode::boot_with_env(fixture.path(), "flow", &[("CELLD_TEST_STUB_STATS", "1")]);
+    let node = TestNode::boot_with_env(fixture.path(), "flow", &[("CELLO_TEST_STUB_STATS", "1")]);
 
     // Stub method call with plain args/results, plus a property GET and a
     // callee-side error crossing back.
@@ -682,9 +682,9 @@ fn rpc_stub_caps_fail_closed() {
         fixture.path(),
         "caps",
         &[
-            ("CELLD_STUB_SCOPE_CAP", "8"),
-            ("CELLD_UPLOAD_CAP", "4"),
-            ("CELLD_TEST_STUB_STATS", "1"),
+            ("CELLO_STUB_SCOPE_CAP", "8"),
+            ("CELLO_UPLOAD_CAP", "4"),
+            ("CELLO_TEST_STUB_STATS", "1"),
         ],
     );
     let baseline = host_stub_count(&node);
@@ -770,7 +770,7 @@ fn rpc_stub_throwing_entrypoint_op_ends_its_ctx() {
     // reply, and must leave no live context behind. The stats read runs
     // as its own request, so exactly one context (itself) is live.
     let fixture = copy_fixture("r4");
-    let node = TestNode::boot_with_env(fixture.path(), "r4", &[("CELLD_TEST_STUB_STATS", "1")]);
+    let node = TestNode::boot_with_env(fixture.path(), "r4", &[("CELLO_TEST_STUB_STATS", "1")]);
     let aborted = get_json(&node, "/entrypoint-op-abort");
     assert_eq!(aborted["error"], "op-boom", "{aborted}");
     assert_eq!(caller_stats(&node)["liveCtxs"], 1, "no live ctx leaks");
@@ -786,8 +786,8 @@ fn rpc_stub_dup_dispose_frees_the_entry() {
         fixture.path(),
         "dup",
         &[
-            ("CELLD_STUB_SCOPE_CAP", "8"),
-            ("CELLD_TEST_STUB_STATS", "1"),
+            ("CELLO_STUB_SCOPE_CAP", "8"),
+            ("CELLO_TEST_STUB_STATS", "1"),
         ],
     );
     let baseline = host_stub_count(&node);
@@ -830,7 +830,7 @@ fn rpc_stub_response_body_across_events() {
     // value and never touches the read path. Both shapes also run
     // through a nested stub op.
     let fixture = copy_fixture("resp");
-    let node = TestNode::boot_with_env(fixture.path(), "resp", &[("CELLD_TEST_WAIT", "1")]);
+    let node = TestNode::boot_with_env(fixture.path(), "resp", &[("CELLO_TEST_WAIT", "1")]);
     let buffered = get_json(&node, "/response-buffered");
     assert_eq!(
         buffered["data"],
@@ -858,7 +858,7 @@ fn rpc_stub_response_body_across_events() {
 
 #[test]
 fn rpc_stub_stats_gated_without_env() {
-    // Without CELLD_TEST_STUB_STATS the stats hook is absent from every
+    // Without CELLO_TEST_STUB_STATS the stats hook is absent from every
     // isolate: production tenants cannot probe neighbor-invocation
     // liveness on a shared heap. The fixture reports its absence
     // instead of counts, on both sides.

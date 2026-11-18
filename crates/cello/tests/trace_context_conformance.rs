@@ -137,13 +137,13 @@ impl TestNode {
             .arg("0")
             .arg("--no-watch")
             .arg("--logs")
-            .env("CELLD_OTEL", otel)
-            .env("CELLD_OTEL_FLUSH_MS", "100")
+            .env("CELLO_OTEL", otel)
+            .env("CELLO_OTEL_FLUSH_MS", "100")
             .env("OTEL_SERVICE_NAME", "trace-probe")
-            // An ambient `CELLD_DEV_STATE` would pull the child's state out
+            // An ambient `CELLO_DEV_STATE` would pull the child's state out
             // of the temporary project and leave `objects.sqlite3` behind.
             // Drop it so the child keeps the normal project-local state.
-            .env_remove("CELLD_DEV_STATE")
+            .env_remove("CELLO_DEV_STATE")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         let mut child = command.spawn().expect("spawn celld dev");

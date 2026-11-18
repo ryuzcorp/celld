@@ -3,7 +3,7 @@
 
 //! The version `celld --version` reports.
 //!
-//! `build.rs` bakes `CELLD_VERSION` into the binary when the build sets it
+//! `build.rs` bakes `CELLO_VERSION` into the binary when the build sets it
 //! (`<version>-ryuzcorp.<n>` on fork releases, `<version>-ryuzcorp.ci` in
 //! CI) and falls back to the crate version otherwise, so a plain `cargo
 //! build` still reports something sane.
@@ -11,7 +11,7 @@
 /// The full build version: the fork release name when the build baked one
 /// in, else the crate version.
 pub fn version() -> &'static str {
-    env!("CELLD_VERSION")
+    env!("CELLO_VERSION")
 }
 
 #[cfg(test)]

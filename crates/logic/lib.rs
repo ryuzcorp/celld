@@ -4323,7 +4323,7 @@ impl State {
     /// already known to be a takeover: a node with room activates locally,
     /// and a node without room for live demand looks for fleet capacity
     /// instead of parking the requests behind a residency slot it will never
-    /// free. An ingress-only node (`CELLD_MAX_RESIDENT_CELLS=0`) used to take
+    /// free. An ingress-only node (`CELLO_MAX_RESIDENT_CELLS=0`) used to take
     /// the dead owner's cell over itself and fail `CapacityExhausted`
     /// forever, even with a healthy peer idle (denoland/celld#263). The
     /// claim keeps its takeover mark and prior owner either way, so the

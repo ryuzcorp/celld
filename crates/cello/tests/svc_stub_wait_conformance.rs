@@ -20,7 +20,7 @@
 //! One `celld dev` boots the app fixture; the controller fixture is
 //! pre-seeded into the dev bucket via the library (the same `build` + `write`
 //! `dev` itself runs), so the node loads both scripts and the service binding
-//! resolves cross-isolate. The node boots with `CELLD_TEST_WAIT=1`, which
+//! resolves cross-isolate. The node boots with `CELLO_TEST_WAIT=1`, which
 //! defines the test-only retained-wait hook the fixture drives. There are
 //! no fixed sleeps: every wait polls an observable condition with a
 //! deadline, and the server guard kills the child on every exit path.
@@ -167,7 +167,7 @@ impl TestNode {
             .arg("0")
             .arg("--no-watch")
             .arg("--logs")
-            .env("CELLD_TEST_WAIT", "1")
+            .env("CELLO_TEST_WAIT", "1")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()

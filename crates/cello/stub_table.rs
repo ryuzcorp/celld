@@ -43,13 +43,13 @@ pub(crate) const HOST_STUB_MAX_PER_SCOPE: usize = 4096;
 pub(crate) const HOST_STUB_MAX_PER_PROCESS: usize = 65536;
 
 /// The effective per-scope mint cap: the default unless
-/// `CELLD_STUB_SCOPE_CAP` overrides it. Conformance tests boot with a
+/// `CELLO_STUB_SCOPE_CAP` overrides it. Conformance tests boot with a
 /// tiny cap so the fail-closed error is reachable without churning
 /// thousands of entries; garbage falls back to the default.
 pub(crate) fn scope_cap() -> usize {
     static CAP: OnceLock<usize> = OnceLock::new();
     *CAP.get_or_init(|| {
-        crate::env_vars::optional::<usize>("CELLD_STUB_SCOPE_CAP")
+        crate::env_vars::optional::<usize>("CELLO_STUB_SCOPE_CAP")
             .ok()
             .flatten()
             .filter(|cap| *cap > 0)
@@ -58,11 +58,11 @@ pub(crate) fn scope_cap() -> usize {
 }
 
 /// The effective per-process mint cap: the default unless
-/// `CELLD_STUB_PROCESS_CAP` overrides it.
+/// `CELLO_STUB_PROCESS_CAP` overrides it.
 pub(crate) fn process_cap() -> usize {
     static CAP: OnceLock<usize> = OnceLock::new();
     *CAP.get_or_init(|| {
-        crate::env_vars::optional::<usize>("CELLD_STUB_PROCESS_CAP")
+        crate::env_vars::optional::<usize>("CELLO_STUB_PROCESS_CAP")
             .ok()
             .flatten()
             .filter(|cap| *cap > 0)
@@ -71,13 +71,13 @@ pub(crate) fn process_cap() -> usize {
 }
 
 /// Whether the harness defines the test-only stub-stats global. Set only
-/// by `CELLD_TEST_STUB_STATS=1` in the node's process environment, which
+/// by `CELLO_TEST_STUB_STATS=1` in the node's process environment, which
 /// tenant code cannot reach (worker bindings never become process
 /// variables); anything else, including garbage, leaves production
 /// isolates without the hook. The conformance suites boot with it set.
 pub(crate) fn test_stub_stats_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var("CELLD_TEST_STUB_STATS").as_deref() == Ok("1"))
+    *ENABLED.get_or_init(|| std::env::var("CELLO_TEST_STUB_STATS").as_deref() == Ok("1"))
 }
 /// A stub id is exactly the minted shape: 32 lowercase hex digits.
 /// Anything else is rejected before any lookup.

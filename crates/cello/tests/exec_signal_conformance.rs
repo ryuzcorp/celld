@@ -14,7 +14,7 @@
 //! signal refuses with its reason before spawning, aborting later sends
 //! SIGKILL to the process, an abort in flight kills the fresh process at
 //! once, and a process that exits first unwires its listener so a later
-//! abort sends nothing. The node boots with `CELLD_TEST_WAIT=1`, which
+//! abort sends nothing. The node boots with `CELLO_TEST_WAIT=1`, which
 //! defines the test-only fake exec engine the fixture drives: the test
 //! environment has no container engine (image resolution needs Docker,
 //! so a fixture cannot even declare `containers[]`), and the fake stands
@@ -69,7 +69,7 @@ impl TestNode {
             .arg("0")
             .arg("--no-watch")
             .arg("--logs")
-            .env("CELLD_TEST_WAIT", "1")
+            .env("CELLO_TEST_WAIT", "1")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()

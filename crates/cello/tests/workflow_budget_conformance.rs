@@ -7,7 +7,7 @@
 // injected clock/filesystem/async rules do not apply to it.
 #![allow(clippy::disallowed_methods)]
 
-//! A Workflow whose steps sum past `CELLD_HANDLER_BUDGET_S` keeps running
+//! A Workflow whose steps sum past `CELLO_HANDLER_BUDGET_S` keeps running
 //! to completion across alarm retries instead of stalling `running` forever
 //! (denoland/celld#299). Each drive runs what fits in the budget; when the
 //! handler expires, the engine retries the alarm, and the redrive replays
@@ -61,7 +61,7 @@ impl TestNode {
             // Twelve one-second steps under a five-second handler budget:
             // no single drive can finish, so completion proves every redrive
             // replays and continues instead of stalling.
-            .env("CELLD_HANDLER_BUDGET_S", "5")
+            .env("CELLO_HANDLER_BUDGET_S", "5")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         let mut child = command.spawn().expect("spawn celld dev");

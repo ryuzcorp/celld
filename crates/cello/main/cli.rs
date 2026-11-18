@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): CELLD_MEMORY_SCOPE help; operator token for the internal listener; staged activation; staged invoke command; CELLD_DEPLOY_AWS_* help; non-dumpable serving process. bucket-posture group commit: bundle switch help (0070); bundle switch defaults off (0075); CELLD_NODE pinning help (upstream #249); background budget help (upstream #275); CELLD_TMP_MAX_BYTES help (upstream #280); celld versions command (upstream #181); CELLD_SQL_STATEMENT_MS help (upstream #274); CELLD_MAX_CELLS_PER_ISOLATE help (upstream #278).
+// Modified by ryuzcorp (ryuzcorp/celld): CELLO_MEMORY_SCOPE help; operator token for the internal listener; staged activation; staged invoke command; CELLO_DEPLOY_AWS_* help; non-dumpable serving process. bucket-posture group commit: bundle switch help (0070); bundle switch defaults off (0075); CELLO_NODE pinning help (upstream #249); background budget help (upstream #275); CELLO_TMP_MAX_BYTES help (upstream #280); celld versions command (upstream #181); CELLO_SQL_STATEMENT_MS help (upstream #274); CELLO_MAX_CELLS_PER_ISOLATE help (upstream #278).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! The command line: what the process was asked to do, and the help text
@@ -126,12 +126,12 @@ pub(crate) fn action_from_process() -> anyhow::Result<Action> {
             .ok()
             .filter(|value| !value.trim().is_empty())
     };
-    let cello_bucket = env("CELLD_BUCKET");
-    let fixture_bucket = env("CELLD_TEST_BUCKET");
-    let control_plane = cello::env_vars::flag("CELLD_CLOUD", false)?;
-    let configured_listen = env("CELLD_ADDR");
-    let configured_internal_listen = env("CELLD_INTERNAL_ADDR");
-    let configured_advertise = env("CELLD_ADVERTISE");
+    let cello_bucket = env("CELLO_BUCKET");
+    let fixture_bucket = env("CELLO_TEST_BUCKET");
+    let control_plane = cello::env_vars::flag("CELLO_CLOUD", false)?;
+    let configured_listen = env("CELLO_ADDR");
+    let configured_internal_listen = env("CELLO_INTERNAL_ADDR");
+    let configured_advertise = env("CELLO_ADVERTISE");
     if !diagnose
         && arguments.is_empty()
         && !control_plane
@@ -167,12 +167,12 @@ pub(crate) fn action_from_process() -> anyhow::Result<Action> {
             .map(cello::startup::Listen::Explicit)
             .unwrap_or(cello::startup::Listen::LoopbackEphemeral),
         advertise: configured_advertise,
-        unsafe_public_advertise: cello::env_vars::flag("CELLD_UNSAFE_PUBLIC_ADVERTISE", false)?,
-        trust_forwarded_headers: cello::env_vars::flag("CELLD_TRUST_FORWARDED_HEADERS", false)?,
+        unsafe_public_advertise: cello::env_vars::flag("CELLO_UNSAFE_PUBLIC_ADVERTISE", false)?,
+        trust_forwarded_headers: cello::env_vars::flag("CELLO_TRUST_FORWARDED_HEADERS", false)?,
         dev_store: if diagnose {
             None
         } else {
-            std::env::var_os("CELLD_INTERNAL_DEV_STORE").map(std::path::PathBuf::from)
+            std::env::var_os("CELLO_INTERNAL_DEV_STORE").map(std::path::PathBuf::from)
         },
     };
     let mut args = arguments.into_iter();
@@ -249,14 +249,14 @@ pub(crate) fn action_from_process() -> anyhow::Result<Action> {
     };
     if listen_configured && public_listener_is_non_loopback && !internal_listen_configured {
         anyhow::bail!(
-            "a non-loopback --listen or CELLD_ADDR requires an explicit --internal-listen or \
-             CELLD_INTERNAL_ADDR; celld does not reuse the public Worker listener for peers"
+            "a non-loopback --listen or CELLO_ADDR requires an explicit --internal-listen or \
+             CELLO_INTERNAL_ADDR; celld does not reuse the public Worker listener for peers"
         );
     }
     if settings.advertise.is_some() && !internal_listen_configured {
         anyhow::bail!(
-            "--advertise or CELLD_ADVERTISE requires an explicit --internal-listen or \
-             CELLD_INTERNAL_ADDR; the default internal listener uses a random loopback port"
+            "--advertise or CELLO_ADVERTISE requires an explicit --internal-listen or \
+             CELLO_INTERNAL_ADDR; the default internal listener uses a random loopback port"
         );
     }
     if settings.dev_store.is_some() {
@@ -322,7 +322,7 @@ OPTIONS:
                          Peer and unauthenticated operator listener
                          (default: 127.0.0.1:0)
   --advertise ADDR:PORT  Address peers can reach: IP:PORT or HOST:PORT
-                         (requires --internal-listen or CELLD_INTERNAL_ADDR)
+                         (requires --internal-listen or CELLO_INTERNAL_ADDR)
   --peer NODE_ID         Diagnose one node with a signed direct probe; repeatable
   --json                 Print one JSON object per diagnostic check
   --read-only            Skip the bucket write probe. celld diagnose otherwise
@@ -343,94 +343,94 @@ OPTIONS:
 
 ENVIRONMENT:
   Boolean variables accept only `0` or `1`; invalid values stop startup.
-  CELLD_BUCKET                    Fleet bucket and prefix; same as --bucket
+  CELLO_BUCKET                    Fleet bucket and prefix; same as --bucket
   S3_ENDPOINT                     S3-compatible endpoint; same as --endpoint
   AWS_REGION, AWS_DEFAULT_REGION  Storage region (default: us-east-1)
   AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN
                                   Explicit credentials in the standard AWS chain
-  CELLD_DEPLOY_AWS_ACCESS_KEY_ID, CELLD_DEPLOY_AWS_SECRET_ACCESS_KEY,
-  CELLD_DEPLOY_AWS_SESSION_TOKEN  A second credential, read-only over the
+  CELLO_DEPLOY_AWS_ACCESS_KEY_ID, CELLO_DEPLOY_AWS_SECRET_ACCESS_KEY,
+  CELLO_DEPLOY_AWS_SESSION_TOKEN  A second credential, read-only over the
                                   deployment pointer and bundles: a node reads
                                   deploy/ and deploy-blobs/ with it and
                                   everything else with AWS_*. S3 only; the
                                   access key and secret are both required.
-  CELLD_ADDR                      Public Worker listener; same as --listen
-  CELLD_INTERNAL_ADDR             Peer and operator listener; same as --internal-listen
-  CELLD_ADVERTISE                 Peer-reachable address; same as --advertise
-  CELLD_UNSAFE_PUBLIC_ADVERTISE   `1` permits a literal public IP in
-                                  CELLD_ADVERTISE; it does not resolve hostnames
-                                  or restrict CELLD_INTERNAL_ADDR
-  CELLD_OPERATOR_TOKEN            Bearer token for every internal-listener
+  CELLO_ADDR                      Public Worker listener; same as --listen
+  CELLO_INTERNAL_ADDR             Peer and operator listener; same as --internal-listen
+  CELLO_ADVERTISE                 Peer-reachable address; same as --advertise
+  CELLO_UNSAFE_PUBLIC_ADVERTISE   `1` permits a literal public IP in
+                                  CELLO_ADVERTISE; it does not resolve hostnames
+                                  or restrict CELLO_INTERNAL_ADDR
+  CELLO_OPERATOR_TOKEN            Bearer token for every internal-listener
                                   route; unset leaves the listener open, empty
                                   refuses to start
-  CELLD_TRUST_FORWARDED_HEADERS   `1` trusts X-Forwarded-Host and
+  CELLO_TRUST_FORWARDED_HEADERS   `1` trusts X-Forwarded-Host and
                                   X-Forwarded-Proto
-  CELLD_NODE                      Node-session ID (default: generated and
+  CELLO_NODE                      Node-session ID (default: generated and
                                   pinned to node-id in the data dir, reused
                                   across restarts on the same data dir; the
                                   PID-scoped default temp dir mints a new id
-                                  every boot, so set CELLD_WATCH to a
+                                  every boot, so set CELLO_WATCH to a
                                   persistent directory to keep the id)
-  CELLD_WATCH                     Local SQLite/replication working directory
-  CELLD_ESBUILD                   Override esbuild executable path
-  CELLD_ACTIVATIONS               Concurrent cold activations
-  CELLD_ASSET_CACHE_DIR           Downloaded static-asset cache directory
-  CELLD_ASSET_CACHE_BYTES         Asset cache limit
+  CELLO_WATCH                     Local SQLite/replication working directory
+  CELLO_ESBUILD                   Override esbuild executable path
+  CELLO_ACTIVATIONS               Concurrent cold activations
+  CELLO_ASSET_CACHE_DIR           Downloaded static-asset cache directory
+  CELLO_ASSET_CACHE_BYTES         Asset cache limit
 
 TUNING:
-  CELLD_TTL_MS                    Node lease lifetime (default: 10000)
-  CELLD_OPERATION_DEADLINE_MS     Non-restore operation deadline (default: 15000)
-  CELLD_SHUTDOWN_TOTAL_MS         Complete process stop bound (default: {shutdown_total_ms})
+  CELLO_TTL_MS                    Node lease lifetime (default: 10000)
+  CELLO_OPERATION_DEADLINE_MS     Non-restore operation deadline (default: 15000)
+  CELLO_SHUTDOWN_TOTAL_MS         Complete process stop bound (default: {shutdown_total_ms})
                                   Internal shutdown waits scale with this bound
-  CELLD_READY_FLEET_GATE_MS       First-readiness wait for fleet capacity
+  CELLO_READY_FLEET_GATE_MS       First-readiness wait for fleet capacity
                                   (default: 120000; 0 disables)
-  CELLD_REBALANCE_INTERVAL_MS     Ownership balancing sample interval
+  CELLO_REBALANCE_INTERVAL_MS     Ownership balancing sample interval
                                   (default: 5000; 0 disables)
-  CELLD_PLACEMENT_WEIGHT          Relative ownership share (default: the
+  CELLO_PLACEMENT_WEIGHT          Relative ownership share (default: the
                                   CPU count)
-  CELLD_IDLE_EVICT_S              Idle-cell eviction age (disabled unless set)
-  CELLD_RECOVERY_RETRY_MS         Dead-owner recovery retry backoff (default: 1000)
-  CELLD_RECOVERY_RETRIES          Recovery retries before a request fails (default: 240)
-  CELLD_LOCAL_CACHE_MAX_BYTES     Hibernated SQLite cache limit (default: 2 GiB; 0 disables)
-  CELLD_MAX_RESIDENT_CELLS        Resident-cell hard cap, enforced at admission
-  CELLD_MAX_CELL_REQUESTS         Concurrent fetches per cell (default: 64)
-  CELLD_MAX_REQUEST_BODY_BYTES    Ingress request body limit (default: 1 GiB)
-  CELLD_MAX_ASSET_FILE_BYTES      Per-file asset limit (default: 25 MiB)
-  CELLD_MAX_DYNAMIC_WORKER_CODE_BYTES  Loaded module total (default: 64 MiB)
-  CELLD_TMP_MAX_BYTES             Per-request /tmp size limit (default: 64 MiB)
-  CELLD_PRESSURE_OWNERSHIP        release to rebalance, sticky to cache locally
-  CELLD_MAX_RSS_MB                Active-memory shed threshold (default: 80%; 0 disables)
-  CELLD_MEMORY_SCOPE              Which cgroup memory pressure reads: the
+  CELLO_IDLE_EVICT_S              Idle-cell eviction age (disabled unless set)
+  CELLO_RECOVERY_RETRY_MS         Dead-owner recovery retry backoff (default: 1000)
+  CELLO_RECOVERY_RETRIES          Recovery retries before a request fails (default: 240)
+  CELLO_LOCAL_CACHE_MAX_BYTES     Hibernated SQLite cache limit (default: 2 GiB; 0 disables)
+  CELLO_MAX_RESIDENT_CELLS        Resident-cell hard cap, enforced at admission
+  CELLO_MAX_CELL_REQUESTS         Concurrent fetches per cell (default: 64)
+  CELLO_MAX_REQUEST_BODY_BYTES    Ingress request body limit (default: 1 GiB)
+  CELLO_MAX_ASSET_FILE_BYTES      Per-file asset limit (default: 25 MiB)
+  CELLO_MAX_DYNAMIC_WORKER_CODE_BYTES  Loaded module total (default: 64 MiB)
+  CELLO_TMP_MAX_BYTES             Per-request /tmp size limit (default: 64 MiB)
+  CELLO_PRESSURE_OWNERSHIP        release to rebalance, sticky to cache locally
+  CELLO_MAX_RSS_MB                Active-memory shed threshold (default: 80%; 0 disables)
+  CELLO_MEMORY_SCOPE              Which cgroup memory pressure reads: the
                                   container root (container, the default) or
                                   the process's own cgroup leaf (self)
-  CELLD_ALARM_RESIDENT_MS         Near-alarm residency window
-  CELLD_WAKER_TICK_MS             Orphan-alarm scan interval
-  CELLD_V8_HEAP_LIMIT_MB          Per-isolate V8 heap limit
-  CELLD_MAX_CELLS_PER_ISOLATE     Cells per isolate (default: 32; lower it
+  CELLO_ALARM_RESIDENT_MS         Near-alarm residency window
+  CELLO_WAKER_TICK_MS             Orphan-alarm scan interval
+  CELLO_V8_HEAP_LIMIT_MB          Per-isolate V8 heap limit
+  CELLO_MAX_CELLS_PER_ISOLATE     Cells per isolate (default: 32; lower it
                                   for heavyweight cells such as agents)
-  CELLD_SQL_STATEMENT_MS          Per-statement SQL time bound (unset means
+  CELLO_SQL_STATEMENT_MS          Per-statement SQL time bound (unset means
                                   unbounded; timed-out statements fail and
                                   roll back)
-  CELLD_FETCH_TIMEOUT_S           Outbound fetch timeout
-  CELLD_HANDLER_BUDGET_S          JavaScript handler budget
-  CELLD_BACKGROUND_BUDGET_S       Post-response background budget (default: 30)
-  CELLD_TOKIO_THREADS             Tokio runtime worker threads
-  CELLD_DURABILITY                `fleet` acks when every follower holds the
+  CELLO_FETCH_TIMEOUT_S           Outbound fetch timeout
+  CELLO_HANDLER_BUDGET_S          JavaScript handler budget
+  CELLO_BACKGROUND_BUDGET_S       Post-response background budget (default: 30)
+  CELLO_TOKIO_THREADS             Tokio runtime worker threads
+  CELLO_DURABILITY                `fleet` acks when every follower holds the
                                   write on disk, or when the bucket upload
                                   wins, and uploads behind either way; needs
                                   2+ nodes, else every ack waits for the
                                   bucket and writes are much slower
                                   (default: `fleet`; `bucket` always waits)
-  CELLD_BUCKET_BUNDLES            Group a bucket-posture flush round into one
+  CELLO_BUCKET_BUNDLES            Group a bucket-posture flush round into one
                                   shared bundle proof (default: `0` uploads
                                   per-cell; `1` enables group commit)
-  CELLD_BUCKET_BUNDLE_LINGER_MS   Hold a bundle round open for concurrent
+  CELLO_BUCKET_BUNDLE_LINGER_MS   Hold a bundle round open for concurrent
                                   writes while 2+ cells are dirty (default: 0;
                                   clamps to 1000)
-  CELLD_LOG_PIPELINE              Fleet log rounds in flight (default: 4)
-  CELLD_LOG_HEDGE_MS              Duplicate a slow log append (default: adaptive; 0 disables)
-  CELLD_LTX_TRUNCATE_PAGES        WAL pages before a truncate checkpoint (default: 128; Queues never truncate; 0 disables)
-  CELLD_LTX_RETENTION_SECS        Grace in seconds before an owner deletes superseded epochs (default: unset, no deletion)
+  CELLO_LOG_PIPELINE              Fleet log rounds in flight (default: 4)
+  CELLO_LOG_HEDGE_MS              Duplicate a slow log append (default: adaptive; 0 disables)
+  CELLO_LTX_TRUNCATE_PAGES        WAL pages before a truncate checkpoint (default: 128; Queues never truncate; 0 disables)
+  CELLO_LTX_RETENTION_SECS        Grace in seconds before an owner deletes superseded epochs (default: unset, no deletion)
   RUST_LOG                        Runtime log filter (default: info)
 
 Documentation: https://celld.dev/docs"#,

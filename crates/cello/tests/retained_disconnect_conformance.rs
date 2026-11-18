@@ -153,7 +153,7 @@ export default {
 "#;
 
 /// Serializes this binary's tests around the retained-wait gate: the
-/// globals exist only with `CELLD_TEST_WAIT=1`, read once per process at
+/// globals exist only with `CELLO_TEST_WAIT=1`, read once per process at
 /// first worker load, so every load in this binary happens under this
 /// lock after the var is set.
 static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -167,7 +167,7 @@ static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 #[test]
 fn disconnect_drops_unrefed_retained_wait_so_later_request_rereads() {
     let _serial = SERIAL.lock().unwrap();
-    std::env::set_var("CELLD_TEST_WAIT", "1");
+    std::env::set_var("CELLO_TEST_WAIT", "1");
     ensure_engine();
     let mut worker = load_worker(RETAINED_DISCONNECT, "retained-disconnect");
 

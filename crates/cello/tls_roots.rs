@@ -82,7 +82,7 @@ mod tests {
     /// The child re-enters this test with the marker set, reads the
     /// fixture path from its own (parent-supplied) environment, and reports
     /// whether the loader surfaced the anchor.
-    const CHILD_ENV: &str = "CELLD_TLS_ROOTS_TEST_CHILD";
+    const CHILD_ENV: &str = "CELLO_TLS_ROOTS_TEST_CHILD";
     const TEST: &str = "tls_roots::tests::native_loader_honors_ssl_cert_file";
 
     #[test]

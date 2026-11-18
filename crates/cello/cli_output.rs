@@ -511,5 +511,5 @@ impl Listed {
 
 #[cfg(all(test, cello_internal_tests))]
 mod cli_output_contract {
-    include!(env!("CELLD_INTERNAL_CLI_OUTPUT_TESTS"));
+    include!(env!("CELLO_INTERNAL_CLI_OUTPUT_TESTS"));
 }

@@ -134,7 +134,7 @@ pub(crate) async fn run(
 ///
 /// One variable for every KV test knob, not one variable each:
 ///
-///   CELLD_TEST_KV=no-sweep,fail-after-blob,min-ttl-ms=1000
+///   CELLO_TEST_KV=no-sweep,fail-after-blob,min-ttl-ms=1000
 ///
 /// These are test-only and read the production environment rather than
 /// sitting behind `cfg(cello_internal_tests)`, because the code they steer
@@ -146,7 +146,7 @@ pub(crate) async fn run(
 /// delay; `legacy-schema` creates the first release's inline-only table.
 pub(crate) fn limits() -> serde_json::Value {
     use cello_logic::kv;
-    let knobs = std::env::var("CELLD_TEST_KV").unwrap_or_default();
+    let knobs = std::env::var("CELLO_TEST_KV").unwrap_or_default();
     let knob = |name: &str| -> Option<String> {
         knobs.split(',').map(str::trim).find_map(|entry| {
             let rest = entry.strip_prefix(name)?;

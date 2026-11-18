@@ -8,7 +8,7 @@
 #![allow(clippy::disallowed_methods)]
 
 //! Upstream denoland/celld#306: `AbortSignal.timeout(ms)` inside a Durable
-//! Object held one of the object's `CELLD_MAX_CELL_REQUESTS` slots until the
+//! Object held one of the object's `CELLO_MAX_CELL_REQUESTS` slots until the
 //! timer fired, so 64 sequential requests each minting an unused timeout
 //! signal made the 65th fail with `503 cell request limit reached`.
 //!

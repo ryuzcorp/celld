@@ -19,7 +19,7 @@
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct PressureConfig {
     /// The ceiling on the memory the cells hold. This is the ordinary limit,
-    /// and `CELLD_MAX_RSS_MB` sets it.
+    /// and `CELLO_MAX_RSS_MB` sets it.
     pub high_bytes: Option<u64>,
     /// An absolute ceiling on the cgroup charge, or process RSS when the
     /// process has no readable cgroup: 95% of the available memory.
@@ -150,7 +150,7 @@ impl PressureConfig {
     /// The policy lives here, not at the edge, because it is arithmetic with a
     /// correctness argument and requires explicit validation. The shell only
     /// supplies the two facts it can read: how much memory the process can use, and what
-    /// `CELLD_MAX_RSS_MB` says. `None` for the setting means the default, and
+    /// `CELLO_MAX_RSS_MB` says. `None` for the setting means the default, and
     /// `Some(0)` disables pressure shedding altogether.
     ///
     /// The absolute cap is 95% of the machine and is never derived from the

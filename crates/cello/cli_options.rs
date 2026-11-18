@@ -11,7 +11,7 @@
 //! one place and not another: a rule spread across four loops is a rule
 //! four authors have to remember.
 //!
-//! The environment fallbacks live here too, so `CELLD_BUCKET`,
+//! The environment fallbacks live here too, so `CELLO_BUCKET`,
 //! `S3_ENDPOINT`, `AWS_REGION` and `AWS_DEFAULT_REGION` mean one thing
 //! across the CLI.
 
@@ -28,7 +28,7 @@ fn env(name: &str) -> Option<String> {
 }
 
 pub(crate) fn bucket_from_environment() -> Option<String> {
-    env("CELLD_BUCKET").map(|value| value.trim().to_string())
+    env("CELLO_BUCKET").map(|value| value.trim().to_string())
 }
 
 /// Which fleet a command acts on.
@@ -83,7 +83,7 @@ impl FleetFlags {
         // always exports, so it must not beat a flag or a default.
         let env = |name: &str| environment(name).filter(|value| !value.trim().is_empty());
         if self.bucket.is_none() {
-            self.bucket = env("CELLD_BUCKET").map(|value| value.trim().to_string());
+            self.bucket = env("CELLO_BUCKET").map(|value| value.trim().to_string());
         }
         if self.endpoint.is_none() {
             self.endpoint = env("S3_ENDPOINT");
@@ -115,7 +115,7 @@ impl FleetFlags {
             .with_context(|| {
                 format!(
                     "{command} requires --bucket s3://NAME, gs://NAME or az://CONTAINER \
-                     (or CELLD_BUCKET)"
+                     (or CELLO_BUCKET)"
                 )
             })?;
         Ok(Storage {
@@ -137,7 +137,7 @@ impl Storage {
 }
 
 /// The shared fleet-flag help, so every command documents them identically.
-pub const FLEET_HELP: &str = "  --bucket NAME       Fleet bucket (or CELLD_BUCKET)
+pub const FLEET_HELP: &str = "  --bucket NAME       Fleet bucket (or CELLO_BUCKET)
   --endpoint URL      Optional S3-compatible endpoint (or S3_ENDPOINT)
   --region REGION     Storage region (default: AWS_REGION or us-east-1)";
 

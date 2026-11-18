@@ -312,7 +312,7 @@ pub(crate) struct GcOptions {
 }
 
 /// The dry run's grace when the operator passes no `--grace-secs`. The
-/// owner has no default: epoch GC is off until `CELLD_LTX_RETENTION_SECS`
+/// owner has no default: epoch GC is off until `CELLO_LTX_RETENTION_SECS`
 /// sets one.
 const DEFAULT_GC_GRACE_SECS: u64 = 3600;
 
@@ -344,7 +344,7 @@ pub(crate) fn gc_options_from_arguments(
     if !dry_run {
         bail!(
             "celld cell gc deletes nothing itself; pass --dry-run to report what the owners \
-             would delete, and give CELLD_LTX_RETENTION_SECS a positive value on the nodes to \
+             would delete, and give CELLO_LTX_RETENTION_SECS a positive value on the nodes to \
              let them"
         );
     }
@@ -367,7 +367,7 @@ newest epoch, the epoch before it, and each epoch whose newest object is
 younger than the grace. This command reads the bucket and writes nothing.
 
 The owners delete fewer, later, or none: only a node with a positive
-CELLD_LTX_RETENTION_SECS deletes, in either CELLD_DURABILITY mode, with
+CELLO_LTX_RETENTION_SECS deletes, in either CELLO_DURABILITY mode, with
 that grace instead of --grace-secs; a paged cell waits until its local
 file is complete; an inactive cell waits until it is active again; a cell
 that is not paged waits until its activation has a write, so a cell that

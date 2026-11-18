@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): cross-isolate RPC stubs and streams; D1 export operator-ingress marker; ported from meln1k/celld: report wake coverage after maintenance (e6cb9a3); wake coverage follow-ups: startup observation ordering, installation comparison; trusted cell RPC; deployment cache scope purge on generation free; staged invoke joins the driver past the reply.; answered drivers poll while waitUntil background is outstanding (upstream #300); drivers take the mailbox once more before retiring (upstream #309); post-response background budget ends orphaned drives (upstream #275); storage-poisoned cells restart on a fresh isolate (upstream #291); restore fails a vanished class before touching disk (upstream #276); incoming spans carry HTTP method/status and 5xx without exception marks error (upstream #285); CELLD_MAX_CELLS_PER_ISOLATE knob (upstream #278).
+// Modified by ryuzcorp (ryuzcorp/celld): cross-isolate RPC stubs and streams; D1 export operator-ingress marker; ported from meln1k/celld: report wake coverage after maintenance (e6cb9a3); wake coverage follow-ups: startup observation ordering, installation comparison; trusted cell RPC; deployment cache scope purge on generation free; staged invoke joins the driver past the reply.; answered drivers poll while waitUntil background is outstanding (upstream #300); drivers take the mailbox once more before retiring (upstream #309); post-response background budget ends orphaned drives (upstream #275); storage-poisoned cells restart on a fresh isolate (upstream #291); restore fails a vanished class before touching disk (upstream #276); incoming spans carry HTTP method/status and 5xx without exception marks error (upstream #285); CELLO_MAX_CELLS_PER_ISOLATE knob (upstream #278).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 // RuntimeManager is the V8 cell-host arm, so its executor and observability
@@ -463,13 +463,13 @@ fn pool_limits_from(lookup: &dyn Fn(&str) -> Option<String>) -> cello_logic::iso
         // rather than two independently configurable values.
         grow_at: GROW_AT,
         shrink_under: SHRINK_UNDER,
-        max_stateless: positive("CELLD_MAX_STATELESS_ISOLATES").unwrap_or(cores),
-        max_requests: positive("CELLD_MAX_REQUESTS"),
+        max_stateless: positive("CELLO_MAX_STATELESS_ISOLATES").unwrap_or(cores),
+        max_requests: positive("CELLO_MAX_REQUESTS"),
         // This is an engine blast-radius policy. The resident-cell and RSS
         // limits are the operator controls for node memory. Heavy-weight
         // cells (agents being the reported case) can lower the per-isolate
         // packing so one heap holds fewer of them (denoland/celld#278).
-        max_cells: positive("CELLD_MAX_CELLS_PER_ISOLATE").unwrap_or(DEFAULT_CELLS_PER_ISOLATE),
+        max_cells: positive("CELLO_MAX_CELLS_PER_ISOLATE").unwrap_or(DEFAULT_CELLS_PER_ISOLATE),
     }
 }
 
@@ -480,7 +480,7 @@ fn pool_limits_from(lookup: &dyn Fn(&str) -> Option<String>) -> cello_logic::iso
 /// live: `Slot::affiliate` counts an affiliation for a request's whole life,
 /// `observe` reports it, and `isolate::admit` refuses against it. Unset
 /// means unbounded, not unwired — `engine/load-under-pressure.md` measures
-/// `CELLD_MAX_REQUESTS=32` admitting 641 rps against a theoretical 640.
+/// `CELLO_MAX_REQUESTS=32` admitting 641 rps against a theoretical 640.
 pub fn pool_limits() -> cello_logic::isolate::PoolLimits {
     pool_limits_from(&|name| crate::env_vars::value(name).expect("readable runtime limit"))
 }
@@ -812,7 +812,7 @@ impl RuntimeManager {
             bucket,
         } = options;
         let max_cell_requests =
-            crate::env_vars::positive_or("CELLD_MAX_CELL_REQUESTS", DEFAULT_MAX_CELL_REQUESTS)?;
+            crate::env_vars::positive_or("CELLO_MAX_CELL_REQUESTS", DEFAULT_MAX_CELL_REQUESTS)?;
         let generation = Arc::new(generation);
         let core = crate::cell_runtime::CellRuntime::new(
             generation.clone(),
@@ -1841,7 +1841,7 @@ impl RuntimeManager {
             // operation deadline expired the firing, so an `alarm()` that left
             // one pending timer — what `AbortSignal.timeout` leaves behind
             // after its fetch finished — delayed every re-arm by up to
-            // `CELLD_OPERATION_DEADLINE_MS`, and the core booked a handler
+            // `CELLO_OPERATION_DEADLINE_MS`, and the core booked a handler
             // that succeeded as a stuck one (denoland/celld#228).
             Ok((alarm, wrote)) => {
                 watch_detached_alarm_drive(drive, &cell, op);
@@ -3343,13 +3343,13 @@ impl CellIsolateStartupTiming {
 /// placed here, because this isolate outlives any of them.
 fn load_cell_isolate(config: Arc<WorkerConfig>) -> anyhow::Result<Worker> {
     #[cfg(debug_assertions)]
-    if let Ok(barrier) = std::env::var("CELLD_TEST_CELL_STARTUP_BARRIER") {
+    if let Ok(barrier) = std::env::var("CELLO_TEST_CELL_STARTUP_BARRIER") {
         while !Path::new(&barrier).exists() {
             std::thread::sleep(Duration::from_millis(10));
         }
     }
     #[cfg(debug_assertions)]
-    if std::env::var("CELLD_TEST_CELL_STARTUP_FAILURE").as_deref() == Ok("1") {
+    if std::env::var("CELLO_TEST_CELL_STARTUP_FAILURE").as_deref() == Ok("1") {
         return Err(anyhow!("injected cell isolate startup failure"));
     }
     Worker::load_config(config).map_err(|error| error.context("cell isolate load failed"))
@@ -4349,14 +4349,14 @@ export default { fetch() { return new Response('ok'); } };
 mod pool_limit_tests {
     use super::*;
 
-    /// `CELLD_MAX_CELLS_PER_ISOLATE` overrides the per-isolate cell packing;
+    /// `CELLO_MAX_CELLS_PER_ISOLATE` overrides the per-isolate cell packing;
     /// unset restores the historical 32 (denoland/celld#278). The lookup is
     /// injected so the test never touches process-wide environment state,
     /// which the parallel runner would leak into unrelated pool readers.
     #[test]
     fn max_cells_per_isolate_is_configurable() {
         let configured =
-            |name: &str| (name == "CELLD_MAX_CELLS_PER_ISOLATE").then(|| "4".to_string());
+            |name: &str| (name == "CELLO_MAX_CELLS_PER_ISOLATE").then(|| "4".to_string());
         assert_eq!(
             pool_limits_from(&configured).max_cells,
             4,

@@ -203,8 +203,8 @@ pub async fn run(arguments: Vec<String>) -> anyhow::Result<()> {
 }
 
 /// `run` with the environment lookup under test control, so tests pass an
-/// empty one instead of inheriting `CELLD_BUCKET`, `S3_ENDPOINT`, or
-/// `CELLD_DEV_STATE` from the developer's shell — and never mutate the
+/// empty one instead of inheriting `CELLO_BUCKET`, `S3_ENDPOINT`, or
+/// `CELLO_DEV_STATE` from the developer's shell — and never mutate the
 /// process environment parallel tests share.
 async fn run_with(
     arguments: Vec<String>,
@@ -442,7 +442,7 @@ async fn open_dev_database(
     if !database.exists() {
         bail!(
             "no celld dev state at {}; run `celld dev` in {} first, with the same `--state DIR` \
-             (or `CELLD_DEV_STATE`) when the node uses one",
+             (or `CELLO_DEV_STATE`) when the node uses one",
             database.display(),
             project.display()
         );
@@ -710,14 +710,14 @@ struct Command {
     /// instead of a fleet bucket.
     local: bool,
     /// The dev state directory for the local path: the `--state` flag,
-    /// resolving the same way as `celld dev` (flag, `CELLD_DEV_STATE`,
+    /// resolving the same way as `celld dev` (flag, `CELLO_DEV_STATE`,
     /// project).
     state: Option<PathBuf>,
 }
 
 impl Command {
     /// `parse` with the environment lookup under test control, so tests
-    /// pass an empty one instead of inheriting `CELLD_BUCKET` or
+    /// pass an empty one instead of inheriting `CELLO_BUCKET` or
     /// `S3_ENDPOINT` from the developer's shell — and never mutate the
     /// process environment parallel tests share. The production conflict
     /// guard below is unchanged: `--local` still refuses any fleet bucket
@@ -877,7 +877,7 @@ impl Command {
         if local && (fleet.bucket.is_some() || fleet.endpoint.is_some()) {
             bail!(
                 "`celld d1 --local` reaches the `celld dev` node through the project's local state, \
-                 not a fleet bucket; drop --bucket/--endpoint (and CELLD_BUCKET/S3_ENDPOINT)"
+                 not a fleet bucket; drop --bucket/--endpoint (and CELLO_BUCKET/S3_ENDPOINT)"
             );
         }
         if !local && state.is_some() {
@@ -925,11 +925,11 @@ needs.
 `--local` runs the subcommand against the `celld dev` node instead of the
 fleet: it reads the database identity from PROJECT as usual, then reaches
 the running dev node through the project's local state (PROJECT/.celld/dev,
-or the `--state`/`CELLD_DEV_STATE` directory when one is set) — the local
+or the `--state`/`CELLO_DEV_STATE` directory when one is set) — the local
 store carries that node's leases and secret, so execute, export, and
 migrations work unchanged. Pass `--state DIR` when the node runs with
-`celld dev --state DIR` (or `CELLD_DEV_STATE`). The dev node must be running.
-`--local` takes no --bucket, --endpoint, CELLD_BUCKET, or S3_ENDPOINT.
+`celld dev --state DIR` (or `CELLO_DEV_STATE`). The dev node must be running.
+`--local` takes no --bucket, --endpoint, CELLO_BUCKET, or S3_ENDPOINT.
 
 Migration files are `NNNN_description.sql` in `migrations/`. The `sql`
 extension is ASCII case-insensitive. celld applies the files in the order of
@@ -962,7 +962,7 @@ OPTIONS:
                       running dev node instead of the fleet
   --state DIR         With --local, use DIR as the `celld dev` state
                       directory instead of PROJECT/.celld/dev
-                      (CELLD_DEV_STATE sets the same)
+                      (CELLO_DEV_STATE sets the same)
   --json              Print one JSON object per row instead of a table
   --output PATH       Write the export to a file instead of stdout
   --table NAME        Export only this table, its indexes, and its triggers;
@@ -982,8 +982,8 @@ mod d1_export_cli_tests {
     use super::*;
 
     /// The tests inherit nothing from the developer's shell: an empty
-    /// environment keeps `CELLD_BUCKET`, `S3_ENDPOINT`, and
-    /// `CELLD_DEV_STATE` from changing what the command resolves — and
+    /// environment keeps `CELLO_BUCKET`, `S3_ENDPOINT`, and
+    /// `CELLO_DEV_STATE` from changing what the command resolves — and
     /// never mutates the process environment parallel tests share.
     fn empty_environment(_name: &str) -> Option<std::ffi::OsString> {
         None
@@ -1203,8 +1203,8 @@ mod d1_export_cli_tests {
             "the refusal must name `celld dev`: {message}"
         );
         assert!(
-            message.contains("CELLD_DEV_STATE"),
-            "the refusal must name `CELLD_DEV_STATE`: {message}"
+            message.contains("CELLO_DEV_STATE"),
+            "the refusal must name `CELLO_DEV_STATE`: {message}"
         );
     }
 

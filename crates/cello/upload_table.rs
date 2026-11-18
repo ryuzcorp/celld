@@ -51,13 +51,13 @@ use std::sync::OnceLock;
 /// closed with a clear error instead of minting.
 pub(crate) const UPLOAD_MAX_PER_PROCESS: usize = 8192;
 
-/// The effective upload cap: the default unless `CELLD_UPLOAD_CAP`
+/// The effective upload cap: the default unless `CELLO_UPLOAD_CAP`
 /// overrides it (conformance tests boot with a tiny cap; garbage falls
 /// back to the default).
 pub(crate) fn upload_cap() -> usize {
     static CAP: OnceLock<usize> = OnceLock::new();
     *CAP.get_or_init(|| {
-        crate::env_vars::optional::<usize>("CELLD_UPLOAD_CAP")
+        crate::env_vars::optional::<usize>("CELLO_UPLOAD_CAP")
             .ok()
             .flatten()
             .filter(|cap| *cap > 0)

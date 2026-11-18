@@ -7,7 +7,7 @@
 // boundary's injected clock/filesystem/async rules do not apply to it.
 #![allow(clippy::disallowed_methods)]
 
-//! Conformance for the tenant egress policy (`CELLD_EGRESS=public`): one
+//! Conformance for the tenant egress policy (`CELLO_EGRESS=public`): one
 //! `celld dev` boots with the loopback echo port allowlisted, proxy
 //! variables pointing at a blackhole listener, and the fixture worker
 //! driving every outbound path — `fetch()` to each denied range (by
@@ -71,9 +71,9 @@ impl TestNode {
             .arg("0")
             .arg("--no-watch")
             .arg("--logs")
-            .env("CELLD_EGRESS", "public")
-            .env("CELLD_EGRESS_ALLOW", format!("127.0.0.1:{echo_port}"))
-            .env("CELLD_FETCH_TIMEOUT_S", "3")
+            .env("CELLO_EGRESS", "public")
+            .env("CELLO_EGRESS_ALLOW", format!("127.0.0.1:{echo_port}"))
+            .env("CELLO_FETCH_TIMEOUT_S", "3")
             .env("HTTP_PROXY", proxy)
             .env("HTTPS_PROXY", proxy)
             .env("ALL_PROXY", proxy)
