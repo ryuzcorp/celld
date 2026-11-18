@@ -309,7 +309,7 @@ pub enum Phase {
 }
 
 /// One authority observation from one state-machine boundary.
-#[cfg(celld_internal_tests)]
+#[cfg(cello_internal_tests)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AuthorityObserverSnapshot {
     pub node_authoritative: bool,
@@ -319,7 +319,7 @@ pub struct AuthorityObserverSnapshot {
 }
 
 /// The independent inputs for one StepSafety census.
-#[cfg(celld_internal_tests)]
+#[cfg(cello_internal_tests)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StepSafetyObserverSnapshot {
     pub occupied_counter: usize,
@@ -740,7 +740,7 @@ pub struct State {
     /// Number of cell-table entries inspected by the shutdown release pump.
     /// Instrumentation uses this to enforce a structural work bound instead
     /// of timing a host whose speed is unrelated to the decision.
-    #[cfg(celld_internal_tests)]
+    #[cfg(cello_internal_tests)]
     drain_table_visits: u64,
     /// Cells reserved at the shutdown or generation-swap quiesce boundary.
     /// The set is bounded by `max_releases`, so an actor event can promote an
@@ -948,7 +948,7 @@ impl State {
             config,
             fenced: false,
             draining: false,
-            #[cfg(celld_internal_tests)]
+            #[cfg(cello_internal_tests)]
             drain_table_visits: 0,
             quiescing_cells: BTreeSet::new(),
             releasing_cells: BTreeSet::new(),
@@ -1076,7 +1076,7 @@ impl State {
     ///
     /// An observer joins these snapshots by cell before it discards each cell
     /// identifier. A node-wide census cannot preserve that association.
-    #[cfg(celld_internal_tests)]
+    #[cfg(cello_internal_tests)]
     pub fn phase_snapshot_for_test(&self) -> BTreeMap<CellId, Phase> {
         self.cells
             .iter()
@@ -1085,7 +1085,7 @@ impl State {
     }
 
     /// Return the authority inputs from one observation boundary.
-    #[cfg(celld_internal_tests)]
+    #[cfg(cello_internal_tests)]
     pub fn authority_observer_snapshot(&self, cell: &str) -> AuthorityObserverSnapshot {
         AuthorityObserverSnapshot {
             node_authoritative: self.node_authoritative(),
@@ -1096,7 +1096,7 @@ impl State {
     }
 
     /// Return both sides of each structural count from the decision core.
-    #[cfg(celld_internal_tests)]
+    #[cfg(cello_internal_tests)]
     pub fn step_safety_observer_snapshot(&self) -> StepSafetyObserverSnapshot {
         StepSafetyObserverSnapshot {
             occupied_counter: self.occupied,
@@ -1198,12 +1198,12 @@ impl State {
     /// Return the release pump's exact cell-table work for a bounded
     /// work assertion. This is not elapsed time, so the result is stable on
     /// every host and under every scheduler.
-    #[cfg(celld_internal_tests)]
+    #[cfg(cello_internal_tests)]
     pub fn drain_table_visits_for_test(&self) -> u64 {
         self.drain_table_visits
     }
 
-    #[cfg(celld_internal_tests)]
+    #[cfg(cello_internal_tests)]
     fn record_drain_table_visits(&mut self, visits: usize) {
         self.drain_table_visits = self.drain_table_visits.saturating_add(visits as u64);
     }
@@ -6116,7 +6116,7 @@ impl State {
         // before resident work can spend the complete bounded batch. The
         // general dormant walk below remains after residents because an idle
         // application cell carries no comparable background obligation.
-        #[cfg(celld_internal_tests)]
+        #[cfg(cello_internal_tests)]
         self.record_drain_table_visits(self.cells.len());
         let dormant_queues: Vec<(CellId, Epoch)> = self
             .cells
@@ -6148,7 +6148,7 @@ impl State {
         // Reserve the complete batch even when its cells are active. Future
         // requests wait in `cell.requests`; the already-running requests keep
         // the runtime pinned until their activity guards finish.
-        #[cfg(celld_internal_tests)]
+        #[cfg(cello_internal_tests)]
         self.record_drain_table_visits(self.cells.len());
         let mut residents: Vec<(CellId, bool, u64, RequestId, u64)> = self
             .cells
@@ -6221,7 +6221,7 @@ impl State {
         // that record only makes a successor wait out the node lease. The
         // runtime is already stopped, so the drain releases the record
         // directly.
-        #[cfg(celld_internal_tests)]
+        #[cfg(cello_internal_tests)]
         self.record_drain_table_visits(self.cells.len());
         let dormant: Vec<(CellId, Epoch)> = self
             .cells

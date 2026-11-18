@@ -1,0 +1,990 @@
+// Modified by ryuzcorp (ryuzcorp/celld): operator token for the internal listener; D1 export operator-ingress marker; trusted cell RPC; marker-aware tunnel negotiation; trusted-header control strip; unguessable tunneled-upgrade park ids.
+// Copyright 2026 Deno Land Inc. All rights reserved.
+
+//! The peer tunnel: an upgraded stream per peer, plain HTTP inside.
+//!
+//! Establishment is an h1 upgrade on `/peer/tunnel` — CONNECT semantics with Upgrade
+//! mechanics, because CONNECT's authority-form target fits this use badly.
+//! After the 101 the connection is an opaque duplex stream, and app requests
+//! cross as literal HTTP driven by hyper on both ends: the hop never
+//! interprets the inner bytes, so the headers the cell must receive
+//! byte-faithful (`Host`, `Content-Length`, `Upgrade`) are data here, not
+//! metadata. Per-call control (scope, cell name, request id, capacity
+//! handoff) rides `x-cells-*` headers on the inner request; node A overwrites
+//! and node B strips them, so the reserved names cannot be smuggled by an
+//! application in either direction.
+//!
+//! Idle tunnels are pooled per peer and reused for sequential calls — plain
+//! h1 keep-alive inside the tunnel, never multiplexing. Without reuse every
+//! call is a fresh TCP connection, and a loopback-speed caller saturates the
+//! whole ephemeral-port range into TIME_WAIT within seconds (~1k calls/s is
+//! the hard OS ceiling), which the pooled transport this replaces never hit.
+
+use std::collections::HashMap;
+use std::convert::Infallible;
+
+use bytes::Bytes;
+use futures_util::StreamExt;
+use futures_util::TryStreamExt;
+use http_body_util::BodyExt;
+use hyper::body::Body;
+use hyper::body::Incoming;
+use hyper::service::service_fn;
+use hyper::Request;
+use hyper::Response;
+use hyper::StatusCode;
+use hyper_util::rt::TokioIo;
+use rand::RngCore;
+
+use super::*;
+use cello::js::HttpChunkStream;
+
+pub(crate) const TUNNEL_PROTOCOL: &str = "celld-tunnel";
+pub(crate) const TUNNEL_VERSION: &str = "5";
+pub(crate) const VERSION_HEADER: &str = "x-cells-tunnel-version";
+pub(crate) const KIND_HEADER: &str = "x-cells-tunnel-kind";
+pub(crate) const SCOPE_HEADER: &str = "x-cells-scope";
+pub(crate) const NAME_HEADER: &str = "x-cells-do-name";
+pub(crate) const REQUEST_ID_HEADER: &str = "x-cells-request-id";
+pub(crate) const HANDOFF_HEADER: &str = "x-cells-capacity-handoff";
+pub(crate) const OPERATOR_HEADER: &str = "x-cells-operator";
+/// A peer that sends this header on establishment forwards only host-set
+/// markers: it strips the marker headers from application input (fetch) or
+/// never takes them from it (RPC). Older peers on the same tunnel version
+/// send no flag, so node B can tell a marker node A set from one a Worker
+/// on node A smuggled through. Unknown establishment headers are ignored,
+/// so the flag crosses a rolling upgrade in both directions.
+pub(crate) const MARKERS_HEADER: &str = "x-cells-tunnel-markers";
+
+/// The inner headers node A owns. A overwrites them on the way in and B
+/// strips them on the way out, so an application header with a reserved name
+/// is dropped rather than obeyed. Nothing on the fetch path reads the
+/// trusted marker, but the name is reserved anyway, so a future reader
+/// cannot be smuggled one.
+const CONTROL_HEADERS: [&str; 6] = [
+    SCOPE_HEADER,
+    NAME_HEADER,
+    REQUEST_ID_HEADER,
+    HANDOFF_HEADER,
+    OPERATOR_HEADER,
+    TRUSTED_HEADER,
+];
+
+enum TunnelKind {
+    Do,
+    Rpc,
+}
+
+/// The control fields of one tunneled call, carried as inner-request headers
+/// so one tunnel can serve calls for any cell.
+pub(crate) struct TunnelControl {
+    pub(crate) scope: String,
+    pub(crate) name: Option<String>,
+    pub(crate) request_id: Option<cello::js::RequestId>,
+    pub(crate) capacity_handoff: bool,
+    pub(crate) operator_ingress: bool,
+}
+
+/// Node B: whether the establishing peer negotiated the marker-aware
+/// tunnel. The flag rides the fleet-authenticated establishment, which a
+/// Worker cannot influence: node A's host code builds those headers.
+fn negotiated_markers(headers: &hyper::HeaderMap) -> bool {
+    headers
+        .get(MARKERS_HEADER)
+        .is_some_and(|value| value.as_bytes() == b"1")
+}
+
+/// Node B honors a marker header only from a peer that negotiated the
+/// marker-aware tunnel. An older peer forwards a Worker's application
+/// headers with these names unstripped, so honoring them would let a
+/// Worker there forge operator ingress (fetch) or a trusted call (RPC)
+/// here.
+fn honored_operator(headers: &hyper::HeaderMap, marker_aware: bool) -> bool {
+    marker_aware && headers.get(OPERATOR_HEADER).is_some()
+}
+
+fn honored_trusted(headers: &hyper::HeaderMap, marker_aware: bool) -> bool {
+    marker_aware
+        && headers
+            .get(TRUSTED_HEADER)
+            .is_some_and(|value| value.as_bytes() == b"1")
+}
+
+pub(crate) fn is_tunnel_request(request: &Request<Incoming>) -> bool {
+    request
+        .headers()
+        .get(hyper::header::UPGRADE)
+        .is_some_and(|value| value.as_bytes() == TUNNEL_PROTOCOL.as_bytes())
+}
+
+/// Node B: answer a tunnel establishment on `/peer/tunnel` with a 101 and serve the
+/// inner connection until the peer closes it.
+///
+/// The establishment carries the fleet HMAC and nothing after it does. The
+/// signature gates who can open a tunnel — the inner calls it then carries
+/// are cell dispatches, and a reserved-class dispatch must demand the fleet
+/// secret on every path the way `/runtime/` does. The signature does not
+/// authenticate the bytes after the 101 and does not encrypt anything; the
+/// private network remains the boundary for both.
+pub(crate) fn accept(mut request: Request<Incoming>, app: AppHandle) -> HttpReply {
+    let path_and_query = request
+        .uri()
+        .path_and_query()
+        .map_or_else(|| request.uri().path().to_string(), ToString::to_string);
+    if let Err(error) = app.peer_auth.verify(
+        request.method(),
+        &path_and_query,
+        request.headers(),
+        b"",
+        app.peer_auth.source(),
+    ) {
+        let mut denied = response(error.status(), error.message());
+        // A wrong target means the dialer holds a stale lease for this
+        // address; the stale marker lets its redispatch invalidate the
+        // route instead of retrying the same dead name.
+        if matches!(error, peer_auth::VerifyError::WrongTarget) {
+            denied.headers_mut().insert(
+                hyper::header::HeaderName::from_static(STALE_ROUTE_HEADER),
+                hyper::header::HeaderValue::from_static(STALE_ROUTE_VALUE),
+            );
+        }
+        return peer_response(denied);
+    }
+    let headers = request.headers();
+    if headers
+        .get(VERSION_HEADER)
+        .is_none_or(|value| value.as_bytes() != TUNNEL_VERSION.as_bytes())
+    {
+        return peer_response(response(
+            StatusCode::UPGRADE_REQUIRED,
+            "peer tunnel version is incompatible",
+        ));
+    }
+    let kind = match headers
+        .get(KIND_HEADER)
+        .map(hyper::header::HeaderValue::as_bytes)
+    {
+        Some(b"do") => TunnelKind::Do,
+        Some(b"rpc") => TunnelKind::Rpc,
+        _ => {
+            return peer_response(response(StatusCode::BAD_REQUEST, "unknown tunnel kind"));
+        }
+    };
+    // The markers are protocol-negotiated: without the flag this peer
+    // predates them, so its marker headers are untrusted input rather than
+    // node A's word. The headers are still stripped as control headers, but
+    // never honored; a legit operator call through such a peer fails closed
+    // in the cell's operator-only branch with the usual "is an operator
+    // operation" refusal.
+    let marker_aware = negotiated_markers(headers);
+    let upgrade = hyper::upgrade::on(&mut request);
+    tokio::spawn(async move {
+        let upgraded = match upgrade.await {
+            Ok(upgraded) => upgraded,
+            Err(_) => return,
+        };
+        match kind {
+            TunnelKind::Do => serve_do(upgraded, app, marker_aware).await,
+            TunnelKind::Rpc => serve_rpc(upgraded, app, marker_aware).await,
+        }
+    });
+    let mut reply = response(StatusCode::SWITCHING_PROTOCOLS, "");
+    reply.headers_mut().insert(
+        hyper::header::UPGRADE,
+        hyper::header::HeaderValue::from_static(TUNNEL_PROTOCOL),
+    );
+    reply.headers_mut().insert(
+        hyper::header::CONNECTION,
+        hyper::header::HeaderValue::from_static("upgrade"),
+    );
+    reply.headers_mut().insert(
+        hyper::header::HeaderName::from_static(VERSION_HEADER),
+        hyper::header::HeaderValue::from_static(TUNNEL_VERSION),
+    );
+    peer_response(reply)
+}
+
+/// One inner request, one call: parse the app request hyper already framed,
+/// dispatch it exactly as the enveloped path did, and let the reply stream
+/// back as an ordinary HTTP response. The connection serves calls until the
+/// peer closes it or an inner upgrade consumes it.
+async fn serve_do(upgraded: hyper::upgrade::Upgraded, app: AppHandle, marker_aware: bool) {
+    let service = service_fn(move |mut inner: Request<Incoming>| {
+        let app = app.clone();
+        async move {
+            let Some(scope) = inner
+                .headers()
+                .get(SCOPE_HEADER)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string)
+                .filter(|scope| cello_logic::cell::valid_cell_scope(scope))
+            else {
+                return Ok::<_, Infallible>(peer_response(malformed_scope()));
+            };
+            let control = TunnelControl {
+                scope,
+                name: inner
+                    .headers()
+                    .get(NAME_HEADER)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_string),
+                request_id: inner
+                    .headers()
+                    .get(REQUEST_ID_HEADER)
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(cello::js::parse_request_id),
+                capacity_handoff: inner.headers().get(HANDOFF_HEADER).is_some(),
+                operator_ingress: honored_operator(inner.headers(), marker_aware),
+            };
+            // A tunneled upgrade is the client's own handshake, so the
+            // owner answers it directly: fastwebsockets computes the 101
+            // for the client's key, and the inner connection becomes the
+            // socket the cell speaks — the same machinery a locally
+            // connected client gets.
+            let client_upgrade = if fastwebsockets::upgrade::is_upgrade_request(&inner) {
+                match fastwebsockets::upgrade::upgrade(&mut inner) {
+                    Ok(pair) => Some(pair),
+                    Err(error) => {
+                        return Ok(peer_response(response(
+                            StatusCode::BAD_REQUEST,
+                            format!("tunneled upgrade: {error}"),
+                        )));
+                    }
+                }
+            } else {
+                None
+            };
+            let (parts, body) = inner.into_parts();
+            let headers = parts
+                .headers
+                .iter()
+                .filter(|(name, _)| !CONTROL_HEADERS.contains(&name.as_str()))
+                .filter_map(|(name, value)| {
+                    value
+                        .to_str()
+                        .ok()
+                        .map(|value| (name.as_str().to_string(), value.to_string()))
+                })
+                .collect();
+            // Streaming by construction: the inner body is handed to the
+            // isolate as a stream whatever its size, bounded the way the
+            // enveloped path bounded its frame.
+            let limited = http_body_util::Limited::new(body, MAX_PEER_FORWARD_BODY_BYTES);
+            let chunks: HttpChunkStream = Box::pin(
+                http_body_util::BodyStream::new(limited)
+                    .try_filter_map(|frame| async move { Ok(frame.into_data().ok()) })
+                    .map_ok(|data: Bytes| data.to_vec())
+                    .map_err(|error| error.to_string()),
+            );
+            let stream_id = match cello::js::register_body_stream(chunks) {
+                Ok(stream_id) => stream_id,
+                Err(error) => {
+                    return Ok(peer_response(response(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        format!("request body stream: {error}"),
+                    )));
+                }
+            };
+            let body = cello::js::RequestBody::Stream(stream_id);
+            let fetch = ForwardedFetch {
+                name: control.name,
+                url: parts.uri.to_string(),
+                method: parts.method.to_string(),
+                headers,
+                request_id: control.request_id,
+                capacity_handoff: control.capacity_handoff,
+                operator_ingress: control.operator_ingress,
+            };
+            let outcome = dispatch_forwarded_fetch(app.clone(), control.scope, fetch, body).await;
+            let (target, worker_headers) = match outcome {
+                ForwardedFetchOutcome::Reply(reply) => return Ok(reply),
+                ForwardedFetchOutcome::WebSocket { target, headers } => (target, headers),
+            };
+            let Some((accept, upgrade)) = client_upgrade else {
+                // `dispatch_forwarded_fetch` refuses a request without
+                // `Upgrade: websocket`, so this branch sees only a request
+                // that names the upgrade but is not a valid handshake. The
+                // socket is registered with the core by now, and the refusal
+                // must release it.
+                let refusal = super::websocket::refuse_websocket_without_upgrade(
+                    &app,
+                    HttpResponseWebSocket::Cell(target),
+                )
+                .await;
+                return Ok(peer_response(refusal));
+            };
+            // The cell accepted: hand the inner stream to the same socket
+            // task a local client gets, and answer with the real 101. The
+            // Worker's application headers ride along; the sidecars and
+            // the hop framing die here.
+            tokio::spawn(async move {
+                match upgrade.await {
+                    Ok(socket) => super::websocket::websocket_task(app, target, socket).await,
+                    Err(error) => {
+                        eprintln!("celld tunneled upgrade failed: {error}");
+                    }
+                }
+            });
+            let (accept_parts, _) = accept.into_parts();
+            let mut answer = Response::from_parts(
+                accept_parts,
+                BodyExt::boxed_unsync(http_body_util::Empty::new().map_err(|never| match never {})),
+            );
+            for (name, value) in &worker_headers {
+                let lowered = name.to_ascii_lowercase();
+                if lowered == "content-length"
+                    || lowered == "upgrade"
+                    || lowered == "connection"
+                    || lowered == "sec-websocket-accept"
+                {
+                    continue;
+                }
+                let Ok(name) = hyper::header::HeaderName::from_bytes(name.as_bytes()) else {
+                    continue;
+                };
+                let Ok(value) = hyper::header::HeaderValue::from_str(value) else {
+                    continue;
+                };
+                answer.headers_mut().append(name, value);
+            }
+            Ok(peer_response(answer))
+        }
+    });
+    let _ = hyper::server::conn::http1::Builder::new()
+        .serve_connection(upgraded, service)
+        .with_upgrades()
+        .await;
+}
+
+type TunnelSender = hyper::client::conn::http1::SendRequest<TunnelBody>;
+
+/// The peer rejected the outer tunnel before an application request crossed
+/// it. This is a definite stale route, so the caller can refresh ownership
+/// without risking a duplicate handler invocation.
+#[derive(Debug)]
+pub(crate) struct StaleTunnelRoute;
+
+impl std::fmt::Display for StaleTunnelRoute {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("peer rejected the stale tunnel route")
+    }
+}
+
+impl std::error::Error for StaleTunnelRoute {}
+
+/// Who node A dials and how it proves itself. One borrow carries the
+/// client, the fleet key, and the routed peer's address and name through
+/// an attempt.
+pub(crate) struct Peer<'a> {
+    pub(crate) http: &'a reqwest::Client,
+    pub(crate) auth: &'a PeerAuth,
+    pub(crate) addr: &'a str,
+    pub(crate) node: &'a str,
+}
+
+/// Idle tunnels per (peer, kind). A sender goes back only after its response
+/// body reaches a clean end, so active replies do not consume the idle bound.
+/// A dropped or poisoned connection reports `is_closed` and is purged on scan.
+static TUNNELS: std::sync::OnceLock<std::sync::Mutex<HashMap<String, Vec<TunnelSender>>>> =
+    std::sync::OnceLock::new();
+/// Completed idle tunnels count against this bound. Active calls own their
+/// senders outside the pool, so concurrency cannot evict a reusable tunnel.
+const TUNNEL_POOL_CAP: usize = 64;
+
+fn checkout(key: &str) -> Option<TunnelSender> {
+    let mut pool = TUNNELS.get_or_init(Default::default).lock().unwrap();
+    let senders = pool.get_mut(key)?;
+    senders.retain(|sender| !sender.is_closed());
+    let index = senders.iter().position(TunnelSender::is_ready)?;
+    Some(senders.swap_remove(index))
+}
+
+fn park(key: &str, sender: TunnelSender) {
+    let mut pool = TUNNELS.get_or_init(Default::default).lock().unwrap();
+    let senders = pool.entry(key.to_string()).or_default();
+    if senders.len() < TUNNEL_POOL_CAP {
+        senders.push(sender);
+    }
+}
+
+/// Establish a fresh tunnel to `addr` and hand back its inner h1 client.
+/// The establishment is a bodiless GET, so the fleet HMAC signs it whole —
+/// the one signature every call on this tunnel then rides.
+async fn establish(peer: &Peer<'_>, kind: &'static str) -> anyhow::Result<TunnelSender> {
+    let request = peer
+        .http
+        .get(format!("http://{}/peer/tunnel", peer.addr))
+        .header(reqwest::header::UPGRADE, TUNNEL_PROTOCOL)
+        .header(reqwest::header::CONNECTION, "upgrade")
+        .header(VERSION_HEADER, TUNNEL_VERSION)
+        .header(MARKERS_HEADER, "1")
+        .header(KIND_HEADER, kind)
+        .header(
+            peer_auth::RESPONSE_VERSION_HEADER,
+            peer_auth::PROTOCOL_VERSION_TEXT,
+        );
+    let signed = peer
+        .auth
+        .sign(request, "GET", "/peer/tunnel", b"", peer.node)?;
+    let response = cello::operator_token::authenticate(signed)?.send().await?;
+    peer_auth::validate_response(response.headers())?;
+    if response
+        .headers()
+        .get(STALE_ROUTE_HEADER)
+        .is_some_and(|value| value == STALE_ROUTE_VALUE)
+    {
+        return Err(StaleTunnelRoute.into());
+    }
+    anyhow::ensure!(
+        response.status() == reqwest::StatusCode::SWITCHING_PROTOCOLS,
+        "tunnel establishment answered {}",
+        response.status()
+    );
+    let upgraded = response.upgrade().await?;
+    let (sender, connection) = hyper::client::conn::http1::Builder::new()
+        .handshake(TokioIo::new(upgraded))
+        .await?;
+    tokio::spawn(async move {
+        let _ = connection.with_upgrades().await;
+    });
+    Ok(sender)
+}
+
+fn inner_request(
+    control: &TunnelControl,
+    url: &str,
+    method: &str,
+    headers: &[(String, String)],
+    body: TunnelBody,
+) -> anyhow::Result<Request<TunnelBody>> {
+    let mut inner = Request::builder().method(method).uri(url);
+    for (name, value) in headers {
+        if CONTROL_HEADERS
+            .iter()
+            .any(|reserved| reserved.eq_ignore_ascii_case(name))
+        {
+            continue;
+        }
+        inner = inner.header(name.as_str(), value.as_str());
+    }
+    inner = inner.header(SCOPE_HEADER, control.scope.as_str());
+    if let Some(name) = &control.name {
+        inner = inner.header(NAME_HEADER, name);
+    }
+    if let Some(request_id) = control.request_id {
+        inner = inner.header(REQUEST_ID_HEADER, cello::js::request_id_string(request_id));
+    }
+    if control.capacity_handoff {
+        inner = inner.header(HANDOFF_HEADER, "1");
+    }
+    if control.operator_ingress {
+        inner = inner.header(OPERATOR_HEADER, "1");
+    }
+    Ok(inner.body(body)?)
+}
+
+/// Send one inner request, preferring a pooled tunnel. A pooled connection
+/// can die between checkout and use, so a replayable body retries once on a
+/// fresh tunnel — the same stale keep-alive race every h1 pool has. A
+/// streamed body is not replayable; its pooled failure surfaces as the
+/// attempt failure the caller already handles.
+async fn send_inner(
+    peer: &Peer<'_>,
+    kind: &'static str,
+    build: impl Fn(TunnelBody) -> anyhow::Result<Request<TunnelBody>>,
+    body: cello::js::RequestBody,
+) -> anyhow::Result<Response<PooledResponseBody>> {
+    let key = format!("{}#{kind}", peer.addr);
+    let replay = match &body {
+        cello::js::RequestBody::Bytes(bytes) => Some(bytes.clone()),
+        cello::js::RequestBody::Stream(_) => None,
+    };
+    let body = match body {
+        cello::js::RequestBody::Bytes(bytes) => full_body(bytes),
+        cello::js::RequestBody::Stream(stream_id) => {
+            let payload = cello::js::take_body_stream(stream_id)
+                .map_err(|error| anyhow::anyhow!("take tunnel body: {error}"))?;
+            stream_body(payload)
+        }
+    };
+    let mut body = Some(body);
+    if let Some(sender) = checkout(&key) {
+        match send_on_tunnel(&key, sender, build(body.take().unwrap())?).await {
+            Ok(response) => {
+                return Ok(response);
+            }
+            Err(error) => {
+                let Some(bytes) = replay else {
+                    return Err(error);
+                };
+                body = Some(full_body(bytes));
+            }
+        }
+    }
+    let sender = establish(peer, kind).await?;
+    send_on_tunnel(&key, sender, build(body.take().unwrap())?).await
+}
+
+async fn send_on_tunnel(
+    key: &str,
+    mut sender: TunnelSender,
+    request: Request<TunnelBody>,
+) -> anyhow::Result<Response<PooledResponseBody>> {
+    let response = sender.send_request(request).await?;
+    let reusable =
+        (response.status() != StatusCode::SWITCHING_PROTOCOLS).then(|| (key.to_string(), sender));
+    Ok(response.map(|body| PooledResponseBody { body, reusable }))
+}
+
+/// An inner response owns its tunnel until the body finishes successfully.
+/// Returning the sender at the response head makes active replies consume the
+/// idle-pool bound. Sustained RPC concurrency then creates and discards one
+/// upgraded TCP connection for every overflow call.
+pub(crate) struct PooledResponseBody {
+    body: Incoming,
+    reusable: Option<(String, TunnelSender)>,
+}
+
+impl Body for PooledResponseBody {
+    type Data = Bytes;
+    type Error = hyper::Error;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
+        match std::pin::Pin::new(&mut self.body).poll_frame(cx) {
+            std::task::Poll::Ready(None) => {
+                if let Some((key, sender)) = self.reusable.take() {
+                    park(&key, sender);
+                }
+                std::task::Poll::Ready(None)
+            }
+            std::task::Poll::Ready(Some(Err(error))) => {
+                // The unread or failed stream cannot carry another request.
+                self.reusable.take();
+                std::task::Poll::Ready(Some(Err(error)))
+            }
+            other => other,
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        // Force one final poll while the sender is still attached. A zero-byte
+        // response can otherwise skip `poll_frame` and close a reusable tunnel.
+        self.reusable.is_none() && self.body.is_end_stream()
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        self.body.size_hint()
+    }
+}
+
+pub(crate) async fn fetch(
+    peer: &Peer<'_>,
+    control: &TunnelControl,
+    url: String,
+    method: String,
+    headers: Vec<(String, String)>,
+    body: cello::js::RequestBody,
+) -> anyhow::Result<Response<PooledResponseBody>> {
+    send_inner(
+        peer,
+        "do",
+        |body| inner_request(control, &url, &method, &headers, body),
+        body,
+    )
+    .await
+}
+
+pub(crate) const METHOD_HEADER: &str = "x-cells-rpc-method";
+pub(crate) const TRUSTED_HEADER: &str = "x-cells-rpc-trusted";
+
+/// One inner request, one RPC: the method name rides a header, the
+/// arguments ride the body, and the content type says which encoding the
+/// caller used.
+async fn serve_rpc(upgraded: hyper::upgrade::Upgraded, app: AppHandle, marker_aware: bool) {
+    let service = service_fn(move |inner: Request<Incoming>| {
+        let app = app.clone();
+        async move {
+            let Some(scope) = inner
+                .headers()
+                .get(SCOPE_HEADER)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string)
+                .filter(|scope| cello_logic::cell::valid_cell_scope(scope))
+            else {
+                return Ok::<_, Infallible>(peer_response(malformed_scope()));
+            };
+            let name = inner
+                .headers()
+                .get(NAME_HEADER)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string);
+            let structured = inner
+                .headers()
+                .get(hyper::header::CONTENT_TYPE)
+                .is_some_and(|value| value.as_bytes() == b"application/octet-stream");
+            let Some(method) = inner
+                .headers()
+                .get(METHOD_HEADER)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string)
+            else {
+                return Ok::<_, Infallible>(peer_response(response(
+                    StatusCode::BAD_REQUEST,
+                    "RPC method header is missing",
+                )));
+            };
+            // A trusted call is one a harness host op built on its node,
+            // never a stub call: the target resolves the method without the
+            // tenant RPC allowlist. The tunnel is peer-authenticated and the
+            // peer negotiated the marker-aware tunnel on establishment, so
+            // the header carries across nodes; absent means untrusted.
+            let trusted = honored_trusted(inner.headers(), marker_aware);
+            let body =
+                match collect_limited_body(inner.into_body(), MAX_PEER_FORWARD_BODY_BYTES).await {
+                    Ok(body) => body,
+                    Err(error) => {
+                        return Ok(peer_response(body_read_error("tunnel RPC", error)));
+                    }
+                };
+            let args = if structured {
+                cello::js::RpcData::V8(body)
+            } else {
+                match String::from_utf8(body.to_vec()) {
+                    Ok(json) => cello::js::RpcData::Json(json),
+                    Err(_) => {
+                        return Ok(peer_response(response(
+                            StatusCode::BAD_REQUEST,
+                            "JSON RPC arguments are not UTF-8",
+                        )));
+                    }
+                }
+            };
+            let reply = dispatch_forwarded_rpc(app, scope, name, method, args, trusted).await;
+            Ok(reply)
+        }
+    });
+    let _ = hyper::server::conn::http1::Builder::new()
+        .serve_connection(upgraded, service)
+        .await;
+}
+
+/// Node A: one RPC through the pooled rpc tunnel.
+pub(crate) async fn rpc(
+    peer: &Peer<'_>,
+    scope: &str,
+    name: Option<&str>,
+    method: &str,
+    args: &cello::js::RpcData,
+    trusted: bool,
+) -> anyhow::Result<Response<PooledResponseBody>> {
+    let (content_type, payload) = match args {
+        cello::js::RpcData::Json(json) => ("application/json", Bytes::from(json.clone())),
+        cello::js::RpcData::V8(bytes) => ("application/octet-stream", bytes.clone()),
+    };
+    send_inner(
+        peer,
+        "rpc",
+        |body| {
+            let mut inner = Request::builder()
+                .method("POST")
+                .uri("/")
+                .header(SCOPE_HEADER, scope)
+                .header(METHOD_HEADER, method)
+                .header(hyper::header::CONTENT_TYPE, content_type);
+            if let Some(name) = name {
+                inner = inner.header(NAME_HEADER, name);
+            }
+            if trusted {
+                inner = inner.header(TRUSTED_HEADER, "1");
+            }
+            Ok(inner.body(body)?)
+        },
+        cello::js::RequestBody::Bytes(payload),
+    )
+    .await
+}
+
+/// The owner half of a tunneled WebSocket 101, parked until the caller's own
+/// client socket finishes upgrading.
+static TUNNEL_UPGRADES: std::sync::OnceLock<
+    std::sync::Mutex<HashMap<u64, hyper::upgrade::OnUpgrade>>,
+> = std::sync::OnceLock::new();
+pub(crate) fn park_upgrade(upgrade: hyper::upgrade::OnUpgrade) -> u64 {
+    // Unguessable park numbers: the id round-trips through caller script
+    // (WsTarget.tunnel) before `claim_upgrade`, so a sequential counter lets
+    // any script splice its own client onto another upgrade's owner half.
+    // The single-use consume at claim already defeats replay; randomness
+    // defeats guessing. Same f64-safe nonzero space as socket ids.
+    loop {
+        let id = rand::rngs::OsRng.next_u64() & 0x1FFF_FFFF_FFFF;
+        if id == 0 {
+            continue;
+        }
+        let mut parked = TUNNEL_UPGRADES
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap();
+        if parked.contains_key(&id) {
+            continue;
+        }
+        parked.insert(id, upgrade);
+        return id;
+    }
+}
+
+fn remove_upgrade(parked: u64) -> Option<hyper::upgrade::OnUpgrade> {
+    TUNNEL_UPGRADES
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap()
+        .remove(&parked)
+}
+
+/// Own one parked upgrade after its numeric id returns from JavaScript.
+///
+/// The id itself releases nothing. Binding it to this value makes every early
+/// response exit and every cancelled executor task remove the stored upgrade.
+/// A successful splice consumes the same value and takes the connection once.
+pub(crate) struct TunnelUpgradeClaim {
+    upgrade: hyper::upgrade::OnUpgrade,
+}
+
+pub(crate) fn claim_upgrade(parked: u64) -> anyhow::Result<TunnelUpgradeClaim> {
+    let upgrade = remove_upgrade(parked)
+        .ok_or_else(|| anyhow::anyhow!("tunneled upgrade {parked} is gone"))?;
+    Ok(TunnelUpgradeClaim { upgrade })
+}
+
+impl TunnelUpgradeClaim {
+    fn into_upgrade(self) -> hyper::upgrade::OnUpgrade {
+        self.upgrade
+    }
+}
+
+/// Splice the upgraded client socket to the tunneled owner: the hop stops
+/// dispatching WebSocket frames and copies bytes until either side closes.
+pub(crate) async fn splice<S>(client: S, parked: TunnelUpgradeClaim) -> anyhow::Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let upgrade = parked.into_upgrade();
+    let inner = upgrade.await?;
+    let inner = TokioIo::new(inner);
+    let (mut client_read, mut client_write) = tokio::io::split(client);
+    let (mut inner_read, mut inner_write) = tokio::io::split(inner);
+    cello::asyncrt::select! {
+        _ = tokio::io::copy(&mut client_read, &mut inner_write) => {
+            // The client went away; the owner sees EOF through the tunnel
+            // and runs its own close dispatch.
+        }
+        can_append_close = copy_owner_to_client(&mut inner_read, &mut client_write) => {
+            // A second Close fails browser channels. An incomplete frame
+            // would consume a synthetic Close as payload, so only append at
+            // a frame boundary before the owner starts closing.
+            if can_append_close {
+                let client = client_read.unsplit(client_write);
+                let mut ws = fastwebsockets::WebSocket::after_handshake(
+                    client,
+                    fastwebsockets::Role::Server,
+                );
+                let _ = ws
+                    .write_frame(fastwebsockets::Frame::close(1012, b"owner unavailable"))
+                    .await;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Return whether owner EOF or a read error leaves room for a failure Close.
+/// A client write failure ends the splice without any further writes.
+async fn copy_owner_to_client<R, W>(owner: &mut R, client: &mut W) -> bool
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut scanner = cello_logic::schedule::WebSocketCloseScanner::default();
+    let mut buffer = [0u8; 8192];
+    loop {
+        let read = match owner.read(&mut buffer).await {
+            Ok(0) | Err(_) => return scanner.can_append_close(),
+            Ok(read) => read,
+        };
+        if client.write_all(&buffer[..read]).await.is_err() {
+            return false;
+        }
+        scanner.observe(&buffer[..read]);
+        // Flush before waiting for more owner bytes, including a peer's
+        // closing-handshake response. Buffered writers must make progress.
+        if client.flush().await.is_err() {
+            return false;
+        }
+    }
+}
+
+type TunnelBody = http_body_util::combinators::UnsyncBoxBody<Bytes, std::io::Error>;
+
+fn full_body(bytes: Bytes) -> TunnelBody {
+    BodyExt::boxed_unsync(http_body_util::Full::new(bytes).map_err(|never| match never {}))
+}
+
+fn stream_body(payload: HttpChunkStream) -> TunnelBody {
+    let frames = payload.map(|chunk| {
+        chunk
+            .map(|data| hyper::body::Frame::data(Bytes::from(data)))
+            .map_err(std::io::Error::other)
+    });
+    BodyExt::boxed_unsync(http_body_util::StreamBody::new(frames))
+}
+
+/// The inner response body as the chunk stream the reply path already
+/// speaks.
+pub(crate) fn response_stream(body: PooledResponseBody) -> HttpChunkStream {
+    Box::pin(
+        http_body_util::BodyStream::new(body)
+            .try_filter_map(|frame| async move { Ok(frame.into_data().ok()) })
+            .map_ok(|data: Bytes| data.to_vec())
+            .map_err(|error| error.to_string()),
+    )
+}
+
+#[cfg(all(test, cello_internal_tests))]
+mod private_tests {
+    include!(env!("CELLD_CONFORMANCE_PEER_TUNNEL_TESTS"));
+}
+
+#[cfg(test)]
+mod operator_tests {
+    use super::*;
+
+    fn control(operator_ingress: bool) -> TunnelControl {
+        TunnelControl {
+            scope: "__D1Database:00".to_string(),
+            name: None,
+            request_id: None,
+            capacity_handoff: false,
+            operator_ingress,
+        }
+    }
+
+    #[test]
+    fn operator_marker_rides_the_tunnel_only_from_control() {
+        // An operator call carries the marker to the owner.
+        let marked = inner_request(
+            &control(true),
+            "http://cell/",
+            "POST",
+            &[],
+            full_body(Bytes::new()),
+        )
+        .expect("inner request");
+        assert_eq!(
+            marked
+                .headers()
+                .get(OPERATOR_HEADER)
+                .map(|value| value.as_bytes()),
+            Some(b"1".as_slice()),
+        );
+        // A plain call carries no marker, even when the application smuggles
+        // the header name: control headers are node A's to set, and an
+        // application header with a reserved name is dropped rather than
+        // obeyed.
+        let smuggled = vec![(OPERATOR_HEADER.to_string(), "1".to_string())];
+        let plain = inner_request(
+            &control(false),
+            "http://cell/",
+            "POST",
+            &smuggled,
+            full_body(Bytes::new()),
+        )
+        .expect("inner request");
+        assert!(!plain.headers().contains_key(OPERATOR_HEADER));
+        assert!(CONTROL_HEADERS.contains(&OPERATOR_HEADER));
+    }
+
+    fn establishment(flag: Option<&'static str>) -> hyper::HeaderMap {
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert(
+            hyper::header::HeaderName::from_static(VERSION_HEADER),
+            hyper::header::HeaderValue::from_static(TUNNEL_VERSION),
+        );
+        if let Some(flag) = flag {
+            headers.insert(
+                hyper::header::HeaderName::from_static(MARKERS_HEADER),
+                hyper::header::HeaderValue::from_static(flag),
+            );
+        }
+        headers
+    }
+
+    fn inner_with_markers() -> hyper::HeaderMap {
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert(
+            hyper::header::HeaderName::from_static(OPERATOR_HEADER),
+            hyper::header::HeaderValue::from_static("1"),
+        );
+        headers.insert(
+            hyper::header::HeaderName::from_static(TRUSTED_HEADER),
+            hyper::header::HeaderValue::from_static("1"),
+        );
+        headers
+    }
+
+    #[test]
+    fn trusted_marker_is_a_control_header_on_the_fetch_tunnel() {
+        // Nothing on the fetch path reads the trusted marker today, but the
+        // name is reserved anyway: a smuggled application header with it is
+        // dropped rather than forwarded to the cell.
+        assert!(CONTROL_HEADERS.contains(&TRUSTED_HEADER));
+        let smuggled = vec![(TRUSTED_HEADER.to_string(), "1".to_string())];
+        let plain = inner_request(
+            &control(false),
+            "http://cell/",
+            "POST",
+            &smuggled,
+            full_body(Bytes::new()),
+        )
+        .expect("inner request");
+        assert!(!plain.headers().contains_key(TRUSTED_HEADER));
+    }
+
+    #[test]
+    fn markers_are_protocol_negotiated() {
+        // A current peer announces the marker-aware tunnel on establishment.
+        assert!(negotiated_markers(&establishment(Some("1"))));
+        // An older peer on the same tunnel version sends no flag, and a
+        // wrong value negotiates nothing.
+        assert!(!negotiated_markers(&establishment(None)));
+        assert!(!negotiated_markers(&establishment(Some("0"))));
+        assert!(!negotiated_markers(&establishment(Some("yes"))));
+    }
+
+    #[test]
+    fn forged_markers_from_an_old_peer_are_not_honored() {
+        // A simulated old-version peer: no flag on establishment, forged
+        // marker headers on the inner request — a Worker there smuggled
+        // them through as application headers. Neither marker is honored.
+        let marker_aware = negotiated_markers(&establishment(None));
+        let inner = inner_with_markers();
+        assert!(!honored_operator(&inner, marker_aware));
+        assert!(!honored_trusted(&inner, marker_aware));
+    }
+
+    #[test]
+    fn current_peer_forwarding_honors_host_set_markers() {
+        // A current peer negotiated the flag, so its markers are node A's
+        // word and both are honored; absent still means unmarked.
+        let marker_aware = negotiated_markers(&establishment(Some("1")));
+        let inner = inner_with_markers();
+        assert!(honored_operator(&inner, marker_aware));
+        assert!(honored_trusted(&inner, marker_aware));
+        let bare = hyper::HeaderMap::new();
+        assert!(!honored_operator(&bare, marker_aware));
+        assert!(!honored_trusted(&bare, marker_aware));
+    }
+}

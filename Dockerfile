@@ -1,27 +1,27 @@
 # syntax=docker/dockerfile:1.7
-# Modified by ryuzcorp (ryuzcorp/celld): the test stage's clippy loads the workspace clippy.toml; the test stage installs esbuild for the deploy --sourcemap tests; the build stage bakes CELLD_VERSION into the binary for --version.
+# Modified by Ryuz Corp (Cello): the test stage's clippy loads the workspace clippy.toml; the test stage installs esbuild for the deploy --sourcemap tests; the build stage bakes CELLO_VERSION into the binary for --version.
 
 ARG RUST_VERSION=1.98.1
-ARG CELLD_COMMIT=unknown
+ARG CELLO_COMMIT=unknown
 
 FROM rust:${RUST_VERSION}-bookworm AS build
 ARG TARGETARCH
 # `release` for shipped artifacts; a fast-loop caller passes `lab` to skip
 # the fat-LTO relink and keep incremental state in the target cache.
-ARG CELLD_PROFILE=release
+ARG CELLO_PROFILE=release
 # The full build version the binary's --version reports
-# (`<version>-ryuzcorp.<n>`, `<version>-ryuzcorp.ci` in CI). Unset here,
+# (`<version>`, `<version>-cello.ci` in CI). Unset here,
 # build.rs falls back to the crate version.
-ARG CELLD_VERSION
+ARG CELLO_VERSION
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
-RUN --mount=type=cache,id=celld-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
-    --mount=type=cache,id=celld-cargo-git,target=/usr/local/cargo/git,sharing=locked \
-    --mount=type=cache,id=celld-target-${TARGETARCH},target=/src/target,sharing=locked \
+RUN --mount=type=cache,id=cello-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=cello-cargo-git,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,id=cello-target-${TARGETARCH},target=/src/target,sharing=locked \
     mkdir -p /out && \
-    CELLD_VERSION="${CELLD_VERSION}" cargo build --profile "${CELLD_PROFILE}" --locked -p celld && \
-    install -m 755 "target/${CELLD_PROFILE}/celld" /out/celld
+    CELLO_VERSION="${CELLO_VERSION}" cargo build --profile "${CELLO_PROFILE}" --locked -p cello && \
+    install -m 755 "target/${CELLO_PROFILE}/cello" /out/cello
 
 # The final image depends on this stage, so a break in the engine's tests or
 # lints stops the build.
@@ -52,21 +52,21 @@ RUN case "${TARGETARCH}" in \
     esbuild --version
 # clippy reads the workspace's disallowed methods, types and macros from here.
 COPY clippy.toml ./
-RUN --mount=type=cache,id=celld-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
-    --mount=type=cache,id=celld-cargo-git,target=/usr/local/cargo/git,sharing=locked \
-    --mount=type=cache,id=celld-target-${TARGETARCH},target=/src/target,sharing=locked \
-    cargo test --profile "${CELLD_PROFILE}" --locked && \
-    cargo clippy --profile "${CELLD_PROFILE}" --all-targets --locked -- -D warnings
+RUN --mount=type=cache,id=cello-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=cello-cargo-git,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,id=cello-target-${TARGETARCH},target=/src/target,sharing=locked \
+    cargo test --profile "${CELLO_PROFILE}" --locked && \
+    cargo clippy --profile "${CELLO_PROFILE}" --all-targets --locked -- -D warnings
 
 FROM debian:bookworm-slim
 RUN apt-get update && \
     apt-get install -y --no-install-recommends ca-certificates && \
     rm -rf /var/lib/apt/lists/*
-ARG CELLD_COMMIT
-ARG CELLD_VERSION=unknown
-LABEL org.opencontainers.image.title="celld" \
-      org.opencontainers.image.revision="${CELLD_COMMIT}" \
-      org.opencontainers.image.version="${CELLD_VERSION}"
-COPY LICENSE NOTICE /usr/share/doc/celld/
-COPY --from=test /out/celld /usr/local/bin/celld
-ENTRYPOINT ["/usr/local/bin/celld"]
+ARG CELLO_COMMIT
+ARG CELLO_VERSION=unknown
+LABEL org.opencontainers.image.title="cello" \
+      org.opencontainers.image.revision="${CELLO_COMMIT}" \
+      org.opencontainers.image.version="${CELLO_VERSION}"
+COPY LICENSE NOTICE /usr/share/doc/cello/
+COPY --from=test /out/cello /usr/local/bin/cello
+ENTRYPOINT ["/usr/local/bin/cello"]

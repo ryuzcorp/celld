@@ -28,7 +28,7 @@ counts. `stored.py` reports the `cells/` objects and bytes left behind.
 
 ## Prerequisites
 
-- `cargo build --release -p celld` (or set `CELLD_BIN` to the binary),
+- `cargo build --release -p cello` (or set `CELLD_BIN` to the binary),
 - `esbuild` on `PATH` (needed by `celld deploy`),
 - `docker` (starts a `rustfs/rustfs` container, credentials via env),
 - `python3` with `boto3`.
@@ -39,7 +39,7 @@ counts. `stored.py` reports the `cells/` objects and bytes left behind.
  plus per-turn end-to-end latency
  (`turn latency ms: n=… mean=… p50=… p95=… p99=…`).
 
-Compare release builds only (`cargo build --release -p celld`): a debug
+Compare release builds only (`cargo build --release -p cello`): a debug
 binary is several times slower on the capture and SQLite paths, which
 shifts batching, request counts and every latency figure. `run.sh` refuses
 to start while another `celld-s3bench-*` container is up, because

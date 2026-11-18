@@ -1,5 +1,5 @@
 [package]
-name = "celld-logic"
+name = "cello-logic"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.94.1"
@@ -12,4 +12,4 @@ test = false
 
 [lints.rust.unexpected_cfgs]
 level = "warn"
-check-cfg = ["cfg(celld_internal_tests)"]
+check-cfg = ["cfg(cello_internal_tests)"]

@@ -410,7 +410,7 @@ pub enum Timer {
 /// somebody decides how a new channel is held and how it is released.
 ///
 /// The core stores a channel and hands it back. It never reads it. A `match`
-/// on `Channel` inside `celld-logic` would split one output invariant into a
+/// on `Channel` inside `cello-logic` would split one output invariant into a
 /// separate rule for each channel.
 ///
 /// An alarm is missing here on purpose, and stays missing. Its consuming
