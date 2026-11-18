@@ -42,7 +42,8 @@ use tokio::sync::{mpsc, watch};
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ContainerSpec {
     pub class_name: String,
-    /// The image reference the engine starts, `cello-image:<content key>`,
+    /// The image reference the engine starts, `celld-image:<content key>`
+    /// (frozen: recorded in stored deployment manifests),
     /// so two deployments of one image share one tar and one load.
     pub image: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -63,15 +64,29 @@ pub struct ContainerSpec {
 /// The key hashes the layer digests and the image config, so an engine
 /// that rebuilds identical content under a new id still resolves it.
 pub fn image_reference(key: &str) -> String {
-    format!("cello-image:{key}")
+    format!("celld-image:{key}")
 }
 
 /// The bucket key of one saved image, from its reference.
 pub fn image_key(image: &str) -> String {
     format!(
         "deploy/images/{}.tar",
-        image.trim_start_matches("cello-image:")
+        image.trim_start_matches("celld-image:")
     )
+}
+
+/// Frozen deployment-format pins. `.13` manifests record
+/// `celld-image:<content key>` in `ContainerSpec.image`; the prefix never
+/// changes so old manifests keep loading. See `rename-frozen.md`.
+#[cfg(test)]
+mod image_key_tests {
+    use super::*;
+
+    #[test]
+    fn stored_manifest_reference_resolves_to_its_tar() {
+        assert_eq!(image_key("celld-image:abc123"), "deploy/images/abc123.tar");
+        assert_eq!(image_reference("abc123"), "celld-image:abc123");
+    }
 }
 
 /// The resources an instance type reserves. Cloudflare's published table;
@@ -2452,7 +2467,7 @@ mod start_order_tests {
             name: "n".into(),
             spec: Arc::new(ContainerSpec {
                 class_name: "C".into(),
-                image: "cello-image:x".into(),
+                image: "celld-image:x".into(),
                 instance_type: None,
                 max_instances: None,
                 runtime: None,
@@ -2570,7 +2585,7 @@ mod pty_tests {
             name: "n".into(),
             spec: Arc::new(ContainerSpec {
                 class_name: "C".into(),
-                image: "cello-image:x".into(),
+                image: "celld-image:x".into(),
                 instance_type: None,
                 max_instances: None,
                 runtime: None,
@@ -3243,7 +3258,7 @@ mod kill_tests {
             name: "n".into(),
             spec: Arc::new(ContainerSpec {
                 class_name: "C".into(),
-                image: "cello-image:x".into(),
+                image: "celld-image:x".into(),
                 instance_type: None,
                 max_instances: None,
                 runtime: None,
@@ -3805,7 +3820,7 @@ mod lifecycle_tests {
             name: name.to_string(),
             spec: Arc::new(ContainerSpec {
                 class_name: "C".into(),
-                image: "cello-image:x".into(),
+                image: "celld-image:x".into(),
                 instance_type: None,
                 max_instances: None,
                 runtime: None,
@@ -3829,7 +3844,7 @@ mod lifecycle_tests {
         let mock = StartFailingDaemon::start(name);
         let mut images = HashMap::new();
         images.insert(
-            "cello-image:x".to_string(),
+            "celld-image:x".to_string(),
             Arc::new(tokio::sync::Mutex::new(true)),
         );
         let engine = ContainerEngine {
