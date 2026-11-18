@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): gzip decode fixture (upstream #238). Apache-2.0.
+// Modified by Ryuz Corp (Cello): gzip decode fixture (upstream #238). Apache-2.0.
 const ORIGIN = "http://127.0.0.1:__GZIP_PORT__";
 
 const probe = async (init, subpath) => {

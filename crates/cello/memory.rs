@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): per-process cgroup memory scope; C-trim threshold 8 MiB with CELLO_C_TRIM_MB knob and trim_due predicate.
+// Modified by Ryuz Corp (Cello): per-process cgroup memory scope; C-trim threshold 8 MiB with CELLO_C_TRIM_MB knob and trim_due predicate.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! What the process holds, and how much of that a cell actually holds.

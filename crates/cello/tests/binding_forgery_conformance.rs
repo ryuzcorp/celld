@@ -1,6 +1,6 @@
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 //
-// Modified by ryuzcorp (ryuzcorp/celld): binding-forgery conformance; WebSocket and TCP socket ownership; deploy --read-root option; ephemeral-port boot (0077). Apache-2.0.
+// Modified by Ryuz Corp (Cello): binding-forgery conformance; WebSocket and TCP socket ownership; deploy --read-root option; ephemeral-port boot (0077). Apache-2.0.
 
 // A black-box runner, not node code: it boots the binary, copies fixtures,
 // and polls TCP with wall-clock deadlines, so the execution boundary's

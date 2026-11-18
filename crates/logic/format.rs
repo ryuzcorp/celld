@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): bucket-posture group commit: BUCKET_FORMAT 3 and the bundle-write gate (0059). bucket-posture group commit: published-format boot self-check (0070).
+// Modified by Ryuz Corp (Cello): bucket-posture group commit: BUCKET_FORMAT 3 and the bundle-write gate (0059). bucket-posture group commit: published-format boot self-check (0070).
 //! The bucket format a node can read, and the fleet-wide gate that keeps a
 //! node from writing what a live peer cannot read.
 //!

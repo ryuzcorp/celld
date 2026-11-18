@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): WebSocket join tokens; joinable targets for loaded-worker 101s (upstream #305); transparent fetch gzip/deflate decode (upstream #238). Apache-2.0.
+// Modified by Ryuz Corp (Cello): WebSocket join tokens; joinable targets for loaded-worker 101s (upstream #305); transparent fetch gzip/deflate decode (upstream #238). Apache-2.0.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! The HTTP stream registry: request and response bodies that cross the host

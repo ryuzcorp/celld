@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): abort-cleared timer regression fixture (upstream #309). Apache-2.0.
+// Modified by Ryuz Corp (Cello): abort-cleared timer regression fixture (upstream #309). Apache-2.0.
 import { DurableObject } from 'cloudflare:workers';
 
 const sleep = (ms, signal) => new Promise((resolve) => {

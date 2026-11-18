@@ -1,6 +1,6 @@
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 //
-// Modified by ryuzcorp (ryuzcorp/celld): RPC disposal regression test (upstream #260).
+// Modified by Ryuz Corp (Cello): RPC disposal regression test (upstream #260).
 
 // A black-box runner, not node code: it boots the binary, copies fixtures,
 // and polls TCP with wall-clock deadlines.

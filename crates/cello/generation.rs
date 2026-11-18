@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): shared runtime cells run in a dedicated runtime isolate pool; runtime compat is the union over declaring scripts; staged activation; deployment cache scope key; staged invoke loads a services-only staged graph.
+// Modified by Ryuz Corp (Cello): shared runtime cells run in a dedicated runtime isolate pool; runtime compat is the union over declaring scripts; staged activation; deployment cache scope key; staged invoke loads a services-only staged graph.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! One application deployment as the running process holds it.
@@ -1138,6 +1138,15 @@ fn fleet_identity(scheme: &str, name: &str, prefix: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The runtime isolate pool's script name is frozen: stored deployment
+    /// graphs and cell-to-script resolution reference it, so a bucket
+    /// written by celld `.13` keeps working under Cello. See
+    /// `rename-frozen.md`. Never rename this without a migration.
+    #[test]
+    fn runtime_script_name_stays_frozen() {
+        assert_eq!(RUNTIME_SCRIPT, "__celld-runtime");
+    }
 
     fn identity() -> ServingIdentity {
         ServingIdentity {

@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): bounded control calls; tiered lifecycle bound.
+// Modified by Ryuz Corp (Cello): bounded control calls; tiered lifecycle bound.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! A minimal Docker Engine API client over the daemon's unix socket.

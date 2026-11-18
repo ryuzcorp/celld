@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): cross-isolate RPC stubs and streams; operator token for the internal listener; D1 export operator-ingress marker; ported from meln1k/cello: report wake coverage after maintenance (e6cb9a3); staged activation; trusted cell RPC; WebSocket join tokens; --version reports the full build version; staged invoke operator route; non-dumpable serving process; bucket-posture group commit: paged gate judges PAGED_FORMAT (0059); bucket-posture group commit: bucket bundle gate plumbing (0060); bucket-posture group commit: bundle switch defaults off (0075); stale-route marker import from peer_auth (upstream #273); resolve the node-session id from the data-dir pin (upstream #249); boot scan takes the due scan's upcoming minute (upstream #308); unclean-restart prune of live-named epochs (upstream #290); cello versions dispatch (upstream #181); telemetry bucket for split log sink (upstream #153).
+// Modified by Ryuz Corp (Cello): cross-isolate RPC stubs and streams; operator token for the internal listener; D1 export operator-ingress marker; ported from meln1k/cello: report wake coverage after maintenance (e6cb9a3); staged activation; trusted cell RPC; WebSocket join tokens; --version reports the full build version; staged invoke operator route; non-dumpable serving process; bucket-posture group commit: paged gate judges PAGED_FORMAT (0059); bucket-posture group commit: bucket bundle gate plumbing (0060); bucket-posture group commit: bundle switch defaults off (0075); stale-route marker import from peer_auth (upstream #273); resolve the node-session id from the data-dir pin (upstream #249); boot scan takes the due scan's upcoming minute (upstream #308); unclean-restart prune of live-named epochs (upstream #290); cello versions dispatch (upstream #181); telemetry bucket for split log sink (upstream #153).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 // The binary contains connection, startup, shutdown, and V8 shell code. The
@@ -248,7 +248,7 @@ fn clean_reload_is_eligible(
 
 type HttpReply = Response<UnsyncBoxBody<Bytes, std::io::Error>>;
 
-use cello::peer_auth::{STALE_ROUTE_HEADER, STALE_ROUTE_VALUE};
+use cello::peer_auth::{OVERLOAD_HEADER, STALE_ROUTE_HEADER, STALE_ROUTE_VALUE};
 /// Marks a forwarded fetch whose handler failed on the owner, so the caller's
 /// `stub.fetch()` rejects as it does for a local owner. Without the marker a
 /// remote handler failure looks like an application 500 response.
@@ -1576,7 +1576,7 @@ async fn dispatch_rpc_call(app: AppHandle, call: RpcCallReq) {
                 if response.status() == StatusCode::SERVICE_UNAVAILABLE
                     && response
                         .headers()
-                        .get("x-celld-overload")
+                        .get(OVERLOAD_HEADER)
                         .is_some_and(|value| value == "cell")
                 {
                     return Err(anyhow::Error::new(cello::js::CellOverloaded));
@@ -2001,7 +2001,7 @@ fn cell_overload_response() -> HttpReply {
         hyper::header::HeaderValue::from_static("1"),
     );
     refused.headers_mut().insert(
-        hyper::header::HeaderName::from_static("x-celld-overload"),
+        hyper::header::HeaderName::from_static(OVERLOAD_HEADER),
         hyper::header::HeaderValue::from_static("cell"),
     );
     refused
@@ -3114,7 +3114,7 @@ async fn internal_log(request: Request<Incoming>, app: AppHandle, path: String) 
         let mut reply = response(StatusCode::SWITCHING_PROTOCOLS, "");
         reply.headers_mut().insert(
             hyper::header::UPGRADE,
-            hyper::header::HeaderValue::from_static("celld-log-stream"),
+            hyper::header::HeaderValue::from_static(cello::node_log::LOG_STREAM_UPGRADE),
         );
         reply.headers_mut().insert(
             hyper::header::CONNECTION,
@@ -6235,6 +6235,13 @@ mod durability_lifecycle_private {
 #[cfg(test)]
 mod internal_log_wire_tests {
     use super::*;
+
+    /// The peer log-stream upgrade value is frozen node-to-node wire.
+    /// See `rename-frozen.md`.
+    #[test]
+    fn log_stream_upgrade_stays_frozen() {
+        assert_eq!(cello::node_log::LOG_STREAM_UPGRADE, "celld-log-stream");
+    }
 
     /// The process-wide Tokio runtime these tests boot node state on, with
     /// the asyncrt host handle installed exactly once (mirrors

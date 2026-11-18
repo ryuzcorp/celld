@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): a serving process is non-dumpable.
+// Modified by Ryuz Corp (Cello): a serving process is non-dumpable.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! Process hardening the fork adds (patch 0053).

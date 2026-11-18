@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): validate CELLO_MEMORY_SCOPE; pin the node-session id in the data dir (upstream #249).
+// Modified by Ryuz Corp (Cello): validate CELLO_MEMORY_SCOPE; pin the node-session id in the data dir (upstream #249).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! What the process can learn about where it is running.

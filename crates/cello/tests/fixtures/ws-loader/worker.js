@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): loader 101 upgrade fixture (upstream #305). Apache-2.0.
+// Modified by Ryuz Corp (Cello): loader 101 upgrade fixture (upstream #305). Apache-2.0.
 import { DurableObject, WorkerEntrypoint } from "cloudflare:workers";
 
 function echo() {

@@ -1,5 +1,5 @@
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
-// Modified by ryuzcorp (ryuzcorp/celld): d1 export; d1 execute --batch; deploy reads stay inside the project; d1 --local targets the cello dev node (upstream #272).
+// Modified by Ryuz Corp (Cello): d1 export; d1 execute --batch; deploy reads stay inside the project; d1 --local targets the cello dev node (upstream #272).
 
 // The D1 CLI reads operator input and migration files outside node storage.
 #![allow(clippy::disallowed_methods)]

@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): operator token for the internal listener; D1 export operator-ingress marker; trusted cell RPC; marker-aware tunnel negotiation; trusted-header control strip; unguessable tunneled-upgrade park ids.
+// Modified by Ryuz Corp (Cello): operator token for the internal listener; D1 export operator-ingress marker; trusted cell RPC; marker-aware tunnel negotiation; trusted-header control strip; unguessable tunneled-upgrade park ids.
 // Copyright 2026 Deno Land Inc. All rights reserved.
 
 //! The peer tunnel: an upgraded stream per peer, plain HTTP inside.
@@ -986,5 +986,12 @@ mod operator_tests {
         let bare = hyper::HeaderMap::new();
         assert!(!honored_operator(&bare, marker_aware));
         assert!(!honored_trusted(&bare, marker_aware));
+    }
+
+    /// The tunnel subprotocol is frozen node-to-node wire: mixed-version
+    /// fleets negotiate it while they upgrade. See `rename-frozen.md`.
+    #[test]
+    fn tunnel_protocol_stays_frozen() {
+        assert_eq!(TUNNEL_PROTOCOL, "celld-tunnel");
     }
 }

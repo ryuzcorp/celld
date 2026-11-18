@@ -1,6 +1,6 @@
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 //
-// Modified by ryuzcorp (ryuzcorp/celld): tenant egress policy; refused-dial test holds its port (0077). Apache-2.0.
+// Modified by Ryuz Corp (Cello): tenant egress policy; refused-dial test holds its port (0077). Apache-2.0.
 
 // Tenant egress policy for Worker-initiated outbound connections.
 // It dials sockets and reads the wall clock for its DNS cache, like

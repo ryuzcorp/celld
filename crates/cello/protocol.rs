@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): staged activation.
+// Modified by Ryuz Corp (Cello): staged activation.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! Durable types on the bucket contract between deployment tools and cello.

@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): re-export the shared list-request builder and the structured listing; reaction-aware request resources.
+// Modified by Ryuz Corp (Cello): re-export the shared list-request builder and the structured listing; reaction-aware request resources.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! The V8 surface over an `r2_buckets` binding.

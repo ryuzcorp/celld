@@ -1,6 +1,6 @@
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 //
-// Modified by ryuzcorp (ryuzcorp/celld): server-initiated close regression test (upstream #279).
+// Modified by Ryuz Corp (Cello): server-initiated close regression test (upstream #279).
 
 // A black-box runner, not node code: it boots the binary, copies fixtures,
 // and speaks raw WebSocket framing over TCP with wall-clock deadlines.

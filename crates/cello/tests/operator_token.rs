@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): operator token for the internal listener;
+// Modified by Ryuz Corp (Cello): operator token for the internal listener;
 // announce-line discovery; ephemeral-port boot (0077). Apache-2.0.
 
 // A black-box runner, not node code: it boots the binary, copies fixtures,

@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): deployment cache scope fixture. Apache-2.0.
+// Modified by Ryuz Corp (Cello): deployment cache scope fixture. Apache-2.0.
 
 // Every endpoint drives `caches` and reports JSON. Cache keys are absolute
 // URLs under a fake origin; nothing is ever fetched. MARKER names the

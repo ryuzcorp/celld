@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): D1 export operator-ingress marker; ported from meln1k/cello: report wake coverage after maintenance (e6cb9a3); shared-cell compat union; WebSocket join tokens; post-response background budget (upstream #275); nodejs process.env population flag (upstream #296).
+// Modified by Ryuz Corp (Cello): D1 export operator-ingress marker; ported from meln1k/cello: report wake coverage after maintenance (e6cb9a3); shared-cell compat union; WebSocket join tokens; post-response background budget (upstream #275); nodejs process.env population flag (upstream #296).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! Engine-neutral types and helpers that the cell runtimes and the host

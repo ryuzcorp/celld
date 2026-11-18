@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): stale-route marker shared with the node-log recovery classifier (upstream #273).
+// Modified by Ryuz Corp (Cello): stale-route marker shared with the node-log recovery classifier (upstream #273).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 // Authentication entropy and signature timestamps belong to the real peer wire.
@@ -10,6 +10,12 @@
 /// Recovery uses it to tell "the old member is gone" from transport noise.
 pub const STALE_ROUTE_HEADER: &str = "x-cells-route-error";
 pub const STALE_ROUTE_VALUE: &str = "stale-owner";
+
+/// The node-to-node overload signal on peer RPC responses. Frozen: a bucket
+/// written by celld `.13` is not involved, but mixed-version fleets exchange
+/// this header while they upgrade, so the spelling never changes.
+/// See `rename-frozen.md`.
+pub const OVERLOAD_HEADER: &str = "x-celld-overload";
 
 use crate::bucket::Bucket;
 use anyhow::{anyhow, Context};
@@ -391,5 +397,17 @@ fn hex_nibble(value: u8) -> anyhow::Result<u8> {
         b'0'..=b'9' => Ok(value - b'0'),
         b'a'..=b'f' => Ok(value - b'a' + 10),
         _ => Err(anyhow!("hexadecimal must be lowercase ASCII")),
+    }
+}
+
+/// Frozen wire identifiers, pinned so a rename cannot drift one side of a
+/// node-to-node exchange. See `rename-frozen.md`.
+#[cfg(test)]
+mod frozen_names_tests {
+    use super::*;
+
+    #[test]
+    fn overload_header_stays_frozen() {
+        assert_eq!(OVERLOAD_HEADER, "x-celld-overload");
     }
 }

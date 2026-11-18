@@ -1,5 +1,5 @@
-// Modified by ryuzcorp (ryuzcorp/celld): round-level fence settlement (0062); renewal lease readback carries the authority bound (upstream #264); lease CAS conflict outcome (upstream #239); RestartRuntime event (upstream #291).
-// Modified by ryuzcorp (ryuzcorp/celld): ported from meln1k/cello: seal a dead lease that never opened a log (01522b3); shared bucket-posture ownership reads across concurrent gates (0056).
+// Modified by Ryuz Corp (Cello): round-level fence settlement (0062); renewal lease readback carries the authority bound (upstream #264); lease CAS conflict outcome (upstream #239); RestartRuntime event (upstream #291).
+// Modified by Ryuz Corp (Cello): ported from meln1k/cello: seal a dead lease that never opened a log (01522b3); shared bucket-posture ownership reads across concurrent gates (0056).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! The vocabulary the core is written in: what it is told, what it
@@ -720,7 +720,7 @@ pub enum Event {
     /// ownership read. A round whose read predates its proof fails the gates
     /// it covers. Layer 2 produces this (per-cell `own.json` reads now,
     /// shard reads later); layer 1 only settles it.
-    /// Modified by ryuzcorp (ryuzcorp/celld): round-level fence settlement (0062).
+    /// Modified by Ryuz Corp (Cello): round-level fence settlement (0062).
     FenceRoundVerified {
         round: log_tier::FenceRoundSettlement,
     },

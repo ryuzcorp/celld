@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): Workers Cache API example. Apache-2.0.
+// Modified by Ryuz Corp (Cello): Workers Cache API example. Apache-2.0.
 export default {
   async fetch(request) {
     const pathname = new URL(request.url).pathname;

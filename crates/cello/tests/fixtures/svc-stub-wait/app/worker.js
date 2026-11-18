@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): cross-event retained-wait fixture. Apache-2.0.
+// Modified by Ryuz Corp (Cello): cross-event retained-wait fixture. Apache-2.0.
 const J = (o, st = 200) => Response.json(o, { status: st });
 
 export default {

@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): exec-signal conformance fixture; exec kill delivery fixture; close/signal delivery fixture; failed-event signal fixture. Apache-2.0.
+// Modified by Ryuz Corp (Cello): exec-signal conformance fixture; exec kill delivery fixture; close/signal delivery fixture; failed-event signal fixture. Apache-2.0.
 import { DurableObject } from 'cloudflare:workers';
 
 const J = (o, st = 200) => Response.json(o, { status: st });

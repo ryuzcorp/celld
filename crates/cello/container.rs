@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): exec() waits for start(); exec pty/resize; fence node-netns exception; process-granularity exec kill; kill conformance tests; exec reads survive their subscribing event; worker container endpoints for the tenant egress policy; exec-kill tests share the common test runtime; bounded engine control calls; tiered lifecycle bound; orphan cleanup on failed start and exec; capped retry loops; binding-forgery enforcement.
+// Modified by Ryuz Corp (Cello): exec() waits for start(); exec pty/resize; fence node-netns exception; process-granularity exec kill; kill conformance tests; exec reads survive their subscribing event; worker container endpoints for the tenant egress policy; exec-kill tests share the common test runtime; bounded engine control calls; tiered lifecycle bound; orphan cleanup on failed start and exec; capped retry loops; binding-forgery enforcement.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! Containers attached to Durable Objects: the engine side of

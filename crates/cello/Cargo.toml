@@ -1,4 +1,4 @@
-# Modified by ryuzcorp (ryuzcorp/celld): node:crypto scrypt; C-trim threshold 8 MiB with CELLO_C_TRIM_MB knob.
+# Modified by Ryuz Corp (Cello): node:crypto scrypt; C-trim threshold 8 MiB with CELLO_C_TRIM_MB knob.
 [package]
 name = "cello"
 version = "0.1.0"

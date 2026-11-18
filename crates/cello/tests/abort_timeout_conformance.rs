@@ -1,6 +1,6 @@
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 //
-// Modified by ryuzcorp (ryuzcorp/celld): AbortSignal.timeout admission regression test (upstream #306).
+// Modified by Ryuz Corp (Cello): AbortSignal.timeout admission regression test (upstream #306).
 
 // A black-box runner, not node code: it boots the binary, copies fixtures,
 // and polls TCP with wall-clock deadlines, so the execution boundary's

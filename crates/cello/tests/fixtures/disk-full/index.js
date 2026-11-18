@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): full-disk recovery fixture (upstream #291).
+// Modified by Ryuz Corp (Cello): full-disk recovery fixture (upstream #291).
 import { DurableObject } from 'cloudflare:workers';
 
 // A cell that writes blobs in a transaction and reads them back. Clamping

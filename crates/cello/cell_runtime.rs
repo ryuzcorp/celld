@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): staged invoke reserves generation ids and parks shadow generations; facet open answers the database path only (upstream #292); local reload replays the boot prune list (upstream #290).
+// Modified by Ryuz Corp (Cello): staged invoke reserves generation ids and parks shadow generations; facet open answers the database path only (upstream #292); local reload replays the boot prune list (upstream #290).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! What a node's cell runtime holds whichever engine runs the cells: the

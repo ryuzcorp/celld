@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): tenant egress policy; shared TLS roots with fetch (upstream #230).
+// Modified by Ryuz Corp (Cello): tenant egress policy; shared TLS roots with fetch (upstream #230).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 // The real peer WebSocket transport is outside the Actor execution domain.

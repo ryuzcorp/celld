@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): r2 list --delimiter, a binding-shape --page, and --cursor continuation; r2 head/get --json answers an absent key with a not_found error object.
+// Modified by Ryuz Corp (Cello): r2 list --delimiter, a binding-shape --page, and --cursor continuation; r2 head/get --json answers an absent key with a not_found error object.
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 // The R2 CLI reads operator input and object bodies outside node storage.

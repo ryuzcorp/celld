@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): validate CELLO_MEMORY_SCOPE; CELLO_CACHE_MAX_BYTES validation; tenant egress policy; CELLO_CACHE_SCOPE validation; CELLO_DEPLOY_AWS_* validation; CELLO_SQLITE_CACHE_KB validation; CELLO_C_TRIM_MB validation; CELLO_BUCKET_BUNDLES startup validation (0070); CELLO_BUCKET_BUNDLES defaults off (0075); CELLO_TMP_MAX_BYTES validation (upstream #280); CELLO_SQL_STATEMENT_MS validation (upstream #274); CELLO_MAX_CELLS_PER_ISOLATE validation (upstream #278).
+// Modified by Ryuz Corp (Cello): validate CELLO_MEMORY_SCOPE; CELLO_CACHE_MAX_BYTES validation; tenant egress policy; CELLO_CACHE_SCOPE validation; CELLO_DEPLOY_AWS_* validation; CELLO_SQLITE_CACHE_KB validation; CELLO_C_TRIM_MB validation; CELLO_BUCKET_BUNDLES startup validation (0070); CELLO_BUCKET_BUNDLES defaults off (0075); CELLO_TMP_MAX_BYTES validation (upstream #280); CELLO_SQL_STATEMENT_MS validation (upstream #274); CELLO_MAX_CELLS_PER_ISOLATE validation (upstream #278).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! Strict runtime environment parsing.

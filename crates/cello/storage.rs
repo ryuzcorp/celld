@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): D1 export; D1 export hardening; D1 batch tests; D1 export sequence scoping; binding-forgery enforcement; per-connection SQLite page-cache budget (CELLO_SQLITE_CACHE_KB); 0.5.1 facet-image import repair (upstream #292); broken-SQL scopes restart the cell (upstream #291); per-statement SQL time bound (upstream #274).
+// Modified by Ryuz Corp (Cello): D1 export; D1 export hardening; D1 batch tests; D1 export sequence scoping; binding-forgery enforcement; per-connection SQLite page-cache budget (CELLO_SQLITE_CACHE_KB); 0.5.1 facet-image import repair (upstream #292); broken-SQL scopes restart the cell (upstream #291); per-statement SQL time bound (upstream #274).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 // This is V8-thread SQLite plumbing outside the Actor execution domain.

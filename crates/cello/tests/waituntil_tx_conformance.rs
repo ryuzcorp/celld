@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): waitUntil background storage transaction conformance (upstream #300). Apache-2.0.
+// Modified by Ryuz Corp (Cello): waitUntil background storage transaction conformance (upstream #300). Apache-2.0.
 
 // A black-box runner, not node code: it boots the real `cello dev` binary,
 // drives a WebSocket pair like the issue's reproduction, and asserts the

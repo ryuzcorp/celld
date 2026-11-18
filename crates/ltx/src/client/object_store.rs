@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): single-key LTX deletes with bounded concurrency for the eviction trim; the eviction guard proves replication with a HEAD on a journaled key instead of a prefix LIST.
+// Modified by Ryuz Corp (Cello): single-key LTX deletes with bounded concurrency for the eviction trim; the eviction guard proves replication with a HEAD on a journaled key instead of a prefix LIST.
 //!
 //! Ported (behavior only) from litestream@v0.5.11 `s3/replica_client.go`. We do
 //! **not** use the Go AWS SDK; instead the five `ReplicaClient` operations are

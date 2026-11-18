@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): per-node Cache API fixture. Apache-2.0.
+// Modified by Ryuz Corp (Cello): per-node Cache API fixture. Apache-2.0.
 
 // Every endpoint drives `caches` and reports JSON. Cache keys are absolute
 // URLs under a fake origin; nothing is ever fetched.

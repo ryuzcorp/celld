@@ -1,6 +1,6 @@
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 //
-// Modified by ryuzcorp (ryuzcorp/celld): shared ephemeral-port boot helpers (0077).
+// Modified by Ryuz Corp (Cello): shared ephemeral-port boot helpers (0077).
 
 //! Shared boot helpers for the black-box runner tests: each test boots the
 //! real `cello dev` binary and polls TCP with wall-clock deadlines.

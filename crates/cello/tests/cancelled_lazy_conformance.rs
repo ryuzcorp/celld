@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): cancelled-request lazy-init conformance (upstream #294). Apache-2.0.
+// Modified by Ryuz Corp (Cello): cancelled-request lazy-init conformance (upstream #294). Apache-2.0.
 
 // A black-box runner, not node code: it boots the real `cello dev` binary,
 // cancels one Durable Object request mid-flight by closing its TCP

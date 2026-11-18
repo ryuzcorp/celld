@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): operator token for the internal listener; staged invoke reuses the signed entrance; bucket-backed entrance for d1 --local (upstream #272).
+// Modified by Ryuz Corp (Cello): operator token for the internal listener; staged invoke reuses the signed entrance; bucket-backed entrance for d1 --local (upstream #272).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! Reaching a reserved-class cell from outside the fleet.

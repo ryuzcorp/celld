@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): Queue DLQ forward/redrive fixture. Apache-2.0.
+// Modified by Ryuz Corp (Cello): Queue DLQ forward/redrive fixture. Apache-2.0.
 // A Worker with two Queue producers and a failing consumer: `dlq-src`
 // dead-letters to `dlq-dst` after its retries are spent. The queue
 // handler logs every delivery (queue, id, attempts, body) for the

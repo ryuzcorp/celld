@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): full-disk recovery test (upstream #291).
+// Modified by Ryuz Corp (Cello): full-disk recovery test (upstream #291).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 // A black-box runner, not node code: it boots the binary and drives HTTP

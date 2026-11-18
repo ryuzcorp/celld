@@ -1,5 +1,5 @@
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
-// Modified by ryuzcorp (ryuzcorp/celld): D1 export operator-ingress marker.
+// Modified by Ryuz Corp (Cello): D1 export operator-ingress marker.
 
 //! Routed local execution and the durability gate for outgoing effects.
 use crate::actor::{ActivityGuard, AppHandle, LocalRequestFailure, Routed};

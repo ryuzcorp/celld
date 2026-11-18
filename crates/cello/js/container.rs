@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): exec() waits for start(); exec pty/resize; test-only fake exec engine; fake kill completion; exec reads survive their subscribing event; close/signal IoContext lifetime with fake completion; binding-forgery enforcement.
+// Modified by Ryuz Corp (Cello): exec() waits for start(); exec pty/resize; test-only fake exec engine; fake kill completion; exec reads survive their subscribing event; close/signal IoContext lifetime with fake completion; binding-forgery enforcement.
 //! Host ops behind `ctx.container`.
 //!
 //! JavaScript owns the surface and every validation message, copied from

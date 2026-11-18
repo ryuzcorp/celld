@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): confine esbuild's reads to the project. Apache-2.0.
+// Modified by Ryuz Corp (Cello): confine esbuild's reads to the project. Apache-2.0.
 
 //! Read confinement for the esbuild child.
 //!

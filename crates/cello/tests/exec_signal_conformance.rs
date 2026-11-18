@@ -1,6 +1,6 @@
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 //
-// Modified by ryuzcorp (ryuzcorp/celld): container exec AbortSignal
+// Modified by Ryuz Corp (Cello): container exec AbortSignal
 // conformance; container exec kill delivery conformance; stdin-close and
 // container-signal delivery conformance; failed-event signal delivery
 // conformance; ephemeral-port boot (0077). Apache-2.0.

@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): post-response outbound dial fixture (upstream #254). Apache-2.0.
+// Modified by Ryuz Corp (Cello): post-response outbound dial fixture (upstream #254). Apache-2.0.
 import { DurableObject } from "cloudflare:workers";
 export class Dialer extends DurableObject {
   log = [];

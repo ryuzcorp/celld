@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): cross-event retained-wait fixture. Apache-2.0.
+// Modified by Ryuz Corp (Cello): cross-event retained-wait fixture. Apache-2.0.
 import { DurableObject, RpcTarget, WorkerEntrypoint } from 'cloudflare:workers';
 
 // A capability holding a promise minted by an earlier native op: `wait`

@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): incoming method/status fixture (upstream #285). Apache-2.0.
+// Modified by Ryuz Corp (Cello): incoming method/status fixture (upstream #285). Apache-2.0.
 import { DurableObject } from "cloudflare:workers";
 
 export class Probe extends DurableObject {

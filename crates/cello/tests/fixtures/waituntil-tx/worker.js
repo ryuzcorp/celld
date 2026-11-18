@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): waitUntil background storage transaction regression fixture (upstream #300). Apache-2.0.
+// Modified by Ryuz Corp (Cello): waitUntil background storage transaction regression fixture (upstream #300). Apache-2.0.
 import { DurableObject } from 'cloudflare:workers';
 
 export class Repro extends DurableObject {

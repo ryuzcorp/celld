@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): MergeTree-style lazy handoff policy (0078).
+// Modified by Ryuz Corp (Cello): MergeTree-style lazy handoff policy (0078).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! MergeTree-style handoff policy: skip the eviction snapshot for a short

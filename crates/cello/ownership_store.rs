@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): bucket-posture group commit: bucket-session node-log wire marker (0059). bucket-posture group commit: published-format boot self-check (0070); lease CAS keeps the 409 conflict kind (upstream #239).
+// Modified by Ryuz Corp (Cello): bucket-posture group commit: bucket-session node-log wire marker (0059). bucket-posture group commit: published-format boot self-check (0070); lease CAS keeps the 409 conflict kind (upstream #239).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 //! Bucket ownership effect adapter, over either conditional-write dialect.

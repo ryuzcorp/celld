@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): tenant egress policy fixture. Apache-2.0.
+// Modified by Ryuz Corp (Cello): tenant egress policy fixture. Apache-2.0.
 import { connect } from 'cloudflare:sockets';
 
 const J = (o, st = 200) => Response.json(o, { status: st });

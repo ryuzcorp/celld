@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): tenant egress policy; reaction-aware request resources; TCP socket ownership; shared TLS roots with fetch (upstream #230).
+// Modified by Ryuz Corp (Cello): tenant egress policy; reaction-aware request resources; TCP socket ownership; shared TLS roots with fetch (upstream #230).
 //! Outbound TCP host ops for `cloudflare:sockets` `connect()`.
 //!
 //! A socket is a split tokio stream in a process-global registry: the

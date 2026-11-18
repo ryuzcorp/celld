@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): cross-isolate RPC stubs and streams; D1 export operator-ingress marker; ported from meln1k/cello: report wake coverage after maintenance (e6cb9a3); wake coverage follow-ups: startup observation ordering, installation comparison; trusted cell RPC; deployment cache scope purge on generation free; staged invoke joins the driver past the reply.; answered drivers poll while waitUntil background is outstanding (upstream #300); drivers take the mailbox once more before retiring (upstream #309); post-response background budget ends orphaned drives (upstream #275); storage-poisoned cells restart on a fresh isolate (upstream #291); restore fails a vanished class before touching disk (upstream #276); incoming spans carry HTTP method/status and 5xx without exception marks error (upstream #285); CELLO_MAX_CELLS_PER_ISOLATE knob (upstream #278).
+// Modified by Ryuz Corp (Cello): cross-isolate RPC stubs and streams; D1 export operator-ingress marker; ported from meln1k/cello: report wake coverage after maintenance (e6cb9a3); wake coverage follow-ups: startup observation ordering, installation comparison; trusted cell RPC; deployment cache scope purge on generation free; staged invoke joins the driver past the reply.; answered drivers poll while waitUntil background is outstanding (upstream #300); drivers take the mailbox once more before retiring (upstream #309); post-response background budget ends orphaned drives (upstream #275); storage-poisoned cells restart on a fresh isolate (upstream #291); restore fails a vanished class before touching disk (upstream #276); incoming spans carry HTTP method/status and 5xx without exception marks error (upstream #285); CELLO_MAX_CELLS_PER_ISOLATE knob (upstream #278).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 // RuntimeManager is the V8 cell-host arm, so its executor and observability
@@ -1629,7 +1629,7 @@ impl RuntimeManager {
                     status: 503,
                     headers: vec![
                         ("retry-after".to_string(), "1".to_string()),
-                        ("x-celld-overload".to_string(), "cell".to_string()),
+                        (crate::peer_auth::OVERLOAD_HEADER.to_string(), "cell".to_string()),
                     ],
                     body: b"cell request limit reached".to_vec(),
                     websocket: None,

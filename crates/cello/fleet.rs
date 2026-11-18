@@ -1,6 +1,6 @@
-// Modified by ryuzcorp (ryuzcorp/celld): staged activation; the serving bucket constructor; cello versions listing (upstream #181).
+// Modified by Ryuz Corp (Cello): staged activation; the serving bucket constructor; cello versions listing (upstream #181).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
-// Modified by ryuzcorp (ryuzcorp/celld): deploy --sourcemap writes the bundle's external map.
+// Modified by Ryuz Corp (Cello): deploy --sourcemap writes the bundle's external map.
 
 // Fleet CLI and peer-diagnostic work executes outside the Actor execution
 // domain.

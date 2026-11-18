@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): a capture before a handoff skips the time-based checkpoint; exact uncaptured-changes probe for the lazy handoff (0078); local L0 retention after L1 compaction (upstream #311).
+// Modified by Ryuz Corp (Cello): a capture before a handoff skips the time-based checkpoint; exact uncaptured-changes probe for the lazy handoff (0078); local L0 retention after L1 compaction (upstream #311).
 //! db.rs — SQLite database lifecycle: WAL-mode setup, the long-running read-lock
 //! checkpoint takeover, the WAL→LTX capture loop, and manual checkpointing.
 //! Ported from litestream@v0.5.11 `db.go`.

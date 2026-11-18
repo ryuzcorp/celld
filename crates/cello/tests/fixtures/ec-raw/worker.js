@@ -1,4 +1,4 @@
-// Modified by ryuzcorp (ryuzcorp/celld): EC raw fixture (upstream #271). Apache-2.0.
+// Modified by Ryuz Corp (Cello): EC raw fixture (upstream #271). Apache-2.0.
 const first = (e) => String(e).split("\n")[0];
 async function probe(name) {
   const algo = { name, namedCurve: "P-256" };
