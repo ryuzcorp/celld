@@ -8,9 +8,9 @@
 //! these tests rely on; they also call it directly so a release build still
 //! checks the final state.
 
-use celld_logic::log_tier::{CellCredit, FenceCellSettlement, FenceRoundSettlement, ProofThenRead};
-use celld_logic::wake::{AlarmSnapshot, AlarmSource, PublicationId};
-use celld_logic::{
+use cello_logic::log_tier::{CellCredit, FenceCellSettlement, FenceRoundSettlement, ProofThenRead};
+use cello_logic::wake::{AlarmSnapshot, AlarmSource, PublicationId};
+use cello_logic::{
     on_event, pressure, CasGuard, CasOutcome, Channel, Config, Effect, Event, Failure,
     LeaseCasOutcome, LocalCell, NodeLeaseRecord, NodeLeaseSpec, OwnerRecord, OwnershipOnEvict,
     Probe, ProofSource, RequestError, RestoreOutcome, State, Timer, WakeHintScope, WebSocketKind,
@@ -254,7 +254,7 @@ impl Shell {
         assert!(
             effects.iter().any(|effect| matches!(
                 effect,
-                Effect::Complete { request: r, result: Ok(celld_logic::Route::Local) } if *r == request
+                Effect::Complete { request: r, result: Ok(cello_logic::Route::Local) } if *r == request
             )),
             "request {request} was not served locally: {effects:?}"
         );
@@ -985,7 +985,7 @@ fn a_hibernatable_socket_event_waits_on_a_quiescing_cell() {
             effect,
             Effect::Complete {
                 request: 3,
-                result: Ok(celld_logic::Route::Local)
+                result: Ok(cello_logic::Route::Local)
             }
         )),
         "the hibernatable event waits for the restarted runtime: {effects:?}"
@@ -1831,7 +1831,7 @@ fn a_live_matching_owner_lease_routes_remote_without_a_claim() {
             effect,
             Effect::Complete {
                 request: 1,
-                result: Ok(celld_logic::Route::Remote { .. }),
+                result: Ok(cello_logic::Route::Remote { .. }),
             }
         )),
         "a live matching owner routes remote: {effects:?}"
@@ -1944,7 +1944,7 @@ fn a_zero_capacity_node_hands_a_dead_owners_cell_to_a_peer() {
             expires_ms: NOW_MS - 1,
             peer_protocol: 1,
             generation: "g1".into(),
-            log_state: Some(celld_logic::log_tier::LogState::Sealed),
+            log_state: Some(cello_logic::log_tier::LogState::Sealed),
             etag: "lease-n1".into(),
         })),
     });
@@ -1970,7 +1970,7 @@ fn a_zero_capacity_node_hands_a_dead_owners_cell_to_a_peer() {
     let effects = shell.send(Event::CapacityPeersRead {
         op,
         now_ms: NOW_MS,
-        result: Ok(vec![celld_logic::CapacityPeer {
+        result: Ok(vec![cello_logic::CapacityPeer {
             node: "n2".into(),
             addr: "n2".into(),
             expires_ms: NOW_MS + TTL_MS,
@@ -1996,7 +1996,7 @@ fn a_zero_capacity_node_hands_a_dead_owners_cell_to_a_peer() {
             effect,
             Effect::Complete {
                 request: 1,
-                result: Ok(celld_logic::Route::Remote { node, .. }),
+                result: Ok(cello_logic::Route::Remote { node, .. }),
             } if node == "n2"
         )),
         "the request must route to the peer with room: {effects:?}"
@@ -2032,9 +2032,9 @@ fn a_failed_start_disarms_the_restored_alarm() {
     };
     let effects = shell.send(Event::RestoreCompleted {
         op,
-        result: Ok(celld_logic::RestoreOutcome {
+        result: Ok(cello_logic::RestoreOutcome {
             restored: true,
-            alarm: Some(celld_logic::RestoredAlarm {
+            alarm: Some(cello_logic::RestoredAlarm {
                 at_ms: NOW_MS as i64 - 1_000,
                 covered: true,
             }),
@@ -2053,7 +2053,7 @@ fn a_failed_start_disarms_the_restored_alarm() {
         op,
         isolate: None,
         generation: 0,
-        result: Err(celld_logic::Failure::Definite),
+        result: Err(cello_logic::Failure::Definite),
     });
     assert!(
         effects.iter().any(|effect| matches!(
@@ -2117,9 +2117,9 @@ fn a_failed_start_rearms_the_uncovered_restored_alarm_at_scan_pace() {
     };
     let effects = shell.send(Event::RestoreCompleted {
         op,
-        result: Ok(celld_logic::RestoreOutcome {
+        result: Ok(cello_logic::RestoreOutcome {
             restored: true,
-            alarm: Some(celld_logic::RestoredAlarm {
+            alarm: Some(cello_logic::RestoredAlarm {
                 at_ms: NOW_MS as i64 - 1_000,
                 covered: false,
             }),
@@ -2138,7 +2138,7 @@ fn a_failed_start_rearms_the_uncovered_restored_alarm_at_scan_pace() {
         op,
         isolate: None,
         generation: 0,
-        result: Err(celld_logic::Failure::Definite),
+        result: Err(cello_logic::Failure::Definite),
     });
     assert!(
         effects.iter().any(|effect| matches!(
@@ -2203,9 +2203,9 @@ fn a_failed_start_rearms_the_uncovered_restored_alarm_at_scan_pace() {
     };
     let effects = shell.send(Event::RestoreCompleted {
         op,
-        result: Ok(celld_logic::RestoreOutcome {
+        result: Ok(cello_logic::RestoreOutcome {
             restored: true,
-            alarm: Some(celld_logic::RestoredAlarm {
+            alarm: Some(cello_logic::RestoredAlarm {
                 at_ms: NOW_MS as i64 - 1_000,
                 covered: false,
             }),
@@ -2224,7 +2224,7 @@ fn a_failed_start_rearms_the_uncovered_restored_alarm_at_scan_pace() {
         op,
         isolate: None,
         generation: 0,
-        result: Err(celld_logic::Failure::Definite),
+        result: Err(cello_logic::Failure::Definite),
     });
     // The restore's immediate timer, the first re-arm, its scan-pace retry,
     // the retry's own restore timer, and the second re-arm: every older

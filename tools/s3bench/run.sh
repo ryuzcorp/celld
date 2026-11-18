@@ -43,10 +43,10 @@ fi
 # Release builds only by default: a debug binary distorts batching and every
 # latency figure, and once made a release look 2x slower than `.10`.
 if [[ -z "${CELLD_BIN:-}" ]]; then
-  CELLD_BIN="$ROOT/target/release/celld"
-  [[ -x "$CELLD_BIN" ]] || CELLD_BIN="$HOME/.cargo-target/celld-wt-$(basename "$ROOT")/release/celld"
+  CELLD_BIN="$ROOT/target/release/cello"
+  [[ -x "$CELLD_BIN" ]] || CELLD_BIN="$HOME/.cargo-target/cello-wt-$(basename "$ROOT")/release/cello"
 fi
-[[ -x "$CELLD_BIN" ]] || { echo "run.sh: no executable CELLD_BIN=$CELLD_BIN (cargo build --release -p celld first)" >&2; exit 1; }
+[[ -x "$CELLD_BIN" ]] || { echo "run.sh: no executable CELLD_BIN=$CELLD_BIN (cargo build --release -p cello first)" >&2; exit 1; }
 command -v esbuild >/dev/null || { echo "run.sh: esbuild not on PATH (needed by celld deploy)" >&2; exit 1; }
 command -v docker >/dev/null || { echo "run.sh: docker not on PATH" >&2; exit 1; }
 python3 -c "import boto3" 2>/dev/null || { echo "run.sh: python3 boto3 missing (pip install boto3)" >&2; exit 1; }

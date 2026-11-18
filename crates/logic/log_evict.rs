@@ -171,7 +171,7 @@ impl FollowerHealth {
     }
 
     /// Return the completion time and latency for each recorded append.
-    #[cfg(celld_internal_tests)]
+    #[cfg(cello_internal_tests)]
     pub fn append_samples_for_test(&self, member: &str) -> Vec<(u64, u64)> {
         self.members
             .get(member)

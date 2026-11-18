@@ -1,6 +1,6 @@
-# celld-ltx
+# cello-ltx
 
-`celld-ltx` is celld's in-process SQLite replication library. It captures
+`cello-ltx` is celld's in-process SQLite replication library. It captures
 committed WAL data as L0 LTX segments and reports the captured position. The
 crate can write segments to a filesystem or an object store. It can restore a
 database, compact levels, create a snapshot, and read segments from bundle

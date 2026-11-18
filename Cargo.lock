@@ -284,8 +284,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "celld"
-version = "0.6.3"
+name = "cello"
+version = "0.1.0"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -295,8 +295,8 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "cbc",
- "celld-logic",
- "celld-ltx",
+ "cello-logic",
+ "cello-ltx",
  "chrono",
  "crc",
  "ctr",
@@ -364,12 +364,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "celld-logic"
+name = "cello-logic"
 version = "0.1.0"
 
 [[package]]
-name = "celld-ltx"
-version = "0.0.0"
+name = "cello-ltx"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "bytes",

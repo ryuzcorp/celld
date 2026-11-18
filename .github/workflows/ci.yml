@@ -1,18 +1,18 @@
-# ryuzcorp/celld: upstream denoland/celld plus our patches, one commit per
-# patch, on `ryuzcorp/v<version>` line branches (see FORK.md). Upstream's own
+# Cello: upstream denoland/celld plus our patches, one commit per
+# patch (see docs/). Upstream's own
 # Dockerfile builds the tree, so its full test suite and clippy run in the
 # image's `test` stage on every build.
 #
-#   pull_request / `ryuzcorp/**` push   `test`: build and test both
-#                                         architectures with a read-only token,
-#                                         push nothing
-#   `v*-ryuzcorp.*` tag push            publish.yml: verify, build, and push
-#                                         ghcr.io/ryuzcorp/celld:<version>-ryuzcorp.<n>
+#   pull_request / `main` push   `test`: build and test both
+#                                 architectures with a read-only token,
+#                                 push nothing
+#   `v*` tag push                publish.yml: verify, build, and push
+#                                 ghcr.io/ryuzcorp/cello:<version>
 name: ci
 
 on:
   push:
-    branches: [ryuzcorp/**]
+    branches: [main]
   pull_request:
 
 permissions:
@@ -43,12 +43,12 @@ jobs:
       - name: Test and build
         run: |
           set -euo pipefail
-          version=$(awk '/^\[package\]/{p=1;next} /^\[/{p=0} p&&/^version = "/{gsub(/"/,"");print $3;exit}' crates/celld/Cargo.toml)
+          version=$(awk '/^\[package\]/{p=1;next} /^\[/{p=0} p&&/^version = "/{gsub(/"/,"");print $3;exit}' crates/cello/Cargo.toml)
           docker buildx build \
             --platform "${{ matrix.platform }}" \
-            --build-arg "CELLD_COMMIT=$GITHUB_SHA" \
-            --build-arg "CELLD_VERSION=$version-ryuzcorp.ci" \
-            --label "org.opencontainers.image.source=https://github.com/ryuzcorp/celld" \
-            --label "org.opencontainers.image.version=$version-ryuzcorp.ci" \
+            --build-arg "CELLO_COMMIT=$GITHUB_SHA" \
+            --build-arg "CELLO_VERSION=$version-cello.ci" \
+            --label "org.opencontainers.image.source=https://github.com/ryuzcorp/cello" \
+            --label "org.opencontainers.image.version=$version-cello.ci" \
             --label "org.opencontainers.image.revision=$GITHUB_SHA" \
             .

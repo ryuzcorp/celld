@@ -1,6 +1,6 @@
 #![warn(clippy::disallowed_methods, clippy::disallowed_types)]
 
-//! `celld-ltx` provides embeddable streaming replication for a SQLite database.
+//! `cello-ltx` provides embeddable streaming replication for a SQLite database.
 //! It captures WAL data as LTX segments, reads and writes replica storage,
 //! restores databases, compacts levels, and reads bundle objects.
 //!
@@ -44,9 +44,9 @@ pub mod internal {
 
 // ── Crate-root re-exports — the ergonomic public surface ────────────────
 //
-// These `pub use` aliases let a host use `celld_ltx::Db`, `celld_ltx::Replica`,
-// and `celld_ltx::restore` without naming the owning module. The original module
-// paths, such as `celld_ltx::db::Db`, remain valid.
+// These `pub use` aliases let a host use `cello_ltx::Db`, `cello_ltx::Replica`,
+// and `cello_ltx::restore` without naming the owning module. The original module
+// paths, such as `cello_ltx::db::Db`, remain valid.
 
 // Re-export the error model at the crate root.
 pub use error::{new_ltx_error, Error, LTXError, Result};

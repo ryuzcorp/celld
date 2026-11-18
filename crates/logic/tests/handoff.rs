@@ -1,13 +1,13 @@
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
-//! Unit tests for the lazy handoff policy: [`celld_logic::handoff`].
+//! Unit tests for the lazy handoff policy: [`cello_logic::handoff`].
 //!
 //! Each policy condition forces the snapshot on its own; only a chain that is
 //! born in this epoch and journaled here, per-cell covered, short, and never
 //! overflowed skips it. The boundary (16 skips, 17 snapshots) is pinned so a
 //! later constant change re-examines the restore-amplification budget.
 
-use celld_logic::handoff::{HANDOFF_CHAIN_MAX_OBJECTS, HandoffChain, handoff_snapshot_needed};
+use cello_logic::handoff::{HANDOFF_CHAIN_MAX_OBJECTS, HandoffChain, handoff_snapshot_needed};
 
 fn fresh_short_chain() -> HandoffChain {
     HandoffChain {

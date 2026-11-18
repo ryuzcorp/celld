@@ -1,4 +1,4 @@
-# celld-ltx: in-process SQLite→object-store replication for celld.
+# cello-ltx: in-process SQLite→object-store replication for celld.
 #
 # Vendored 2026-08-03 from rustyriver (github.com/mikenomitch/rustyriver,
 # Apache-2.0), itself a Rust reimplementation of Litestream v0.5
@@ -7,8 +7,8 @@
 # this snapshot; it does not track an upstream branch. It serves celld's RPO=0
 # durability goal for every cell write.
 [package]
-name = "celld-ltx"
-version = "0.0.0"
+name = "cello-ltx"
+version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
 description = "In-process SQLite WAL replication to object storage (LTX format) for celld."
@@ -20,7 +20,7 @@ test = false
 
 [lints.rust.unexpected_cfgs]
 level = "warn"
-check-cfg = ["cfg(celld_internal_tests)"]
+check-cfg = ["cfg(cello_internal_tests)"]
 
 [lints.clippy]
 disallowed_macros = "forbid"
