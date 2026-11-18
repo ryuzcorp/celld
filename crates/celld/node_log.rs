@@ -7681,8 +7681,8 @@ impl NodeLogManager {
     }
 
     /// Stop bucket bundling so pending rows fall back to per-cell uploads
-    /// (`sync_loop` picks them up on its next wake; it has a fallback tick, so
-    /// no new write is needed), never acked on the bundle. `fenced` latches a
+    /// (the wake below hands the scan its retry at once; its fallback tick
+    /// stays the backstop, never acked on the bundle). `fenced` latches a
     /// definitive refusal (the bucket read the record and it moved); a
     /// transient failure (PUT or read error) leaves the session re-armable, and
     /// re-arming re-reads the record from the bucket.
@@ -7691,6 +7691,12 @@ impl NodeLogManager {
             self.bucket_fenced.store(true, Ordering::SeqCst);
         }
         self.bucket_epoch.store(0, Ordering::SeqCst);
+        // The stalled round consumed the loop wake with no new write coming
+        // to retry it, and the scan suppresses per-cell uploads while
+        // bundling is armed. Wake the scan now that the cells are its again
+        // instead of waiting out its fallback tick, or the retry parks until
+        // the tick fires — unbounded under load.
+        self.ltx.wake_sync_scan();
     }
 
     /// A failed lone-cell upload must fall back like a failed bundle PUT:
@@ -9423,6 +9429,38 @@ mod bucket_executor_tests {
                 source,
                 celld_logic::ProofSource::Bucket,
                 "the healed write still acks on the per-cell proof"
+            );
+        });
+    }
+
+    /// A bundling stall hands the scan its wake directly: dropping bundling
+    /// leaves dirty cells to the sync loop, and the stalled round consumed
+    /// the loop wake with no new write coming to retry it. Fail-before:
+    /// without the wake the stall parks the retry on the loop's fallback
+    /// tick, which load can delay past the durability budget (the lone-cell
+    /// retry above flaked exactly there). No timing here: the wake counts,
+    /// and a parked scan consumes Notify permits, so a permit assertion
+    /// would race the very loop it observes.
+    #[test]
+    fn bundle_stall_wakes_the_sync_scan_without_a_new_write() {
+        let runtime = crate::asyncrt::shared_test_runtime();
+        runtime.block_on(async {
+            let dir = tempfile::tempdir().expect("test dir");
+            let store = Arc::new(ListCountingStore::new());
+            let bucket = Arc::new(Bucket::with_store_for_test(
+                store.clone() as Arc<dyn celld_ltx::object_store::ObjectStore>
+            ));
+            let manager = test_manager_with_store(dir.path(), bucket.clone(), store.clone());
+            assert_eq!(
+                manager.ltx.stall_wake_count(),
+                0,
+                "no bundling drop has run yet"
+            );
+            manager.note_bucket_bundle_stalled();
+            assert_eq!(
+                manager.ltx.stall_wake_count(),
+                1,
+                "the stall must wake the sync scan: no new write may come to retry it"
             );
         });
     }

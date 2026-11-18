@@ -1446,6 +1446,10 @@ pub struct LtxRepl {
     /// Woken when a cell's `committed` advances, so the background loop syncs
     /// without polling; a slow tick backstops any missed notification.
     dirty: Arc<Notify>,
+    /// Bundling-drop scan wakes served, so a test can pin the stall's wake
+    /// without timing: each drop must hand the scan its wake directly.
+    #[cfg(test)]
+    stall_wake_count: AtomicU64,
     /// Shared by every activation, so the restore bound is per node, not per
     /// cell. The generic LTX restore keeps its sequential compatibility path.
     restore_slots: Arc<Semaphore>,
@@ -1836,6 +1840,8 @@ impl LtxRepl {
             bucket_bundles_fleet: AtomicBool::new(false),
             #[cfg(test)]
             bucket_env_override: Mutex::new(None),
+            #[cfg(test)]
+            stall_wake_count: AtomicU64::new(0),
             paged_min_bytes: AtomicU64::new(config.paged_min_bytes),
             hydrate_bytes_per_s: config.hydrate_bytes_per_s,
             hydrations: Arc::new(Semaphore::new(1)),
@@ -3268,6 +3274,22 @@ impl LtxRepl {
             return forced;
         }
         bucket_bundles_env_on()
+    }
+    /// Wake the per-cell sync scan: bundling just dropped, so dirty cells are
+    /// the sync loop's again, and the stalled round consumed the loop wake
+    /// with no new write coming to retry it. Without this the retry waits
+    /// out the loop's fallback tick, which is unbounded under load.
+    pub(crate) fn wake_sync_scan(&self) {
+        #[cfg(test)]
+        self.stall_wake_count.fetch_add(1, Ordering::SeqCst);
+        self.dirty.notify_one();
+    }
+
+    /// Bundling-drop scan wakes served, so a test can pin the stall's wake
+    /// without timing or racing the parked scan for a Notify permit.
+    #[cfg(test)]
+    pub(crate) fn stall_wake_count(&self) -> u64 {
+        self.stall_wake_count.load(Ordering::SeqCst)
     }
 
     /// Test override for the operator switch, so deterministic tests do not touch
