@@ -49,11 +49,21 @@ unchanged):
   `celld.version` becomes `cello.version` — because those are emitted
   fresh on every export, never read back.
 
+Persisted container references:
+
+- the `celld-image:` prefix recorded in stored `.13` deployment
+  manifests (`ContainerSpec.image`), resolved to
+  `deploy/images/<key>.tar`, so an old manifest's image reference
+  still resolves to its tar.
+
 Wire (node-to-node, unchanged so mixed versions gossip while you roll):
 
 - the `celld-tunnel` WebSocket subprotocol on `/peer/tunnel`,
 - the `x-celld-overload` overload signal on peer RPC responses,
-- the `celld-log-stream` upgrade value for peer log-tail streams.
+- the `celld-log-stream` upgrade value for peer log-tail streams,
+- the overload marker value
+  `celld-internal-cell-overload-7ec38c64-12d7-4ddc-9e77-b63f9dc14130`,
+  which crosses nodes inside peer-forwarded errors.
 
 Upstream `denoland/celld#NNN` links in comments and docs are historical
 references and still resolve. Fence image names such as `celld-fence…`
@@ -68,8 +78,9 @@ deployments record `cello-fence…`.
    `CELLO_BUCKET`, `CELLD_OPERATOR_TOKEN` → `CELLO_OPERATOR_TOKEN`,
    `CELLD_DEV_STATE` → `CELLO_DEV_STATE`,
    `CELLD_DEPLOY_AWS_*` → `CELLO_DEPLOY_AWS_*`, and so on for all 220
-   names. A node started with a `CELLD_*` variable simply does not see
-   it — check the startup log for unset-required-knob errors.
+   names. The node, `cello dev`, and every CLI refuse to start when any
+   `CELLD_*` variable is set, naming the `CELLO_*` spelling — a
+   carried-over environment can never silently lose config.
 2. **Image.** `ghcr.io/ryuzcorp/celld:<version>-ryuzcorp.<n>` becomes
    `ghcr.io/ryuzcorp/cello:<semver>` (`0.1.0`, `0.1`, `beta`,
    `latest`). Consumers pin by digest as before.
