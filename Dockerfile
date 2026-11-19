@@ -52,9 +52,14 @@ RUN case "${TARGETARCH}" in \
     esbuild --version
 # clippy reads the workspace's disallowed methods, types and macros from here.
 COPY clippy.toml ./
+# Tests run under a hostile env: a stale CELLD_* (cello refuses to start) and
+# a CELLO_DEV_STATE pointing nowhere writable. A test whose outcome depends on
+# the harness env, or a `cello` spawn that bypasses tests/common's cleared
+# env, fails here instead of on a developer machine.
 RUN --mount=type=cache,id=cello-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=cello-cargo-git,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,id=cello-target-${TARGETARCH},target=/src/target,sharing=locked \
+    CELLD_HERMETIC_CANARY=1 CELLO_DEV_STATE=/proc/cello-canary \
     cargo test --profile "${CELLO_PROFILE}" --locked && \
     cargo clippy --profile "${CELLO_PROFILE}" --all-targets --locked -- -D warnings
 

@@ -613,6 +613,7 @@ mod renamed_prefix_tests {
 
     #[test]
     fn clean_environment_still_validates() {
-        assert!(validate().is_ok());
+        refuse_renamed(vars(&[("CELLO_OPERATOR_TOKEN", "token"), ("PATH", "/bin")]).into_iter())
+            .expect("an env without CELLD_* validates");
     }
 }
