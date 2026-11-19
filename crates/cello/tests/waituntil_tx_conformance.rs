@@ -29,17 +29,13 @@
 
 mod common;
 
-use common::{announced, forward_announce};
+use common::{NO_EXTRA_ENV, announced, cello_command, forward_announce};
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-
-fn cello_binary() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_cello"))
-}
 
 fn fixture_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -64,7 +60,7 @@ struct TestNode {
 
 impl TestNode {
     fn boot(project: &Path) -> Self {
-        let mut child = Command::new(cello_binary())
+        let mut child = cello_command(project, NO_EXTRA_ENV)
             .arg("dev")
             .arg(project)
             .arg("--port")

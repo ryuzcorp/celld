@@ -15,17 +15,13 @@
 
 mod common;
 
-use common::{announced, forward_announce};
+use common::{announced, cello_command, forward_announce};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-
-fn cello_binary() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_cello"))
-}
 
 fn fixture_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -124,7 +120,14 @@ struct TestNode {
 
 impl TestNode {
     fn boot(project: &Path, otel: &str) -> Self {
-        let mut command = Command::new(cello_binary());
+        let mut command = cello_command(
+            project,
+            [
+                ("CELLO_OTEL", otel),
+                ("CELLO_OTEL_FLUSH_MS", "100"),
+                ("OTEL_SERVICE_NAME", "telemetry-http-probe"),
+            ],
+        );
         command
             .arg("dev")
             .arg(project)
@@ -132,9 +135,6 @@ impl TestNode {
             .arg("0")
             .arg("--no-watch")
             .arg("--logs")
-            .env("CELLO_OTEL", otel)
-            .env("CELLO_OTEL_FLUSH_MS", "100")
-            .env("OTEL_SERVICE_NAME", "telemetry-http-probe")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         let mut child = command.spawn().expect("spawn cello dev");

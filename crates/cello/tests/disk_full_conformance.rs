@@ -25,17 +25,13 @@
 
 mod common;
 
-use common::{announced, forward_announce};
+use common::{announced, apply_hermetic_env, cello_binary, forward_announce};
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-
-fn cello_binary() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_cello"))
-}
 
 fn fixture_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -81,12 +77,15 @@ impl TestNode {
         // Bash ignores SIGXFSZ before exec so a clamped file-size limit
         // fails writes with EFBIG instead of killing the node; the ignore
         // disposition survives exec into cello.
-        let mut child = Command::new("bash")
+        let mut bash = Command::new("bash");
+        // The trap wrapper `exec`s the binary, preserving this environment
+        // into it: hermetic first, then the trap argv.
+        apply_hermetic_env(&mut bash, project, [("NO_COLOR", "1")]);
+        let mut child = bash
             .arg("-c")
             .arg("trap \"\" XFSZ; exec \"$0\" \"$@\"")
             .arg(cello_binary())
             .arg("dev")
-            .env("NO_COLOR", "1")
             .arg(project)
             .arg("--port")
             .arg("0")

@@ -14,13 +14,9 @@
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-
-fn cello_binary() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_cello"))
-}
 
 fn fixture_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -30,7 +26,7 @@ fn fixture_dir() -> PathBuf {
 }
 
 mod common;
-use common::{announced, forward_announce};
+use common::{announced, cello_command, forward_announce};
 
 /// Tempdir for one fixture copy: `/dev/shm` when usable, else the
 /// default tempdir.
@@ -68,13 +64,10 @@ impl TestNode {
     /// Boot with extra process environment, so a test can set a knob such
     /// as `CELLO_TMP_MAX_BYTES` for the node under test.
     fn boot_with_env(app_project: &Path, extra_env: &[(&str, &str)]) -> Self {
-        let mut command = Command::new(cello_binary());
-        for (key, value) in extra_env {
-            command.env(key, value);
-        }
+        let mut command = cello_command(app_project, [("NO_COLOR", "1")]);
+        command.envs(extra_env.iter().copied());
         let mut child = command
             .arg("dev")
-            .env("NO_COLOR", "1")
             .arg(app_project)
             .arg("--port")
             .arg("0")

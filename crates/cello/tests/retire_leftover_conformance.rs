@@ -23,11 +23,11 @@
 
 mod common;
 
-use common::{announced, forward_announce};
+use common::{announced, cello_command, forward_announce};
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -36,10 +36,6 @@ const SCHEME: &str = "Bearer";
 
 fn bearer() -> String {
     format!("{SCHEME} {TOKEN}")
-}
-
-fn cello_binary() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_cello"))
 }
 
 fn fixture_dir() -> PathBuf {
@@ -87,13 +83,15 @@ impl TestNode {
     fn boot(project: &Path) -> Self {
         // Port zero: the OS assigns the worker port, so parallel boots
         // never claim the same one; discovery below learns it.
-        let mut child = Command::new(cello_binary())
+        let mut child = cello_command(
+            project,
+            [
+                ("NO_COLOR", "1"),
+                ("CELLO_BACKGROUND_BUDGET_S", "5"),
+                ("CELLO_OPERATOR_TOKEN", TOKEN),
+            ],
+        )
             .arg("dev")
-            .env("NO_COLOR", "1")
-            // Seconds, not the 30 s default: the test watches one budget
-            // pass, not a production ceiling.
-            .env("CELLO_BACKGROUND_BUDGET_S", "5")
-            .env("CELLO_OPERATOR_TOKEN", TOKEN)
             .arg(project)
             .arg("--port")
             .arg("0")

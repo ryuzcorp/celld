@@ -26,16 +26,12 @@
 //! deadline, and the server guard kills the child on every exit path.
 
 use serde_json::Value;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-
-fn cello_binary() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_cello"))
-}
 
 fn fixture_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -44,35 +40,9 @@ fn fixture_dir() -> PathBuf {
         .expect("fixture exists")
 }
 
-/// One address of a `cello dev` node, from the announce line the supervisor
-/// forwards to its stderr. The node is non-dumpable (patch 0053), so
-/// `/proc/<pid>/fd` no longer names its listeners, and this is the node's
-/// own report of where it bound.
-fn announced(lines: &Mutex<Vec<String>>, prefix: &str) -> Option<String> {
-    lines
-        .lock()
-        .expect("announce lock")
-        .iter()
-        .find_map(|line| {
-            let address = line.strip_prefix(prefix)?.split_once(' ')?.0;
-            Some(address.to_string())
-        })
-}
+mod common;
 
-/// Collect the supervisor's stderr lines, which carry the node's announce
-/// lines (`--logs` forwards them).
-fn forward_announce(stderr: std::process::ChildStderr, lines: Arc<Mutex<Vec<String>>>) {
-    std::thread::spawn(move || {
-        let mut reader = BufReader::new(stderr);
-        let mut line = String::new();
-        while reader.read_line(&mut line).is_ok_and(|read| read > 0) {
-            lines
-                .lock()
-                .expect("announce lock")
-                .push(std::mem::take(&mut line));
-        }
-    });
-}
+use common::{announced, cello_command, forward_announce};
 
 fn copy_dir(src: &Path, dst: &Path) {
     std::fs::create_dir_all(dst).expect("create fixture dir");
@@ -159,15 +129,13 @@ impl TestNode {
     fn boot(app_project: &Path) -> Self {
         // Port zero: the OS assigns the worker port, so parallel boots
         // can never claim the same one; discovery below learns it.
-        let mut child = Command::new(cello_binary())
+        let mut child = cello_command(app_project, [("NO_COLOR", "1"), ("CELLO_TEST_WAIT", "1")])
             .arg("dev")
-            .env("NO_COLOR", "1")
             .arg(app_project)
             .arg("--port")
             .arg("0")
             .arg("--no-watch")
             .arg("--logs")
-            .env("CELLO_TEST_WAIT", "1")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
