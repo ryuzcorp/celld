@@ -8,6 +8,7 @@
 //! configuration of a running node.
 
 use anyhow::{anyhow, bail};
+use std::ffi::OsString;
 
 pub const DEFAULT_SHUTDOWN_TOTAL_MS: u64 = 40_000;
 
@@ -215,17 +216,13 @@ const REMOVED_PREFIX: (&str, &str) = (
 /// calls before serving anything.
 const RENAMED_PREFIX: (&str, &str) = ("CELLD_", "CELLO_");
 
-/// Validate every typed production variable before the runtime starts.
-///
-/// Some consumers cache a value or read it from a synchronous callback, so
-/// they cannot return a configuration error at the point of use. This pass
-/// makes those reads infallible without giving malformed values a default.
-pub fn validate() -> anyhow::Result<()> {
-    // The renamed prefix first: a stale `CELLD_*` setting is the most likely
-    // operator error after an upgrade, and everything below would silently
-    // ignore it.
+/// Refuse a stale pre-rename `CELLD_*` setting found in `vars`, naming the
+/// new spelling. Pure over the injected iterator so tests pin the refusal
+/// without touching the process environment (parallel tests share it);
+/// `validate` passes the real environment.
+fn refuse_renamed(mut vars: impl Iterator<Item = (OsString, OsString)>) -> anyhow::Result<()> {
     let (old_prefix, new_prefix) = RENAMED_PREFIX;
-    if let Some(name) = std::env::vars_os().find_map(|(name, _)| {
+    if let Some(name) = vars.find_map(|(name, _)| {
         let name = name.to_string_lossy().into_owned();
         name.starts_with(old_prefix).then_some(name)
     }) {
@@ -235,6 +232,19 @@ pub fn validate() -> anyhow::Result<()> {
              refusing to start rather than running with silently ignored configuration"
         );
     }
+    Ok(())
+}
+
+/// Validate every typed production variable before the runtime starts.
+///
+/// Some consumers cache a value or read it from a synchronous callback, so
+/// they cannot return a configuration error at the point of use. This pass
+/// makes those reads infallible without giving malformed values a default.
+pub fn validate() -> anyhow::Result<()> {
+    // The renamed prefix first: a stale `CELLD_*` setting is the most likely
+    // operator error after an upgrade, and everything below would silently
+    // ignore it.
+    refuse_renamed(std::env::vars_os())?;
     // Each entry carries its own empty-value rule, because whether `NAME=` was
     // inert is a property of the reader that went away and not of removal.
     for removed in REMOVED {
@@ -575,14 +585,26 @@ mod deploy_credential_tests {
 mod renamed_prefix_tests {
     use super::*;
 
+    fn vars(pairs: &[(&str, &str)]) -> Vec<(OsString, OsString)> {
+        pairs
+            .iter()
+            .map(|(name, value)| (OsString::from(name), OsString::from(value)))
+            .collect()
+    }
+
     #[test]
     fn stale_celld_setting_refuses_to_start_and_names_the_cello_spelling() {
-        std::env::set_var("CELLD_OPERATOR_TOKEN", "stale");
-        let result = validate();
-        std::env::remove_var("CELLD_OPERATOR_TOKEN");
-        let message = result
-            .expect_err("a stale CELLD_* setting must refuse to start")
-            .to_string();
+        // Pure over explicit vars: no process environment is touched, so
+        // this test can never race a sibling test or the harness env.
+        let message = refuse_renamed(
+            vars(&[
+                ("CELLO_OPERATOR_TOKEN", "token"),
+                ("CELLD_OPERATOR_TOKEN", "stale"),
+            ])
+            .into_iter(),
+        )
+        .expect_err("a stale CELLD_* setting must refuse to start")
+        .to_string();
         assert!(
             message.contains("CELLD_OPERATOR_TOKEN was renamed to CELLO_OPERATOR_TOKEN"),
             "refusal must name the new spelling, got: {message}"
