@@ -199,6 +199,14 @@ The `tail` and `email` handlers are unavailable.
   out. Only the closing writes run under a 5-second progress bound — the
   close flush, the automatic ping/pong and close replies, and the loud-1011
   attempts — and each frame delivered restarts the wait.
+- A single WebSocket message — one frame or fragments assembled — is
+  bounded at 32 MiB, Cloudflare's own message size limit: a peer that
+  fragments past it ends the socket loudly with close code 1009 (Message
+  Too Big) instead of growing host memory without bound, and the cell
+  observes the 1009 as an abnormal application close. The per-frame size
+  is bounded at the same 32 MiB. Bytes held mid-assembly do not count
+  against the 16 MiB staging cap above, so the worst case per socket is
+  the 32 MiB message plus one full staged budget.
 - Socket delivery is best-effort: if a 1011 attempt times out, the local
   pipe still reports 1011 but the wire peer may see an abnormal disconnect
   with no Close frame. Likewise, a write that stops mid-frame poisons the
