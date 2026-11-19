@@ -118,14 +118,14 @@ async fn settle_parked_send<SendFut>(
         return;
     };
     enum Settle {
-        Sent(PipeSendOutcome),
+        Sent,
         Shutdown,
     }
     let _ = crate::asyncrt::timeout(
         ISOLATE_PIPE_CLOSE_FLUSH_TIMEOUT,
         async {
             crate::asyncrt::select! {
-                outcome = send_head => Settle::Sent(outcome),
+                _ = send_head => Settle::Sent,
                 _ = shutdown.changed() => Settle::Shutdown,
             }
         },
@@ -757,12 +757,20 @@ mod tests {
     /// `OverLimit`: the head frame still crosses whole ahead of the loud
     /// 1011 the teardown writes. Dropping the parked send (the pre-fix
     /// behavior) loses the head frame, so the drain finds a closed sink and
-    /// this fails before the fix. No sleeps or timeouts: the marker is sent
-    /// only after the entry gate observes the parked send, and the drain
-    /// frees it, so the bound never fires.
+    /// this fails before the fix. Deterministic without sleeps: the
+    /// direction runs on a single-threaded runtime, so each yield runs it to
+    /// pending, and the test frees the sink only after the marker was
+    /// processed — no scheduling can free it first.
     #[test]
     fn overload_settles_parked_send_before_over_limit() {
-        let runtime = crate::asyncrt::shared_test_runtime();
+        // The closing bound reads the process domain clock; the direction
+        // itself runs on a single-threaded runtime below for exact
+        // scheduling control.
+        let _ = crate::asyncrt::shared_test_runtime();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime builds");
         runtime.block_on(async {
             let (sink_tx, mut sink_rx) = tokio::sync::mpsc::channel(1);
             // Fill the sink before the direction starts, so the first
@@ -771,55 +779,44 @@ mod tests {
                 .send(WsOut::Text("pre".into()))
                 .await
                 .expect("pre-fill the sink");
-            let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
             let (tx, from) = tokio::sync::mpsc::unbounded_channel();
             tx.send(WsOut::Text("head".into())).expect("stage data");
             let (_shutdown_tx, shutdown) = tokio::sync::watch::channel(false);
-            let sink = {
-                let entered_tx = entered_tx.clone();
-                move |frame: WsOut| {
-                    let entered_tx = entered_tx.clone();
-                    let tx = sink_tx.clone();
-                    Box::pin(async move {
-                        let _ = entered_tx.send(());
-                        if tx.send(frame).await.is_err() {
-                            PipeSendOutcome::Gone
-                        } else {
-                            PipeSendOutcome::Sent
-                        }
-                    })
-                        as std::pin::Pin<
-                            Box<dyn Future<Output = PipeSendOutcome> + Send + 'static>,
-                        >
-                }
-            };
-            let direction = crate::asyncrt::spawn(forward_pipe_direction(
+            let direction = tokio::spawn(forward_pipe_direction(
                 from,
-                sink,
+                boxed_test_sink(sink_tx),
                 shutdown,
                 WsPipeBudget::new(ISOLATE_PIPE_MAX_STAGED_BYTES),
             ));
-            // The marker lands only after the entry gate observes the parked
-            // send: the direction is committed to settling it, so no
-            // scheduling lets the drain free the sink first.
-            entered_rx.recv().await.expect("the send parks on the sink");
+            // One yield runs the direction to pending: the head send is
+            // parked on the pre-filled sink, so the direction cannot have
+            // finished — and a single-threaded yield cannot return before
+            // every ready task ran to pending.
+            tokio::task::yield_now().await;
+            assert!(
+                !direction.is_finished(),
+                "the parked send must hold the direction"
+            );
             tx.send(WsOut::Overload).expect("stage marker");
-            // Drain concurrently: the settle parks behind the pre-filled
-            // sink until the test consumes the head, so awaiting the
-            // direction before draining would park the test instead.
-            let drain = crate::asyncrt::spawn(async move {
-                let mut seen = Vec::new();
-                for _ in 0..2 {
-                    seen.push(sink_rx.recv().await.expect("sink drains in order"));
-                }
-                seen
-            });
+            // Yields run the direction through the marker: without the
+            // settle it returns at once and drops the parked send, while
+            // the settle parks in the closing bound until the drain below
+            // frees the sink.
+            for _ in 0..5 {
+                tokio::task::yield_now().await;
+            }
+            // Free the sink only now, after the marker was processed: the
+            // settle completes the parked send, while the pre-fix return
+            // left a closed sink behind and the second receive fails.
+            let mut seen = Vec::new();
+            for _ in 0..2 {
+                seen.push(sink_rx.recv().await.expect("sink drains in order"));
+            }
             let (end, _from) = direction.await.expect("direction joins");
             assert!(
                 matches!(end, PipeDirectionEnd::OverLimit),
                 "the refusal marker must end OverLimit, got {end:?}"
             );
-            let seen = drain.await.expect("drain joins");
             let mut texts = Vec::new();
             for frame in seen {
                 match frame {
@@ -839,64 +836,63 @@ mod tests {
     /// only after the parked frame crosses: same settle, `Retired` instead
     /// of `OverLimit`. Without the settle the shutdown drops the parked
     /// send, so the drain finds a closed sink and this fails before the fix.
-    /// The gate orders the shutdown behind the parked send — observed
-    /// through the sink entry, not through timing — so the settle, not the
-    /// shutdown race, is what the direction takes.
+    /// Deterministic without sleeps: the direction runs on a
+    /// single-threaded runtime, so each yield runs it to pending, and the
+    /// test frees the sink only after the shutdown was processed — no
+    /// scheduling can free it first.
     #[test]
     fn shutdown_settles_parked_send_before_retire() {
-        let runtime = crate::asyncrt::shared_test_runtime();
+        // The closing bound reads the process domain clock; the direction
+        // itself runs on a single-threaded runtime below for exact
+        // scheduling control.
+        let _ = crate::asyncrt::shared_test_runtime();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime builds");
         runtime.block_on(async {
             let (sink_tx, mut sink_rx) = tokio::sync::mpsc::channel(1);
             sink_tx
                 .send(WsOut::Text("pre".into()))
                 .await
                 .expect("pre-fill the sink");
-            let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
             let (tx, from) = tokio::sync::mpsc::unbounded_channel();
             tx.send(WsOut::Text("head".into())).expect("stage data");
             let (shutdown_tx, shutdown) = tokio::sync::watch::channel(false);
-            let sink = {
-                let entered_tx = entered_tx.clone();
-                move |frame: WsOut| {
-                    let entered_tx = entered_tx.clone();
-                    let tx = sink_tx.clone();
-                    Box::pin(async move {
-                        let _ = entered_tx.send(());
-                        if tx.send(frame).await.is_err() {
-                            PipeSendOutcome::Gone
-                        } else {
-                            PipeSendOutcome::Sent
-                        }
-                    })
-                        as std::pin::Pin<
-                            Box<dyn Future<Output = PipeSendOutcome> + Send + 'static>,
-                        >
-                }
-            };
-            let direction = crate::asyncrt::spawn(forward_pipe_direction(
+            let direction = tokio::spawn(forward_pipe_direction(
                 from,
-                sink,
+                boxed_test_sink(sink_tx),
                 shutdown,
                 WsPipeBudget::new(ISOLATE_PIPE_MAX_STAGED_BYTES),
             ));
-            // The first forward is parked on the pre-filled sink; only then
-            // does the other direction end. No timing: the entry gate orders
-            // the shutdown behind the parked send.
-            entered_rx.recv().await.expect("the send parks on the sink");
+            // One yield runs the direction to pending: the head send is
+            // parked on the pre-filled sink, so the direction cannot have
+            // finished.
+            tokio::task::yield_now().await;
+            assert!(
+                !direction.is_finished(),
+                "the parked send must hold the direction"
+            );
             shutdown_tx.send(true).expect("the other direction ended");
-            let drain = crate::asyncrt::spawn(async move {
-                let mut seen = Vec::new();
-                for _ in 0..2 {
-                    seen.push(sink_rx.recv().await.expect("sink drains in order"));
-                }
-                seen
-            });
+            // Yields run the direction through the shutdown: without the
+            // settle it returns at once and drops the parked send, while
+            // the settle parks in the closing bound until the drain below
+            // frees the sink.
+            for _ in 0..5 {
+                tokio::task::yield_now().await;
+            }
+            // Free the sink only now, after the shutdown was processed: the
+            // settle completes the parked send, while the pre-fix return
+            // left a closed sink behind and the second receive fails.
+            let mut seen = Vec::new();
+            for _ in 0..2 {
+                seen.push(sink_rx.recv().await.expect("sink drains in order"));
+            }
             let (end, _from) = direction.await.expect("direction joins");
             assert!(
                 matches!(end, PipeDirectionEnd::Retired),
                 "shutdown during a parked send retires the direction, got {end:?}"
             );
-            let seen = drain.await.expect("drain joins");
             let mut texts = Vec::new();
             for frame in seen {
                 match frame {
