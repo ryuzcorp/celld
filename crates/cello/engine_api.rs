@@ -232,8 +232,10 @@ pub struct CellOverloaded;
 /// Also include an opaque marker so unrelated application text cannot restore
 /// an HTTP overload response, and keep the producer and ingress checks on one
 /// value. The marker crosses nodes inside peer-forwarded errors, so its
-/// `cello-` spelling is frozen: mixed-version fleets must agree on it.
-/// See `rename-frozen.md`.
+/// spelling is frozen at the new value: every node of a fleet runs the
+/// same binary, and a mixed celld/cello fleet is unsupported. Upgrading
+/// means stopping all celld nodes, then starting cello on the same
+/// bucket. See `docs/compatibility.md`.
 #[doc(hidden)]
 pub const CELL_OVERLOAD_ERROR_MARKER: &str =
     "cello-internal-cell-overload-7ec38c64-12d7-4ddc-9e77-b63f9dc14130";

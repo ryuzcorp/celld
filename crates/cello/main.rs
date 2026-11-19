@@ -6237,8 +6237,8 @@ mod durability_lifecycle_private {
 mod internal_log_wire_tests {
     use super::*;
 
-    /// The peer log-stream upgrade value is frozen node-to-node wire.
-    /// See `rename-frozen.md`.
+    /// The peer log-stream upgrade value is frozen node-to-node wire at
+    /// the new spelling: no mixed fleets. See `docs/compatibility.md`.
     #[test]
     fn log_stream_upgrade_stays_frozen() {
         assert_eq!(cello::node_log::LOG_STREAM_UPGRADE, "cello-log-stream");

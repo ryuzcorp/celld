@@ -177,10 +177,14 @@ export class AttackerDO extends DurableObject {
     return { secret: r.secret, a: back.obj?.a, b: back.obj?.b };
   }
   // Read back a hand-planted pre-gate envelope: it decodes as plain data
-  // and grants nothing.
+  // and grants nothing. The `legacy` shape uses the pre-rename marker
+  // spelling a celld node wrote, which must load the same way.
   async plantV1Inert(victimHex) {
     const scope = this.ctx.storage._scope;
-    const tree = { evil: { __cello$do: 'VictimDO', v: victimHex, n: null } };
+    const tree = {
+      evil: { __cello$do: 'VictimDO', v: victimHex, n: null },
+      legacy: { __celld$do: 'VictimDO', v: victimHex, n: null },
+    };
     globalThis.__celloPlantStoredV1ForTestOnly(scope, 'planted-v1', tree);
     const back = await this.ctx.storage.get('planted-v1');
     const evilFetch = typeof back?.evil?.fetch;
@@ -191,10 +195,21 @@ export class AttackerDO extends DurableObject {
         leaked = r.secret ?? null;
       }
     } catch {}
+    const legacyFetch = typeof back?.legacy?.fetch;
+    let legacyLeaked = null;
+    try {
+      if (legacyFetch === 'function') {
+        const r = await (await back.legacy.fetch('https://x/')).json();
+        legacyLeaked = r.secret ?? null;
+      }
+    } catch {}
     return {
       evilFetch,
       leaked,
       keys: back?.evil ? Object.keys(back.evil).sort() : [],
+      legacyFetch,
+      legacyLeaked,
+      legacyKeys: back?.legacy ? Object.keys(back.legacy).sort() : [],
     };
   }
   // The remaining stored-marker shapes: a lone plain marker stays data, a

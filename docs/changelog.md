@@ -1,7 +1,26 @@
 ---
 title: Changelog
-description: What shipped in each Cello release, from v0.6.3-ryuzcorp.4 to v0.1.0.
+description: What shipped in each Cello release, from v0.6.3-ryuzcorp.4 to v0.2.0.
 ---
+## v0.2.0
+
+Simple backward compatibility with
+[denoland/celld](https://github.com/denoland/celld): swap the binary or
+image on the same bucket. Stop every old node first — the peer protocol
+is new (`cello-tunnel`, `x-cello-overload`, `cello-log-stream`, new
+overload marker), so a mixed fleet is unsupported — then start 0.2.0.
+Rename every `CELLD_*` variable to `CELLO_*`; the node refuses to start
+otherwise, fail-closed.
+
+Persisted identifiers are now written with the `cello` spelling and read
+with both: `__cello-runtime`, the `__cello$*` stub envelopes (rows
+written before the binding-isolation patches still decode as plain
+data), `cello-r2` metadata and `cello-r2-cursor-*` cursors,
+`cello-schema` / `cello-retention`, and the `cello-image:` prefix. Data
+an older node wrote carries over with no migration step and no rewrite
+pass. In-process dunders and the wire identifiers were renamed outright.
+See [Compatibility](compatibility.md).
+
 
 ## v0.1.0
 

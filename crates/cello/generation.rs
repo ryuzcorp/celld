@@ -732,11 +732,26 @@ impl Generation {
             .collect()
     }
 
+    /// The cell-isolate pool for `script`, forgiving the pre-rename
+    /// runtime script name a celld-written graph may record. Stored graphs
+    /// name live scripts; only the runtime pool predates the rename.
     pub(crate) fn cell_isolates(&self, script: &str) -> Option<Arc<crate::pool::Pool>> {
+        let script = if is_runtime_script(script) {
+            RUNTIME_SCRIPT
+        } else {
+            script
+        };
         self.cell_isolates.get(script).cloned()
     }
 
+    /// The stateless runtime for `script`, with the same forgiveness for
+    /// the pre-rename runtime script name.
     pub(crate) fn service(&self, script: &str) -> Option<crate::runtime::StatelessRuntime> {
+        let script = if is_runtime_script(script) {
+            RUNTIME_SCRIPT
+        } else {
+            script
+        };
         self.services.get(script).cloned()
     }
 
@@ -823,6 +838,21 @@ pub struct GenerationTag(pub GenerationId);
 /// The shared classes address fleet-wide namespace keys, so their cells
 /// resolve identically whichever script name hosts them.
 pub(crate) const RUNTIME_SCRIPT: &str = "__cello-runtime";
+
+/// The pre-rename spelling of [`RUNTIME_SCRIPT`], recorded in stored
+/// deployment graphs a celld node wrote. Cello writes the new spelling
+/// and reads both, so the bucket carries over after the swap: accepting
+/// is not migrating, and nothing rewrites the old spelling in place.
+/// See `docs/compatibility.md`.
+pub(crate) const LEGACY_RUNTIME_SCRIPT: &str = "__celld-runtime";
+
+/// Whether `name` addresses the runtime isolate pool, under either the
+/// current or the pre-rename spelling. The one place cell-to-script
+/// resolution forgives the old name; delete it when celld-written graphs
+/// are gone.
+pub(crate) fn is_runtime_script(name: &str) -> bool {
+    name == RUNTIME_SCRIPT || name == LEGACY_RUNTIME_SCRIPT
+}
 
 /// The entry module of a runtime isolate. The harness plus this fixed inert
 /// module is the whole realm: no tenant bundle is compiled or evaluated, so
@@ -1139,13 +1169,25 @@ fn fleet_identity(scheme: &str, name: &str, prefix: &str) -> String {
 mod tests {
     use super::*;
 
-    /// The runtime isolate pool's script name is frozen: stored deployment
-    /// graphs and cell-to-script resolution reference it, so a bucket
-    /// written by cello `.13` keeps working under Cello. See
-    /// `rename-frozen.md`. Never rename this without a migration.
+    /// The runtime isolate pool's script name is frozen at the new
+    /// spelling: stored deployment graphs and cell-to-script resolution
+    /// reference it. Graphs a celld node wrote record the pre-rename
+    /// spelling, which [`is_runtime_script`] still accepts. See
+    /// `docs/compatibility.md`.
     #[test]
     fn runtime_script_name_stays_frozen() {
         assert_eq!(RUNTIME_SCRIPT, "__cello-runtime");
+        assert_eq!(LEGACY_RUNTIME_SCRIPT, "__celld-runtime");
+    }
+
+    /// A graph a celld node wrote names the old runtime script: it still
+    /// resolves to the runtime pool. Anything else is untouched.
+    #[test]
+    fn legacy_runtime_script_still_resolves() {
+        assert!(is_runtime_script("__cello-runtime"));
+        assert!(is_runtime_script("__celld-runtime"));
+        assert!(!is_runtime_script("app"));
+        assert!(!is_runtime_script(""));
     }
 
     fn identity() -> ServingIdentity {

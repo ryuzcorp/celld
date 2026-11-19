@@ -22,7 +22,7 @@ for the complete surface.
   nothing, with `sources` rebased lexically so the map cannot probe
   which host files exist.
 - `0046` — `cello --version` reports the full build version
-  (`0.1.0`, `<version>-ryuzcorp.<n>` on the old line): `build.rs` bakes
+  (`0.2.0`, `<version>-ryuzcorp.<n>` on the old line): `build.rs` bakes
   `CELLO_VERSION` into the binary from the Docker build stage, and a
   plain `cargo build` without it reports the crate version.
 - `0049` — `cello invoke --header-env NAME=VAR` sends header NAME with

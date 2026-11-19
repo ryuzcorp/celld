@@ -67,17 +67,27 @@ pub fn image_reference(key: &str) -> String {
     format!("cello-image:{key}")
 }
 
-/// The bucket key of one saved image, from its reference.
+/// The bucket key of one saved image, from its reference. Accepts the
+/// pre-rename `celld-image:` prefix too, so manifests a celld node wrote
+/// resolve to the same tar after the swap.
 pub fn image_key(image: &str) -> String {
-    format!(
-        "deploy/images/{}.tar",
-        image.trim_start_matches("cello-image:")
-    )
+    let stripped = image.trim_start_matches("cello-image:");
+    let key = stripped
+        .strip_prefix(LEGACY_IMAGE_PREFIX)
+        .unwrap_or(stripped);
+    format!("deploy/images/{key}.tar")
 }
 
-/// Frozen deployment-format pins. `.13` manifests record
-/// `cello-image:<content key>` in `ContainerSpec.image`; the prefix never
-/// changes so old manifests keep loading. See `rename-frozen.md`.
+/// The pre-rename spelling of the image-reference prefix, recorded in
+/// `ContainerSpec.image` by manifests a celld node wrote. Read-only:
+/// [`image_reference`] always writes the new spelling.
+const LEGACY_IMAGE_PREFIX: &str = "celld-image:";
+
+/// Frozen deployment-format pins. Manifests record
+/// `cello-image:<content key>` in `ContainerSpec.image`, and manifests a
+/// celld node wrote record `celld-image:<content key>`; both resolve to
+/// the same tar, so old manifests keep loading. See
+/// `docs/compatibility.md`.
 #[cfg(test)]
 mod image_key_tests {
     use super::*;
@@ -85,6 +95,19 @@ mod image_key_tests {
     #[test]
     fn stored_manifest_reference_resolves_to_its_tar() {
         assert_eq!(image_key("cello-image:abc123"), "deploy/images/abc123.tar");
+        assert_eq!(image_reference("abc123"), "cello-image:abc123");
+    }
+
+    /// A manifest a celld node wrote carries the old prefix: it resolves
+    /// to the same tar, and new references keep the new spelling.
+    #[test]
+    fn legacy_manifest_reference_resolves_to_its_tar() {
+        assert_eq!(
+            image_key("celld-image:abc123"),
+            image_key("cello-image:abc123"),
+            "both spellings resolve identically"
+        );
+        assert_eq!(image_key("celld-image:abc123"), "deploy/images/abc123.tar");
         assert_eq!(image_reference("abc123"), "cello-image:abc123");
     }
 }

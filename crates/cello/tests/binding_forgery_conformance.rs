@@ -615,7 +615,8 @@ fn binding_forgery_conformance() {
     assert_eq!(ok["b"], "x", "{ok}");
 
     // A hand-planted pre-gate envelope decodes as plain data and grants
-    // nothing.
+    // nothing -- under the new marker spelling and under the pre-rename
+    // one a celld node wrote, which loads the same way.
     let planted = get_json(&node, "/plant-v1-inert");
     assert_eq!(planted["ok"], true, "{planted}");
     assert_ne!(planted["evilFetch"], "function", "{planted}");
@@ -628,6 +629,13 @@ fn binding_forgery_conformance() {
             .as_array()
             .is_some_and(|keys| keys.iter().any(|key| key == "__cello$do")),
         "/plant-v1-inert keeps marker keys as data: {planted}"
+    );
+    assert_ne!(planted["legacyFetch"], "function", "{planted}");
+    assert!(
+        planted["legacyKeys"]
+            .as_array()
+            .is_some_and(|keys| keys.iter().any(|key| key == "__celld$do")),
+        "/plant-v1-inert keeps the celld marker spelling as data: {planted}"
     );
 
     // The remaining stored-marker shapes: a lone plain marker stays data,
