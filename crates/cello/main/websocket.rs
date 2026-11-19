@@ -2101,10 +2101,14 @@ mod pump_tests {
     fn slow_handler_keeps_socket() {
         test_runtime().block_on(async {
             let (client_stream, server) = tokio::io::duplex(64 * 1024);
-            let socket = fastwebsockets::WebSocket::after_handshake(
+            let mut socket = fastwebsockets::WebSocket::after_handshake(
                 server,
                 fastwebsockets::Role::Server,
             );
+            // As the production callers do: the pump owns the close echo,
+            // so the collector must not auto-echo a peer close through the
+            // bounded reply write behind a parked socket write.
+            socket.set_auto_close(false);
             let (_outbound, outputs) = mpsc::unbounded_channel();
             let (entered_tx, mut entered_rx) = mpsc::unbounded_channel::<()>();
             let (done_tx, mut done_rx) =
@@ -2180,10 +2184,11 @@ mod pump_tests {
     fn trickle_client_stays_connected() {
         test_runtime().block_on(async {
             let (mut client_stream, server) = tokio::io::duplex(1024);
-            let socket = fastwebsockets::WebSocket::after_handshake(
+            let mut socket = fastwebsockets::WebSocket::after_handshake(
                 server,
                 fastwebsockets::Role::Server,
             );
+            socket.set_auto_close(false);
             // Held, not dropped: in production the registry owns the sender
             // until the pump returns, so a channel close here would retire
             // the write direction before the test even starts stalling it.
@@ -2233,10 +2238,11 @@ mod pump_tests {
     fn flood_past_cap_gets_1011() {
         test_runtime().block_on(async {
             let (client_stream, server) = tokio::io::duplex(64 * 1024);
-            let socket = fastwebsockets::WebSocket::after_handshake(
+            let mut socket = fastwebsockets::WebSocket::after_handshake(
                 server,
                 fastwebsockets::Role::Server,
             );
+            socket.set_auto_close(false);
             let (_outbound, outputs) = mpsc::unbounded_channel();
             let pump = tokio::spawn(pump_cell_socket(
                 socket,
@@ -2305,10 +2311,11 @@ mod pump_tests {
     fn close_behind_data_arrives_in_order() {
         test_runtime().block_on(async {
             let (mut client_stream, server) = tokio::io::duplex(64 * 1024);
-            let socket = fastwebsockets::WebSocket::after_handshake(
+            let mut socket = fastwebsockets::WebSocket::after_handshake(
                 server,
                 fastwebsockets::Role::Server,
             );
+            socket.set_auto_close(false);
             // Held, not dropped: a channel close racing the flush would
             // retire the write direction instead of reporting the close.
             let (_outbound, outputs) = mpsc::unbounded_channel();
@@ -2378,10 +2385,11 @@ mod pump_tests {
     fn shutdown_during_parked_send_ends_pump() {
         test_runtime().block_on(async {
             let (client_stream, server) = tokio::io::duplex(1024);
-            let socket = fastwebsockets::WebSocket::after_handshake(
+            let mut socket = fastwebsockets::WebSocket::after_handshake(
                 server,
                 fastwebsockets::Role::Server,
             );
+            socket.set_auto_close(false);
             // Held, not dropped: a channel close racing the parked send
             // would retire the write direction before the peer close lands.
             let (_outbound, outputs) = mpsc::unbounded_channel();
@@ -2431,10 +2439,11 @@ mod pump_tests {
     fn pump_overload_marker_writes_loud_1011_close() {
         test_runtime().block_on(async {
             let (mut client_stream, server) = tokio::io::duplex(64 * 1024);
-            let socket = fastwebsockets::WebSocket::after_handshake(
+            let mut socket = fastwebsockets::WebSocket::after_handshake(
                 server,
                 fastwebsockets::Role::Server,
             );
+            socket.set_auto_close(false);
             // Held, not dropped: in production the registry owns the sender
             // until the pump returns.
             let (_outbound, outputs) = mpsc::unbounded_channel();
