@@ -1121,43 +1121,6 @@ enum ReadEnd {
     OverLimit,
 }
 
-/// Carry frames between a socket and the cell behind it until one side stops.
-///
-/// The read is never cancelled. `fastwebsockets::read_frame` consumes header
-/// bytes from its buffer and then awaits for the payload, holding what it parsed
-/// in local variables, so dropping that future keeps the buffer advanced and
-/// loses the header. The next read then treats a payload byte as a frame header
-/// and the stream never realigns. Earlier versions of both callers read the
-/// socket in the same select as the cell's outbound queue, which drops the losing
-/// future on every iteration. Cancelling a read mid-payload fails against that
-/// shape.
-///
-/// One async block therefore owns each direction. The halves are split so that
-/// the writer can write while the reader reads, and the writer stops on a signal
-/// instead of being dropped, because dropping it can leave a partial frame on
-/// the socket.
-///
-/// The caller sets `auto_close` and `auto_pong` on the socket before the pump
-/// runs, and the pump keeps that choice: an automatic reply is written on the
-/// same socket, exactly as the unsplit collector wrote it.
-///
-/// `outbound_close_is_clean` reports a close that the application sends as the
-/// close state of the socket. The local path leaves that false, because it
-/// answers an unclean end with its own protocol echo after the pump returns.
-/// The initiator remains separate because only a peer close needs that echo.
-///
-/// Reads stage ahead of a slow cell instead of parking behind its dispatch:
-/// dispatches run without any time bound, so a slow handler never trips the
-/// pipe — only frames staged past the cap end it loudly. The write direction
-/// is one pipe forwarder: normal writes run unbounded so a slow but live
-/// peer still drains fully, while the close flush, the automatic replies,
-/// and the loud-1011 attempts run under the progress bound. Each completed
-/// send restarts the wait; a peer that stopped reading ends the closing
-/// pipe instead of blocking closure.
-///
-/// The returned writer is still live, so the caller can write the close frames
-/// that follow.
-
 /// A control-frame reply on a pump socket: the copied-out frame the reader's
 /// callback answers pings and echoes with. Boxed: the callback's concrete
 /// closure type is unnameable, and the owned read future below must name the
@@ -1219,6 +1182,48 @@ where
     (event, state)
 }
 
+/// One owned socket read in flight: the reader and its reply callback travel
+/// with the read and come back with every outcome, so arming it moves values
+/// instead of borrowing the pump loop's locals across iterations.
+type PumpReadInFlight<S> =
+    std::pin::Pin<Box<dyn Future<Output = (PumpReadEvent, PumpReader<S>)> + Send>>;
+
+/// Carry frames between a socket and the cell behind it until one side stops.
+///
+/// The read is never cancelled. `fastwebsockets::read_frame` consumes header
+/// bytes from its buffer and then awaits for the payload, holding what it parsed
+/// in local variables, so dropping that future keeps the buffer advanced and
+/// loses the header. The next read then treats a payload byte as a frame header
+/// and the stream never realigns. Earlier versions of both callers read the
+/// socket in the same select as the cell's outbound queue, which drops the losing
+/// future on every iteration. Cancelling a read mid-payload fails against that
+/// shape.
+///
+/// One async block therefore owns each direction. The halves are split so that
+/// the writer can write while the reader reads, and the writer stops on a signal
+/// instead of being dropped, because dropping it can leave a partial frame on
+/// the socket.
+///
+/// The caller sets `auto_close` and `auto_pong` on the socket before the pump
+/// runs, and the pump keeps that choice: an automatic reply is written on the
+/// same socket, exactly as the unsplit collector wrote it.
+///
+/// `outbound_close_is_clean` reports a close that the application sends as the
+/// close state of the socket. The local path leaves that false, because it
+/// answers an unclean end with its own protocol echo after the pump returns.
+/// The initiator remains separate because only a peer close needs that echo.
+///
+/// Reads stage ahead of a slow cell instead of parking behind its dispatch:
+/// dispatches run without any time bound, so a slow handler never trips the
+/// pipe — only frames staged past the cap end it loudly. The write direction
+/// is one pipe forwarder: normal writes run unbounded so a slow but live
+/// peer still drains fully, while the close flush, the automatic replies,
+/// and the loud-1011 attempts run under the progress bound. Each completed
+/// send restarts the wait; a peer that stopped reading ends the closing
+/// pipe instead of blocking closure.
+///
+/// The returned writer is still live, so the caller can write the close frames
+/// that follow.
 async fn pump_cell_socket<S, F, Fut>(
     socket: fastwebsockets::WebSocket<S>,
     outputs: mpsc::UnboundedReceiver<cello::js::WsOut>,
@@ -1313,9 +1318,7 @@ where
                 reader,
                 reply: obligated,
             });
-            let mut reading: Option<
-                std::pin::Pin<Box<dyn Future<Output = (PumpReadEvent, PumpReader<S>)> + Send>>,
-            > = None;
+            let mut reading: Option<PumpReadInFlight<S>> = None;
             let mut dispatching: Option<std::pin::Pin<Box<Fut>>> = None;
             loop {
                 if dispatching.is_none() {
