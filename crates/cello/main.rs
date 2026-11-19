@@ -6233,6 +6233,29 @@ mod durability_lifecycle_private {
 /// tests there construct the marker directly — so this module serves real
 /// seal requests through `internal_log` over a socket and asserts on the
 /// bytes back.
+/// The process-wide Tokio runtime bin tests boot node state on, with the
+/// asyncrt host handle installed exactly once for the whole test binary.
+/// (Mirrors `cello::asyncrt::shared_test_runtime`, which the binary cannot
+/// name because it is `pub(crate)` to the library.) A `#[tokio::test]`
+/// runtime dies with its test, so sharing one runtime keeps the installed
+/// handle alive for the whole test process. Every bin test module must use
+/// this instead of installing its own handle: `set_host_handle` asserts its
+/// exactly-once install, so a second runtime poisons every later test.
+#[cfg(test)]
+pub(crate) fn bin_test_runtime() -> &'static tokio::runtime::Runtime {
+    static RUNTIME: std::sync::LazyLock<tokio::runtime::Runtime> =
+        std::sync::LazyLock::new(|| {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(4)
+                .enable_all()
+                .build()
+                .expect("test runtime builds");
+            cello::asyncrt::set_host_handle(runtime.handle().clone());
+            runtime
+        });
+    &RUNTIME
+}
+
 #[cfg(test)]
 mod internal_log_wire_tests {
     use super::*;
@@ -6244,23 +6267,12 @@ mod internal_log_wire_tests {
         assert_eq!(cello::node_log::LOG_STREAM_UPGRADE, "cello-log-stream");
     }
 
-    /// The process-wide Tokio runtime these tests boot node state on, with
-    /// the asyncrt host handle installed exactly once (mirrors
-    /// `cello::asyncrt::shared_test_runtime`, which the binary cannot name
-    /// because it is `pub(crate)` to the library). A `#[tokio::test]`
-    /// runtime dies with its test, so sharing one runtime keeps the
-    /// installed handle alive for the whole test process.
+    /// The process-wide Tokio runtime these tests boot node state on: shared
+    /// with every other bin test module through `super::bin_test_runtime`,
+    /// which installs the asyncrt host handle exactly once for the whole
+    /// test process.
     fn test_runtime() -> &'static tokio::runtime::Runtime {
-        static RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
-        RUNTIME.get_or_init(|| {
-            let runtime = tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(4)
-                .enable_all()
-                .build()
-                .expect("test runtime builds");
-            cello::asyncrt::set_host_handle(runtime.handle().clone());
-            runtime
-        })
+        super::bin_test_runtime()
     }
 
     fn test_app(
