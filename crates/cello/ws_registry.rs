@@ -754,6 +754,12 @@ impl WsPipeBudget {
             tripped: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
+    /// Bytes currently charged. Test-only: lets a forwarder test observe
+    /// that every staged frame was received without racing the forwarder.
+    #[cfg(test)]
+    pub(crate) fn used(&self) -> usize {
+        self.used.load(std::sync::atomic::Ordering::Relaxed)
+    }
 
     /// Charge `bytes`; false when the budget is full and the frame must not
     /// enqueue. Saturating, so a burst past the cap refuses rather than
@@ -812,7 +818,7 @@ pub struct WsRegistry {
 impl WsRegistry {
     #[doc(hidden)]
     pub fn register(&mut self, id: u64, tx: tokio::sync::mpsc::UnboundedSender<WsOut>) {
-        self.register_budgeted(id, tx, None);
+        let _ = self.register_budgeted(id, tx, None);
     }
 
     /// Register an output channel with an admission budget. A budget created
@@ -829,20 +835,19 @@ impl WsRegistry {
         id: u64,
         tx: tokio::sync::mpsc::UnboundedSender<WsOut>,
         budget: Option<WsPipeBudget>,
-    ) {
-        match budget {
+    ) -> Option<WsPipeBudget> {
+        let effective = match budget {
             // Buffered frames already charged against the existing budget;
             // keep their accounting, including a trip, instead of charging
             // twice. Otherwise the passed budget polices live sends.
-            Some(budget) => {
-                self.budgets.entry(id).or_insert(budget);
-            }
+            Some(budget) => self.budgets.entry(id).or_insert(budget).clone(),
             // The plain `register` path stays unpoliced: drop any accounting
             // the buffered backlog created, now that it has flushed.
             None => {
                 self.budgets.remove(&id);
+                return None;
             }
-        }
+        };
         let pending = if let Some(meta) = self.metadata.get_mut(&id) {
             std::mem::take(&mut meta.pending)
         } else {
@@ -852,6 +857,7 @@ impl WsRegistry {
             let _ = tx.send(frame);
         }
         self.outputs.insert(id, tx);
+        Some(effective)
     }
 
     /// Admit one frame onto `tx`, charging the direction's budget when it has
@@ -1398,15 +1404,20 @@ pub(crate) fn ws_consume_bind_token(id: u64, token: u64) -> bool {
 /// Register an output channel with an admission budget for one pipe
 /// direction. Only directions that register a budget are policed; the
 /// pre-registration backlog flushes through the same check as live sends.
+/// Returns the budget the direction is policed by: a backlog buffered
+/// before registration keeps the budget it was charged against, so the
+/// forwarder must release what it receives against the returned one, not
+/// the passed one, or releases leak and live sends trip early.
 pub fn ws_register_budgeted(
     id: u64,
     tx: tokio::sync::mpsc::UnboundedSender<WsOut>,
     budget: WsPipeBudget,
-) {
+) -> WsPipeBudget {
     ws_registry()
         .lock()
         .unwrap()
-        .register_budgeted(id, tx, Some(budget));
+        .register_budgeted(id, tx, Some(budget))
+        .expect("a passed budget always leaves an effective one")
 }
 
 /// Record the host-owned quota identity of a socket prepared for a join
@@ -2478,7 +2489,7 @@ mod join_handoff_tests {
         let id: u64 = 1 << 61;
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let budget = WsPipeBudget::new(1024);
-        ws_registry()
+        let _ = ws_registry()
             .lock()
             .unwrap()
             .register_budgeted(id, tx, Some(budget.clone()));
