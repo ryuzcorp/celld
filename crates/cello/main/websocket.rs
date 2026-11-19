@@ -614,7 +614,11 @@ async fn local_isolate_websocket_pipe(
     // Stop accepting output, but keep both pull endpoints: each stays
     // reachable, owner-checked, until its terminal is consumed or its request
     // retires, so a close queued behind text is delivered instead of turning
-    // into a synthetic 1006 on the next `__ws_next`.
+    // into a synthetic 1006 on the next `__ws_next`. `drop_handoff`
+    // unregisters the loaded output registration through its `Drop` (output
+    // and budget entries included), so no separate `ws_unregister(loaded_id)`
+    // belongs here: only the pull endpoint stays, owned by the handoff the
+    // joining request tracks from bind time.
     cello::js::ws_unregister(id);
     worker.drop_handoff();
     let _ = target;
@@ -1467,6 +1471,24 @@ where
             (write_end, receiver) = &mut write => {
                 match write_end {
                     PipeDirectionEnd::Close(code, reason) => {
+                        // The forwarder ends the direction on the close
+                        // without writing it — only data crosses the sink —
+                        // so the pump writes the cell's close frame here,
+                        // behind everything the forwarder flushed ahead of
+                        // it, as the pre-forwarder pump wrote every output
+                        // inline. Without this the peer sees EOF instead of
+                        // the close. Best-effort under the closing progress
+                        // bound: the close dispatch below already told the
+                        // cell, and the echo after the drain decides the
+                        // protocol close.
+                        let _ = cello::asyncrt::timeout(
+                            PUMP_SEND_PROGRESS_TIMEOUT,
+                            write_ws_out(
+                                &writer,
+                                cello::js::WsOut::Close(code, reason.clone()),
+                            ),
+                        )
+                        .await;
                         close = PumpClose {
                             state: if outbound_close_is_clean {
                                 (code, reason, true)
@@ -1999,22 +2021,14 @@ mod overload_tests {
 mod pump_tests {
     use super::*;
 
-    /// A process-shared runtime for the pump tests, mirroring the lib's
-    /// `shared_test_runtime`: the pump's `asyncrt::timeout` reads the process
-    /// domain clock, which needs the host handle installed exactly once.
-    /// The runtime lives for the test process, so the handle stays valid.
+    /// A process-shared runtime for the pump tests: the crate-root
+    /// `bin_test_runtime`, shared with every other bin test module, which
+    /// installs the asyncrt host handle exactly once for the whole test
+    /// process. The pump's `asyncrt::timeout` reads the process domain
+    /// clock, and a second install would trip `set_host_handle`'s
+    /// exactly-once assert and poison every later pump test.
     fn test_runtime() -> &'static tokio::runtime::Runtime {
-        static RUNTIME: std::sync::LazyLock<tokio::runtime::Runtime> =
-            std::sync::LazyLock::new(|| {
-                let runtime = tokio::runtime::Builder::new_multi_thread()
-                    .worker_threads(4)
-                    .enable_all()
-                    .build()
-                    .expect("test runtime builds");
-                cello::asyncrt::set_host_handle(runtime.handle().clone());
-                runtime
-            });
-        &RUNTIME
+        crate::bin_test_runtime()
     }
 
     /// One server-to-client frame off a duplex pair: server frames are
@@ -2302,11 +2316,12 @@ mod pump_tests {
     }
 
     /// A close queued behind data crosses in order: the pump flushes the
-    /// queued frames before reporting the application close, and the caller
-    /// writes that close behind them, as the cell task's echo does. The
-    /// whole queue is staged before the pump starts, so no timing is
-    /// involved. Returning the close without the flush drops the data, so
-    /// the first frame is a close and this fails before the change.
+    /// queued frames and writes the close behind them before reporting the
+    /// application close. The whole queue is staged before the pump starts,
+    /// so no timing is involved. Returning the close without the flush drops
+    /// the data, so the first frame is a close and this fails before the
+    /// change; never writing the close leaves the peer at EOF, which fails
+    /// the terminal read the same way.
     #[test]
     fn close_behind_data_arrives_in_order() {
         test_runtime().block_on(async {
@@ -2328,7 +2343,7 @@ mod pump_tests {
                 .send(cello::js::WsOut::Close(1000, "done".into()))
                 .expect("stage close");
             // Awaited inline: the read parks on a silent peer while the write
-            // direction flushes and reports the close on its own.
+            // direction flushes, writes the close, and reports it on its own.
             let (close, writer, _) = tokio::time::timeout(
                 std::time::Duration::from_secs(30),
                 pump_cell_socket(
@@ -2349,16 +2364,8 @@ mod pump_tests {
                 },
                 "the pump reports the queued application close"
             );
-            // The reported close goes out behind the flushed data, as the
-            // cell task's echo does after the pump returns. Written before
-            // the reads, and the write half dropped after it, so the reads
-            // terminate on EOF instead of parking on an open socket when a
-            // reverted flush drops the data.
-            assert!(
-                !write_ws_out(&writer, cello::js::WsOut::Close(1000, "done".into()))
-                    .await,
-                "the terminal ends the socket"
-            );
+            // The write half is dropped so a missing terminal ends the reads
+            // on EOF instead of parking on an open socket.
             drop(writer);
             for want in ["one", "two", "three"] {
                 let (opcode, payload) = read_server_frame(&mut client_stream).await;
@@ -2373,6 +2380,66 @@ mod pump_tests {
                 "the queued close keeps its code"
             );
             assert_eq!(&payload[2..], b"done", "the queued close keeps its reason");
+        });
+    }
+
+    /// The cell's close reaches the peer on the local path: the pump writes
+    /// the queued close frame before the socket shuts, even though the local
+    /// close state stays an unclean 1006 for the dispatch. Without the
+    /// pump-side write the peer reads EOF instead of the close — the
+    /// `server_close_reaches_the_client` conformance regression — so the
+    /// terminal read fails before the fix. Staged before the pump starts, so
+    /// no timing is involved.
+    #[test]
+    fn cell_close_reaches_the_peer_before_shutdown() {
+        test_runtime().block_on(async {
+            let (mut client_stream, server) = tokio::io::duplex(64 * 1024);
+            let mut socket = fastwebsockets::WebSocket::after_handshake(
+                server,
+                fastwebsockets::Role::Server,
+            );
+            socket.set_auto_close(false);
+            // Held, not dropped: a channel close racing the close would
+            // retire the write direction instead of reporting it.
+            let (_outbound, outputs) = mpsc::unbounded_channel();
+            _outbound
+                .send(cello::js::WsOut::Close(1008, "refused".into()))
+                .expect("stage close");
+            // Awaited inline: the read parks on a silent peer while the write
+            // direction writes the close and reports it on its own.
+            let (close, writer, _) = tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                pump_cell_socket(
+                    socket,
+                    outputs,
+                    false,
+                    |_: cello::js::WsIn| std::future::pending::<anyhow::Result<()>>(),
+                    cello::js::WsPipeBudget::new(ISOLATE_PIPE_MAX_STAGED_BYTES),
+                ),
+            )
+            .await
+            .expect("the queued close must end the pump");
+            assert_eq!(
+                close,
+                PumpClose {
+                    state: (1006, String::new(), false),
+                    initiator: CloseInitiator::Application,
+                },
+                "the local path still reports the close as unclean"
+            );
+            drop(writer);
+            let (opcode, payload) = read_server_frame(&mut client_stream).await;
+            assert_eq!(opcode, 0x8, "the terminal is a close frame");
+            assert_eq!(
+                u16::from_be_bytes([payload[0], payload[1]]),
+                1008,
+                "the cell close keeps its code"
+            );
+            assert_eq!(
+                &payload[2..],
+                b"refused",
+                "the cell close keeps its reason"
+            );
         });
     }
 
