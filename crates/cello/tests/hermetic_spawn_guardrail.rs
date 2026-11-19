@@ -32,9 +32,7 @@ fn cello_spawns_use_the_hermetic_helper() {
     for entry in entries {
         let entry = entry.expect("tests entry");
         let path = entry.path();
-        if !path.is_file()
-            || !matches!(path.extension().and_then(|ext| ext.to_str()), Some("rs"))
-        {
+        if !path.is_file() || !matches!(path.extension().and_then(|ext| ext.to_str()), Some("rs")) {
             continue;
         }
         if path.file_name().expect("test file name") == own {

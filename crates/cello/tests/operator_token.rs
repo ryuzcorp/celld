@@ -318,17 +318,20 @@ fn empty_operator_token_refuses_to_start() {
     let fixture = copy_fixture("empty");
     // No probe port: the child refuses before its listeners bind, and
     // `--port 0` names no port for a sibling test to steal.
-    let mut child = cello_command(fixture.path(), [("NO_COLOR", "1"), ("CELLO_OPERATOR_TOKEN", "")])
-        .arg("dev")
-        .arg(fixture.path())
-        .arg("--port")
-        .arg("0")
-        .arg("--no-watch")
-        .arg("--clean")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn cello dev");
+    let mut child = cello_command(
+        fixture.path(),
+        [("NO_COLOR", "1"), ("CELLO_OPERATOR_TOKEN", "")],
+    )
+    .arg("dev")
+    .arg(fixture.path())
+    .arg("--port")
+    .arg("0")
+    .arg("--no-watch")
+    .arg("--clean")
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()
+    .expect("spawn cello dev");
     let mut stdout = child.stdout.take().expect("piped stdout");
     let stderr = child.stderr.take().expect("piped stderr");
     // Drain both pipes on threads so a failing child can never block on a
