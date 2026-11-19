@@ -183,15 +183,28 @@ The `tail` and `email` handlers are unavailable.
   message larger than 1 MiB uses the complete budget.
 - If the isolate stops polling, Cello discards unread frames during cleanup. A
   later pull reports an abnormal close.
-- Each pipe direction between two ends stages at most 16 MiB upstream of its
-  destination — another isolate's input queue, a cell dispatch, or the socket
-  itself. A flood past the cap ends the pipe loudly instead of growing host
-  memory without bound: both ends observe close code 1011 with
-  `wasClean: false`, an abnormal host-originated close no peer sent. Only
-  staged bytes count against the cap: handler runtime stays unbounded, so a
-  slow `webSocketMessage` handler never trips it, and a slow but live peer
-  still drains fully — normal writes never time out. Only the close flush
-  runs under a progress bound, and each frame it delivers restarts the wait.
+- Each pipe direction between two ends is bounded twice: at most 16 MiB may
+  wait in its output channel (the admission cap), and at most 16 MiB may be
+  staged upstream of its destination (the staging cap) — another isolate's
+  input queue, a cell dispatch, or the socket itself. Admission bytes are
+  released when the pipe's forwarder receives a frame, and staged bytes when
+  its send completes, so a direction with a full staging queue can still
+  admit up to another 16 MiB into its output channel: the two limits are
+  separate, not one 16 MiB aggregate. A flood past either cap ends the pipe
+  loudly instead of growing host memory without bound: both ends observe
+  close code 1011 with `wasClean: false`, an abnormal host-originated close
+  no peer sent. Only staged bytes count against the cap: handler runtime
+  stays unbounded, so a slow `webSocketMessage` handler never trips it, and
+  a slow but live peer still drains fully — ordinary data writes never time
+  out. Only the closing writes run under a 5-second progress bound — the
+  close flush, the automatic ping/pong and close replies, and the loud-1011
+  attempts — and each frame delivered restarts the wait.
+- Socket delivery is best-effort: if a 1011 attempt times out, the local
+  pipe still reports 1011 but the wire peer may see an abnormal disconnect
+  with no Close frame. Likewise, a write that stops mid-frame poisons the
+  socket: no further frame is ever written after it, and the transport drops
+  instead — the peer sees a truncation, never a terminal frame parsed as a
+  continuation of the unfinished one.
 - A close queued behind data still delivers every frame first, in order,
   while the peer can make progress; a peer that stopped reading ends the
   pipe instead of blocking closure.
