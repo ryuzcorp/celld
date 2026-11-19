@@ -1220,6 +1220,13 @@ enum ReadEnd {
     /// memory without bound. A slow handler never trips this: dispatches
     /// run without any time bound, and reads only stage what fits.
     OverLimit,
+    /// One message's fragments passed the message cap (or a single frame
+    /// reached it): end loudly with 1009 instead of growing the assembly
+    /// buffer without bound. The reader drops the partial assembly with the
+    /// error, so no further frame may be read on this socket — the pump
+    /// ends, and the teardown below is the last write, on an unpoisoned
+    /// writer only.
+    MessageTooBig,
 }
 
 /// A control-frame reply on a pump socket: the copied-out frame the reader's
@@ -1235,7 +1242,7 @@ type PumpReply = Box<dyn for<'f> FnMut(fastwebsockets::Frame<'f>) -> PumpReplyFu
 /// with every outcome, so arming a read moves values instead of borrowing
 /// the pump loop's locals across iterations.
 struct PumpReader<S> {
-    reader: fastwebsockets::FragmentCollectorRead<tokio::io::ReadHalf<S>>,
+    reader: cello::ws_message::CappedFragmentReader<tokio::io::ReadHalf<S>>,
     reply: PumpReply,
 }
 
@@ -1254,6 +1261,9 @@ enum PumpReadEvent {
     /// a failure. The loop stops reading and drains the accepted staged
     /// messages in order before reporting the transport close.
     Eof,
+    /// One message's fragments passed the message cap, or a single frame
+    /// reached it: fail loud with 1009, never by buffering further.
+    MessageTooBig,
     /// A read failure: fail-closed.
     Transport,
 }
@@ -1270,6 +1280,7 @@ where
     let frame = state.reader.read_frame(&mut state.reply).await;
     let event = match frame {
         Err(fastwebsockets::WebSocketError::UnexpectedEOF) => PumpReadEvent::Eof,
+        Err(fastwebsockets::WebSocketError::FrameTooLarge) => PumpReadEvent::MessageTooBig,
         Err(_) => PumpReadEvent::Transport,
         Ok(frame) => match frame.opcode {
             fastwebsockets::OpCode::Text => PumpReadEvent::Data(cello::js::WsIn::Text(
@@ -1325,7 +1336,12 @@ type PumpReadInFlight<S> =
 ///
 /// Reads stage ahead of a slow cell instead of parking behind its dispatch:
 /// dispatches run without any time bound, so a slow handler never trips the
-/// pipe — only frames staged past the cap end it loudly. A peer close
+/// pipe — only frames staged past the cap end it loudly. Fragments assemble
+/// in the reader under the message cap, uncharged against the staged
+/// budget: the worst case per socket is the message cap plus one full
+/// staged budget (see `cello::ws_message`), and a message whose fragments
+/// pass the cap ends the socket loudly with 1009 instead of staging
+/// anything. A peer close
 /// pending behind a stuck dispatch ends the read with the pending close
 /// after one unrenewed progress interval instead of parking teardown; each
 /// completed dispatch restarts that wait. An orderly EOF with no close
@@ -1339,10 +1355,11 @@ type PumpReadInFlight<S> =
 /// peer still drains fully, while the close flush runs under the progress
 /// bound. Each completed send restarts the wait; a peer that stopped
 /// reading ends the closing pipe instead of blocking closure.
-/// The automatic replies and the loud-1011 attempts run under the same
-/// bound, and every pump socket write is poison tracked: a write abandoned
-/// mid-frame poisons the writer before the lock releases, after which no
-/// further frame may be written and teardown drops the transport instead.
+/// The automatic replies and the loud-close attempts (1011 and 1009) run
+/// under the same bound, and every pump socket write is poison tracked: a
+/// write abandoned mid-frame poisons the writer before the lock releases,
+/// after which no further frame may be written and teardown drops the
+/// transport instead.
 ///
 /// The returned writer is still live, so the caller can write the close frames
 /// that follow — unless a write may have stopped mid-frame, which the
@@ -1368,10 +1385,11 @@ where
     F: FnMut(cello::js::WsIn) -> Fut,
     Fut: Future<Output = anyhow::Result<()>>,
 {
-    use fastwebsockets::{FragmentCollectorRead, Frame as WsFrame, Payload};
+    use cello::ws_message::CappedFragmentReader;
+    use fastwebsockets::{Frame as WsFrame, Payload};
 
     let (reader, writer) = socket.split(tokio::io::split);
-    let reader = FragmentCollectorRead::new(reader);
+    let reader = CappedFragmentReader::new(reader);
     let writer: PumpWriter<S> = PumpWriter {
         writer: std::sync::Arc::new(tokio::sync::Mutex::new(writer)),
         poisoned: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -1530,6 +1548,9 @@ where
                             PumpReadEvent::Eof => {
                                 read_done = true;
                             }
+                            PumpReadEvent::MessageTooBig => {
+                                return ReadEnd::MessageTooBig;
+                            }
                             PumpReadEvent::Transport => {
                                 return ReadEnd::Transport;
                             }
@@ -1620,7 +1641,8 @@ where
         receiver = {
             cello::asyncrt::select! {
                 result = &mut read => {
-                    let read_loud = matches!(result, ReadEnd::OverLimit);
+                    let read_loud_1011 = matches!(result, ReadEnd::OverLimit);
+                    let read_loud_1009 = matches!(result, ReadEnd::MessageTooBig);
                     match result {
                         ReadEnd::Peer(details) => close = details,
                         ReadEnd::OverLimit => {
@@ -1633,6 +1655,16 @@ where
                                 initiator: CloseInitiator::Application,
                             };
                         }
+                        ReadEnd::MessageTooBig => {
+                            close = PumpClose {
+                                state: (
+                                    cello::ws_message::WS_MESSAGE_TOO_BIG_CODE,
+                                    cello::ws_message::WS_MESSAGE_TOO_BIG_REASON.to_string(),
+                                    false,
+                                ),
+                                initiator: CloseInitiator::Application,
+                            };
+                        }
                         ReadEnd::Transport => {}
                     }
                     // Settle the outbound write before attempting the loud
@@ -1640,12 +1672,12 @@ where
                     // parked outbound write may hold while it waits for the
                     // peer to read. Poll the forwarder first — its settle
                     // keeps the in-flight send alive for the remainder of
-                    // the progress bound — and only then attempt the 1011
-                    // under the close deadline if the writer is still at a
-                    // frame boundary. Otherwise drop the transport instead
-                    // of writing another frame. The cell learns the same
-                    // 1011 through the close dispatch the caller runs after
-                    // the pump returns.
+                    // the progress bound — and only then attempt the loud
+                    // 1011 or 1009 under the close deadline if the writer is
+                    // still at a frame boundary. Otherwise drop the
+                    // transport instead of writing another frame. The cell
+                    // learns the same code through the close dispatch the
+                    // caller runs after the pump returns.
                     let _ = shutdown_tx.send(true);
                     let (write_end, receiver) = write.await;
                     // Either direction can trip the overload while the other
@@ -1665,12 +1697,32 @@ where
                             initiator: CloseInitiator::Application,
                         };
                     }
-                    let loud =
-                        read_loud || matches!(write_end, PipeDirectionEnd::OverLimit);
-                    if loud && !writer.poisoned() {
+                    let loud_1011 =
+                        read_loud_1011 || matches!(write_end, PipeDirectionEnd::OverLimit);
+                    if loud_1011 && !writer.poisoned() {
                         let _ = cello::asyncrt::timeout(
                             PUMP_SEND_PROGRESS_TIMEOUT,
                             write_ws_out(&writer, cello::js::WsOut::Overload),
+                        )
+                        .await;
+                    }
+                    // The same settle-then-write shape as the 1011 above,
+                    // with the direct 1009 frame: the attempt still needs a
+                    // writer at a frame boundary, and a poisoned writer is
+                    // dropped instead of writing after a partial frame. The
+                    // cell learns the same 1009 through the close dispatch
+                    // the caller runs after the pump returns.
+                    if read_loud_1009 && !writer.poisoned() {
+                        let _ = cello::asyncrt::timeout(
+                            PUMP_SEND_PROGRESS_TIMEOUT,
+                            pump_write_frame(
+                                &writer,
+                                fastwebsockets::Frame::close(
+                                    cello::ws_message::WS_MESSAGE_TOO_BIG_CODE,
+                                    cello::ws_message::WS_MESSAGE_TOO_BIG_REASON.as_bytes(),
+                                ),
+                                None,
+                            ),
                         )
                         .await;
                     }
@@ -2341,13 +2393,27 @@ mod pump_tests {
     /// test splits its client stream so its sender can park while its reader
     /// still observes the loud close. Masked, as a server-role socket
     /// requires; written in chunks so the flood never holds two copies.
+    /// Always final: fragmented tests use `write_masked_fragment`.
     async fn write_masked_frame(
         writer: &mut (impl tokio::io::AsyncWrite + Unpin),
         opcode: u8,
         payload: &[u8],
     ) -> std::io::Result<()> {
+        write_masked_fragment(writer, true, opcode, payload).await
+    }
+
+    /// One masked client-to-server frame with an explicit FIN bit: a
+    /// fragment flood starts with FIN clear and never sets it, while the
+    /// reassembly test ends its message with FIN set. Same masking and
+    /// chunking as `write_masked_frame`.
+    async fn write_masked_fragment(
+        writer: &mut (impl tokio::io::AsyncWrite + Unpin),
+        fin: bool,
+        opcode: u8,
+        payload: &[u8],
+    ) -> std::io::Result<()> {
         use tokio::io::AsyncWriteExt;
-        let mut head = vec![0x80 | opcode, 0x80];
+        let mut head = vec![(if fin { 0x80 } else { 0x00 }) | opcode, 0x80];
         if payload.len() < 126 {
             head[1] |= payload.len() as u8;
         } else if payload.len() <= u16::MAX as usize {
@@ -2645,6 +2711,154 @@ mod pump_tests {
                 "the pump reports the application-sent 1011"
             );
             sender.abort();
+        });
+    }
+
+    /// A fragment flood past the message cap ends loudly with 1009: a FIN=0
+    /// frame plus continuations past 32 MiB, into a pump whose dispatch is
+    /// parked, ends the socket with the application-sent 1009. The close
+    /// arrives while the sender is still parked mid-flood, proving the
+    /// server never buffers the whole flood — only the cap plus the frame
+    /// in flight. Without the cap the pump keeps buffering and the close
+    /// never arrives, so the read times out and this fails before the fix.
+    #[test]
+    fn fragment_flood_past_cap_gets_1009() {
+        test_runtime().block_on(async {
+            let (client_stream, server) = tokio::io::duplex(64 * 1024);
+            let mut socket =
+                fastwebsockets::WebSocket::after_handshake(server, fastwebsockets::Role::Server);
+            socket.set_auto_close(false);
+            let (_outbound, outputs) = mpsc::unbounded_channel();
+            let pump = tokio::spawn(pump_cell_socket(
+                socket,
+                outputs,
+                false,
+                |_: cello::js::WsIn| std::future::pending::<anyhow::Result<()>>(),
+                cello::js::WsPipeBudget::new(ISOLATE_PIPE_MAX_STAGED_BYTES),
+            ));
+            let (mut reader, mut writer) = tokio::io::split(client_stream);
+            // Forty-eight megabytes that never ends: the sender parks once
+            // the pump stops reading past the cap, and the close below
+            // arrives while megabytes are still unsent.
+            let sender = tokio::spawn(async move {
+                let chunk = vec![0u8; 1024 * 1024];
+                if write_masked_fragment(&mut writer, false, 0x2, &chunk)
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                for _ in 1..48 {
+                    if write_masked_fragment(&mut writer, false, 0x0, &chunk)
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            });
+            let (opcode, payload) = tokio::time::timeout(
+                std::time::Duration::from_secs(60),
+                read_server_frame(&mut reader),
+            )
+            .await
+            .expect("the loud close must arrive");
+            assert_eq!(opcode, 0x8, "the fragment flood ends in a close frame");
+            assert_eq!(
+                u16::from_be_bytes([payload[0], payload[1]]),
+                cello::ws_message::WS_MESSAGE_TOO_BIG_CODE,
+                "loud 1009 close"
+            );
+            assert_eq!(
+                &payload[2..],
+                cello::ws_message::WS_MESSAGE_TOO_BIG_REASON.as_bytes(),
+                "message-too-big reason"
+            );
+            assert!(
+                !sender.is_finished(),
+                "the close arrives before the endless flood is fully sent"
+            );
+            let (close, _, _, _) = tokio::time::timeout(std::time::Duration::from_secs(30), pump)
+                .await
+                .expect("the flood must end the pump")
+                .expect("pump joins");
+            assert_eq!(
+                close,
+                PumpClose {
+                    state: (
+                        cello::ws_message::WS_MESSAGE_TOO_BIG_CODE,
+                        cello::ws_message::WS_MESSAGE_TOO_BIG_REASON.to_string(),
+                        false,
+                    ),
+                    initiator: CloseInitiator::Application,
+                },
+                "the pump reports the application-sent 1009"
+            );
+            sender.abort();
+        });
+    }
+
+    /// Fragments reassemble in order below the caps: a FIN=0 frame plus two
+    /// continuations arrive as the one message the peer sent, proving the
+    /// capped reader still defragments the ordinary case, and the peer's
+    /// close then ends the pump as its own clean close. Returning a
+    /// fragment per read — instead of waiting for FIN — would dispatch
+    /// three messages, so the single dispatch fails before the fix.
+    #[test]
+    fn fragmented_message_reassembles_in_order() {
+        test_runtime().block_on(async {
+            let (client_stream, server) = tokio::io::duplex(64 * 1024);
+            let mut socket =
+                fastwebsockets::WebSocket::after_handshake(server, fastwebsockets::Role::Server);
+            socket.set_auto_close(false);
+            let (_outbound, outputs) = mpsc::unbounded_channel();
+            let (dispatch_tx, mut dispatch_rx) = mpsc::unbounded_channel::<cello::js::WsIn>();
+            let pump = tokio::spawn(pump_cell_socket(
+                socket,
+                outputs,
+                false,
+                move |data| {
+                    let dispatch_tx = dispatch_tx.clone();
+                    async move {
+                        let _ = dispatch_tx.send(data);
+                        Ok::<(), anyhow::Error>(())
+                    }
+                },
+                cello::js::WsPipeBudget::new(ISOLATE_PIPE_MAX_STAGED_BYTES),
+            ));
+            let (_, mut writer) = tokio::io::split(client_stream);
+            write_masked_fragment(&mut writer, false, 0x2, b"first")
+                .await
+                .expect("first fragment writes");
+            write_masked_fragment(&mut writer, false, 0x0, b"second")
+                .await
+                .expect("continuation writes");
+            write_masked_fragment(&mut writer, true, 0x0, b"third")
+                .await
+                .expect("final fragment writes");
+            let data = tokio::time::timeout(std::time::Duration::from_secs(30), dispatch_rx.recv())
+                .await
+                .expect("the reassembled message must dispatch")
+                .expect("dispatch channel stays open");
+            assert!(
+                matches!(&data, cello::js::WsIn::Binary(bytes) if bytes == b"firstsecondthird"),
+                "fragments arrive as the one message the peer sent"
+            );
+            write_masked_frame(&mut writer, 0x8, &[0x03, 0xe8])
+                .await
+                .expect("peer closes");
+            let (close, _, _, _) = tokio::time::timeout(std::time::Duration::from_secs(30), pump)
+                .await
+                .expect("the peer close must end the pump")
+                .expect("pump joins");
+            assert_eq!(
+                close,
+                PumpClose {
+                    state: (1000, String::new(), true),
+                    initiator: CloseInitiator::Peer,
+                },
+                "the peer close still ends the socket as its own clean close"
+            );
         });
     }
 

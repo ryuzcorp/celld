@@ -1036,10 +1036,14 @@ where
     T: FnMut(String) -> TFut,
     TFut: Future<Output = anyhow::Result<Option<String>>>,
 {
-    use fastwebsockets::{FragmentCollectorRead, Payload};
+    use fastwebsockets::Payload;
 
     let (reader, writer) = socket.split(tokio::io::split);
-    let mut reader = FragmentCollectorRead::new(reader);
+    // Same message cap as every tenant socket: a compromised peer on this
+    // internal session cannot grow the node with endless continuations
+    // either. An over-cap message ends the read with FrameTooLarge and the
+    // session — and its reconnect — with it.
+    let mut reader = crate::ws_message::CappedFragmentReader::new(reader);
     let writer = Arc::new(tokio::sync::Mutex::new(writer));
 
     let mut ticker = tokio::time::interval(heartbeat_period);
