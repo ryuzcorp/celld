@@ -1,7 +1,12 @@
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 //
 // Modified by Ryuz Corp (Cello): hermetic spawn guardrail.
+#![allow(clippy::disallowed_methods)]
 
+//! Scans test sources on disk, not node code: it reads the repo's own
+//! test files, so the execution boundary's injected filesystem rules do
+//! not apply to it.
+//!
 //! Guardrail: every spawn of the cello binary in `crates/cello/tests/`
 //! goes through `common::cello_command` (or `common::apply_hermetic_env`
 //! for the one wrapper spawn), which clears the inherited environment and
