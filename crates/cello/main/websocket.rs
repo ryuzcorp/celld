@@ -9,11 +9,11 @@
 //! socket proxied to the owning peer, and a socket the worker opened
 //! outbound — and they differ only in what sits on the far end.
 use super::*;
-use std::future::Future;
 use cello::isolate_pipe::{
     forward_isolate_direction, forward_pipe_direction, PipeDirectionEnd, PipeSendOutcome,
     ISOLATE_PIPE_MAX_STAGED_BYTES,
 };
+use std::future::Future;
 
 /// Where the events of one socket go.
 ///
@@ -693,9 +693,7 @@ async fn local_websocket_pipe(
                     async move {
                         let data = match frame {
                             cello::js::WsOut::Text(text) => cello::js::WsIn::Text(text),
-                            cello::js::WsOut::Binary(bytes) => {
-                                cello::js::WsIn::Binary(bytes)
-                            }
+                            cello::js::WsOut::Binary(bytes) => cello::js::WsIn::Binary(bytes),
                             // The forwarder only sends data frames; anything
                             // else ends the direction retired instead of
                             // panicking it.
@@ -735,9 +733,7 @@ async fn local_websocket_pipe(
                     async move {
                         let data = match frame {
                             cello::js::WsOut::Text(text) => cello::js::WsPull::Text(text),
-                            cello::js::WsOut::Binary(bytes) => {
-                                cello::js::WsPull::Binary(bytes)
-                            }
+                            cello::js::WsOut::Binary(bytes) => cello::js::WsPull::Binary(bytes),
                             // The forwarder only sends data frames; anything
                             // else ends the direction retired instead of
                             // panicking it.
@@ -790,10 +786,7 @@ async fn local_websocket_pipe(
     // Set by an overload on either side: a flood past the cap ends the pipe
     // loudly instead of growing host memory without bound.
     let mut overloaded = false;
-    for (slot, end) in [
-        (&mut caller_close, caller_end),
-        (&mut cell_close, cell_end),
-    ] {
+    for (slot, end) in [(&mut caller_close, caller_end), (&mut cell_close, cell_end)] {
         match end {
             PipeDirectionEnd::Close(code, reason) => *slot = Some((code, reason)),
             PipeDirectionEnd::OverLimit => overloaded = true,
@@ -1169,11 +1162,9 @@ enum ReadEnd {
 /// callback answers pings and echoes with. Boxed: the callback's concrete
 /// closure type is unnameable, and the owned read future below must name the
 /// state it carries.
-type PumpReplyFut = std::pin::Pin<
-    Box<dyn Future<Output = Result<(), fastwebsockets::WebSocketError>> + Send>,
->;
-type PumpReply =
-    Box<dyn for<'f> FnMut(fastwebsockets::Frame<'f>) -> PumpReplyFut + Send>;
+type PumpReplyFut =
+    std::pin::Pin<Box<dyn Future<Output = Result<(), fastwebsockets::WebSocketError>> + Send>>;
+type PumpReply = Box<dyn for<'f> FnMut(fastwebsockets::Frame<'f>) -> PumpReplyFut + Send>;
 
 /// The socket-reader half of the pump: the fragment reader plus the callback
 /// its control-frame replies need. Travels into the in-flight read and back
@@ -1212,11 +1203,9 @@ where
     let event = match frame {
         Err(_) => PumpReadEvent::Transport,
         Ok(frame) => match frame.opcode {
-            fastwebsockets::OpCode::Text => {
-                PumpReadEvent::Data(cello::js::WsIn::Text(
-                    String::from_utf8_lossy(&frame.payload).into_owned(),
-                ))
-            }
+            fastwebsockets::OpCode::Text => PumpReadEvent::Data(cello::js::WsIn::Text(
+                String::from_utf8_lossy(&frame.payload).into_owned(),
+            )),
             fastwebsockets::OpCode::Binary => {
                 PumpReadEvent::Data(cello::js::WsIn::Binary(frame.payload.to_vec()))
             }
@@ -1286,10 +1275,9 @@ where
                     // instead of parking the read behind the reply. A timeout
                     // reports the connection as closed, and the read ends the
                     // pump as an unclean transport.
-                    match cello::asyncrt::timeout(
-                        PUMP_SEND_PROGRESS_TIMEOUT,
-                        async move { writer.lock().await.write_frame(reply).await },
-                    )
+                    match cello::asyncrt::timeout(PUMP_SEND_PROGRESS_TIMEOUT, async move {
+                        writer.lock().await.write_frame(reply).await
+                    })
                     .await
                     {
                         Ok(result) => result,
@@ -1326,16 +1314,13 @@ where
                 reply: obligated,
             });
             let mut reading: Option<
-                std::pin::Pin<
-                    Box<dyn Future<Output = (PumpReadEvent, PumpReader<S>)> + Send>,
-                >,
+                std::pin::Pin<Box<dyn Future<Output = (PumpReadEvent, PumpReader<S>)> + Send>>,
             > = None;
             let mut dispatching: Option<std::pin::Pin<Box<Fut>>> = None;
             loop {
                 if dispatching.is_none() {
                     if let Some(data) = staged.pop_front() {
-                        staged_bytes = staged_bytes
-                            .saturating_sub(ws_in_staged_bytes(&data));
+                        staged_bytes = staged_bytes.saturating_sub(ws_in_staged_bytes(&data));
                         dispatching = Some(Box::pin(inbound(data)));
                     } else if let Some((code, reason)) = pending.take() {
                         return ReadEnd::Peer(PumpClose {
@@ -1436,97 +1421,97 @@ where
         let mut write = std::pin::pin!(write);
         receiver = {
             cello::asyncrt::select! {
-            result = &mut read => {
-                match result {
-                    ReadEnd::Peer(details) => close = details,
-                    ReadEnd::OverLimit => {
-                        close = PumpClose {
-                            state: (
-                                cello::js::WS_PIPE_OVERLOAD_CODE,
-                                cello::js::WS_PIPE_OVERLOAD_REASON.to_string(),
-                                false,
-                            ),
-                            initiator: CloseInitiator::Application,
-                        };
-                        // Best-effort loud close to the flooder, under the
-                        // same bound as every other closing write. The cell
-                        // learns the same 1011 through the close dispatch
-                        // the caller runs after the pump returns.
-                        let _ = cello::asyncrt::timeout(
-                            PUMP_SEND_PROGRESS_TIMEOUT,
-                            write_ws_out(&writer, cello::js::WsOut::Overload),
-                        )
-                        .await;
+                result = &mut read => {
+                    match result {
+                        ReadEnd::Peer(details) => close = details,
+                        ReadEnd::OverLimit => {
+                            close = PumpClose {
+                                state: (
+                                    cello::js::WS_PIPE_OVERLOAD_CODE,
+                                    cello::js::WS_PIPE_OVERLOAD_REASON.to_string(),
+                                    false,
+                                ),
+                                initiator: CloseInitiator::Application,
+                            };
+                            // Best-effort loud close to the flooder, under the
+                            // same bound as every other closing write. The cell
+                            // learns the same 1011 through the close dispatch
+                            // the caller runs after the pump returns.
+                            let _ = cello::asyncrt::timeout(
+                                PUMP_SEND_PROGRESS_TIMEOUT,
+                                write_ws_out(&writer, cello::js::WsOut::Overload),
+                            )
+                            .await;
+                        }
+                        ReadEnd::Transport => {}
                     }
-                    ReadEnd::Transport => {}
+                    // Retire the write direction: a parked socket write owns no
+                    // frame the loop has to keep, so the forwarder returns
+                    // promptly and hands back the outputs receiver for the
+                    // post-pump drain of the close handler's frames below.
+                    let _ = shutdown_tx.send(true);
+                    let (_, receiver) = write.await;
+                    receiver
                 }
-                // Retire the write direction: a parked socket write owns no
-                // frame the loop has to keep, so the forwarder returns
-                // promptly and hands back the outputs receiver for the
-                // post-pump drain of the close handler's frames below.
-                let _ = shutdown_tx.send(true);
-                let (_, receiver) = write.await;
-                receiver
-            }
-            (write_end, receiver) = &mut write => {
-                match write_end {
-                    PipeDirectionEnd::Close(code, reason) => {
-                        // The forwarder ends the direction on the close
-                        // without writing it — only data crosses the sink —
-                        // so the pump writes the cell's close frame here,
-                        // behind everything the forwarder flushed ahead of
-                        // it, as the pre-forwarder pump wrote every output
-                        // inline. Without this the peer sees EOF instead of
-                        // the close. Best-effort under the closing progress
-                        // bound: the close dispatch below already told the
-                        // cell, and the echo after the drain decides the
-                        // protocol close.
-                        let _ = cello::asyncrt::timeout(
-                            PUMP_SEND_PROGRESS_TIMEOUT,
-                            write_ws_out(
-                                &writer,
-                                cello::js::WsOut::Close(code, reason.clone()),
-                            ),
-                        )
-                        .await;
-                        close = PumpClose {
-                            state: if outbound_close_is_clean {
-                                (code, reason, true)
-                            } else {
-                                (1006, String::new(), false)
-                            },
-                            initiator: CloseInitiator::Application,
-                        };
+                (write_end, receiver) = &mut write => {
+                    match write_end {
+                        PipeDirectionEnd::Close(code, reason) => {
+                            // The forwarder ends the direction on the close
+                            // without writing it — only data crosses the sink —
+                            // so the pump writes the cell's close frame here,
+                            // behind everything the forwarder flushed ahead of
+                            // it, as the pre-forwarder pump wrote every output
+                            // inline. Without this the peer sees EOF instead of
+                            // the close. Best-effort under the closing progress
+                            // bound: the close dispatch below already told the
+                            // cell, and the echo after the drain decides the
+                            // protocol close.
+                            let _ = cello::asyncrt::timeout(
+                                PUMP_SEND_PROGRESS_TIMEOUT,
+                                write_ws_out(
+                                    &writer,
+                                    cello::js::WsOut::Close(code, reason.clone()),
+                                ),
+                            )
+                            .await;
+                            close = PumpClose {
+                                state: if outbound_close_is_clean {
+                                    (code, reason, true)
+                                } else {
+                                    (1006, String::new(), false)
+                                },
+                                initiator: CloseInitiator::Application,
+                            };
+                        }
+                        // A flood staged past the cap, or an admission refusal
+                        // queued behind admitted data: the same loud 1011 the
+                        // forwarder reports for every other pipe, and the same
+                        // loud close on the socket the read path writes — the
+                        // marker cut admitted data, so the peer must observe it.
+                        PipeDirectionEnd::OverLimit => {
+                            close = PumpClose {
+                                state: (
+                                    cello::js::WS_PIPE_OVERLOAD_CODE,
+                                    cello::js::WS_PIPE_OVERLOAD_REASON.to_string(),
+                                    false,
+                                ),
+                                initiator: CloseInitiator::Application,
+                            };
+                            let _ = cello::asyncrt::timeout(
+                                PUMP_SEND_PROGRESS_TIMEOUT,
+                                write_ws_out(&writer, cello::js::WsOut::Overload),
+                            )
+                            .await;
+                        }
+                        // The socket is gone: fail-closed, default close. The
+                        // read is dropped here. That is safe only because the
+                        // pump is over and the socket is never read again.
+                        PipeDirectionEnd::Retired => {}
                     }
-                    // A flood staged past the cap, or an admission refusal
-                    // queued behind admitted data: the same loud 1011 the
-                    // forwarder reports for every other pipe, and the same
-                    // loud close on the socket the read path writes — the
-                    // marker cut admitted data, so the peer must observe it.
-                    PipeDirectionEnd::OverLimit => {
-                        close = PumpClose {
-                            state: (
-                                cello::js::WS_PIPE_OVERLOAD_CODE,
-                                cello::js::WS_PIPE_OVERLOAD_REASON.to_string(),
-                                false,
-                            ),
-                            initiator: CloseInitiator::Application,
-                        };
-                        let _ = cello::asyncrt::timeout(
-                            PUMP_SEND_PROGRESS_TIMEOUT,
-                            write_ws_out(&writer, cello::js::WsOut::Overload),
-                        )
-                        .await;
-                    }
-                    // The socket is gone: fail-closed, default close. The
-                    // read is dropped here. That is safe only because the
-                    // pump is over and the socket is never read again.
-                    PipeDirectionEnd::Retired => {}
+                    receiver
                 }
-                receiver
             }
-        }
-    };
+        };
     }
     (close, writer, receiver)
 }
@@ -1676,11 +1661,9 @@ pub(super) async fn websocket_task<S>(
     let mut handler_sent_close = false;
     while let Ok(output) = outputs.try_recv() {
         handler_sent_close |= matches!(output, cello::js::WsOut::Close(_, _));
-        let written = cello::asyncrt::timeout(
-            PUMP_SEND_PROGRESS_TIMEOUT,
-            write_ws_out(&writer, output),
-        )
-        .await;
+        let written =
+            cello::asyncrt::timeout(PUMP_SEND_PROGRESS_TIMEOUT, write_ws_out(&writer, output))
+                .await;
         if !matches!(written, Ok(true)) {
             break;
         }
@@ -2034,9 +2017,7 @@ mod pump_tests {
     /// One server-to-client frame off a duplex pair: server frames are
     /// unmasked. Handles the short, 16-bit, and 64-bit length forms, so the
     /// trickle test reads its 64 KiB frame through the same helper.
-    async fn read_server_frame(
-        client: &mut (impl tokio::io::AsyncRead + Unpin),
-    ) -> (u8, Vec<u8>) {
+    async fn read_server_frame(client: &mut (impl tokio::io::AsyncRead + Unpin)) -> (u8, Vec<u8>) {
         use tokio::io::AsyncReadExt;
         let mut head = [0u8; 2];
         client.read_exact(&mut head).await.expect("frame head");
@@ -2045,18 +2026,12 @@ mod pump_tests {
         let len = match head[1] & 0x7f {
             126 => {
                 let mut ext = [0u8; 2];
-                client
-                    .read_exact(&mut ext)
-                    .await
-                    .expect("extended length");
+                client.read_exact(&mut ext).await.expect("extended length");
                 u16::from_be_bytes(ext) as usize
             }
             127 => {
                 let mut ext = [0u8; 8];
-                client
-                    .read_exact(&mut ext)
-                    .await
-                    .expect("extended length");
+                client.read_exact(&mut ext).await.expect("extended length");
                 u64::from_be_bytes(ext) as usize
             }
             len => len as usize,
@@ -2115,18 +2090,15 @@ mod pump_tests {
     fn slow_handler_keeps_socket() {
         test_runtime().block_on(async {
             let (client_stream, server) = tokio::io::duplex(64 * 1024);
-            let mut socket = fastwebsockets::WebSocket::after_handshake(
-                server,
-                fastwebsockets::Role::Server,
-            );
+            let mut socket =
+                fastwebsockets::WebSocket::after_handshake(server, fastwebsockets::Role::Server);
             // As the production callers do: the pump owns the close echo,
             // so the collector must not auto-echo a peer close through the
             // bounded reply write behind a parked socket write.
             socket.set_auto_close(false);
             let (_outbound, outputs) = mpsc::unbounded_channel();
             let (entered_tx, mut entered_rx) = mpsc::unbounded_channel::<()>();
-            let (done_tx, mut done_rx) =
-                mpsc::unbounded_channel::<cello::js::WsIn>();
+            let (done_tx, mut done_rx) = mpsc::unbounded_channel::<cello::js::WsIn>();
             let pump = tokio::spawn(pump_cell_socket(
                 socket,
                 outputs,
@@ -2154,11 +2126,10 @@ mod pump_tests {
             entered_rx.recv().await.expect("dispatch starts");
             // Six real seconds, past the old bound: the handler must run to
             // completion instead of the pump timing it out.
-            let data =
-                tokio::time::timeout(std::time::Duration::from_secs(30), done_rx.recv())
-                    .await
-                    .expect("a slow handler must run, not time out")
-                    .expect("handler records its frame");
+            let data = tokio::time::timeout(std::time::Duration::from_secs(30), done_rx.recv())
+                .await
+                .expect("a slow handler must run, not time out")
+                .expect("handler records its frame");
             assert!(
                 matches!(&data, cello::js::WsIn::Text(text) if text == "hello"),
                 "the handler ran to completion on its frame"
@@ -2171,11 +2142,10 @@ mod pump_tests {
                 .write_frame(fastwebsockets::Frame::close(1000, b"bye"))
                 .await
                 .expect("peer closes");
-            let (close, _, _) =
-                tokio::time::timeout(std::time::Duration::from_secs(30), pump)
-                    .await
-                    .expect("the peer close must end the pump")
-                    .expect("pump joins");
+            let (close, _, _) = tokio::time::timeout(std::time::Duration::from_secs(30), pump)
+                .await
+                .expect("the peer close must end the pump")
+                .expect("pump joins");
             assert_eq!(
                 close,
                 PumpClose {
@@ -2198,10 +2168,8 @@ mod pump_tests {
     fn trickle_client_stays_connected() {
         test_runtime().block_on(async {
             let (mut client_stream, server) = tokio::io::duplex(1024);
-            let mut socket = fastwebsockets::WebSocket::after_handshake(
-                server,
-                fastwebsockets::Role::Server,
-            );
+            let mut socket =
+                fastwebsockets::WebSocket::after_handshake(server, fastwebsockets::Role::Server);
             socket.set_auto_close(false);
             // Held, not dropped: in production the registry owns the sender
             // until the pump returns, so a channel close here would retire
@@ -2232,11 +2200,10 @@ mod pump_tests {
             // No terminal follows the data: dropping the client ends the pump
             // on the transport instead.
             drop(client_stream);
-            let (close, _, _) =
-                tokio::time::timeout(std::time::Duration::from_secs(30), pump)
-                    .await
-                    .expect("dropping the peer must end the pump")
-                    .expect("pump joins");
+            let (close, _, _) = tokio::time::timeout(std::time::Duration::from_secs(30), pump)
+                .await
+                .expect("dropping the peer must end the pump")
+                .expect("pump joins");
             assert_eq!(close.initiator, CloseInitiator::Transport);
             assert_eq!(close.state, (1006, String::new(), false));
         });
@@ -2252,10 +2219,8 @@ mod pump_tests {
     fn flood_past_cap_gets_1011() {
         test_runtime().block_on(async {
             let (client_stream, server) = tokio::io::duplex(64 * 1024);
-            let mut socket = fastwebsockets::WebSocket::after_handshake(
-                server,
-                fastwebsockets::Role::Server,
-            );
+            let mut socket =
+                fastwebsockets::WebSocket::after_handshake(server, fastwebsockets::Role::Server);
             socket.set_auto_close(false);
             let (_outbound, outputs) = mpsc::unbounded_channel();
             let pump = tokio::spawn(pump_cell_socket(
@@ -2273,10 +2238,7 @@ mod pump_tests {
             let sender = tokio::spawn(async move {
                 for _ in 0..20 {
                     let chunk = vec![0u8; 1024 * 1024];
-                    if write_masked_frame(&mut writer, 0x2, &chunk)
-                        .await
-                        .is_err()
-                    {
+                    if write_masked_frame(&mut writer, 0x2, &chunk).await.is_err() {
                         break;
                     }
                 }
@@ -2294,11 +2256,10 @@ mod pump_tests {
                 cello::js::WS_PIPE_OVERLOAD_REASON.as_bytes(),
                 "overload reason"
             );
-            let (close, _, _) =
-                tokio::time::timeout(std::time::Duration::from_secs(30), pump)
-                    .await
-                    .expect("the flood must end the pump")
-                    .expect("pump joins");
+            let (close, _, _) = tokio::time::timeout(std::time::Duration::from_secs(30), pump)
+                .await
+                .expect("the flood must end the pump")
+                .expect("pump joins");
             assert_eq!(
                 close,
                 PumpClose {
@@ -2326,10 +2287,8 @@ mod pump_tests {
     fn close_behind_data_arrives_in_order() {
         test_runtime().block_on(async {
             let (mut client_stream, server) = tokio::io::duplex(64 * 1024);
-            let mut socket = fastwebsockets::WebSocket::after_handshake(
-                server,
-                fastwebsockets::Role::Server,
-            );
+            let mut socket =
+                fastwebsockets::WebSocket::after_handshake(server, fastwebsockets::Role::Server);
             socket.set_auto_close(false);
             // Held, not dropped: a channel close racing the flush would
             // retire the write direction instead of reporting the close.
@@ -2394,10 +2353,8 @@ mod pump_tests {
     fn cell_close_reaches_the_peer_before_shutdown() {
         test_runtime().block_on(async {
             let (mut client_stream, server) = tokio::io::duplex(64 * 1024);
-            let mut socket = fastwebsockets::WebSocket::after_handshake(
-                server,
-                fastwebsockets::Role::Server,
-            );
+            let mut socket =
+                fastwebsockets::WebSocket::after_handshake(server, fastwebsockets::Role::Server);
             socket.set_auto_close(false);
             // Held, not dropped: a channel close racing the close would
             // retire the write direction instead of reporting it.
@@ -2435,11 +2392,7 @@ mod pump_tests {
                 1008,
                 "the cell close keeps its code"
             );
-            assert_eq!(
-                &payload[2..],
-                b"refused",
-                "the cell close keeps its reason"
-            );
+            assert_eq!(&payload[2..], b"refused", "the cell close keeps its reason");
         });
     }
 
@@ -2452,10 +2405,8 @@ mod pump_tests {
     fn shutdown_during_parked_send_ends_pump() {
         test_runtime().block_on(async {
             let (client_stream, server) = tokio::io::duplex(1024);
-            let mut socket = fastwebsockets::WebSocket::after_handshake(
-                server,
-                fastwebsockets::Role::Server,
-            );
+            let mut socket =
+                fastwebsockets::WebSocket::after_handshake(server, fastwebsockets::Role::Server);
             socket.set_auto_close(false);
             // Held, not dropped: a channel close racing the parked send
             // would retire the write direction before the peer close lands.
@@ -2481,11 +2432,10 @@ mod pump_tests {
                 .write_frame(fastwebsockets::Frame::close(1000, b"bye"))
                 .await
                 .expect("peer closes");
-            let (close, _, _) =
-                tokio::time::timeout(std::time::Duration::from_secs(30), pump)
-                    .await
-                    .expect("shutdown must end the parked send")
-                    .expect("pump joins");
+            let (close, _, _) = tokio::time::timeout(std::time::Duration::from_secs(30), pump)
+                .await
+                .expect("shutdown must end the parked send")
+                .expect("pump joins");
             assert_eq!(
                 close,
                 PumpClose {
@@ -2506,10 +2456,8 @@ mod pump_tests {
     fn pump_overload_marker_writes_loud_1011_close() {
         test_runtime().block_on(async {
             let (mut client_stream, server) = tokio::io::duplex(64 * 1024);
-            let mut socket = fastwebsockets::WebSocket::after_handshake(
-                server,
-                fastwebsockets::Role::Server,
-            );
+            let mut socket =
+                fastwebsockets::WebSocket::after_handshake(server, fastwebsockets::Role::Server);
             socket.set_auto_close(false);
             // Held, not dropped: in production the registry owns the sender
             // until the pump returns.

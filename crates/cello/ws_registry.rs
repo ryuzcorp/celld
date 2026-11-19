@@ -888,8 +888,8 @@ impl WsRegistry {
         }
         // Only a charged data frame holds budget: closes, the marker, and
         // unpoliced directions bypassed the charge above.
-        let charged = !matches!(out, WsOut::Close(..) | WsOut::Overload)
-            && self.budgets.get(&id).is_some();
+        let charged =
+            !matches!(out, WsOut::Close(..) | WsOut::Overload) && self.budgets.contains_key(&id);
         let bytes = if charged { ws_out_bytes(&out) } else { 0 };
         if tx.send(out).is_err() {
             // The frame never reached its channel: release the admission

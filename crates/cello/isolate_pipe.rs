@@ -121,15 +121,12 @@ async fn settle_parked_send<SendFut>(
         Sent,
         Shutdown,
     }
-    let _ = crate::asyncrt::timeout(
-        ISOLATE_PIPE_CLOSE_FLUSH_TIMEOUT,
-        async {
-            crate::asyncrt::select! {
-                _ = send_head => Settle::Sent,
-                _ = shutdown.changed() => Settle::Shutdown,
-            }
-        },
-    )
+    let _ = crate::asyncrt::timeout(ISOLATE_PIPE_CLOSE_FLUSH_TIMEOUT, async {
+        crate::asyncrt::select! {
+            _ = send_head => Settle::Sent,
+            _ = shutdown.changed() => Settle::Shutdown,
+        }
+    })
     .await;
 }
 
@@ -183,10 +180,7 @@ where
     // settles it under the closing progress bound instead of tearing the
     // head frame; dropping it outright would leave a partial frame ahead
     // of the terminal the teardown reports.
-    let mut sending: Option<(
-        std::pin::Pin<Box<SendFut>>,
-        usize,
-    )> = None;
+    let mut sending: Option<(std::pin::Pin<Box<SendFut>>, usize)> = None;
     // A close waiting behind flushed frames. Set instead of returned while
     // anything remains to flush; delivered once the queue drains.
     let mut pending_close: Option<(u16, String)> = None;
@@ -203,22 +197,18 @@ where
                     Sent(PipeSendOutcome),
                     Shutdown,
                 }
-                let outcome = crate::asyncrt::timeout(
-                    ISOLATE_PIPE_CLOSE_FLUSH_TIMEOUT,
-                    async {
-                        crate::asyncrt::select! {
-                            outcome = send_head => Settle::Sent(outcome),
-                            _ = shutdown.changed() => Settle::Shutdown,
-                        }
-                    },
-                )
+                let outcome = crate::asyncrt::timeout(ISOLATE_PIPE_CLOSE_FLUSH_TIMEOUT, async {
+                    crate::asyncrt::select! {
+                        outcome = send_head => Settle::Sent(outcome),
+                        _ = shutdown.changed() => Settle::Shutdown,
+                    }
+                })
                 .await;
                 match outcome {
                     Ok(Settle::Sent(PipeSendOutcome::Sent)) => {
                         staged_bytes = staged_bytes.saturating_sub(bytes);
                     }
-                    Ok(Settle::Sent(PipeSendOutcome::Gone))
-                    | Ok(Settle::Shutdown) => {
+                    Ok(Settle::Sent(PipeSendOutcome::Gone)) | Ok(Settle::Shutdown) => {
                         return (PipeDirectionEnd::Retired, from);
                     }
                     Err(_) => {
@@ -267,22 +257,18 @@ where
                 Sent(PipeSendOutcome),
                 Shutdown,
             }
-            let outcome = crate::asyncrt::timeout(
-                ISOLATE_PIPE_CLOSE_FLUSH_TIMEOUT,
-                async {
-                    crate::asyncrt::select! {
-                        outcome = send(head) => FlushWait::Sent(outcome),
-                        _ = shutdown.changed() => FlushWait::Shutdown,
-                    }
-                },
-            )
+            let outcome = crate::asyncrt::timeout(ISOLATE_PIPE_CLOSE_FLUSH_TIMEOUT, async {
+                crate::asyncrt::select! {
+                    outcome = send(head) => FlushWait::Sent(outcome),
+                    _ = shutdown.changed() => FlushWait::Shutdown,
+                }
+            })
             .await;
             match outcome {
                 Ok(FlushWait::Sent(PipeSendOutcome::Sent)) => {
                     staged_bytes = staged_bytes.saturating_sub(bytes);
                 }
-                Ok(FlushWait::Sent(PipeSendOutcome::Gone))
-                | Ok(FlushWait::Shutdown) => {
+                Ok(FlushWait::Sent(PipeSendOutcome::Gone)) | Ok(FlushWait::Shutdown) => {
                     return (PipeDirectionEnd::Retired, from);
                 }
                 Err(_) => {
@@ -689,18 +675,12 @@ mod tests {
                         std::future::pending::<()>().await;
                         PipeSendOutcome::Gone
                     })
-                        as std::pin::Pin<
-                            Box<dyn Future<Output = PipeSendOutcome> + Send + 'static>,
-                        >
+                        as std::pin::Pin<Box<dyn Future<Output = PipeSendOutcome> + Send + 'static>>
                 }
             };
             let (shutdown_tx, shutdown) = tokio::sync::watch::channel(false);
-            let direction = crate::asyncrt::spawn(forward_pipe_direction(
-                from,
-                sink,
-                shutdown,
-                budget.clone(),
-            ));
+            let direction =
+                crate::asyncrt::spawn(forward_pipe_direction(from, sink, shutdown, budget.clone()));
             // The first forward is parked at the gate; the budget drains to
             // zero exactly when both data frames are received, which also
             // means the close is staged and the direction is pending. No
@@ -913,5 +893,4 @@ mod tests {
             );
         });
     }
-
 }

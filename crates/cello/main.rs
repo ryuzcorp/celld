@@ -6243,16 +6243,15 @@ mod durability_lifecycle_private {
 /// exactly-once install, so a second runtime poisons every later test.
 #[cfg(test)]
 pub(crate) fn bin_test_runtime() -> &'static tokio::runtime::Runtime {
-    static RUNTIME: std::sync::LazyLock<tokio::runtime::Runtime> =
-        std::sync::LazyLock::new(|| {
-            let runtime = tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(4)
-                .enable_all()
-                .build()
-                .expect("test runtime builds");
-            cello::asyncrt::set_host_handle(runtime.handle().clone());
-            runtime
-        });
+    static RUNTIME: std::sync::LazyLock<tokio::runtime::Runtime> = std::sync::LazyLock::new(|| {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(4)
+            .enable_all()
+            .build()
+            .expect("test runtime builds");
+        cello::asyncrt::set_host_handle(runtime.handle().clone());
+        runtime
+    });
     &RUNTIME
 }
 
