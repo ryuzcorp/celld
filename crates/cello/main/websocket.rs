@@ -1105,9 +1105,14 @@ impl Drop for WriteGuard<'_> {
 /// teardown drops the transport instead of writing another frame. A write
 /// that never acquires the writer — a close attempt parked behind a stuck
 /// outbound write — poisons it too: the in-flight write may finish partial.
+///
+/// `write_bound` limits only the write itself, never the wait for the
+/// writer: a reply queued behind a slow but progressing data write must not
+/// time out — and poison the socket — for time the data write spent.
 async fn pump_write_frame<S>(
     ws: &PumpWriter<S>,
     frame: fastwebsockets::Frame<'_>,
+    write_bound: Option<std::time::Duration>,
 ) -> Result<(), fastwebsockets::WebSocketError>
 where
     S: tokio::io::AsyncWrite + Unpin,
@@ -1138,7 +1143,13 @@ where
     if ws.poisoned.load(Ordering::SeqCst) {
         return Err(fastwebsockets::WebSocketError::ConnectionClosed);
     }
-    let result = writer.write_frame(frame).await;
+    // A bound that fires drops the write mid-frame; the guard poisons.
+    let result = match write_bound {
+        Some(bound) => cello::asyncrt::timeout(bound, writer.write_frame(frame))
+            .await
+            .unwrap_or(Err(fastwebsockets::WebSocketError::ConnectionClosed)),
+        None => writer.write_frame(frame).await,
+    };
     if result.is_ok() {
         guard.complete = true;
     }
@@ -1163,7 +1174,7 @@ where
             cello::js::WS_PIPE_OVERLOAD_REASON.as_bytes(),
         ),
     };
-    pump_write_frame(ws, frame).await.is_ok() && keep_open
+    pump_write_frame(ws, frame, None).await.is_ok() && keep_open
 }
 
 async fn echo_websocket_close<S>(
@@ -1399,22 +1410,17 @@ where
                     Payload::Owned(frame.payload.to_vec()),
                 );
                 Box::pin(async move {
-                    // Bounded like every other pump socket write: a peer that
-                    // sent a ping and then stopped reading must end the pump
+                    // Bounded once it holds the writer: a peer that sent a
+                    // ping and then stopped reading must end the pump
                     // instead of parking the read behind the reply. A timeout
                     // reports the connection as closed, and the read ends the
-                    // pump as an unclean transport. The write is poison
-                    // tracked: abandoning it drops the transport instead of
-                    // writing another frame after a possibly partial one.
-                    match cello::asyncrt::timeout(
-                        PUMP_SEND_PROGRESS_TIMEOUT,
-                        pump_write_frame(&writer, reply),
-                    )
-                    .await
-                    {
-                        Ok(result) => result,
-                        Err(_) => Err(fastwebsockets::WebSocketError::ConnectionClosed),
-                    }
+                    // pump as an unclean transport. The wait for the writer
+                    // is not bounded: a reply queued behind a slow data write
+                    // to a live peer waits for it, as the data write does.
+                    // The write is poison tracked: abandoning it drops the
+                    // transport instead of writing another frame after a
+                    // possibly partial one.
+                    pump_write_frame(&writer, reply, Some(PUMP_SEND_PROGRESS_TIMEOUT)).await
                 }) as PumpReplyFut
             }
         });
@@ -1709,6 +1715,7 @@ where
                                                 code,
                                                 reason.as_bytes(),
                                             ),
+                                            None,
                                         ),
                                     )
                                     .await,
@@ -1886,6 +1893,11 @@ pub(super) async fn websocket_task<S>(
         )
         .await
     };
+    // A poisoned writer may have stopped mid-frame, so no further frame may
+    // follow it: drop it — closing the transport — before the close handler
+    // runs, instead of making the peer wait on the handler for EOF. The
+    // drain and the echo below are skipped alike.
+    let writer = (!writer.poisoned()).then_some(writer);
     if let Err(error) = dispatch_ws_closed(
         &app,
         &route,
@@ -1944,12 +1956,9 @@ pub(super) async fn websocket_task<S>(
     // instead of holding the socket task open. Best-effort: the cell
     // already learned the close above, and the write forwarder owns no
     // frames of its own.
-    let handler_sent_close = drain_close_outputs(&writer, &mut outputs, &budget).await;
-    // A poisoned writer skips the drain and the echo alike: a write may
-    // have stopped mid-frame, so no further frame may follow it. Dropping
-    // the writer here closes the transport instead.
-    if !writer.poisoned() {
-        echo_websocket_close(&writer, &close.state, handler_sent_close).await;
+    if let Some(writer) = &writer {
+        let handler_sent_close = drain_close_outputs(writer, &mut outputs, &budget).await;
+        echo_websocket_close(writer, &close.state, handler_sent_close).await;
     }
     app.websocket_closed(route.cell().to_string(), target.id);
     cello::js::ws_unregister(target.id);
@@ -2490,6 +2499,77 @@ mod pump_tests {
                 .expect("pump joins");
             assert_eq!(close.initiator, CloseInitiator::Transport);
             assert_eq!(close.state, (1006, String::new(), false));
+        });
+    }
+
+    /// A ping behind a parked data write must not kill a slow but live peer:
+    /// the pong waits for the writer as long as the data write does, and its
+    /// own bound starts only once it holds the writer. The peer pings while
+    /// the server's 64 KiB write is parked on a full pipe, stays silent for
+    /// six real seconds, then reads: the data arrives intact, followed by
+    /// the pong. A reply bound that also covers the wait for the writer
+    /// fires at 5 s, poisons the writer and ends the pump, so this fails
+    /// before the change.
+    #[test]
+    fn ping_behind_parked_write_keeps_socket() {
+        test_runtime().block_on(async {
+            let (client_stream, server) = tokio::io::duplex(1024);
+            let mut socket =
+                fastwebsockets::WebSocket::after_handshake(server, fastwebsockets::Role::Server);
+            socket.set_auto_close(false);
+            let (_outbound, outputs) = mpsc::unbounded_channel();
+            let data = vec![7u8; 64 * 1024];
+            _outbound
+                .send(cello::js::WsOut::Binary(data.clone()))
+                .expect("stage frame");
+            let pump = tokio::spawn(pump_cell_socket(
+                socket,
+                outputs,
+                true,
+                |_: cello::js::WsIn| std::future::pending::<anyhow::Result<()>>(),
+                cello::js::WsPipeBudget::new(ISOLATE_PIPE_MAX_STAGED_BYTES),
+            ));
+            let (mut reader, mut writer) = tokio::io::split(client_stream);
+            // The data frame's head proves its write holds the writer; the
+            // 64 KiB payload still parks on the 1 KiB pipe. Only then ping,
+            // so the pong queues behind the parked write.
+            use tokio::io::AsyncReadExt;
+            let mut head = [0u8; 10];
+            reader.read_exact(&mut head).await.expect("data frame head");
+            assert_eq!(head[0], 0x82, "the data frame's write starts first");
+            assert_eq!(head[1], 127, "64 KiB uses the 64-bit length form");
+            assert_eq!(
+                u64::from_be_bytes(head[2..].try_into().expect("length")),
+                data.len() as u64
+            );
+            write_masked_frame(&mut writer, 0x9, b"ping")
+                .await
+                .expect("peer pings");
+            tokio::time::sleep(std::time::Duration::from_secs(6)).await;
+            assert!(
+                !pump.is_finished(),
+                "a pong queued behind a parked data write must not end the pump"
+            );
+            let mut payload = vec![0u8; data.len()];
+            reader
+                .read_exact(&mut payload)
+                .await
+                .expect("the parked data drains intact");
+            assert_eq!(payload, data, "the drained frame is intact");
+            let (opcode, payload) = tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                read_server_frame(&mut reader),
+            )
+            .await
+            .expect("the pong must follow the data");
+            assert_eq!(opcode, 0xA, "the pong follows the data");
+            assert_eq!(payload, b"ping", "the pong echoes the ping payload");
+            drop((reader, writer));
+            let (close, _, _, _) = tokio::time::timeout(std::time::Duration::from_secs(30), pump)
+                .await
+                .expect("dropping the peer must end the pump")
+                .expect("pump joins");
+            assert_eq!(close.initiator, CloseInitiator::Transport);
         });
     }
 
@@ -3254,6 +3334,7 @@ mod pump_tests {
                     pump_write_frame(
                         &a_writer,
                         fastwebsockets::Frame::binary(vec![9u8; 1024].into()),
+                        None,
                     )
                     .await
                 });
