@@ -97,38 +97,70 @@ fn stage_pipe_frame(
     }
 }
 
-/// Settle a parked sink send under the closing progress bound before the
-/// direction reports an end that drops the pipe: the parked send owns the
-/// head frame, and dropping it mid socket-write would tear that frame ahead
-/// of the terminal the teardown reports (the loud 1011 for an overload,
-/// nothing for a retirement). The end stands either way — only the head
-/// frame's delivery is at stake — so an expired bound or a freshly observed
-/// shutdown still returns promptly. No-op when nothing is parked.
-///
-/// Delivery only: the producer budget was released when the frame was
-/// received, and the staged-bytes ledger drops with the direction, so the
-/// outcome only decides whether the head frame crossed whole.
+/// What settling a parked send decided. The pipe's end stands either way —
+/// only the head frame's delivery is at stake.
+#[derive(Debug)]
+enum SettleOutcome {
+    /// Nothing was parked.
+    Idle,
+    /// The send finished before the bound, with the head frame's staged
+    /// bytes for the ledger.
+    Done(PipeSendOutcome, usize),
+    /// The bound expired with the send still parked; the send is dropped.
+    Expired,
+}
+
+ /// Settle a parked sink send under the closing progress bound before the
+ /// direction reports an end that drops the pipe: the parked send owns the
+ /// head frame, and dropping it mid socket-write would tear that frame ahead
+ /// of the terminal the teardown reports (the loud 1011 for an overload,
+ /// nothing for a retirement). The end stands either way — only the head
+ /// frame's delivery is at stake — so an expired bound still returns
+ /// promptly. A shutdown observed mid-wait does not drop the send: it stays
+ /// alive for the remainder of the bound, and the caller stops at a frame
+ /// boundary instead of starting the next queued frame. No-op when nothing
+ /// is parked, reporting whether the shutdown is already set.
+ ///
+ /// Delivery only: the producer budget was released when the frame was
+ /// received, and the staged-bytes ledger drops with the direction, so the
+ /// outcome only decides whether the head frame crossed whole.
 async fn settle_parked_send<SendFut>(
     sending: &mut Option<(std::pin::Pin<Box<SendFut>>, usize)>,
     shutdown: &mut tokio::sync::watch::Receiver<bool>,
-) where
-    SendFut: Future<Output = PipeSendOutcome>,
-{
-    let Some((send_head, _)) = sending.take() else {
-        return;
+) -> (SettleOutcome, bool)
+ where
+     SendFut: Future<Output = PipeSendOutcome>,
+ {
+    let Some((mut send_head, bytes)) = sending.take() else {
+        return (SettleOutcome::Idle, *shutdown.borrow());
     };
-    enum Settle {
-        Sent,
+    // One bound for both phases: a shutdown mid-wait keeps the same send
+    // alive for the remainder instead of dropping it, so teardown lands at
+    // a frame boundary. A fresh timeout per phase would extend the bound.
+    let deadline_ms = crate::asyncrt::mono_ms()
+        .saturating_add(ISOLATE_PIPE_CLOSE_FLUSH_TIMEOUT.as_millis() as u64);
+    enum Wait {
+        Sent(PipeSendOutcome),
         Shutdown,
     }
-    let _ = crate::asyncrt::timeout(ISOLATE_PIPE_CLOSE_FLUSH_TIMEOUT, async {
+    // Borrowed phase by phase: the future stays owned here so the shutdown
+    // phase can keep polling the same send after the first phase ends.
+    let first = crate::asyncrt::timeout_at(deadline_ms, async {
         crate::asyncrt::select! {
-            _ = send_head => Settle::Sent,
-            _ = shutdown.changed() => Settle::Shutdown,
+            outcome = send_head.as_mut() => Wait::Sent(outcome),
+            _ = shutdown.changed() => Wait::Shutdown,
         }
     })
     .await;
-}
+    match first {
+        Ok(Wait::Sent(outcome)) => (SettleOutcome::Done(outcome, bytes), *shutdown.borrow()),
+        Ok(Wait::Shutdown) => match crate::asyncrt::timeout_at(deadline_ms, send_head).await {
+            Ok(outcome) => (SettleOutcome::Done(outcome, bytes), true),
+            Err(_) => (SettleOutcome::Expired, true),
+        },
+        Err(_) => (SettleOutcome::Expired, *shutdown.borrow()),
+    }
+ }
 
 /// One direction of a WebSocket pipe: data frames staged from `from` cross
 /// into the sink one at a time, in channel order.
@@ -191,32 +223,30 @@ where
             // bound. A parked send owns the head frame — it was popped when
             // the send was created — so settle it under the same progress
             // bound first instead of dropping it: dropping it would lose the
-            // head with the closing pipe.
-            if let Some((send_head, bytes)) = sending.take() {
-                enum Settle {
-                    Sent(PipeSendOutcome),
-                    Shutdown,
+            // head with the closing pipe. A shutdown mid-settle keeps the
+            // send alive for the remainder of the bound; the flush then
+            // stops at the frame boundary instead of starting the next
+            // queued frame.
+            let (settled, shutdown_seen) = settle_parked_send(&mut sending, &mut shutdown).await;
+            match settled {
+                SettleOutcome::Done(PipeSendOutcome::Sent, bytes) => {
+                    staged_bytes = staged_bytes.saturating_sub(bytes);
                 }
-                let outcome = crate::asyncrt::timeout(ISOLATE_PIPE_CLOSE_FLUSH_TIMEOUT, async {
-                    crate::asyncrt::select! {
-                        outcome = send_head => Settle::Sent(outcome),
-                        _ = shutdown.changed() => Settle::Shutdown,
-                    }
-                })
-                .await;
-                match outcome {
-                    Ok(Settle::Sent(PipeSendOutcome::Sent)) => {
-                        staged_bytes = staged_bytes.saturating_sub(bytes);
-                    }
-                    Ok(Settle::Sent(PipeSendOutcome::Gone)) | Ok(Settle::Shutdown) => {
-                        return (PipeDirectionEnd::Retired, from);
-                    }
-                    Err(_) => {
-                        let (code, reason) =
-                            pending_close.take().expect("close pending while flushing");
-                        return (PipeDirectionEnd::Close(code, reason), from);
-                    }
+                SettleOutcome::Done(PipeSendOutcome::Gone, _) => {
+                    return (PipeDirectionEnd::Retired, from);
                 }
+                SettleOutcome::Expired if shutdown_seen => {
+                    return (PipeDirectionEnd::Retired, from);
+                }
+                SettleOutcome::Expired => {
+                    let (code, reason) =
+                        pending_close.take().expect("close pending while flushing");
+                    return (PipeDirectionEnd::Close(code, reason), from);
+                }
+                SettleOutcome::Idle => {}
+            }
+            if shutdown_seen {
+                return (PipeDirectionEnd::Retired, from);
             }
             // Eagerly stage whatever arrived, still under the cap. The other
             // direction shutting down ends the flush instead of draining it.
@@ -252,30 +282,34 @@ where
                 let (code, reason) = pending_close.take().expect("close pending while flushing");
                 return (PipeDirectionEnd::Close(code, reason), from);
             };
+            // Park the head as the direction's send and settle it: a shutdown
+            // mid-send keeps the same send alive for the remainder of the
+            // bound instead of dropping it mid-frame, and the flush then
+            // stops instead of starting the next queued frame.
             let bytes = ws_out_bytes(&head);
-            enum FlushWait {
-                Sent(PipeSendOutcome),
-                Shutdown,
-            }
-            let outcome = crate::asyncrt::timeout(ISOLATE_PIPE_CLOSE_FLUSH_TIMEOUT, async {
-                crate::asyncrt::select! {
-                    outcome = send(head) => FlushWait::Sent(outcome),
-                    _ = shutdown.changed() => FlushWait::Shutdown,
-                }
-            })
-            .await;
-            match outcome {
-                Ok(FlushWait::Sent(PipeSendOutcome::Sent)) => {
+            sending = Some((Box::pin(send(head)), bytes));
+            let (settled, shutdown_seen) = settle_parked_send(&mut sending, &mut shutdown).await;
+            match settled {
+                SettleOutcome::Done(PipeSendOutcome::Sent, bytes) => {
                     staged_bytes = staged_bytes.saturating_sub(bytes);
                 }
-                Ok(FlushWait::Sent(PipeSendOutcome::Gone)) | Ok(FlushWait::Shutdown) => {
+                SettleOutcome::Done(PipeSendOutcome::Gone, _) => {
                     return (PipeDirectionEnd::Retired, from);
                 }
-                Err(_) => {
+                SettleOutcome::Expired if shutdown_seen => {
+                    return (PipeDirectionEnd::Retired, from);
+                }
+                SettleOutcome::Expired => {
                     let (code, reason) =
                         pending_close.take().expect("close pending while flushing");
                     return (PipeDirectionEnd::Close(code, reason), from);
                 }
+                SettleOutcome::Idle => {
+                    return (PipeDirectionEnd::Retired, from);
+                }
+            }
+            if shutdown_seen {
+                return (PipeDirectionEnd::Retired, from);
             }
             continue;
         }
@@ -317,14 +351,16 @@ where
                     // frame: settle it under the closing progress bound
                     // instead of tearing it ahead of the terminal the
                     // teardown reports. The end stands either way.
-                    settle_parked_send(&mut sending, &mut shutdown).await;
+                    let _ = settle_parked_send(&mut sending, &mut shutdown).await;
                     return (end, from);
                 }
             }
             _ = shutdown.changed() => {
                 // Same settle on the shutdown path: the other direction
-                // ending must not tear a live peer's in-flight frame.
-                settle_parked_send(&mut sending, &mut shutdown).await;
+                // ending must not tear a live peer's in-flight frame. The
+                // settle keeps the send alive for the remainder of the
+                // bound even after the shutdown lands.
+                let _ = settle_parked_send(&mut sending, &mut shutdown).await;
                 return (PipeDirectionEnd::Retired, from);
             }
             outcome = async {
@@ -556,6 +592,40 @@ mod tests {
         }
     }
 
+    /// A bounded test sink that counts every poll of its send futures. The
+    /// direction under test runs on a single-threaded runtime, so each test
+    /// yield runs it to pending — but `yield_now` alone cannot prove the
+    /// direction processed a queued trigger before the test frees the sink:
+    /// a freed sink lets the parked send complete on its own, and the test
+    /// passes even with the settlement removed. Spinning until the poll
+    /// count advances past its baseline (or the direction finishes) is the
+    /// barrier: only the direction polling the parked send — receiving the
+    /// trigger and entering settlement — advances it.
+    fn counting_test_sink(
+        tx: tokio::sync::mpsc::Sender<WsOut>,
+        polls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) -> impl FnMut(WsOut) -> std::pin::Pin<Box<dyn Future<Output = PipeSendOutcome> + Send + 'static>>
+    {
+        use std::sync::atomic::Ordering;
+        move |frame| {
+            let tx = tx.clone();
+            let polls = polls.clone();
+            Box::pin(async move {
+                // One boxed send per frame: settlement re-polls the same
+                // parked future it took over, so the count advances exactly
+                // when the direction receives the trigger and settles it.
+                let mut send = Box::pin(tx.send(frame));
+                std::future::poll_fn(|context| {
+                    polls.fetch_add(1, Ordering::SeqCst);
+                    send.as_mut().poll(context)
+                })
+                .await
+                .map(|_| PipeSendOutcome::Sent)
+                .unwrap_or(PipeSendOutcome::Gone)
+            })
+        }
+    }
+
     /// A close that arrives while a sink send is parked waits behind the
     /// parked frame even when the queue itself just drained: the parked
     /// frame still crosses first, then the close ends the direction. Without
@@ -738,8 +808,8 @@ mod tests {
     /// 1011 the teardown writes. Dropping the parked send (the pre-fix
     /// behavior) loses the head frame, so the drain finds a closed sink and
     /// this fails before the fix. Deterministic without sleeps: the
-    /// direction runs on a single-threaded runtime, so each yield runs it to
-    /// pending, and the test frees the sink only after the marker was
+    /// direction runs on a single-threaded runtime, and the test frees the
+    /// sink only after the poll-count barrier proves the marker was
     /// processed — no scheduling can free it first.
     #[test]
     fn overload_settles_parked_send_before_over_limit() {
@@ -766,27 +836,34 @@ mod tests {
             // `asyncrt::spawn` would run the direction on the shared
             // multi-thread runtime and lose the exact scheduling control
             // the yields below rely on.
+            let polls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let direction = runtime.spawn(forward_pipe_direction(
                 from,
-                boxed_test_sink(sink_tx),
+                counting_test_sink(sink_tx, polls.clone()),
                 shutdown,
                 WsPipeBudget::new(ISOLATE_PIPE_MAX_STAGED_BYTES),
             ));
-            // One yield runs the direction to pending: the head send is
-            // parked on the pre-filled sink, so the direction cannot have
-            // finished — and a single-threaded yield cannot return before
-            // every ready task ran to pending.
-            tokio::task::yield_now().await;
+            // The barrier: spin until the direction parks its head send.
+            // Only the direction polling the parked send advances the
+            // count, so leaving zero proves it is parked — a fixed number
+            // of yields cannot prove that.
+            while polls.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
             assert!(
                 !direction.is_finished(),
                 "the parked send must hold the direction"
             );
             tx.send(WsOut::Overload).expect("stage marker");
-            // Yields run the direction through the marker: without the
-            // settle it returns at once and drops the parked send, while
-            // the settle parks in the closing bound until the drain below
-            // frees the sink.
-            for _ in 0..5 {
+            // Spin until the count advances past the baseline or the
+            // direction finishes: advancing proves the direction received
+            // the marker and entered settlement before the test frees the
+            // sink below. Without the settle the direction returns at once
+            // and drops the parked send, so the drain finds a closed sink.
+            let parked = polls.load(std::sync::atomic::Ordering::SeqCst);
+            while polls.load(std::sync::atomic::Ordering::SeqCst) <= parked
+                && !direction.is_finished()
+            {
                 tokio::task::yield_now().await;
             }
             // Free the sink only now, after the marker was processed: the
@@ -821,9 +898,9 @@ mod tests {
     /// of `OverLimit`. Without the settle the shutdown drops the parked
     /// send, so the drain finds a closed sink and this fails before the fix.
     /// Deterministic without sleeps: the direction runs on a
-    /// single-threaded runtime, so each yield runs it to pending, and the
-    /// test frees the sink only after the shutdown was processed — no
-    /// scheduling can free it first.
+    /// single-threaded runtime, and the test frees the sink only after the
+    /// poll-count barrier proves the shutdown was processed — no scheduling
+    /// can free it first.
     #[test]
     fn shutdown_settles_parked_send_before_retire() {
         // The closing bound reads the process domain clock; the direction
@@ -844,27 +921,36 @@ mod tests {
             tx.send(WsOut::Text("head".into())).expect("stage data");
             let (shutdown_tx, shutdown) = tokio::sync::watch::channel(false);
             // Onto this test's own runtime, not the process domain: the
-            // yields below rely on single-threaded scheduling.
+            // spins below rely on single-threaded scheduling.
+            let polls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let direction = runtime.spawn(forward_pipe_direction(
                 from,
-                boxed_test_sink(sink_tx),
+                counting_test_sink(sink_tx, polls.clone()),
                 shutdown,
                 WsPipeBudget::new(ISOLATE_PIPE_MAX_STAGED_BYTES),
             ));
-            // One yield runs the direction to pending: the head send is
-            // parked on the pre-filled sink, so the direction cannot have
-            // finished.
-            tokio::task::yield_now().await;
+            // The barrier: spin until the direction parks its head send.
+            // Only the direction polling the parked send advances the
+            // count, so leaving zero proves it is parked — a fixed number
+            // of yields cannot prove that.
+            while polls.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
             assert!(
                 !direction.is_finished(),
                 "the parked send must hold the direction"
             );
             shutdown_tx.send(true).expect("the other direction ended");
-            // Yields run the direction through the shutdown: without the
-            // settle it returns at once and drops the parked send, while
-            // the settle parks in the closing bound until the drain below
-            // frees the sink.
-            for _ in 0..5 {
+            // Spin until the count advances past the baseline or the
+            // direction finishes: advancing proves the direction observed
+            // the shutdown and entered settlement — the settle keeps the
+            // same send alive for the remainder of the bound instead of
+            // dropping it. Without the settle the direction returns at once
+            // and drops the parked send, so the drain finds a closed sink.
+            let parked = polls.load(std::sync::atomic::Ordering::SeqCst);
+            while polls.load(std::sync::atomic::Ordering::SeqCst) <= parked
+                && !direction.is_finished()
+            {
                 tokio::task::yield_now().await;
             }
             // Free the sink only now, after the shutdown was processed: the
@@ -878,6 +964,99 @@ mod tests {
             assert!(
                 matches!(end, PipeDirectionEnd::Retired),
                 "shutdown during a parked send retires the direction, got {end:?}"
+            );
+            let mut texts = Vec::new();
+            for frame in seen {
+                match frame {
+                    WsOut::Text(text) => texts.push(text),
+                    _ => panic!("data frames cross before the retire"),
+                }
+            }
+            assert_eq!(
+                texts,
+                vec!["pre".to_string(), "head".to_string()],
+                "the parked frame crosses whole before the retire"
+            );
+        });
+    }
+
+    /// A shutdown that lands while the close flush settles a parked send
+    /// keeps the same send alive for the remainder of the progress bound
+    /// instead of dropping it: the flush then stops at the frame boundary
+    /// instead of starting the next queued frame. Dropping the send (the
+    /// pre-fix behavior) loses the head frame with the closing pipe, so the
+    /// drain finds a closed sink and this fails before the fix — and in the
+    /// socket pump the dropped send would leave a partial frame ahead of the
+    /// peer-close response. Deterministic without sleeps: the poll-count
+    /// barrier proves the close was processed and the shutdown was observed
+    /// before the test frees the sink.
+    #[test]
+    fn close_flush_settle_survives_shutdown() {
+        // The closing bound reads the process domain clock; the direction
+        // itself runs on a single-threaded runtime below for exact
+        // scheduling control.
+        let _ = crate::asyncrt::shared_test_runtime();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime builds");
+        runtime.block_on(async {
+            use std::sync::atomic::Ordering;
+            let (sink_tx, mut sink_rx) = tokio::sync::mpsc::channel(1);
+            sink_tx
+                .send(WsOut::Text("pre".into()))
+                .await
+                .expect("pre-fill the sink");
+            let (tx, from) = tokio::sync::mpsc::unbounded_channel();
+            tx.send(WsOut::Text("head".into())).expect("stage data");
+            let (shutdown_tx, shutdown) = tokio::sync::watch::channel(false);
+            let polls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            // Onto this test's own runtime, not the process domain: the
+            // spins below rely on single-threaded scheduling.
+            let direction = runtime.spawn(forward_pipe_direction(
+                from,
+                counting_test_sink(sink_tx, polls.clone()),
+                shutdown,
+                WsPipeBudget::new(ISOLATE_PIPE_MAX_STAGED_BYTES),
+            ));
+            // Spin until the direction parks its head send.
+            while polls.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+            assert!(
+                !direction.is_finished(),
+                "the parked send must hold the direction"
+            );
+            tx.send(WsOut::Close(1000, "done".into()))
+                .expect("stage close");
+            // Spin until the close is processed: the count advances when the
+            // direction re-polls the parked send and enters the flush settle.
+            let parked = polls.load(Ordering::SeqCst);
+            while polls.load(Ordering::SeqCst) <= parked && !direction.is_finished() {
+                tokio::task::yield_now().await;
+            }
+            assert!(
+                !direction.is_finished(),
+                "the flush settle must outlive the closing bound, not the test"
+            );
+            shutdown_tx.send(true).expect("the other direction ended");
+            // Spin until the shutdown is observed or the direction finishes:
+            // observing keeps the same send alive for the remainder of the
+            // bound, so the count advances; dropping it returns at once.
+            let settling = polls.load(Ordering::SeqCst);
+            while polls.load(Ordering::SeqCst) <= settling && !direction.is_finished() {
+                tokio::task::yield_now().await;
+            }
+            // Free the sink only now: the settle completes the parked send,
+            // while the pre-fix return left a closed sink behind.
+            let mut seen = Vec::new();
+            for _ in 0..2 {
+                seen.push(sink_rx.recv().await.expect("sink drains in order"));
+            }
+            let (end, _from) = direction.await.expect("direction joins");
+            assert!(
+                matches!(end, PipeDirectionEnd::Retired),
+                "shutdown during the close flush retires the direction, got {end:?}"
             );
             let mut texts = Vec::new();
             for frame in seen {
