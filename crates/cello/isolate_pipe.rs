@@ -91,9 +91,9 @@ fn stage_pipe_frame(
         // itself stays in channel order behind everything admitted ahead of
         // it, so either overload trigger reaches the same teardown. Queued
         // frames drop, exactly as past the staged cap.
-        Some(WsOut::Overload) => return Some(PipeDirectionEnd::OverLimit),
+        Some(WsOut::Overload) => Some(PipeDirectionEnd::OverLimit),
         // The socket's request retired and took its socket with it.
-        None => return Some(PipeDirectionEnd::Retired),
+        None => Some(PipeDirectionEnd::Retired),
     }
 }
 
@@ -782,7 +782,11 @@ mod tests {
             let (tx, from) = tokio::sync::mpsc::unbounded_channel();
             tx.send(WsOut::Text("head".into())).expect("stage data");
             let (_shutdown_tx, shutdown) = tokio::sync::watch::channel(false);
-            let direction = tokio::spawn(forward_pipe_direction(
+            // Onto this test's own runtime, not the process domain:
+            // `asyncrt::spawn` would run the direction on the shared
+            // multi-thread runtime and lose the exact scheduling control
+            // the yields below rely on.
+            let direction = runtime.spawn(forward_pipe_direction(
                 from,
                 boxed_test_sink(sink_tx),
                 shutdown,
@@ -859,7 +863,9 @@ mod tests {
             let (tx, from) = tokio::sync::mpsc::unbounded_channel();
             tx.send(WsOut::Text("head".into())).expect("stage data");
             let (shutdown_tx, shutdown) = tokio::sync::watch::channel(false);
-            let direction = tokio::spawn(forward_pipe_direction(
+            // Onto this test's own runtime, not the process domain: the
+            // yields below rely on single-threaded scheduling.
+            let direction = runtime.spawn(forward_pipe_direction(
                 from,
                 boxed_test_sink(sink_tx),
                 shutdown,
