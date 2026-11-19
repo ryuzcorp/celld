@@ -1611,6 +1611,11 @@ fn with_batch_savepoint<T>(
     })
 }
 
+/// The blob key in bound-parameter JSON. celld spelled it `__celld_bytes`;
+/// payloads it captured still decode (read-both, write-new).
+const BYTES_KEY: &str = "__cello_bytes";
+const LEGACY_BYTES_KEY: &str = "__celld_bytes";
+
 pub(crate) fn json_to_sql(v: &serde_json::Value) -> rusqlite::types::Value {
     use rusqlite::types::Value;
     match v {
@@ -1619,9 +1624,12 @@ pub(crate) fn json_to_sql(v: &serde_json::Value) -> rusqlite::types::Value {
         serde_json::Value::Number(n) if n.is_i64() => Value::Integer(n.as_i64().unwrap()),
         serde_json::Value::Number(n) => Value::Real(n.as_f64().unwrap_or(0.0)),
         serde_json::Value::String(s) => Value::Text(s.clone()),
-        serde_json::Value::Object(o) if o.contains_key("__cello_bytes") => {
+        serde_json::Value::Object(o)
+            if o.contains_key(BYTES_KEY) || o.contains_key(LEGACY_BYTES_KEY) =>
+        {
             let bytes = o
-                .get("__cello_bytes")
+                .get(BYTES_KEY)
+                .or_else(|| o.get(LEGACY_BYTES_KEY))
                 .and_then(|v| v.as_array())
                 .map(|values| {
                     values
@@ -1649,7 +1657,7 @@ fn vref_to_json(v: rusqlite::types::ValueRef) -> serde_json::Value {
         ValueRef::Integer(i) => serde_json::json!(i),
         ValueRef::Real(f) => serde_json::json!(f),
         ValueRef::Text(bytes) => serde_json::Value::String(sql_text(bytes)),
-        ValueRef::Blob(b) => serde_json::json!({ "__cello_bytes": b }),
+        ValueRef::Blob(b) => serde_json::json!({ BYTES_KEY: b }),
     }
 }
 
@@ -7760,5 +7768,19 @@ mod statement_timeout_tests {
             "an expired read keeps the rollback message, got: {error}"
         );
         restore_statement_timeout(previous);
+    }
+}
+
+#[cfg(test)]
+mod bytes_key_tests {
+    use super::*;
+
+    #[test]
+    fn blob_json_decodes_under_both_spellings() {
+        use rusqlite::types::Value;
+        for key in [BYTES_KEY, LEGACY_BYTES_KEY] {
+            let v = serde_json::json!({ key: [1, 2, 255] });
+            assert_eq!(json_to_sql(&v), Value::Blob(vec![1, 2, 255]), "{key}");
+        }
     }
 }
