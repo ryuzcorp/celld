@@ -1,12 +1,16 @@
-// One direction of the isolate-to-isolate WebSocket pipe: frames read from
-// one socket's output channel cross into the other socket's pull queue.
+use std::future::Future;
+
+// One direction of a WebSocket pipe: frames read from one socket's output
+// channel cross into the other end's sink.
 //
-// Staged bytes one pipe direction may hold upstream of the pull queue.
+// Staged bytes one pipe direction may hold upstream of its sink.
 //
 // The direction's channel and its staged queue are both unbounded, so a
 // flood into a peer that never reads would otherwise grow host memory
 // without bound. Well above legitimate bursts (the `/flood-close` test
-// stages ~3 MiB) and still a hard bound per stuck pipe.
+// stages ~3 MiB) and still a hard bound per stuck pipe. Every pipe
+// direction shares it: the isolate-to-isolate pipe, the cell pipe, and the
+// producer budgets behind the upgrade pump (see `ws_registry::WsPipeBudget`).
 pub const ISOLATE_PIPE_MAX_STAGED_BYTES: usize = 16 * 1024 * 1024;
 
 /// How long a closing flush waits for the peer to make progress before it
@@ -17,26 +21,26 @@ pub const ISOLATE_PIPE_MAX_STAGED_BYTES: usize = 16 * 1024 * 1024;
 /// close timeout.
 const ISOLATE_PIPE_CLOSE_FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// How one direction of the isolate-to-isolate pipe ended.
+/// How one direction of a WebSocket pipe ended.
 #[derive(Debug)]
-pub enum IsolateDirectionEnd {
+pub enum PipeDirectionEnd {
     /// The side sent a close frame; the teardown delivers it.
     Close(u16, String),
-    /// The staged frames passed the cap; the teardown closes both ends loudly.
+    /// The staged frames passed the cap, or an admission refusal queued the
+    /// overload marker; the teardown closes both ends loudly.
     OverLimit,
-    /// The socket retired, or its queue went away: fail-closed, no terminal.
+    /// The socket retired, the sink went away, or the other direction shut
+    /// the pipe down: fail-closed, no terminal.
     Retired,
 }
 
-/// One frame's staged bytes, charged the way the pull queue charges them.
-fn isolate_staged_bytes(frame: &crate::js::WsPull) -> usize {
-    let payload = match frame {
-        crate::js::WsPull::Text(text) => text.len(),
-        crate::js::WsPull::Open(protocol) => protocol.len(),
-        crate::js::WsPull::Binary(bytes) => bytes.len(),
-        crate::js::WsPull::Close(_, reason, _) => reason.len(),
-    };
-    std::mem::size_of::<crate::js::WsPull>().saturating_add(payload)
+/// What one sink send attempt did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PipeSendOutcome {
+    /// The frame reached the sink; the direction keeps forwarding.
+    Sent,
+    /// The sink is gone; the direction ends retired, fail-closed.
+    Gone,
 }
 
 /// Buffer one received frame, accounting its bytes and releasing the
@@ -47,45 +51,269 @@ fn isolate_staged_bytes(frame: &crate::js::WsPull) -> usize {
 /// direction reports it only after the flush below delivers everything ahead
 /// of it. First close wins; anything later is dropped with the closing
 /// pipe. Overload ends immediately either way, like the staged cap.
-fn stage_isolate_frame(
+///
+/// `busy` is whether a send is still parked: a close that arrives while one
+/// is must wait behind it even when the queue itself just drained, or the
+/// parked frame would be dropped with the closing pipe.
+fn stage_pipe_frame(
     frame: Option<crate::js::WsOut>,
-    queued: &mut std::collections::VecDeque<crate::js::WsPull>,
+    queued: &mut std::collections::VecDeque<crate::js::WsOut>,
     staged_bytes: &mut usize,
     budget: &crate::js::WsPipeBudget,
     pending_close: &mut Option<(u16, String)>,
-) -> Option<IsolateDirectionEnd> {
-    use crate::js::{WsOut, WsPull};
+    busy: bool,
+) -> Option<PipeDirectionEnd> {
+    use crate::js::{ws_out_bytes, WsOut};
     if let Some(data) = frame.as_ref() {
         match data {
-            WsOut::Text(_) | WsOut::Binary(_) => budget.release(crate::js::ws_out_bytes(data)),
+            WsOut::Text(_) | WsOut::Binary(_) => budget.release(ws_out_bytes(data)),
             WsOut::Close(..) | WsOut::Overload => {}
         }
     }
-    let data = match frame {
-        Some(WsOut::Text(text)) => WsPull::Text(text),
-        Some(WsOut::Binary(bytes)) => WsPull::Binary(bytes),
+    match frame {
+        Some(data @ (WsOut::Text(_) | WsOut::Binary(_))) => {
+            *staged_bytes = staged_bytes.saturating_add(ws_out_bytes(&data));
+            queued.push_back(data);
+            if *staged_bytes > ISOLATE_PIPE_MAX_STAGED_BYTES {
+                return Some(PipeDirectionEnd::OverLimit);
+            }
+            None
+        }
         Some(WsOut::Close(code, reason)) => {
-            if queued.is_empty() && pending_close.is_none() {
-                return Some(IsolateDirectionEnd::Close(code, reason));
+            if queued.is_empty() && pending_close.is_none() && !busy {
+                return Some(PipeDirectionEnd::Close(code, reason));
             }
             pending_close.get_or_insert((code, reason));
-            return None;
+            None
         }
         // An admission refusal queued behind the admitted data: like the
         // staged cap it ends the direction loudly, immediately — the marker
         // itself stays in channel order behind everything admitted ahead of
         // it, so either overload trigger reaches the same teardown. Queued
         // frames drop, exactly as past the staged cap.
-        Some(WsOut::Overload) => return Some(IsolateDirectionEnd::OverLimit),
+        Some(WsOut::Overload) => return Some(PipeDirectionEnd::OverLimit),
         // The socket's request retired and took its socket with it.
-        None => return Some(IsolateDirectionEnd::Retired),
-    };
-    *staged_bytes = staged_bytes.saturating_add(isolate_staged_bytes(&data));
-    queued.push_back(data);
-    if *staged_bytes > ISOLATE_PIPE_MAX_STAGED_BYTES {
-        return Some(IsolateDirectionEnd::OverLimit);
+        None => return Some(PipeDirectionEnd::Retired),
     }
-    None
+}
+
+/// One direction of a WebSocket pipe: data frames staged from `from` cross
+/// into the sink one at a time, in channel order.
+///
+/// `send` runs only for data frames (`WsOut::Text`/`WsOut::Binary`): closes,
+/// overload markers, and retirements end the direction instead of reaching
+/// it, so a sink that names every `WsOut` variant still never sees one it
+/// cannot handle, and no task panics on an unexpected variant. The parked
+/// send owns no frame the loop has to keep — `send` takes the frame by
+/// value — so the loop keeps receiving, and keeps observing closes,
+/// retirements, and the shutdown signal, while it waits.
+///
+/// A close behind queued frames waits for the flush instead of dropping it,
+/// but the flush only moves while the peer can make progress: each
+/// forwarded frame restarts the progress wait, so a slow but live peer
+/// still drains fully, while a peer that stopped reading ends the pipe with
+/// the pending close instead of blocking closure indefinitely. The flush
+/// also watches the pipe shutdown, so the other direction ending still tears
+/// down promptly instead of draining through one progress interval per
+/// queued frame.
+///
+/// Staged frames are accounted against [`ISOLATE_PIPE_MAX_STAGED_BYTES`]:
+/// past the cap the direction reports [`PipeDirectionEnd::OverLimit`] so
+/// the teardown closes both ends loudly instead of growing host memory
+/// without bound behind a peer that never reads.
+pub async fn forward_pipe_direction<SendFn, SendFut>(
+    mut from: tokio::sync::mpsc::UnboundedReceiver<crate::js::WsOut>,
+    mut send: SendFn,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+    budget: crate::js::WsPipeBudget,
+) -> (
+    PipeDirectionEnd,
+    tokio::sync::mpsc::UnboundedReceiver<crate::js::WsOut>,
+)
+where
+    SendFn: FnMut(crate::js::WsOut) -> SendFut,
+    SendFut: Future<Output = PipeSendOutcome>,
+{
+    use crate::js::{ws_out_bytes, WsOut};
+    let mut queued: std::collections::VecDeque<WsOut> = std::collections::VecDeque::new();
+    // Bytes staged upstream of the sink. Added on stage, released when a
+    // send completes for the head frame.
+    let mut staged_bytes: usize = 0;
+    // A parked sink send with the head frame's staged bytes: stored rather
+    // than awaited so the loop keeps receiving while it is pending.
+    // Re-polling a parked send is cancel-safe, and dropping it ends the
+    // pipe, so nothing already delivered is lost.
+    let mut sending: Option<(
+        std::pin::Pin<Box<SendFut>>,
+        usize,
+    )> = None;
+    // A close waiting behind flushed frames. Set instead of returned while
+    // anything remains to flush; delivered once the queue drains.
+    let mut pending_close: Option<(u16, String)> = None;
+    loop {
+        if pending_close.is_some() {
+            // A close is waiting behind flushed frames: forward while the
+            // peer can make progress, and never park behind it without a
+            // bound. A parked send owns the head frame — it was popped when
+            // the send was created — so settle it under the same progress
+            // bound first instead of dropping it: dropping it would lose the
+            // head with the closing pipe.
+            if let Some((send_head, bytes)) = sending.take() {
+                enum Settle {
+                    Sent(PipeSendOutcome),
+                    Shutdown,
+                }
+                let outcome = crate::asyncrt::timeout(
+                    ISOLATE_PIPE_CLOSE_FLUSH_TIMEOUT,
+                    async {
+                        crate::asyncrt::select! {
+                            outcome = send_head => Settle::Sent(outcome),
+                            _ = shutdown.changed() => Settle::Shutdown,
+                        }
+                    },
+                )
+                .await;
+                match outcome {
+                    Ok(Settle::Sent(PipeSendOutcome::Sent)) => {
+                        staged_bytes = staged_bytes.saturating_sub(bytes);
+                    }
+                    Ok(Settle::Sent(PipeSendOutcome::Gone))
+                    | Ok(Settle::Shutdown) => {
+                        return (PipeDirectionEnd::Retired, from);
+                    }
+                    Err(_) => {
+                        let (code, reason) =
+                            pending_close.take().expect("close pending while flushing");
+                        return (PipeDirectionEnd::Close(code, reason), from);
+                    }
+                }
+            }
+            // Eagerly stage whatever arrived, still under the cap. The other
+            // direction shutting down ends the flush instead of draining it.
+            loop {
+                if shutdown.has_changed().unwrap_or(true) {
+                    return (PipeDirectionEnd::Retired, from);
+                }
+                match from.try_recv() {
+                    Ok(frame) => {
+                        if let Some(end) = stage_pipe_frame(
+                            Some(frame),
+                            &mut queued,
+                            &mut staged_bytes,
+                            &budget,
+                            &mut pending_close,
+                            false,
+                        ) {
+                            return (end, from);
+                        }
+                    }
+                    Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                    Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                        return (PipeDirectionEnd::Retired, from);
+                    }
+                }
+            }
+            // Reserve the head with a progress bound: each forwarded frame
+            // restarts the wait, so a slow but live peer still drains fully,
+            // while a peer that stopped reading ends the pipe with the
+            // pending close instead of blocking closure indefinitely. The
+            // other direction ending wins over the wait.
+            let Some(head) = queued.pop_front() else {
+                let (code, reason) = pending_close.take().expect("close pending while flushing");
+                return (PipeDirectionEnd::Close(code, reason), from);
+            };
+            let bytes = ws_out_bytes(&head);
+            enum FlushWait {
+                Sent(PipeSendOutcome),
+                Shutdown,
+            }
+            let outcome = crate::asyncrt::timeout(
+                ISOLATE_PIPE_CLOSE_FLUSH_TIMEOUT,
+                async {
+                    crate::asyncrt::select! {
+                        outcome = send(head) => FlushWait::Sent(outcome),
+                        _ = shutdown.changed() => FlushWait::Shutdown,
+                    }
+                },
+            )
+            .await;
+            match outcome {
+                Ok(FlushWait::Sent(PipeSendOutcome::Sent)) => {
+                    staged_bytes = staged_bytes.saturating_sub(bytes);
+                }
+                Ok(FlushWait::Sent(PipeSendOutcome::Gone))
+                | Ok(FlushWait::Shutdown) => {
+                    return (PipeDirectionEnd::Retired, from);
+                }
+                Err(_) => {
+                    let (code, reason) =
+                        pending_close.take().expect("close pending while flushing");
+                    return (PipeDirectionEnd::Close(code, reason), from);
+                }
+            }
+            continue;
+        }
+        if sending.is_none() {
+            if let Some(head) = queued.pop_front() {
+                let bytes = ws_out_bytes(&head);
+                sending = Some((Box::pin(send(head)), bytes));
+            } else {
+                // Idle: wait for work or for the other direction's shutdown.
+                crate::asyncrt::select! {
+                    frame = from.recv() => {
+                        if let Some(end) = stage_pipe_frame(
+                            frame,
+                            &mut queued,
+                            &mut staged_bytes,
+                            &budget,
+                            &mut pending_close,
+                            false,
+                        ) {
+                            return (end, from);
+                        }
+                    }
+                    _ = shutdown.changed() => return (PipeDirectionEnd::Retired, from),
+                };
+                continue;
+            }
+        }
+        crate::asyncrt::select! {
+            frame = from.recv() => {
+                if let Some(end) = stage_pipe_frame(
+                    frame,
+                    &mut queued,
+                    &mut staged_bytes,
+                    &budget,
+                    &mut pending_close,
+                    true,
+                ) {
+                    return (end, from);
+                }
+            }
+            _ = shutdown.changed() => return (PipeDirectionEnd::Retired, from),
+            outcome = async {
+                sending
+                    .as_mut()
+                    .expect("send armed while forwarding")
+                    .0
+                    .as_mut()
+                    .await
+            } => {
+                let (_, bytes) = sending.take().expect("send armed while forwarding");
+                match outcome {
+                    PipeSendOutcome::Sent => {
+                        staged_bytes = staged_bytes.saturating_sub(bytes);
+                        if queued.is_empty() {
+                            if let Some((code, reason)) = pending_close.take() {
+                                return (PipeDirectionEnd::Close(code, reason), from);
+                            }
+                        }
+                    }
+                    PipeSendOutcome::Gone => return (PipeDirectionEnd::Retired, from),
+                }
+            }
+        }
+    }
 }
 
 /// One direction of the isolate-to-isolate pipe: frames read from `from`
@@ -94,149 +322,44 @@ fn stage_isolate_frame(
 /// Capacity is reserved before a frame moves, never as part of moving it:
 /// the parked reservation owns no frame, so the loop keeps receiving —
 /// and keeps observing closes, retirements, and the shutdown signal — while
-/// it waits. A close behind queued frames waits for the flush instead of
-/// dropping it, but the flush only moves while the peer can make progress:
-/// each forwarded frame restarts the progress wait, so a slow but live peer
-/// still drains fully, while a peer that stopped reading ends the pipe with
-/// the pending close instead of blocking closure indefinitely. Each
-/// direction sends one frame at a time, in channel order, so per-direction
-/// frame order is preserved.
-///
-/// Staged frames are accounted against [`ISOLATE_PIPE_MAX_STAGED_BYTES`]:
-/// past the cap the direction reports [`IsolateDirectionEnd::OverLimit`] so
-/// the teardown closes both ends loudly instead of growing host memory
-/// without bound behind a peer that never reads.
+/// it waits. See [`forward_pipe_direction`] for the shared shape.
 pub async fn forward_isolate_direction(
-    mut from: tokio::sync::mpsc::UnboundedReceiver<crate::js::WsOut>,
+    from: tokio::sync::mpsc::UnboundedReceiver<crate::js::WsOut>,
     to: crate::js::WsPullSender,
-    mut shutdown: tokio::sync::watch::Receiver<bool>,
+    shutdown: tokio::sync::watch::Receiver<bool>,
     budget: crate::js::WsPipeBudget,
-) -> IsolateDirectionEnd {
-    use crate::js::{WsPull, WsPullSender};
-    let mut queued: std::collections::VecDeque<WsPull> = std::collections::VecDeque::new();
-    // Bytes staged upstream of the pull queue. Added on stage, released when
-    // a reservation moves the head frame into the queue.
-    let mut staged_bytes: usize = 0;
-    // A parked capacity reservation: stored rather than awaited so the loop
-    // keeps receiving while it is pending. Re-polling a parked reservation
-    // is cancel-safe, and dropping it owns no frame, so nothing is lost.
-    let mut acquiring = None;
-    // A close waiting behind flushed frames. Set instead of returned while
-    // anything remains to flush; delivered once the queue drains.
-    let mut pending_close: Option<(u16, String)> = None;
-    loop {
-        if pending_close.is_some() {
-            // A close is waiting behind flushed frames: forward while the
-            // peer can make progress, and never park behind it without a
-            // bound. Drop any parked acquire first — it owns no frame, so
-            // nothing is lost.
-            acquiring = None;
-            // Eagerly stage whatever arrived, still under the cap.
-            loop {
-                match from.try_recv() {
-                    Ok(frame) => {
-                        if let Some(end) = stage_isolate_frame(
-                            Some(frame),
-                            &mut queued,
-                            &mut staged_bytes,
-                            &budget,
-                            &mut pending_close,
-                        ) {
-                            return end;
+) -> PipeDirectionEnd {
+    use crate::js::{WsOut, WsPull, WsPullSender};
+    forward_pipe_direction(
+        from,
+        move |frame| {
+            let to = to.clone();
+            async move {
+                let data = match frame {
+                    WsOut::Text(text) => WsPull::Text(text),
+                    WsOut::Binary(bytes) => WsPull::Binary(bytes),
+                    // The forwarder only sends data frames; anything else
+                    // ends the direction retired instead of panicking it.
+                    WsOut::Close(..) | WsOut::Overload => return PipeSendOutcome::Gone,
+                };
+                let bytes = WsPullSender::permit_bytes(&data);
+                match to.reserve(bytes).await {
+                    Some(permit) => {
+                        if to.send_reserved(data, permit).is_err() {
+                            PipeSendOutcome::Gone
+                        } else {
+                            PipeSendOutcome::Sent
                         }
                     }
-                    Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
-                    Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
-                        return IsolateDirectionEnd::Retired;
-                    }
+                    None => PipeSendOutcome::Gone,
                 }
             }
-            // Reserve the head with a progress bound: each forwarded frame
-            // restarts the wait, so a slow but live peer still drains fully,
-            // while a peer that stopped reading ends the pipe with the
-            // pending close instead of blocking closure indefinitely.
-            let Some(head) = queued.front() else {
-                let (code, reason) = pending_close.take().expect("close pending while flushing");
-                return IsolateDirectionEnd::Close(code, reason);
-            };
-            let bytes = WsPullSender::permit_bytes(head);
-            match crate::asyncrt::timeout(ISOLATE_PIPE_CLOSE_FLUSH_TIMEOUT, to.reserve(bytes)).await
-            {
-                Ok(Some(permit)) => {
-                    let head = queued.pop_front().expect("head staged above");
-                    staged_bytes = staged_bytes.saturating_sub(isolate_staged_bytes(&head));
-                    if to.send_reserved(head, permit).is_err() {
-                        return IsolateDirectionEnd::Retired;
-                    }
-                }
-                Ok(None) => {
-                    // The queue is gone: the terminal sender closed the
-                    // semaphore before queueing the close.
-                    return IsolateDirectionEnd::Retired;
-                }
-                Err(_) => {
-                    let (code, reason) =
-                        pending_close.take().expect("close pending while flushing");
-                    return IsolateDirectionEnd::Close(code, reason);
-                }
-            }
-            continue;
-        }
-        if acquiring.is_none() {
-            if let Some(head) = queued.front() {
-                acquiring = Some(Box::pin(to.reserve(WsPullSender::permit_bytes(head))));
-            } else {
-                // Idle: wait for work or for the other direction's shutdown.
-                crate::asyncrt::select! {
-                    frame = from.recv() => {
-                        if let Some(end) = stage_isolate_frame(
-                            frame,
-                            &mut queued,
-                            &mut staged_bytes,
-                            &budget,
-                            &mut pending_close,
-                        ) {
-                            return end;
-                        }
-                    }
-                    _ = shutdown.changed() => return IsolateDirectionEnd::Retired,
-                };
-                continue;
-            }
-        }
-        crate::asyncrt::select! {
-            frame = from.recv() => {
-                if let Some(end) = stage_isolate_frame(
-                    frame,
-                    &mut queued,
-                    &mut staged_bytes,
-                    &budget,
-                    &mut pending_close,
-                ) {
-                    return end;
-                }
-            }
-            _ = shutdown.changed() => return IsolateDirectionEnd::Retired,
-            permit = async { acquiring.as_mut().expect("acquire armed while forwarding").await } => {
-                acquiring = None;
-                let Some(permit) = permit else {
-                    // The queue is gone: the terminal sender closed the
-                    // semaphore before queueing the close.
-                    return IsolateDirectionEnd::Retired;
-                };
-                let head = queued.pop_front().expect("acquire reserved the head frame");
-                staged_bytes = staged_bytes.saturating_sub(isolate_staged_bytes(&head));
-                if to.send_reserved(head, permit).is_err() {
-                    return IsolateDirectionEnd::Retired;
-                }
-                if queued.is_empty() {
-                    if let Some((code, reason)) = pending_close.take() {
-                        return IsolateDirectionEnd::Close(code, reason);
-                    }
-                }
-            }
-        }
-    }
+        },
+        shutdown,
+        budget,
+    )
+    .await
+    .0
 }
 
 #[cfg(test)]
@@ -295,7 +418,7 @@ mod tests {
             assert_eq!(binary_tag(&first), 1, "frames keep channel order");
             let end = direction.await.expect("direction joins");
             match end {
-                IsolateDirectionEnd::Close(code, reason) => {
+                PipeDirectionEnd::Close(code, reason) => {
                     assert_eq!(code, 1000, "the pending close is delivered");
                     assert_eq!(reason, "done", "the pending close keeps its reason");
                     // The pipe teardown queues the reported terminal; it must
@@ -340,7 +463,7 @@ mod tests {
                 )
                 .await;
                 assert!(
-                    matches!(end, IsolateDirectionEnd::OverLimit),
+                    matches!(end, PipeDirectionEnd::OverLimit),
                     "{direction} direction: the refusal marker must end OverLimit, got {end:?}"
                 );
             }
@@ -369,10 +492,214 @@ mod tests {
                 )
                 .await;
                 assert!(
-                    matches!(end, IsolateDirectionEnd::OverLimit),
+                    matches!(end, PipeDirectionEnd::OverLimit),
                     "{direction} direction: staged flood must end OverLimit, got {end:?}"
                 );
             }
+        });
+    }
+
+    /// A bounded test sink: one frame of capacity, drained by the test. A
+    /// send parks while it is full, like a pull-queue reservation behind a
+    /// peer that stopped reading — and the parked send must not blind the
+    /// direction to the close queued behind it. Boxed: the closure type is
+    /// unnameable, so a nested `impl Future` return is not expressible.
+    fn boxed_test_sink(
+        tx: tokio::sync::mpsc::Sender<WsOut>,
+    ) -> impl FnMut(WsOut) -> std::pin::Pin<Box<dyn Future<Output = PipeSendOutcome> + Send + 'static>>
+    {
+        move |frame| {
+            let tx = tx.clone();
+            Box::pin(async move {
+                if tx.send(frame).await.is_err() {
+                    PipeSendOutcome::Gone
+                } else {
+                    PipeSendOutcome::Sent
+                }
+            })
+        }
+    }
+
+    /// A close that arrives while a sink send is parked waits behind the
+    /// parked frame even when the queue itself just drained: the parked
+    /// frame still crosses first, then the close ends the direction. Without
+    /// the parked-send check the close returns at once and drops both data
+    /// frames — only the pre-fill ever reaches the sink — so the concurrent
+    /// drain finds a closed sink and this fails before the fix with no
+    /// sleeps or timeouts.
+    #[test]
+    fn parked_send_still_observes_close_in_order() {
+        let runtime = crate::asyncrt::shared_test_runtime();
+        runtime.block_on(async {
+            let (sink_tx, mut sink_rx) = tokio::sync::mpsc::channel(1);
+            // Fill the sink before the direction starts, so the first
+            // forward parks with the queue empty behind it.
+            sink_tx
+                .send(WsOut::Text("pre".into()))
+                .await
+                .expect("pre-fill the sink");
+            let (tx, from) = tokio::sync::mpsc::unbounded_channel();
+            tx.send(WsOut::Text("a".into())).expect("stage first");
+            tx.send(WsOut::Text("b".into())).expect("stage second");
+            tx.send(WsOut::Close(1000, "done".into()))
+                .expect("stage close");
+            let (_shutdown_tx, shutdown) = tokio::sync::watch::channel(false);
+            let direction = crate::asyncrt::spawn(forward_pipe_direction(
+                from,
+                boxed_test_sink(sink_tx),
+                shutdown,
+                WsPipeBudget::new(ISOLATE_PIPE_MAX_STAGED_BYTES),
+            ));
+            // Drain concurrently: the flush parks its second forward until
+            // the test consumes the first, so awaiting the direction before
+            // draining would park the test against the direction. Without the
+            // parked-send check the close returns at once and drops both data
+            // frames, so the drain finds a closed sink and this fails before
+            // the fix with no sleeps or timeouts.
+            let drain = crate::asyncrt::spawn(async move {
+                let mut seen = Vec::new();
+                for _ in 0..3 {
+                    seen.push(sink_rx.recv().await.expect("sink drains in order"));
+                }
+                seen
+            });
+            let (end, _from) = direction.await.expect("direction joins");
+            assert!(
+                matches!(end, PipeDirectionEnd::Close(1000, _)),
+                "the pending close ends the direction, got {end:?}"
+            );
+            let seen = drain.await.expect("drain joins");
+            let mut texts = Vec::new();
+            for frame in seen {
+                match frame {
+                    WsOut::Text(text) => texts.push(text),
+                    _ => panic!("data frames cross before the close"),
+                }
+            }
+            assert_eq!(
+                texts,
+                vec!["pre".to_string(), "a".to_string(), "b".to_string()],
+                "the parked frame and the queued frame cross before the close"
+            );
+        });
+    }
+
+    /// The closing flush watches the pipe shutdown: the other direction
+    /// ending retires a flush parked behind a peer that never reads, instead
+    /// of draining through one progress interval per queued frame. The gate
+    /// holds the first forward until both data frames and the close are
+    /// staged — observed through the producer budget draining to zero, not
+    /// through timing — so the shutdown deterministically lands in the flush.
+    /// Without the shutdown arm the direction only returns the pending close
+    /// after the progress bound expires, so this fails before the fix.
+    #[test]
+    fn closing_flush_observes_shutdown() {
+        let runtime = crate::asyncrt::shared_test_runtime();
+        runtime.block_on(async {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            let budget = WsPipeBudget::new(ISOLATE_PIPE_MAX_STAGED_BYTES);
+            let (tx, from) = tokio::sync::mpsc::unbounded_channel();
+            for text in ["one", "two"] {
+                let frame = WsOut::Text(text.into());
+                assert!(
+                    budget.charge(crate::js::ws_out_bytes(&frame)),
+                    "the test budget admits the staged frame"
+                );
+                tx.send(frame).expect("stage data");
+            }
+            tx.send(WsOut::Close(1000, "done".into()))
+                .expect("stage close");
+            // The first forward holds until the test staged everything
+            // behind it; every later forward parks: the peer never reads.
+            // Each call reports its index, so the test knows the flush —
+            // not the normal parked send — is what the shutdown interrupts.
+            let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel::<u8>();
+            let (gate_tx, gate_rx) = tokio::sync::oneshot::channel::<()>();
+            let gate_rx = std::sync::Arc::new(std::sync::Mutex::new(Some(gate_rx)));
+            let calls = std::sync::Arc::new(AtomicUsize::new(0));
+            let sink = {
+                let calls = calls.clone();
+                move |frame: WsOut| {
+                    let entered_tx = entered_tx.clone();
+                    let gate_rx = gate_rx.clone();
+                    let calls = calls.clone();
+                    let _ = frame;
+                    // Taken here, outside the async block: holding a
+                    // `std` mutex guard across an await is not `Send`.
+                    let gate = gate_rx.lock().unwrap().take();
+                    Box::pin(async move {
+                        let call = calls.fetch_add(1, Ordering::SeqCst);
+                        let _ = entered_tx.send(call as u8);
+                        if call == 0 {
+                            if let Some(rx) = gate {
+                                let _ = rx.await;
+                            }
+                            return PipeSendOutcome::Sent;
+                        }
+                        std::future::pending::<()>().await;
+                        PipeSendOutcome::Gone
+                    })
+                        as std::pin::Pin<
+                            Box<dyn Future<Output = PipeSendOutcome> + Send + 'static>,
+                        >
+                }
+            };
+            let (shutdown_tx, shutdown) = tokio::sync::watch::channel(false);
+            let direction = crate::asyncrt::spawn(forward_pipe_direction(
+                from,
+                sink,
+                shutdown,
+                budget.clone(),
+            ));
+            // The first forward is parked at the gate; the budget drains to
+            // zero exactly when both data frames are received, which also
+            // means the close is staged and the direction is pending. No
+            // timing: the releases must happen, and the spin only waits.
+            assert_eq!(
+                entered_rx.recv().await,
+                Some(0),
+                "the first forward parks at the gate"
+            );
+            while budget.used() > 0 {
+                tokio::task::yield_now().await;
+            }
+            gate_tx.send(()).expect("release the first forward");
+            assert_eq!(
+                entered_rx.recv().await,
+                Some(1),
+                "the closing flush parks its forward"
+            );
+            shutdown_tx.send(true).expect("the other direction ended");
+            let (end, _from) = direction.await.expect("direction joins");
+            assert!(
+                matches!(end, PipeDirectionEnd::Retired),
+                "shutdown during the closing flush retires the direction, got {end:?}"
+            );
+        });
+    }
+
+    /// The generic forwarder ends an admission refusal `OverLimit` for any
+    /// sink, so every pipe direction tears down loudly on the same marker.
+    #[test]
+    fn generic_direction_overload_marker_ends_over_limit() {
+        let runtime = crate::asyncrt::shared_test_runtime();
+        runtime.block_on(async {
+            let (sink_tx, _sink_rx) = tokio::sync::mpsc::channel::<WsOut>(1);
+            let (tx, from) = tokio::sync::mpsc::unbounded_channel();
+            tx.send(WsOut::Text("admitted".into())).expect("stage data");
+            tx.send(WsOut::Overload).expect("stage marker");
+            let (_shutdown_tx, shutdown) = tokio::sync::watch::channel(false);
+            let (end, _from) = forward_pipe_direction(
+                from,
+                boxed_test_sink(sink_tx),
+                shutdown,
+                WsPipeBudget::new(ISOLATE_PIPE_MAX_STAGED_BYTES),
+            )
+            .await;
+            assert!(
+                matches!(end, PipeDirectionEnd::OverLimit),
+                "the refusal marker must end OverLimit, got {end:?}"
+            );
         });
     }
 }

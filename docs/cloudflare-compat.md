@@ -183,6 +183,18 @@ The `tail` and `email` handlers are unavailable.
   message larger than 1 MiB uses the complete budget.
 - If the isolate stops polling, Cello discards unread frames during cleanup. A
   later pull reports an abnormal close.
+- Each pipe direction between two ends stages at most 16 MiB upstream of its
+  destination — another isolate's input queue, a cell dispatch, or the socket
+  itself. A flood past the cap ends the pipe loudly instead of growing host
+  memory without bound: both ends observe close code 1011 with
+  `wasClean: false`, an abnormal host-originated close no peer sent. Only
+  staged bytes count against the cap: handler runtime stays unbounded, so a
+  slow `webSocketMessage` handler never trips it, and a slow but live peer
+  still drains fully — normal writes never time out. Only the close flush
+  runs under a progress bound, and each frame it delivers restarts the wait.
+- A close queued behind data still delivers every frame first, in order,
+  while the peer can make progress; a peer that stopped reading ends the
+  pipe instead of blocking closure.
 - A WebSocket transport cannot move to a new cell owner. A client must reconnect
   with the same application operation ID.
 - A tunneled connection forwards the owner's Close without an additional Close.
