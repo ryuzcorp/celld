@@ -1,6 +1,6 @@
 ---
 title: Workers compatibility
-description: Closer Cloudflare parity — cache, containers, crypto, SQL, and runtime APIs over upstream celld.
+description: Closer Cloudflare parity — cache, containers, crypto, SQL, and runtime APIs over upstream denoland/celld.
 ---
 
 Patches that move Workers, Durable Objects, and the surrounding APIs
@@ -33,7 +33,7 @@ names its fork patch number.
   services, loaders, or schedule. Per-cell placement and ownership are
   unchanged — state stays in the cells' SQLite, so a rolling upgrade
   moves cells with no migration — and `/state` reports the pool under
-  its reserved name `__celld-runtime`. Deploy refuses a service binding
+  its reserved name `__cello-runtime`. Deploy refuses a service binding
   whose target is not a valid script name.
 
 ## Containers

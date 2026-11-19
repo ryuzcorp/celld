@@ -201,8 +201,8 @@ pub fn set_rpc_call_tx(tx: tokio::sync::mpsc::UnboundedSender<RpcCallReq>) {
     let _ = RPC_CALL_TX.set(tx);
 }
 
-/// One operation on a cross-isolate RPC stub (`__celld$stub`/`__celld$rs`/
-/// `__celld$ws` with `h: 1`). A call runs a method/property path against
+/// One operation on a cross-isolate RPC stub (`__cello$stub`/`__cello$rs`/
+/// `__cello$ws` with `h: 1`). A call runs a method/property path against
 /// the entry in the owning cell's isolate; a release frees it. Stream
 /// reads, writes, cancels, closes, and aborts are calls on the bridge
 /// entry, exactly the same-isolate bridge method names.

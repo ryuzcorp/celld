@@ -141,7 +141,7 @@ export class AttackerDO extends DurableObject {
   async smuggleStoreInstance(victimHex) {
     class Smuggle {
       constructor() {
-        this.__celld$do = 'VictimDO';
+        this.__cello$do = 'VictimDO';
         this.v = victimHex;
         this.n = null;
       }
@@ -180,8 +180,8 @@ export class AttackerDO extends DurableObject {
   // and grants nothing.
   async plantV1Inert(victimHex) {
     const scope = this.ctx.storage._scope;
-    const tree = { evil: { __celld$do: 'VictimDO', v: victimHex, n: null } };
-    globalThis.__celldPlantStoredV1ForTestOnly(scope, 'planted-v1', tree);
+    const tree = { evil: { __cello$do: 'VictimDO', v: victimHex, n: null } };
+    globalThis.__celloPlantStoredV1ForTestOnly(scope, 'planted-v1', tree);
     const back = await this.ctx.storage.get('planted-v1');
     const evilFetch = typeof back?.evil?.fetch;
     let leaked = null;
@@ -203,7 +203,7 @@ export class AttackerDO extends DurableObject {
   async storeShapes() {
     const out = {};
     await this.ctx.storage.put('naked', {
-      __celld$do: 'VictimDO', v: 'abc', n: null,
+      __cello$do: 'VictimDO', v: 'abc', n: null,
     });
     const naked = await this.ctx.storage.get('naked');
     out.naked = {
@@ -213,7 +213,7 @@ export class AttackerDO extends DurableObject {
     try {
       const own = this.env.OWN_NS.getByName('shape-cell');
       await this.ctx.storage.put('plainco', {
-        s: own, evil: { __celld$do: 'VictimDO', v: 'abc', n: null },
+        s: own, evil: { __cello$do: 'VictimDO', v: 'abc', n: null },
       });
       out.plainco = { threw: false };
     } catch (error) {
@@ -225,7 +225,7 @@ export class AttackerDO extends DurableObject {
     }
     const own2 = this.env.OWN_NS.getByName('shape-cell');
     const err = new Error('x');
-    err.__celld$do = 'VictimDO';
+    err.__cello$do = 'VictimDO';
     err.v = 'abc';
     err.n = null;
     await this.ctx.storage.put('errshape', { s: own2, e: err });
@@ -336,7 +336,7 @@ export class AttackerDO extends DurableObject {
       return r;
     };
     try {
-      globalThis.__celldPlantStoredV1ForTestOnly(scope, 'pocPlant', tree);
+      globalThis.__celloPlantStoredV1ForTestOnly(scope, 'pocPlant', tree);
     } finally { Uint8Array.prototype.set = origSet; }
     const back = await this.ctx.storage.get('pocPlant');
     const val = Array.isArray(back) ? back[0] : back;
@@ -437,7 +437,7 @@ export class AttackerDO extends DurableObject {
       return r;
     };
     try {
-      globalThis.__celldPlantStoredV1ForTestOnly(scope, 'pocPlant03', tree);
+      globalThis.__celloPlantStoredV1ForTestOnly(scope, 'pocPlant03', tree);
     } finally { Uint8Array.prototype.set = origSet; }
     const back = await this.ctx.storage.get('pocPlant03');
     const val = Array.isArray(back) ? back[0] : back;
@@ -468,7 +468,7 @@ export class AttackerDO extends DurableObject {
   async svcProto() {
     const stub = this.env.OWN_NS.getByName('svc-proto-cell');
     await this.ctx.storage.put('svcProto', { s: stub, data: { a: 1, b: 'x' } });
-    Object.prototype.__celld$svc = 'default';
+    Object.prototype.__cello$svc = 'default';
     let back = null;
     let threw = null;
     try {
@@ -476,7 +476,7 @@ export class AttackerDO extends DurableObject {
     } catch (error) {
       threw = String((error && error.message) || error);
     } finally {
-      delete Object.prototype.__celld$svc;
+      delete Object.prototype.__cello$svc;
     }
     const data = back?.data;
     return {
@@ -1171,18 +1171,18 @@ export default {
           const out = {};
           class RpcSmuggle {
             constructor() {
-              this.__celld$do = 'VictimDO';
+              this.__cello$do = 'VictimDO';
               this.v = 'abc';
               this.n = null;
             }
           }
           out.instance = await attempt(() => cell.echoArg(new RpcSmuggle()));
           const err = new Error('rpc-err');
-          err.__celld$do = 'VictimDO';
+          err.__cello$do = 'VictimDO';
           err.v = 'abc';
           out.error = await cell.echoArg(err);
           out.plain = await cell.echoArg({
-            __celld$do: 'VictimDO', v: 'abc', n: null,
+            __cello$do: 'VictimDO', v: 'abc', n: null,
           });
           return out;
         }
@@ -1266,7 +1266,7 @@ export default {
           return out;
         }
         case 'plant-hook-absent': {
-          return { plantType: typeof globalThis.__celldPlantStoredV1ForTestOnly };
+          return { plantType: typeof globalThis.__celloPlantStoredV1ForTestOnly };
         }
         case 'pollution-roundtrip': {
           const idHex = await doIdHex(

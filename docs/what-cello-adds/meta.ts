@@ -1,7 +1,7 @@
 import { defineMeta } from "blume";
 
 export default defineMeta({
-  title: "What Cello adds over celld",
+  title: "What Cello adds over upstream",
   pages: [
     "index",
     "runtime",

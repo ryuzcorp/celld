@@ -232,11 +232,11 @@ pub struct CellOverloaded;
 /// Also include an opaque marker so unrelated application text cannot restore
 /// an HTTP overload response, and keep the producer and ingress checks on one
 /// value. The marker crosses nodes inside peer-forwarded errors, so its
-/// `celld-` spelling is frozen: mixed-version fleets must agree on it.
+/// `cello-` spelling is frozen: mixed-version fleets must agree on it.
 /// See `rename-frozen.md`.
 #[doc(hidden)]
 pub const CELL_OVERLOAD_ERROR_MARKER: &str =
-    "celld-internal-cell-overload-7ec38c64-12d7-4ddc-9e77-b63f9dc14130";
+    "cello-internal-cell-overload-7ec38c64-12d7-4ddc-9e77-b63f9dc14130";
 
 impl std::fmt::Display for CellOverloaded {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

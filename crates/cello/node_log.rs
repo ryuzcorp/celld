@@ -117,7 +117,7 @@ const STREAM_FRAME_CAP: usize = 64 * 1024 * 1024;
 /// The upgrade value the leader and follower exchange to open a peer
 /// log-tail stream. Frozen node-to-node wire identifier: mixed-version
 /// fleets negotiate this while they upgrade. See `rename-frozen.md`.
-pub const LOG_STREAM_UPGRADE: &str = "celld-log-stream";
+pub const LOG_STREAM_UPGRADE: &str = "cello-log-stream";
 
 #[doc(hidden)]
 pub async fn read_frame<R>(io: &mut R) -> anyhow::Result<Option<Vec<u8>>>

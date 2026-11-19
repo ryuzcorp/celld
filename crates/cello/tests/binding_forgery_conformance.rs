@@ -626,7 +626,7 @@ fn binding_forgery_conformance() {
     assert!(
         planted["keys"]
             .as_array()
-            .is_some_and(|keys| keys.iter().any(|key| key == "__celld$do")),
+            .is_some_and(|keys| keys.iter().any(|key| key == "__cello$do")),
         "/plant-v1-inert keeps marker keys as data: {planted}"
     );
 
@@ -638,7 +638,7 @@ fn binding_forgery_conformance() {
     assert!(
         shapes["naked"]["keys"]
             .as_array()
-            .is_some_and(|keys| keys.iter().any(|key| key == "__celld$do")),
+            .is_some_and(|keys| keys.iter().any(|key| key == "__cello$do")),
         "{shapes}"
     );
     assert_ne!(shapes["naked"]["hasFetch"], "function", "{shapes}");
@@ -659,7 +659,7 @@ fn binding_forgery_conformance() {
     assert!(
         rpc["plain"]["keys"]
             .as_array()
-            .is_some_and(|keys| keys.iter().any(|key| key == "__celld$do")),
+            .is_some_and(|keys| keys.iter().any(|key| key == "__cello$do")),
         "{rpc}"
     );
     assert_ne!(rpc["plain"]["hasFetch"], "function", "{rpc}");

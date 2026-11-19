@@ -6523,7 +6523,7 @@ mod sourcemap_tests {
         let root = tempfile::tempdir().unwrap();
         std::fs::write(
             root.path().join("wrangler.json"),
-            r#"{"name": "svctest", "main": "entry.js", "no_bundle": true, "services": [{"binding": "SB", "service": "__celld-runtime"}]}"#,
+            r#"{"name": "svctest", "main": "entry.js", "no_bundle": true, "services": [{"binding": "SB", "service": "__cello-runtime"}]}"#,
         )
         .unwrap();
         std::fs::write(root.path().join("entry.js"), "export default {};\n").unwrap();
@@ -6533,7 +6533,7 @@ mod sourcemap_tests {
         };
         let message = format!("{error:?}");
         assert!(
-            message.contains("__celld-runtime"),
+            message.contains("__cello-runtime"),
             "the refusal must name the bad target: {message}"
         );
     }

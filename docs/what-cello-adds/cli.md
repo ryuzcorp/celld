@@ -1,6 +1,6 @@
 ---
 title: CLI
-description: New cello commands and flags — deploy, invoke, d1, r2, versions, dev state — over upstream celld.
+description: New cello commands and flags — deploy, invoke, d1, r2, versions, dev state — over upstream denoland/celld.
 ---
 
 New commands, flags, and output shapes in the `cello` CLI. Each entry
@@ -23,7 +23,7 @@ for the complete surface.
   which host files exist.
 - `0046` — `cello --version` reports the full build version
   (`0.1.0`, `<version>-ryuzcorp.<n>` on the old line): `build.rs` bakes
-  `CELLD_VERSION` into the binary from the Docker build stage, and a
+  `CELLO_VERSION` into the binary from the Docker build stage, and a
   plain `cargo build` without it reports the crate version.
 - `0049` — `cello invoke --header-env NAME=VAR` sends header NAME with
   the value of environment variable VAR, so a secret header never sits

@@ -5523,8 +5523,8 @@ var require_stream = __commonJS({
     },
   };
 
-  __celld.__streamModule = Stream;
-  __celld.__streamPromises = Stream.promises;
-  __celld.__streamWeb = web;
-  __celld.__streamConsumers = consumers;
+  __cello.__streamModule = Stream;
+  __cello.__streamPromises = Stream.promises;
+  __cello.__streamWeb = web;
+  __cello.__streamConsumers = consumers;
 })();

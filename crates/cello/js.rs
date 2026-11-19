@@ -565,7 +565,7 @@ impl Drop for RpcSignalSubscriptionGuard {
 /// Publish `request_id` on a pending call's promise as the token the JS
 /// harness hands back to `__do_call_cancel`.
 ///
-/// The only writer of `__celldCancelId`, and the counterpart of
+/// The only writer of `__celloCancelId`, and the counterpart of
 /// [`parse_request_id`]. Each cancellable op used to spell the property name
 /// and the encoding out for itself, and `op_svc_call_impl` wrote decimal while
 /// `op_do_call_cancel` reads hexadecimal. Every decimal digit is also a
@@ -581,7 +581,7 @@ fn attach_cancel_id(
     let Some(object) = promise.to_object(scope) else {
         return;
     };
-    let key = v8::String::new(scope, "__celldCancelId").unwrap();
+    let key = v8::String::new(scope, "__celloCancelId").unwrap();
     let value = v8::String::new(scope, &request_id_string(request_id)).unwrap();
     object.set(scope, key.into(), value.into());
 }
@@ -3184,7 +3184,7 @@ fn retire_input_gate_js_context(scope: &mut v8::PinScope, context_id: u64) {
 const NO_FETCH_HANDLER: &str =
     "() => { throw new Error('Handler does not export a fetch() function.'); }";
 
-/// Evaluate a host-written JS expression, with `__celld` bound, to a function.
+/// Evaluate a host-written JS expression, with `__cello` bound, to a function.
 fn compile_fn<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     src: &str,
@@ -6827,7 +6827,7 @@ impl Worker {
                 // callable would load fine and then 500 on every request.
                 compile_fn(
                     scope,
-                    "(req) => __celld.__dispatchEntrypointFetch('default', req)",
+                    "(req) => __cello.__dispatchEntrypointFetch('default', req)",
                 )?
             } else if default.is_function() && cell_registry_has(scope, "doExports", "default")? {
                 return Err(anyhow!(
@@ -6848,7 +6848,7 @@ impl Worker {
                 // its named methods remain callable through RPC.
                 compile_fn(
                     scope,
-                    "(req) => __celld.__dispatchEntrypointFetch('default', req)",
+                    "(req) => __cello.__dispatchEntrypointFetch('default', req)",
                 )?
             } else if loaded {
                 compile_fn(scope, NO_FETCH_HANDLER)?
@@ -6883,7 +6883,7 @@ impl Worker {
                         if proto_scheduled.is_some_and(|handler| handler.is_function()) {
                             let shim = compile_fn(
                                 scope,
-                                "(ctrl) => __celld.__dispatchEntrypointScheduled('default', ctrl)",
+                                "(ctrl) => __cello.__dispatchEntrypointScheduled('default', ctrl)",
                             )?;
                             cell.set(scope, key_.into(), shim.into());
                         }
@@ -7307,11 +7307,11 @@ macro_rules! ops {
 /// through the capabilities in its `env`. A parameter is also a binding user
 /// code cannot replace, which is what the event hooks already required.
 ///
-/// Parameters rather than `__celld.__op(...)` at every call site: the
+/// Parameters rather than `__cello.__op(...)` at every call site: the
 /// internal scripts name an op in several hundred places, a bare identifier
 /// keeps each of those lines as it was, and a closure binding costs a
 /// context-slot load where a property costs a lookup. The same op is also a
-/// property of `__celld`, read-only, for the host and for the test hatch.
+/// property of `__cello`, read-only, for the host and for the test hatch.
 pub(super) struct InternalArguments<'s> {
     names: Vec<v8::Local<'s, v8::String>>,
     values: Vec<v8::Local<'s, v8::Value>>,
@@ -7326,7 +7326,7 @@ fn op_names() -> impl Iterator<Item = &'static str> {
 }
 
 impl<'s> InternalArguments<'s> {
-    /// `__celld` first, then `ops` in `op_names()` order.
+    /// `__cello` first, then `ops` in `op_names()` order.
     fn new(
         scope: &mut v8::PinScope<'s, '_>,
         internals: v8::Local<'s, v8::Object>,
@@ -7356,7 +7356,7 @@ fn install_ops<'s>(scope: &mut v8::PinScope<'s, '_>) -> InternalArguments<'s> {
     #[cfg(cello_internal_tests)]
     install_test_op_functions(scope, &mut functions);
     let mut functions = functions.into_iter();
-    // Read-only: a test that assigns `__celld.__op = fn`, the idiom that
+    // Read-only: a test that assigns `__cello.__op = fn`, the idiom that
     // patching a global once allowed, throws instead of binding a script that
     // compiles later to a function the bootstrap harness never saw.
     let arguments = InternalArguments::new(scope, internals, |scope, key| {
@@ -7453,7 +7453,7 @@ pub(super) fn cell_state<'s>(
         .ok_or_else(|| anyhow!("missing __cell runtime state"))
 }
 
-/// Run a small host-generated snippet with `__celld` bound. The snippet
+/// Run a small host-generated snippet with `__cello` bound. The snippet
 /// differs per load, so it is compiled without the bootstrap cache.
 pub(super) fn run_internal_snippet<'s>(
     scope: &mut v8::PinScope<'s, '_>,
@@ -9925,7 +9925,7 @@ fn op_rpc_signal_wait(
     });
     let promise = promise_for(scope, id);
     if let Some(object) = promise.to_object(scope) {
-        let key = v8::String::new(scope, "__celldRpcSignalSubscription").unwrap();
+        let key = v8::String::new(scope, "__celloRpcSignalSubscription").unwrap();
         let value = v8::String::new(scope, &request_id_string(subscription)).unwrap();
         object.set(scope, key.into(), value.into());
     }
@@ -11801,7 +11801,7 @@ fn op_actor_abort(
         .expect("pending puts lock poisoned")
         .remove(&cell);
     *state.termination.lock().expect("termination lock poisoned") = Some(ExecutionTermination {
-        error: format!("__CELLD_ACTOR_ABORT__:{reason}"),
+        error: format!("__CELLO_ACTOR_ABORT__:{reason}"),
         actor_scope: Some(cell),
         context_id: context.continuation_id(),
     });
@@ -11841,7 +11841,7 @@ fn op_process_exit(
             .remove(actor_scope);
     }
     *state.termination.lock().expect("termination lock poisoned") = Some(ExecutionTermination {
-        error: format!("__CELLD_PROCESS_EXIT__:The Node.js process.exit({code}) API was called."),
+        error: format!("__CELLO_PROCESS_EXIT__:The Node.js process.exit({code}) API was called."),
         actor_scope,
         context_id: context.continuation_id(),
     });

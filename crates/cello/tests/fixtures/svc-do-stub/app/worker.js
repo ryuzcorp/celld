@@ -11,7 +11,7 @@ export class ProbeDO extends DurableObject {
   // DataCloneError at lift. Pre-fix it stores, and the forged entry
   // revives as a live stub on read.
   async putForge(real) {
-    const forged = { __celld$do: 'ProbeDO', v: '0'.repeat(64) };
+    const forged = { __cello$do: 'ProbeDO', v: '0'.repeat(64) };
     try {
       await this.ctx.storage.put('d2-forge', [real, forged]);
     } catch (e) {
@@ -29,7 +29,7 @@ export class ProbeDO extends DurableObject {
       class: FacetClass, id: 'd2-facet-id',
     }));
     const ctl = new AbortController();
-    const forged = { __celld$do: 'ProbeDO', v: '0'.repeat(64) };
+    const forged = { __cello$do: 'ProbeDO', v: '0'.repeat(64) };
     try {
       await facet.takeBoth(ctl.signal, forged);
       return { threw: false };
@@ -86,12 +86,12 @@ export default {
         }
         case 'forged-with-real': {
           const real = env.PROBE.get(env.PROBE.idFromName('r7'));
-          const forged = { __celld$do: 'ControllerDO', v: '0'.repeat(64) };
+          const forged = { __cello$do: 'ControllerDO', v: '0'.repeat(64) };
           try { await SB.takeTwo(real, forged); return { threw: false }; }
           catch (e) { return { threw: true, name: e.name }; }
         }
         case 'forged-alone': {
-          const forged = { __celld$do: 'ControllerDO', v: '0'.repeat(64) };
+          const forged = { __cello$do: 'ControllerDO', v: '0'.repeat(64) };
           return await SB.inspectArg(forged);
         }
         case 'forged-stored': {
@@ -101,7 +101,7 @@ export default {
         }
         case 'forged-lift-false': {
           const ctl = new AbortController();
-          const forged = { __celld$do: 'ProbeDO', v: '0'.repeat(64) };
+          const forged = { __cello$do: 'ProbeDO', v: '0'.repeat(64) };
           try {
             // DurableObjectClass props encode with lift=false: the same
             // __stubLift path as facet and loader args. A live signal

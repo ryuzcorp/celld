@@ -31,7 +31,7 @@
 
   // The verbatim header list, one pair per append: casing and multiplicity
   // survive the round trip, and `set-cookie` values stay apart.
-  const headerPairs = (headers) => headers.__celldHeaderList;
+  const headerPairs = (headers) => headers.__celloHeaderList;
 
   // Largest single entry, body plus headers plus key: the budget the host
   // enforces in worker_cache.rs (`MAX_ENTRY_BYTES`). The drain below stops

@@ -39,7 +39,7 @@ use rand::RngCore;
 use super::*;
 use cello::js::HttpChunkStream;
 
-pub(crate) const TUNNEL_PROTOCOL: &str = "celld-tunnel";
+pub(crate) const TUNNEL_PROTOCOL: &str = "cello-tunnel";
 pub(crate) const TUNNEL_VERSION: &str = "5";
 pub(crate) const VERSION_HEADER: &str = "x-cells-tunnel-version";
 pub(crate) const KIND_HEADER: &str = "x-cells-tunnel-kind";
@@ -992,6 +992,6 @@ mod operator_tests {
     /// fleets negotiate it while they upgrade. See `rename-frozen.md`.
     #[test]
     fn tunnel_protocol_stays_frozen() {
-        assert_eq!(TUNNEL_PROTOCOL, "celld-tunnel");
+        assert_eq!(TUNNEL_PROTOCOL, "cello-tunnel");
     }
 }

@@ -115,6 +115,6 @@ the waker role, and it wakes only the cells whose owner node has stopped.
 - [Operations](operations.md): configure storage, deploy, develop locally, run and scale nodes.
 - **Services** — one page per service in the sidebar, each with a runnable example and the known differences from the Cloudflare service.
 - [What Cello guarantees](guarantees.md): the durability and failover contract.
-- [What Cello adds over celld](what-cello-adds/index.md): every improvement over upstream, grouped by area.
-- [Compatibility with celld](compatibility.md): frozen identifiers and upgrading from a celld deployment.
+- [What Cello adds over upstream](what-cello-adds/index.md): every improvement over upstream, grouped by area.
+- [Compatibility](compatibility.md): the 0.2.0 clean break — no data or wire compatibility with upstream denoland/celld or Cello 0.1.x.
 - [Changelog](changelog.md): what shipped in each release.

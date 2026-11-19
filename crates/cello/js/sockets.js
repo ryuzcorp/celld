@@ -227,5 +227,5 @@
     );
   };
 
-  __celld.__cfSockets = { connect };
+  __cello.__cfSockets = { connect };
 })();

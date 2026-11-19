@@ -475,7 +475,7 @@ pub(super) fn op_storage_drop_pending_puts_reset(
         let instances = cell_state.get(scope, key.into())?.to_object(scope)?;
         let key = v8::String::new(scope, &cell)?;
         let instance = instances.get(scope, key.into())?.to_object(scope)?;
-        let key = v8::String::new(scope, "__celldState")?;
+        let key = v8::String::new(scope, "__celloState")?;
         let state = instance.get(scope, key.into())?.to_object(scope)?;
         let key = v8::String::new(scope, "_aborted")?;
         Some(state.get(scope, key.into())?.is_true())
@@ -754,7 +754,7 @@ fn sql_value_to_v8<'s>(
         storage::SqlValue::Real(f) => v8::Number::new(scope, f).into(),
         storage::SqlValue::Text(text) => v8::String::new(scope, &text).unwrap().into(),
         // An ArrayBuffer, because that is what the `_decode` closure produced
-        // from `{__celld_bytes: [...]}`. The bytes move into the backing store
+        // from `{__cello_bytes: [...]}`. The bytes move into the backing store
         // without a copy, as `bytes_value` in `js.rs` does.
         storage::SqlValue::Blob(bytes) => {
             if bytes.is_empty() {

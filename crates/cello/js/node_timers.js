@@ -38,7 +38,7 @@
     }
   }
 
-  __celld.__timersPromises = {
+  __cello.__timersPromises = {
     setTimeout: setTimeout_,
     setImmediate: setImmediate_,
     setInterval: setInterval_,

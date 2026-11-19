@@ -1,6 +1,6 @@
 ---
 title: Fleet and durability
-description: Ownership, replication, takeover, staged activation, and bucket-posture group commit over upstream celld.
+description: Ownership, replication, takeover, staged activation, and bucket-posture group commit over upstream denoland/celld.
 ---
 
 Patches to the fleet core: lease ownership and takeover, staged

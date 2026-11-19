@@ -9,7 +9,7 @@ export default defineConfig({
     repo: "cello",
   },
   footer: {
-    copyright: "© 2026 Ryuz Corp. Based on celld, © 2026 Deno Land Inc.",
+    copyright: "© 2026 Ryuz Corp.",
     links: [
       { label: "GitHub", href: "https://github.com/ryuzcorp/cello" },
       { label: "Changelog", href: "/changelog" },

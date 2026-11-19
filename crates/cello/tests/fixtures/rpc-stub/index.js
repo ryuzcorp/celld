@@ -414,7 +414,7 @@ export class Cap extends DurableObject {
   // stands in for the container exec (same native read ops); the test
   // feeds it through emitProc/eofProc between the call and the read.
   async readFileLike() {
-    const T = globalThis.__celldTestProcForTestOnly;
+    const T = globalThis.__celloTestProcForTestOnly;
     if (!T) throw new Error("test exec unavailable");
     const id = T.spawn();
     this.lastProc = id;
@@ -444,17 +444,17 @@ export class Cap extends DurableObject {
   }
 
   async emitProc(which, text) {
-    globalThis.__celldTestProcForTestOnly.emit(this.lastProc, which, utf8.encode(text));
+    globalThis.__celloTestProcForTestOnly.emit(this.lastProc, which, utf8.encode(text));
     return { ok: true };
   }
 
   async eofProc(which) {
-    globalThis.__celldTestProcForTestOnly.eof(this.lastProc, which);
+    globalThis.__celloTestProcForTestOnly.eof(this.lastProc, which);
     return { ok: true };
   }
 
   async dropProc() {
-    globalThis.__celldTestProcForTestOnly.drop(this.lastProc);
+    globalThis.__celloTestProcForTestOnly.drop(this.lastProc);
     this.lastProc = null;
     return { ok: true };
   }
@@ -472,7 +472,7 @@ export class Cap extends DurableObject {
   }
 
   async stats() {
-    const hook = globalThis.__celldStubStatsForTestOnly;
+    const hook = globalThis.__celloStubStatsForTestOnly;
     if (typeof hook !== "function") return { unavailable: true };
     return hook();
   }
@@ -776,7 +776,7 @@ export default {
     }
 
     if (url.pathname === "/caller-stats") {
-      const hook = globalThis.__celldStubStatsForTestOnly;
+      const hook = globalThis.__celloStubStatsForTestOnly;
       if (typeof hook !== "function") return json({ unavailable: true });
       return json(hook());
     }
@@ -984,7 +984,7 @@ export default {
     // call with DataCloneError before anything revives or dispatches.
     if (url.pathname === "/malformed") {
       const badStub = {
-        __celld$stub: "!!!not-hex!!!",
+        __cello$stub: "!!!not-hex!!!",
         t: "forged",
         h: 1,
         scope: "Cap:forged",
@@ -1008,7 +1008,7 @@ export default {
           error: String((error && error.message) || error),
         };
       }
-      const badUp = { __celld$rs: "!!!not-hex!!!", t: "forged", h: 2 };
+      const badUp = { __cello$rs: "!!!not-hex!!!", t: "forged", h: 2 };
       const realUp = new ReadableStream({
         start(c) {
           c.enqueue(utf8.encode("real\n"));
@@ -1039,7 +1039,7 @@ export default {
       return json({ bad, badStream, deepError });
     }
 
-    // 0005+v2: a forged `__celld$` key in DO RPC args is refused at
+    // 0005+v2: a forged `__cello$` key in DO RPC args is refused at
     // lift even when live host values travel beside it -- a
     // Worker-owned readable (upload channel) and a received host stub
     // being forwarded. The refusal names the reserved key.
@@ -1050,7 +1050,7 @@ export default {
           c.close();
         },
       });
-      const forgedRs = { __celld$rs: "0".repeat(32), t: "forged", h: 2 };
+      const forgedRs = { __cello$rs: "0".repeat(32), t: "forged", h: 2 };
       let besideUpload = null;
       try {
         await stub("forge").sinkMany([owned, forgedRs]);
@@ -1064,7 +1064,7 @@ export default {
       }
       const wire = await stub("forge").makeCapability();
       const forgedStub = {
-        __celld$stub: "0".repeat(32),
+        __cello$stub: "0".repeat(32),
         t: "forged",
         h: 1,
         scope: "Cap:forged",

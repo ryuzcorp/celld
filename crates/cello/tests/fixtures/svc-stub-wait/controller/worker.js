@@ -16,7 +16,7 @@ class WaitCap extends RpcTarget {
 }
 
 const testWait = () => {
-  const hook = globalThis.__celldTestWaitForTestOnly;
+  const hook = globalThis.__celloTestWaitForTestOnly;
   if (hook === undefined) throw new Error('test waits are disabled on this node');
   return hook;
 };

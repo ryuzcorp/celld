@@ -1619,9 +1619,9 @@ pub(crate) fn json_to_sql(v: &serde_json::Value) -> rusqlite::types::Value {
         serde_json::Value::Number(n) if n.is_i64() => Value::Integer(n.as_i64().unwrap()),
         serde_json::Value::Number(n) => Value::Real(n.as_f64().unwrap_or(0.0)),
         serde_json::Value::String(s) => Value::Text(s.clone()),
-        serde_json::Value::Object(o) if o.contains_key("__celld_bytes") => {
+        serde_json::Value::Object(o) if o.contains_key("__cello_bytes") => {
             let bytes = o
-                .get("__celld_bytes")
+                .get("__cello_bytes")
                 .and_then(|v| v.as_array())
                 .map(|values| {
                     values
@@ -1649,7 +1649,7 @@ fn vref_to_json(v: rusqlite::types::ValueRef) -> serde_json::Value {
         ValueRef::Integer(i) => serde_json::json!(i),
         ValueRef::Real(f) => serde_json::json!(f),
         ValueRef::Text(bytes) => serde_json::Value::String(sql_text(bytes)),
-        ValueRef::Blob(b) => serde_json::json!({ "__celld_bytes": b }),
+        ValueRef::Blob(b) => serde_json::json!({ "__cello_bytes": b }),
     }
 }
 
@@ -2042,7 +2042,7 @@ unsafe fn sql_cursor_columns(statement: *mut rusqlite::ffi::sqlite3_stmt) -> Vec
 /// Both cursor ops turn this straight into V8 values, so a result row never
 /// becomes a JSON string. `serde_json::Value` cannot carry the type faithfully
 /// anyway: it holds no byte string, so a BLOB had to travel as a
-/// `__celld_bytes` array of decimal numbers, and it holds no infinity, so
+/// `__cello_bytes` array of decimal numbers, and it holds no infinity, so
 /// SQLite's `9e999` collapsed to null.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SqlValue {
@@ -2986,7 +2986,7 @@ fn d1_json_string_len(value: &str) -> usize {
 /// One result cell as JSON, plus the approximate bytes it will occupy in the
 /// caller's heap, for the result-bytes cap. BLOBs cross as arrays of bytes --
 /// the shape upstream D1 returns them in -- which is what retired the
-/// `__celld_bytes` sentinel on this path.
+/// `__cello_bytes` sentinel on this path.
 unsafe fn d1_row_value(
     statement: *mut rusqlite::ffi::sqlite3_stmt,
     index: i32,

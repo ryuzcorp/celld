@@ -1,9 +1,9 @@
 ---
-title: What Cello adds over celld
-description: Every improvement Cello carries over upstream celld, grouped by area.
+title: What Cello adds over upstream
+description: Every improvement Cello carries over upstream denoland/celld, grouped by area.
 ---
 
-Cello 0.1.0 is upstream celld `v0.6.3` plus 136 patches, carried
+Cello 0.1.0 is upstream denoland/celld `v0.6.3` plus 136 patches, carried
 one-commit-per-patch and released as `v0.6.3-ryuzcorp.4` through `.13`
 before the rename. This section turns those patch entries into readable
 groups. Each entry names its fork patch number; `(upstream #NNN)` links

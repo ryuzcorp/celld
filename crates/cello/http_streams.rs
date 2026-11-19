@@ -31,7 +31,7 @@ pub(crate) static NEXT_HTTP_STREAM_ID: AtomicU64 = AtomicU64::new(1);
 /// resolves as a `Uint8Array`, therefore body bytes can never look like
 /// this marker. The value stays distinctive, so a reader that does compare
 /// the value cannot match a plausible body.
-pub(crate) const HTTP_STREAM_DONE: &str = "__celld_http_stream_end__";
+pub(crate) const HTTP_STREAM_DONE: &str = "__cello_http_stream_end__";
 pub(crate) const HTTP_STREAM_IDLE_TIMEOUT_MS: u64 = 60_000;
 pub(crate) const HTTP_STREAM_REGISTRATION_CLOSED: &str = "the HTTP stream service is closed";
 pub(crate) const HTTP_TEE_BRANCH_CAPACITY: usize = 16;

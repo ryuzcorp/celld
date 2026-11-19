@@ -40,7 +40,7 @@ v8_static_strings!(
     CELL = "__cell",
     // The internals object itself: the first parameter of every internal
     // script, and the only `__`-prefixed global a test build has.
-    INTERNALS = "__celld",
+    INTERNALS = "__cello",
     ENV = "env",
     // `op_url_parse` writes all nine on every `new URL(...)`.
     URL_PROTOCOL = "protocol",

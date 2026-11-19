@@ -117,7 +117,7 @@ let outcomeB = "unset";
 export default {
   async fetch(request) {
     const url = new URL(request.url);
-    const hooks = globalThis.__celldTestWaitForTestOnly;
+    const hooks = globalThis.__celloTestWaitForTestOnly;
     if (!hooks) return new Response("test waits disabled", { status: 500 });
     if (url.pathname === "/start") {
       // Retained-wait share over an unrefed backing wait, mirroring

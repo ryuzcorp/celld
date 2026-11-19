@@ -582,8 +582,8 @@ pub fn drain_spawns() -> Vec<(u64, OpFuture, OpLifetime, Option<u64>)> {
     })
 }
 
-pub use crate::__celld_domain_select as select;
-pub use crate::__celld_domain_select_biased as select_biased;
+pub use crate::__cello_domain_select as select;
+pub use crate::__cello_domain_select_biased as select_biased;
 
 pub mod rng {
     use super::*;

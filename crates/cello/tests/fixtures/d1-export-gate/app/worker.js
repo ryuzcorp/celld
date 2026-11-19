@@ -57,7 +57,7 @@ export default {
             method: "POST",
             headers: { "content-type": "application/json" },
             body: JSON.stringify({ export: {} }),
-            __celldOperatorIngress: true,
+            __celloOperatorIngress: true,
           }));
           return { status: res.status, body: (await res.text()).slice(0, 300) };
         }

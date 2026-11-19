@@ -160,7 +160,7 @@ impl StorageBackend {
     ///
     /// Azure Blob Storage requires a metadata name to be a C# identifier,
     /// and it refuses the whole write with `400 InvalidMetadata` when a name
-    /// holds a hyphen. celld names such as `celld-r2` failed every R2 write
+    /// holds a hyphen. cello names such as `cello-r2` failed every R2 write
     /// and lost every telemetry batch on an `az://` bucket
     /// (denoland/celld#209). Azure therefore gets an underscore for each
     /// hyphen, and [`BlobAttributes::metadata_value`] reads either spelling.

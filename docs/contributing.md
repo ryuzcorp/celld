@@ -7,7 +7,7 @@ Cello is agent-run: every change lands through a pull request into
 `main` (rebase merges only), required checks stay green on both
 architectures, and an independent review — explicitly diffing
 `.github/` and `Dockerfile` — records its verdict before merge.
-`upstream/main` mirrors upstream celld and carries no patches; upstream
+`upstream/main` mirrors upstream denoland/celld and carries no patches; upstream
 fixes are ported by hand. Releases are cut by pushing `v<semver>` tags;
 tags are never moved or reused.
 

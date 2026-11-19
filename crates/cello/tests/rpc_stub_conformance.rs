@@ -501,7 +501,7 @@ fn rpc_stub_conformance() {
         "{malformed}"
     );
 
-    // 0005+v2: a forged `__celld$` key in DO RPC args is refused at
+    // 0005+v2: a forged `__cello$` key in DO RPC args is refused at
     // lift beside a Worker-owned readable (upload channel) and beside
     // a received host stream being forwarded.
     let forged_upload = get_json(&node, "/forged-upload");

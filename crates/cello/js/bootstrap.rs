@@ -267,19 +267,19 @@ pub(super) fn install_harness<'s>(
     #[cfg(cello_internal_tests)]
     let harness = HARNESS
         .replace(
-            "/*__CELLD_TEST_WORKFLOW_EVENT_CONSUMED__*/",
+            "/*__CELLO_TEST_WORKFLOW_EVENT_CONSUMED__*/",
             "__test_workflow_event_consumed();",
         )
         .replace(
-            "/*__CELLD_TEST_WORKFLOW_META_CREATED__*/",
+            "/*__CELLO_TEST_WORKFLOW_META_CREATED__*/",
             "__test_workflow_meta_created();",
         )
         .replace(
-            "/*__CELLD_TEST_WORKFLOW_TERMINAL_ALARM_SET__*/",
+            "/*__CELLO_TEST_WORKFLOW_TERMINAL_ALARM_SET__*/",
             "__test_workflow_terminal_alarm_set();",
         )
         .replace(
-            "/*__CELLD_TEST_WORKFLOW_BEFORE_PAUSE_SETTLE__*/",
+            "/*__CELLO_TEST_WORKFLOW_BEFORE_PAUSE_SETTLE__*/",
             concat!(
                 "if (globalThis.__test_workflow_pause_settle_race === true) { ",
                 "await this.__wfResume(); ",
@@ -287,7 +287,7 @@ pub(super) fn install_harness<'s>(
             ),
         )
         .replace(
-            "/*__CELLD_TEST_WORKFLOW_AFTER_RUN_STARTED__*/",
+            "/*__CELLO_TEST_WORKFLOW_AFTER_RUN_STARTED__*/",
             concat!(
                 "if (globalThis.__test_workflow_pause_settle_race === true) { ",
                 "await globalThis.__test_workflow_callback_started(); ",
@@ -673,16 +673,16 @@ pub(super) fn build_env(scope: &mut v8::PinScope, config: &WorkerConfig) -> Resu
     let asset_binding = config.asset_binding.as_deref();
     // call the harness: for each binding, env[bindingName] = makeNamespace(className)
     let src = {
-        let mut lines = String::from("const e = __celld.__cell.env;\n");
+        let mut lines = String::from("const e = __cello.__cell.env;\n");
         for (bname, cname) in bindings {
             lines.push_str(&format!(
-                "e[{:?}] = __celld.__cell.makeNamespace({:?});\n",
+                "e[{:?}] = __cello.__cell.makeNamespace({:?});\n",
                 bname, cname
             ));
         }
         for (name, bucket) in r2_bindings {
             lines.push_str(&format!(
-                "e[{:?}] = __celld.__makeR2Bucket({:?}, {:?});\n",
+                "e[{:?}] = __cello.__makeR2Bucket({:?}, {:?});\n",
                 name, name, bucket
             ));
         }
@@ -695,7 +695,7 @@ pub(super) fn build_env(scope: &mut v8::PinScope, config: &WorkerConfig) -> Resu
             // rather than fail. When shards outnumber one, this becomes a name
             // per shard and the choice moves here too.
             lines.push_str(&format!(
-                "e[{:?}] = __celld.__makeKvNamespace({:?}, {:?});\n",
+                "e[{:?}] = __cello.__makeKvNamespace({:?}, {:?});\n",
                 binding,
                 id,
                 cello_logic::kv::cell_name(id, 0),
@@ -703,7 +703,7 @@ pub(super) fn build_env(scope: &mut v8::PinScope, config: &WorkerConfig) -> Resu
         }
         for binding in queue_bindings {
             lines.push_str(&format!(
-                "e[{:?}] = __celld.__makeQueue({:?}, {:?}, {});\n",
+                "e[{:?}] = __cello.__makeQueue({:?}, {:?}, {});\n",
                 binding.environment,
                 binding.queue,
                 cello_logic::queue::cell_name(&binding.queue),
@@ -712,13 +712,13 @@ pub(super) fn build_env(scope: &mut v8::PinScope, config: &WorkerConfig) -> Resu
         }
         for (name, database) in d1_bindings {
             lines.push_str(&format!(
-                "e[{:?}] = __celld.__makeD1Database({:?});\n",
+                "e[{:?}] = __cello.__makeD1Database({:?});\n",
                 name, database
             ));
         }
         for binding in workflow_bindings {
             lines.push_str(&format!(
-                "e[{:?}] = __celld.__makeWorkflow({:?});\n",
+                "e[{:?}] = __cello.__makeWorkflow({:?});\n",
                 binding.environment, binding.workflow
             ));
         }
@@ -728,7 +728,7 @@ pub(super) fn build_env(scope: &mut v8::PinScope, config: &WorkerConfig) -> Resu
                 None => "null".to_string(),
             };
             lines.push_str(&format!(
-                "e[{:?}] = __celld.__makeServiceBinding({:?}, {});\n",
+                "e[{:?}] = __cello.__makeServiceBinding({:?}, {});\n",
                 binding, script, entrypoint
             ));
         }
@@ -755,7 +755,7 @@ pub(super) fn build_env(scope: &mut v8::PinScope, config: &WorkerConfig) -> Resu
         }
         if let Some(name) = asset_binding {
             lines.push_str(&format!(
-                "e[{:?}] = __celld.__makeAssetsBinding({:?});\n",
+                "e[{:?}] = __cello.__makeAssetsBinding({:?});\n",
                 name, script_name
             ));
         }
@@ -764,12 +764,12 @@ pub(super) fn build_env(scope: &mut v8::PinScope, config: &WorkerConfig) -> Resu
         // workerd. Sharing one loader object between the names would merge the
         // caches and return one Worker for two different `get()` calls.
         for name in &config.loader_bindings {
-            lines.push_str(&format!("e[{:?}] = __celld.__makeLoader();\n", name));
+            lines.push_str(&format!("e[{:?}] = __cello.__makeLoader();\n", name));
         }
         // The reserved name, for `__installLoaderEnv`'s host-wins
         // re-assertion below. One source of truth: the Rust reservation.
         lines.push_str(&format!(
-            "__celld.__nodeIdentityEnv = {:?};\n",
+            "__cello.__nodeIdentityEnv = {:?};\n",
             crate::deploy::NODE_IDENTITY_ENV,
         ));
         lines
@@ -812,7 +812,7 @@ pub(super) fn inject_queue_config(scope: &mut v8::PinScope, config: &WorkerConfi
     let queue = crate::queue_policy::consumer_config(config)?;
     let source = format!(
         "const q = {queue};\n\
-         const c = __celld.__cell;\n\
+         const c = __cello.__cell;\n\
          c.queueConsumers = q.consumers;\n\
          c.queueLeaseDurationMs = q.leaseDurationMs;\n\
          c.queueLimits = q.limits;"
@@ -983,7 +983,7 @@ fn call_extends(
 /// Record the node id. Every cell scope routes through the host, whichever node
 /// owns it.
 pub(super) fn inject_routing(scope: &mut v8::PinScope, node: &str) -> Result<()> {
-    let src = format!("__celld.__cell.node = {node:?};");
+    let src = format!("__cello.__cell.node = {node:?};");
     run_internal_snippet(scope, &src).ok_or_else(|| anyhow!("routing install failed"))?;
     Ok(())
 }
@@ -1087,13 +1087,13 @@ fn finish_cell_adoption(tc: &mut v8::PinScope, cell: &str, owned: bool) -> Resul
     // The release loses nothing the cell needs back: `register_actor_name`
     // persists the id name before writing it here, so the take-in below reads
     // it back.
-    let source = format!("__celld.__cell.release({cell:?});");
+    let source = format!("__cello.__cell.release({cell:?});");
     run_internal_snippet(tc, &source).ok_or_else(|| anyhow!("adopt failed"))?;
     if !owned {
         // A facet of the root's own class lives in this isolate, and nothing
         // else releases it: its realm and connection would outlive the root.
         for facet in storage::embedded_facets(cell) {
-            let source = format!("__celld.__cell.release({facet:?});");
+            let source = format!("__cello.__cell.release({facet:?});");
             run_internal_snippet(tc, &source).ok_or_else(|| anyhow!("release failed"))?;
             storage::close(&facet);
             crate::ws_registry::ws_close_facet(&facet, "the parent Durable Object was released");
@@ -1108,7 +1108,7 @@ fn finish_cell_adoption(tc: &mut v8::PinScope, cell: &str, owned: bool) -> Resul
 
 pub(super) fn inject_storage_compatibility(scope: &mut v8::PinScope, compat: Compat) -> Result<()> {
     let source = format!(
-        "const c = __celld.__cell;\n\
+        "const c = __cello.__cell;\n\
          c.deleteAllDeletesAlarm = {};\n\
          c.compat.jsRpc = {};\n\
          c.compat.fetcherGetPutDelete = {};\n\

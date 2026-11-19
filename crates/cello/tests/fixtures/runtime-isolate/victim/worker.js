@@ -4,7 +4,7 @@
 // the first script's top level overrides shared primordials, so every probe
 // here reads a shared runtime cell that must be unaffected by that pollution.
 const J = (o, st = 200) => Response.json(o, { status: st });
-const MARK = "__celld_probe_marker";
+const MARK = "__cello_probe_marker";
 
 const stubPost = (stub, body) =>
   stub.fetch("http://cell/", {

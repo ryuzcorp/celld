@@ -5,7 +5,7 @@ description: OTLP resource attributes, traceparent exposure, span method and sta
 
 Patches to what Cello records and where it sends it. The
 [Telemetry](../telemetry.md) page is the reference; these are the
-deltas over upstream celld. Each entry names its fork patch number.
+deltas over upstream denoland/celld. Each entry names its fork patch number.
 
 - `0132` — The OTLP resource parses the standard
   `OTEL_RESOURCE_ATTRIBUTES` env var into ordered resource entries.

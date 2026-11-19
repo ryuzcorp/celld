@@ -478,7 +478,7 @@ fn ignored_project_path(
                         // path. Probe one child so `generated/**` also ignores
                         // the event that creates `generated` itself.
                         || pattern.matches_path_with(
-                            &candidate.join("__celld_watch_descendant__"),
+                            &candidate.join("__cello_watch_descendant__"),
                             options,
                         )
                 })

@@ -1,6 +1,6 @@
 ---
 title: Efficiency and cost
-description: Fewer bucket requests, less memory, and the s3bench harness over upstream celld.
+description: Fewer bucket requests, less memory, and the s3bench harness over upstream denoland/celld.
 ---
 
 Patches that cut bucket request counts, memory, and latency — with the
