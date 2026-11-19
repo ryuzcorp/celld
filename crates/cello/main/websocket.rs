@@ -2961,10 +2961,15 @@ mod pump_tests {
 
     /// An orderly EOF drains staged messages in order before reporting the
     /// transport close: the peer sends A and B then ends its write side
-    /// while A's dispatch is parked, so the read-ahead stages B before
+    /// while B's dispatch is parked, so the read-ahead stages B before
     /// observing EOF. The old inline loop dispatched B before reading EOF;
     /// dropping B with the transport close fails the order assertion before
-    /// the fix.
+    /// the fix. The drain behind a parked dispatch is bounded by one
+    /// unrenewed progress interval — a truncation mid-frame is
+    /// indistinguishable from this clean end — so the pump waits for the
+    /// in-flight dispatch but not forever (see
+    /// truncated_frame_with_stuck_dispatch_ends_transport for the bound
+    /// firing).
     #[test]
     fn orderly_eof_drains_staged_in_order() {
         test_runtime().block_on(async {
@@ -3005,10 +3010,12 @@ mod pump_tests {
                 .await
                 .expect("client data");
             drop(client_stream);
-            // The pump must wait for the drain: the first dispatch is still
-            // parked, so a pump that drops the staged queue with the
-            // transport close returns here instead of timing out.
-            let waited = tokio::time::timeout(std::time::Duration::from_secs(5), &mut pump).await;
+            // The pump must wait for the drain: B's dispatch is still
+            // parked, so a pump that drops the in-flight dispatch with the
+            // transport close returns here instead of timing out. Well under
+            // the five-second progress bound the EOF drain runs under — the
+            // bound firing is truncated_frame's case, not this one's.
+            let waited = tokio::time::timeout(std::time::Duration::from_secs(1), &mut pump).await;
             assert!(
                 waited.is_err(),
                 "the pump must wait for the staged drain, not report the transport close early"
