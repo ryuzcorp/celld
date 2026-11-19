@@ -44,8 +44,11 @@ pub const LOG_BODY_CAP: usize = 8 * 1024;
 const SCHEMA_VERSION: &str = "v0-unstable";
 
 /// User-metadata keys stamped on every telemetry batch object in the bucket.
-/// Frozen: old batches must keep decoding under new binaries, so these
-/// spellings never change. See `rename-frozen.md`. (The OTLP resource
+/// New writes use this spelling; batches a celld node wrote carry
+/// `celld-schema` / `celld-retention`, and the retention sweep reads the
+/// date-partitioned key rather than the forensic stamp, so both keep
+/// their lifecycle. Readers of the stamp itself must accept both
+/// spellings. See `docs/compatibility.md`. (The OTLP resource
 /// attributes such as `cello.version` are a different surface and do rename.)
 pub(crate) const RETENTION_META_KEY: &str = "cello-retention";
 pub(crate) const SCHEMA_META_KEY: &str = "cello-schema";
@@ -1507,13 +1510,61 @@ pub fn encode_logs(logs: &[Log], node: &str, region: &str) -> anyhow::Result<Vec
 mod tests {
     use super::*;
 
-    /// The batch object user-metadata keys are frozen: old telemetry batches
-    /// in the bucket must keep their schema tag under new binaries. See
-    /// `rename-frozen.md`. Never rename these without a migration.
+    /// The batch object user-metadata keys are written with the new
+    /// spelling. Batches a celld node wrote carry `celld-schema` /
+    /// `celld-retention`; the sweep reads the date-partitioned key, never
+    /// the forensic stamp, so both lifecycles are identical. Readers of
+    /// the stamp itself must accept both spellings. See
+    /// `docs/compatibility.md`.
     #[test]
     fn batch_object_metadata_keys_stay_frozen() {
         assert_eq!(RETENTION_META_KEY, "cello-retention");
         assert_eq!(SCHEMA_META_KEY, "cello-schema");
+    }
+
+    /// A batch a celld node wrote carries the old stamps: it lists like a
+    /// new one, and the sweep judges it by its date-partitioned key, never
+    /// by the forensic stamp. An old batch is neither skipped nor
+    /// stranded. (The sweep's page walk needs a paginated store, which the
+    /// unit-test bucket does not serve, so this pins the listing plus the
+    /// sweep's per-key verdict — the only two places a stamp could
+    /// matter.)
+    #[tokio::test]
+    async fn legacy_stamped_batch_keeps_its_lifecycle() {
+        let bucket = Bucket::for_test();
+        let legacy_meta = [("celld-schema", "v0-unstable"), ("celld-retention", "30d")];
+        let old_key = format!("{TRACES_PREFIX}/n/2001/01/02/03/1-00000000.parquet");
+        bucket
+            .put_with_meta(&old_key, b"old".to_vec(), &legacy_meta)
+            .await
+            .expect("seed the celld-written batch");
+        let fresh_key = format!("{TRACES_PREFIX}/n/2026/11/19/03/2-00000000.parquet");
+        bucket
+            .put_with_meta(&fresh_key, b"fresh".to_vec(), &legacy_meta)
+            .await
+            .expect("seed the fresh legacy-stamped batch");
+        let listed = bucket.list(TRACES_PREFIX).await.expect("list");
+        assert_eq!(listed.len(), 2, "both batches list");
+        let cutoff = (2020, 6, 15);
+        let verdicts: Vec<(&str, bool)> = listed
+            .iter()
+            .map(|object| {
+                let key: &str = object.location.as_ref();
+                (key, expired(key, TRACES_PREFIX, cutoff))
+            })
+            .collect();
+        assert!(
+            verdicts
+                .iter()
+                .any(|(key, expired)| *key == old_key && *expired),
+            "the old legacy-stamped batch is swept: {verdicts:?}"
+        );
+        assert!(
+            verdicts
+                .iter()
+                .any(|(key, expired)| *key == fresh_key && !expired),
+            "the fresh legacy-stamped batch is retained: {verdicts:?}"
+        );
     }
 
     #[test]

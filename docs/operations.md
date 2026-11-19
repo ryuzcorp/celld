@@ -421,9 +421,12 @@ release, so keep operator tooling and Cello releases together.
 
 ## Upgrade notes
 
-- **v0.1.0 to v0.2.0: stop all.** Stop every v0.1.0 node, then start
-  v0.2.0. The two versions use different peer addresses and data formats,
-  so a fleet must not mix them.
+- **celld / Cello 0.1.x to v0.2.0: stop all.** Stop every old node, then
+  start v0.2.0 on the same bucket: 0.2.0 reads data a celld node wrote
+  (new writes use the `cello` spellings) but speaks a new peer protocol,
+  so a fleet must not mix versions. Rename every `CELLD_*` variable to
+  `CELLO_*`; the node refuses to start otherwise. See
+  [Compatibility](compatibility.md).
 - **v0.2.1 to v0.3.0: rolling.** The default durability changes from
   `bucket` to `fleet`. Do not start a v0.2.x binary after a node runs
   v0.3.0 unless its shutdown log contains

@@ -15,7 +15,7 @@ it installs the latest stable release. To live on prereleases instead,
 pass `--beta` or set `CELLO_CHANNEL=beta`: the installer then takes the
 newest `-beta.N` / `-rc.N` tag (unrelated to the `beta` image tag, which
 tracks the newest release of any kind). `CELLO_VERSION` (for example
-`0.1.0` or `v0.1.0`) installs one exact release and overrides both
+`0.2.0` or `v0.2.0`) installs one exact release and overrides both
 paths; to go back, run the installer again with the previous tag.
 
 Install location: a set, non-empty `CELLO_INSTALL_DIR` wins outright.
@@ -37,7 +37,7 @@ releases one attestation covers the `<version>`, `<major>.<minor>`,
 ## Docker
 
 The release image is published for Linux amd64 and arm64 at
-`ghcr.io/ryuzcorp/cello`, tagged `0.1.0`, `0.1`, `beta`, and `latest`.
+`ghcr.io/ryuzcorp/cello`, tagged `0.2.0`, `0.2`, `beta`, and `latest`.
 `latest` moves only on stable releases; `beta` also moves on `-beta.N`
 prereleases.
 

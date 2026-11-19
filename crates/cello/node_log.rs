@@ -115,8 +115,8 @@ pub type LogStreamIo = Box<dyn LogStreamDuplex>;
 const STREAM_FRAME_CAP: usize = 64 * 1024 * 1024;
 
 /// The upgrade value the leader and follower exchange to open a peer
-/// log-tail stream. Frozen node-to-node wire identifier: mixed-version
-/// fleets negotiate this while they upgrade. See `rename-frozen.md`.
+/// log-tail stream. Frozen node-to-node wire identifier at the new
+/// spelling: no mixed fleets. See `docs/compatibility.md`.
 pub const LOG_STREAM_UPGRADE: &str = "cello-log-stream";
 
 #[doc(hidden)]

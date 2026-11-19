@@ -45,8 +45,15 @@ const STREAM_PART: usize = 8 << 20;
 
 /// The user-metadata name the R2 object record lives under. See
 /// [`Envelope`]. The bucket stores it as `cello_r2` on Azure, which
-/// refuses a hyphen in a metadata name.
+/// refuses a hyphen in a metadata name. Cello writes this spelling and
+/// reads [`LEGACY_ENVELOPE`] too, so objects a celld node wrote keep
+/// loading after the swap: accepting is not migrating, and nothing
+/// rewrites the old name in place.
 const ENVELOPE: &str = "cello-r2";
+
+/// The pre-rename spelling of [`ENVELOPE`], recorded on objects a celld
+/// node wrote. Read-only: writes always use [`ENVELOPE`].
+const LEGACY_ENVELOPE: &str = "celld-r2";
 
 /// The key space one binding owns inside the fleet bucket. `bucket_name`
 /// comes from the deployment manifest, which validates it, so the prefix
@@ -120,8 +127,10 @@ impl Envelope {
     /// headers come off the response, because they are the object's own
     /// headers and stay right even for an object written by another tool.
     fn read(attributes: &BlobAttributes) -> Self {
-        let mut envelope = attributes
+        let record = attributes
             .metadata_value(ENVELOPE)
+            .or_else(|| attributes.metadata_value(LEGACY_ENVELOPE));
+        let mut envelope = record
             .and_then(|value| serde_json::from_str::<Self>(value).ok())
             .unwrap_or_else(|| Self {
                 custom: attributes
@@ -552,9 +561,16 @@ fn unscope_key(strip: &str, key: &str) -> String {
 /// keeps working; a seeded listing's cursor carries its bound, because the
 /// offset alone would re-admit keys the first page filtered out where
 /// encoded and decoded orders disagree. The token is shell-safe base64url
-/// over JSON, so the CLI prints it back unchanged.
+/// over JSON, so the CLI prints it back unchanged. Cello writes this
+/// spelling and reads [`LEGACY_CURSOR_FAMILY`] too, so a cursor an
+/// operator holds from a celld node keeps working after the swap.
 const CURSOR_FAMILY: &str = "cello-r2-cursor-";
 const CURSOR_V1: &str = "cello-r2-cursor-v1.";
+
+/// The pre-rename spelling of the cursor family. Read-only: an operator
+/// may still hold one from a celld node, and it must keep working.
+const LEGACY_CURSOR_FAMILY: &str = "celld-r2-cursor-";
+const LEGACY_CURSOR_V1: &str = "celld-r2-cursor-v1.";
 
 /// A seeded listing's cursor: the consumed position plus the decoded
 /// bound of the listing it came from, both in the caller's key space.
@@ -579,15 +595,16 @@ fn encode_cursor(pos: &str, bound: Option<&str>) -> String {
 }
 
 /// Split a cursor into its consumed position and its listing's bound. A
-/// plain key is an offset with no bound; anything in the token family
-/// must parse, so a corrupt token fails loudly instead of resuming
-/// somewhere surprising.
+/// plain key is an offset with no bound; anything in either spelling of
+/// the token family must parse, so a corrupt token fails loudly instead
+/// of resuming somewhere surprising.
 fn decode_cursor(cursor: &str) -> Result<(String, Option<String>), String> {
-    if !cursor.starts_with(CURSOR_FAMILY) {
+    if !cursor.starts_with(CURSOR_FAMILY) && !cursor.starts_with(LEGACY_CURSOR_FAMILY) {
         return Ok((cursor.to_string(), None));
     }
     let payload = cursor
         .strip_prefix(CURSOR_V1)
+        .or_else(|| cursor.strip_prefix(LEGACY_CURSOR_V1))
         .ok_or_else(|| format!("unsupported R2 cursor version: {cursor:?}"))?;
     let json = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(payload)
@@ -599,11 +616,11 @@ fn decode_cursor(cursor: &str) -> Result<(String, Option<String>), String> {
 
 /// The cursor a page answers a position with: the key itself, wrapped
 /// with the listing's bound when the walk is seeded. A key that itself
-/// starts like a token is wrapped too, without a bound, so it can never
-/// be read back as a token.
+/// starts like a token, under either spelling, is wrapped too, without a
+/// bound, so it can never be read back as a token.
 fn wrap_cursor(strip: &str, bound: Option<&str>, key: &str) -> String {
     let pos = unscope_key(strip, key);
-    if bound.is_some() || pos.starts_with(CURSOR_FAMILY) {
+    if bound.is_some() || pos.starts_with(CURSOR_FAMILY) || pos.starts_with(LEGACY_CURSOR_FAMILY) {
         encode_cursor(&pos, bound)
     } else {
         pos
@@ -959,15 +976,93 @@ mod tests {
     use super::*;
     use serde_json::Value;
 
-    /// The envelope and cursor user-metadata keys are frozen: they are
-    /// persisted on bucket objects, so old objects keep decoding under new
-    /// binaries. See `rename-frozen.md`. Never rename these without a
-    /// migration (and dual-read).
+    /// The envelope and cursor user-metadata keys are frozen: new writes
+    /// use the `cello` spelling, and reads accept the pre-rename `celld`
+    /// spelling too, so objects a celld node wrote keep loading after the
+    /// swap. See `docs/compatibility.md`.
     #[test]
     fn envelope_and_cursor_keys_stay_frozen() {
         assert_eq!(ENVELOPE, "cello-r2");
+        assert_eq!(LEGACY_ENVELOPE, "celld-r2");
         assert_eq!(CURSOR_FAMILY, "cello-r2-cursor-");
         assert_eq!(CURSOR_V1, "cello-r2-cursor-v1.");
+        assert_eq!(LEGACY_CURSOR_FAMILY, "celld-r2-cursor-");
+        assert_eq!(LEGACY_CURSOR_V1, "celld-r2-cursor-v1.");
+    }
+
+    /// An object a celld node wrote carries its record under the legacy
+    /// name: it still reads, with the response headers winning as always.
+    /// A corrupt legacy record falls back to raw user metadata, exactly
+    /// like a corrupt new one.
+    #[test]
+    fn legacy_envelope_still_reads() {
+        use std::collections::BTreeMap;
+        let record = serde_json::to_string(&Envelope {
+            custom: BTreeMap::from([("k".to_string(), "v".to_string())]),
+            http: HttpMeta {
+                content_type: None,
+                content_language: None,
+                content_disposition: None,
+                content_encoding: None,
+                cache_control: None,
+                cache_expiry: None,
+            },
+            ..Default::default()
+        })
+        .expect("the record serializes");
+        let attributes = BlobAttributes {
+            metadata: vec![(LEGACY_ENVELOPE.to_string(), record)],
+            content_type: Some("text/plain".to_string()),
+            ..Default::default()
+        };
+        let envelope = Envelope::read(&attributes);
+        assert_eq!(
+            envelope.custom.get("k").map(String::as_str),
+            Some("v"),
+            "the legacy record parses"
+        );
+        assert_eq!(
+            envelope.http.content_type.as_deref(),
+            Some("text/plain"),
+            "response headers still win"
+        );
+        assert!(
+            !envelope.custom.contains_key(LEGACY_ENVELOPE),
+            "the legacy record is not leaked as custom metadata"
+        );
+    }
+
+    /// A cursor an operator holds from a celld node keeps working: the
+    /// legacy family decodes like the new one, and new writes keep the
+    /// new spelling. A corrupt legacy token fails loudly, like a corrupt
+    /// new one.
+    #[test]
+    fn legacy_cursor_still_decodes() {
+        let token = encode_cursor("a/1", Some("a"));
+        let legacy = token
+            .strip_prefix(CURSOR_V1)
+            .map(|payload| format!("{LEGACY_CURSOR_V1}{payload}"))
+            .expect("a written token carries the new prefix");
+        assert_eq!(
+            decode_cursor(&legacy),
+            Ok(("a/1".to_string(), Some("a".to_string()))),
+            "a legacy cursor decodes"
+        );
+        assert!(
+            decode_cursor(&format!("{LEGACY_CURSOR_V1}not-base64!!!")).is_err(),
+            "a corrupt legacy cursor fails loudly"
+        );
+        let wrapped = wrap_cursor("b/", None, &format!("b/{LEGACY_CURSOR_FAMILY}x"));
+        assert_ne!(
+            wrapped,
+            format!("{LEGACY_CURSOR_FAMILY}x"),
+            "a legacy-looking key is wrapped, never answered raw"
+        );
+        assert_eq!(
+            decode_cursor(&wrapped),
+            Ok((format!("{LEGACY_CURSOR_FAMILY}x"), None)),
+            "the wrapped legacy-looking key resumes after itself"
+        );
     }
 
     static STORE: OnceLock<()> = OnceLock::new();

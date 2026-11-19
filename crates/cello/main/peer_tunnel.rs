@@ -988,8 +988,9 @@ mod operator_tests {
         assert!(!honored_trusted(&bare, marker_aware));
     }
 
-    /// The tunnel subprotocol is frozen node-to-node wire: mixed-version
-    /// fleets negotiate it while they upgrade. See `rename-frozen.md`.
+    /// The tunnel subprotocol is frozen node-to-node wire at the new
+    /// spelling: no mixed fleets — stop all celld nodes, then start cello
+    /// on the same bucket. See `docs/compatibility.md`.
     #[test]
     fn tunnel_protocol_stays_frozen() {
         assert_eq!(TUNNEL_PROTOCOL, "cello-tunnel");

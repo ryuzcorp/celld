@@ -12,7 +12,7 @@ plane or consensus service, and an inactive cell costs almost nothing.
 
 📚 Docs: **https://cello.ryuz.eu** — [Install](https://cello.ryuz.eu/install) ·
 [Operations](https://cello.ryuz.eu/operations) ·
-[What Cello adds over celld](https://cello.ryuz.eu/what-cello-adds) ·
+[What Cello adds over upstream](https://cello.ryuz.eu/what-cello-adds) ·
 [Changelog](https://cello.ryuz.eu/changelog)
 
 ## Quickstart
@@ -124,12 +124,13 @@ the same configuration. Mixed versions cannot share a serving fleet.
 ## Based on celld
 
 Cello is a renamed continuation of [celld](https://github.com/denoland/celld)
-by Deno Land Inc., plus 136 patches — the [What Cello adds over
-celld](https://cello.ryuz.eu/what-cello-adds) page documents every one.
-A bucket written by celld `v0.6.3-ryuzcorp.13` opens under Cello 0.1.0
-with no migration; [Compatibility with
-celld](https://cello.ryuz.eu/compatibility) lists the frozen identifiers
-and the upgrade steps.
+by Deno Land Inc. — the [What Cello adds over
+upstream](https://cello.ryuz.eu/what-cello-adds) page documents every
+improvement. To upgrade, swap the binary or image on the same bucket:
+stop all celld nodes first (a mixed fleet is unsupported), rename
+`CELLD_*` variables to `CELLO_*`, and start Cello. Cello reads
+celld-written data and writes new data with `cello` names; see
+[Compatibility](https://cello.ryuz.eu/compatibility) for the details.
 
 ## License
 

@@ -11,10 +11,11 @@
 pub const STALE_ROUTE_HEADER: &str = "x-cells-route-error";
 pub const STALE_ROUTE_VALUE: &str = "stale-owner";
 
-/// The node-to-node overload signal on peer RPC responses. Frozen: a bucket
-/// written by cello `.13` is not involved, but mixed-version fleets exchange
-/// this header while they upgrade, so the spelling never changes.
-/// See `rename-frozen.md`.
+/// The node-to-node overload signal on peer RPC responses. Frozen at the
+/// new spelling: peer responses cross nodes, so every node of a fleet
+/// runs the same binary and a mixed celld/cello fleet is unsupported.
+/// Upgrading means stopping all celld nodes, then starting cello on the
+/// same bucket. See `docs/compatibility.md`.
 pub const OVERLOAD_HEADER: &str = "x-cello-overload";
 
 use crate::bucket::Bucket;
@@ -401,7 +402,7 @@ fn hex_nibble(value: u8) -> anyhow::Result<u8> {
 }
 
 /// Frozen wire identifiers, pinned so a rename cannot drift one side of a
-/// node-to-node exchange. See `rename-frozen.md`.
+/// node-to-node exchange. See `docs/compatibility.md`.
 #[cfg(test)]
 mod frozen_names_tests {
     use super::*;
