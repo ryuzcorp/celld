@@ -15,18 +15,14 @@
 
 mod common;
 
-use common::{announced, forward_announce};
+use common::{announced, cello_command, forward_announce};
 use serde_json::Value;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-
-fn cello_binary() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_cello"))
-}
 
 fn fixture_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -52,7 +48,10 @@ struct TestNode {
 
 impl TestNode {
     fn boot(project: &Path) -> Self {
-        let mut command = Command::new(cello_binary());
+        // `--logs` forwards through the configured filter: pin the filter
+        // the default path already uses, so the lease records boot waits
+        // for are always emitted.
+        let mut command = cello_command(project, [("RUST_LOG", "info")]);
         command
             .arg("dev")
             .arg(project)
@@ -60,14 +59,6 @@ impl TestNode {
             .arg("0")
             .arg("--no-watch")
             .arg("--logs")
-            // `--logs` forwards through the inherited filter, so an ambient
-            // `RUST_LOG=error` would suppress the lease records boot waits
-            // for. Pin the filter the default path already uses.
-            .env("RUST_LOG", "info")
-            // An ambient `CELLO_DEV_STATE` would pull the child's state out
-            // of the temporary project and leave `objects.sqlite3` behind.
-            // Drop it so the child keeps the normal project-local state.
-            .env_remove("CELLO_DEV_STATE")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         let mut child = command.spawn().expect("spawn cello dev");

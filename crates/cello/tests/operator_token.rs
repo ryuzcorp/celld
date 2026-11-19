@@ -23,21 +23,17 @@
 
 mod common;
 
-use common::{announced, forward_announce};
+use common::{announced, cello_command, forward_announce};
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const TOKEN: &str = "fleet-test-token";
 const AUTH: &str = "Bearer fleet-test-token";
 const WRONG_AUTH: &str = "Bearer wrong-token";
-
-fn cello_binary() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_cello"))
-}
 
 fn fixture_source() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -72,16 +68,16 @@ impl TestNode {
     fn boot_with_env(fixture: &Path, name: &str, env: &[(&str, &str)]) -> Self {
         // The port is ephemeral (`--port 0`); the readiness poll takes the
         // public address from the node's own announce line below.
-        let mut child = Command::new(cello_binary())
+        let mut command = cello_command(fixture, [("NO_COLOR", "1")]);
+        command.envs(env.iter().copied());
+        let mut child = command
             .arg("dev")
-            .env("NO_COLOR", "1")
             .arg(fixture)
             .arg("--port")
             .arg("0")
             .arg("--no-watch")
             .arg("--clean")
             .arg("--logs")
-            .envs(env.iter().copied())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -322,15 +318,13 @@ fn empty_operator_token_refuses_to_start() {
     let fixture = copy_fixture("empty");
     // No probe port: the child refuses before its listeners bind, and
     // `--port 0` names no port for a sibling test to steal.
-    let mut child = Command::new(cello_binary())
+    let mut child = cello_command(fixture.path(), [("NO_COLOR", "1"), ("CELLO_OPERATOR_TOKEN", "")])
         .arg("dev")
-        .env("NO_COLOR", "1")
         .arg(fixture.path())
         .arg("--port")
         .arg("0")
         .arg("--no-watch")
         .arg("--clean")
-        .env("CELLO_OPERATOR_TOKEN", "")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()

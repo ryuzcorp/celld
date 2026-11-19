@@ -24,11 +24,11 @@
 
 mod common;
 
-use common::{announced, forward_announce};
+use common::{announced, cello_command, forward_announce};
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -69,10 +69,6 @@ fn bearer(token: &str) -> String {
 const APP: &str = "staged-invoke-app";
 const HELPER: &str = "staged-invoke-helper";
 
-fn cello_binary() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_cello"))
-}
-
 fn fixture_src(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/staged-invoke")
@@ -110,22 +106,18 @@ impl TestNode {
         // No `--clean`: the store below already holds helper-v1, deployed
         // before boot so the live graph resolves, and cleaning would wipe
         // it. The temp project is fresh per test, so nothing stale lurks.
-        let mut command = Command::new(cello_binary());
-        command
+        let mut command = cello_command(project, [("NO_COLOR", "1")]);
+        if let Some(token) = token {
+            command.env("CELLO_OPERATOR_TOKEN", token);
+        }
+        command.envs(env.iter().copied());
+        let mut child = command
             .arg("dev")
-            .env("NO_COLOR", "1")
             .arg(project)
             .arg("--port")
             .arg("0")
             .arg("--no-watch")
-            .arg("--logs");
-        if let Some(token) = token {
-            command.env("CELLO_OPERATOR_TOKEN", token);
-        }
-        for (key, value) in env {
-            command.env(key, value);
-        }
-        let mut child = command
+            .arg("--logs")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()

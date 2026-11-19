@@ -30,10 +30,10 @@
 //! count alone would miss either side leaking.
 
 use serde_json::Value;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -42,10 +42,6 @@ const RELEASED_STUB_ERROR: &str =
 const STREAM_DISCONNECT_ERROR: &str = "ReadableStream received over RPC disconnected prematurely.";
 const STUB_DISPOSED_ERROR: &str = "RPC stub used after being disposed.";
 const FOREIGN_STREAM_ERROR: &str = "RPC streams cannot cross isolate boundaries yet.";
-
-fn cello_binary() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_cello"))
-}
 
 fn fixture_source() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -95,35 +91,9 @@ struct TestNode {
     internal: String,
 }
 
-/// One address of a `cello dev` node, from the announce line the supervisor
-/// forwards to its stderr. The node is non-dumpable (patch 0053), so
-/// `/proc/<pid>/fd` no longer names its listeners, and this is the node's
-/// own report of where it bound.
-fn announced(lines: &Mutex<Vec<String>>, prefix: &str) -> Option<String> {
-    lines
-        .lock()
-        .expect("announce lock")
-        .iter()
-        .find_map(|line| {
-            let address = line.strip_prefix(prefix)?.split_once(' ')?.0;
-            Some(address.to_string())
-        })
-}
+mod common;
 
-/// Collect the supervisor's stderr lines, which carry the node's announce
-/// lines (`--logs` forwards them).
-fn forward_announce(stderr: std::process::ChildStderr, lines: Arc<Mutex<Vec<String>>>) {
-    std::thread::spawn(move || {
-        let mut reader = BufReader::new(stderr);
-        let mut line = String::new();
-        while reader.read_line(&mut line).is_ok_and(|read| read > 0) {
-            lines
-                .lock()
-                .expect("announce lock")
-                .push(std::mem::take(&mut line));
-        }
-    });
-}
+use common::{announced, cello_command, forward_announce};
 
 impl TestNode {
     fn boot(fixture: &Path, name: &str) -> Self {
@@ -133,16 +103,16 @@ impl TestNode {
     fn boot_with_env(fixture: &Path, name: &str, env: &[(&str, &str)]) -> Self {
         // Port zero: the OS assigns the worker port, so parallel boots
         // can never claim the same one; discovery below learns it.
-        let mut child = Command::new(cello_binary())
+        let mut command = cello_command(fixture, [("NO_COLOR", "1")]);
+        command.envs(env.iter().copied());
+        let mut child = command
             .arg("dev")
-            .env("NO_COLOR", "1")
             .arg(fixture)
             .arg("--port")
             .arg("0")
             .arg("--no-watch")
             .arg("--clean")
             .arg("--logs")
-            .envs(env.iter().copied())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()

@@ -24,18 +24,14 @@
 
 mod common;
 
-use common::{announced, forward_announce};
+use common::{announced, cello_command, forward_announce};
 use serde_json::Value;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-
-fn cello_binary() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_cello"))
-}
 
 fn fixture_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -60,14 +56,13 @@ struct TestNode {
 
 impl TestNode {
     fn boot(app_project: &Path) -> Self {
-        let mut child = Command::new(cello_binary())
+        let mut child = cello_command(app_project, [("CELLO_TEST_WAIT", "1")])
             .arg("dev")
             .arg(app_project)
             .arg("--port")
             .arg("0")
             .arg("--no-watch")
             .arg("--logs")
-            .env("CELLO_TEST_WAIT", "1")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()

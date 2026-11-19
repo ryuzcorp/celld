@@ -32,18 +32,14 @@
 
 mod common;
 
-use common::{announced, forward_announce};
+use common::{announced, cello_command, forward_announce};
 use serde_json::Value;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-
-fn cello_binary() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_cello"))
-}
 
 fn fixture_source() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -72,7 +68,10 @@ struct TestNode {
 
 impl TestNode {
     fn boot(fixture: &Path, name: &str) -> Self {
-        let mut child = Command::new(cello_binary())
+        // One stateless isolate, so concurrent requests share the
+        // fixture's module state (its isolate-once shared setup) the
+        // way suspended requests pile onto one isolate in production.
+        let mut child = cello_command(fixture, [("CELLO_MAX_STATELESS_ISOLATES", "1")])
             .arg("dev")
             .arg(fixture)
             .arg("--port")
@@ -80,10 +79,6 @@ impl TestNode {
             .arg("--no-watch")
             .arg("--clean")
             .arg("--logs")
-            // One stateless isolate, so concurrent requests share the
-            // fixture's module state (its isolate-once shared setup) the
-            // way suspended requests pile onto one isolate in production.
-            .env("CELLO_MAX_STATELESS_ISOLATES", "1")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()

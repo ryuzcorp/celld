@@ -16,18 +16,14 @@
 
 mod common;
 
-use common::{announced, forward_announce};
+use common::{announced, cello_command, forward_announce};
 use serde_json::Value;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-
-fn cello_binary() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_cello"))
-}
 
 fn fixture_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -50,7 +46,10 @@ struct TestNode {
 
 impl TestNode {
     fn boot(project: &Path) -> Self {
-        let mut command = Command::new(cello_binary());
+        // Twelve one-second steps under a five-second handler budget:
+        // no single drive can finish, so completion proves every redrive
+        // replays and continues instead of stalling.
+        let mut command = cello_command(project, [("CELLO_HANDLER_BUDGET_S", "5")]);
         command
             .arg("dev")
             .arg(project)
@@ -58,10 +57,6 @@ impl TestNode {
             .arg("0")
             .arg("--no-watch")
             .arg("--logs")
-            // Twelve one-second steps under a five-second handler budget:
-            // no single drive can finish, so completion proves every redrive
-            // replays and continues instead of stalling.
-            .env("CELLO_HANDLER_BUDGET_S", "5")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         let mut child = command.spawn().expect("spawn cello dev");

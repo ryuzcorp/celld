@@ -30,18 +30,14 @@
 
 mod common;
 
-use common::{announced, forward_announce};
+use common::{NO_EXTRA_ENV, announced, cello_command, forward_announce};
 use serde_json::Value;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-
-fn cello_binary() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_cello"))
-}
 
 fn fixture_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -115,7 +111,10 @@ impl TestNode {
     /// like the plant hook defined) or without it (shipping shape, the
     /// plant hook absent).
     fn boot_with_env(attacker_project: &Path, with_test_hooks: bool) -> Self {
-        let mut command = Command::new(cello_binary());
+        let mut command = match with_test_hooks {
+            true => cello_command(attacker_project, [("CELLO_TEST_WAIT", "1")]),
+            false => cello_command(attacker_project, NO_EXTRA_ENV),
+        };
         command
             .arg("dev")
             .arg(attacker_project)
@@ -125,9 +124,6 @@ impl TestNode {
             .arg("--logs")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        if with_test_hooks {
-            command.env("CELLO_TEST_WAIT", "1");
-        }
         let mut child = command.spawn().expect("spawn cello dev");
         let mut stdout = child.stdout.take().expect("piped stdout");
         let stderr = child.stderr.take().expect("piped stderr");

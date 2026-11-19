@@ -26,18 +26,14 @@
 
 mod common;
 
-use common::{announced, forward_announce};
+use common::{announced, cello_command, forward_announce};
 use serde_json::Value;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-
-fn cello_binary() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_cello"))
-}
 
 fn fixture_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -64,21 +60,28 @@ struct TestNode {
 
 impl TestNode {
     fn boot(app_project: &Path, echo_port: u16, proxy: &str) -> Self {
-        let mut child = Command::new(cello_binary())
+        // Proxies are explicit: the cleared environment drops ambient
+        // `HTTP(S)_PROXY`/`ALL_PROXY` (and `NO_PROXY`, which the child's
+        // loopback probes must not bypass the test proxy for), so the
+        // test's own proxy is the only one in play.
+        let allow = format!("127.0.0.1:{echo_port}");
+        let mut child = cello_command(
+            app_project,
+            [
+                ("CELLO_EGRESS", "public"),
+                ("CELLO_EGRESS_ALLOW", allow.as_str()),
+                ("CELLO_FETCH_TIMEOUT_S", "3"),
+                ("HTTP_PROXY", proxy),
+                ("HTTPS_PROXY", proxy),
+                ("ALL_PROXY", proxy),
+            ],
+        )
             .arg("dev")
             .arg(app_project)
             .arg("--port")
             .arg("0")
             .arg("--no-watch")
             .arg("--logs")
-            .env("CELLO_EGRESS", "public")
-            .env("CELLO_EGRESS_ALLOW", format!("127.0.0.1:{echo_port}"))
-            .env("CELLO_FETCH_TIMEOUT_S", "3")
-            .env("HTTP_PROXY", proxy)
-            .env("HTTPS_PROXY", proxy)
-            .env("ALL_PROXY", proxy)
-            .env_remove("NO_PROXY")
-            .env_remove("no_proxy")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
