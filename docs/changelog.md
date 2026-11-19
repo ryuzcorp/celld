@@ -1,7 +1,26 @@
 ---
 title: Changelog
-description: What shipped in each Cello release, from v0.6.3-ryuzcorp.4 to v0.2.0.
+description: What shipped in each Cello release, from v0.6.3-ryuzcorp.4 to v0.2.1.
 ---
+## v0.2.1
+
+WebSocket robustness. No configuration, data, or bucket-format changes.
+
+- **Backpressure-safe WebSocket pipes** (#83, #87). The upgrade pump and
+  the cell pipes no longer block on a full queue. A peer that stops reading
+  is held to a 16 MiB backlog per direction, and the socket then ends
+  loudly with 1011. A single message of up to 32 MiB still passes, whatever
+  smaller backlog is ahead of it. Closes stay observable while a send is
+  parked, and teardown is bounded. A slow but live peer or a slow handler
+  is never timed out.
+- **WebSocket messages are capped at 32 MiB** (#85), the Cloudflare
+  Workers limit, whether sent as one frame or as fragments. A peer that
+  streams continuation frames past the cap gets close code 1009 instead
+  of growing the node's memory without bound, and the cell sees
+  `(1009, reason, false)`. An over-cap frame is refused from its header.
+  The reader holds under about 100 MiB per socket while messages are read;
+  `docs/cloudflare-compat.md` states the full per-direction bounds.
+
 ## v0.2.0
 
 Simple backward compatibility with
