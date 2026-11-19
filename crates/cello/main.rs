@@ -4590,7 +4590,8 @@ async fn async_main(
         // Either signal can demand the bucket: traces via `CELLO_OTEL=1`,
         // logs via `CELLO_OTEL_LOGS=bucket` under any traces sink.
         let sink_bucket = match (&config.sink, &config.logs_sink) {
-            (cello::telemetry::SinkChoice::Bucket, _) | (_, cello::telemetry::LogsSink::Bucket) => {
+            (Some(cello::telemetry::SinkChoice::Bucket), _)
+            | (_, cello::telemetry::LogsSink::Bucket) => {
                 if settings.bucket.is_none() {
                     anyhow::bail!(
                         "CELLO_OTEL=1 or CELLO_OTEL_LOGS=bucket but this node has no bucket; the \

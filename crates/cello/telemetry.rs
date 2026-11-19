@@ -110,7 +110,9 @@ pub enum LogsSink {
 
 #[derive(Debug)]
 pub struct Config {
-    pub sink: SinkChoice,
+    /// `None` when `CELLO_OTEL` is unset or `0`: traces are dropped and
+    /// only a `CELLO_OTEL_LOGS=bucket` split keeps telemetry on.
+    pub sink: Option<SinkChoice>,
     /// `CELLO_OTEL_BUCKET`, same endpoint/region/credentials as the
     /// fleet bucket. `None` means the fleet bucket itself.
     pub bucket_override: Option<String>,
@@ -135,8 +137,9 @@ pub struct Config {
 }
 
 impl Config {
-    /// `None` when `CELLO_OTEL` is unset or `0` — the default, and the
-    /// only zero-cost state.
+    /// `None` when neither a traces sink (`CELLO_OTEL`) nor bucket-only
+    /// logging (`CELLO_OTEL_LOGS=bucket`) is selected — the default, and
+    /// the only zero-cost state.
     pub fn from_env() -> anyhow::Result<Option<Config>> {
         Self::from_lookup(crate::env_vars::value)
     }
@@ -241,7 +244,13 @@ impl Config {
         )?
         .unwrap_or(5 * 1024 * 1024);
         let bucket_override = get("CELLO_OTEL_BUCKET")?;
-        Ok(sink.map(|sink| Config {
+        // Bucket-only logging keeps telemetry on with no traces sink: the
+        // traces side drops every span below, while logs export to the
+        // bucket (and the node still refuses to start without one).
+        if sink.is_none() && logs_sink != LogsSink::Bucket {
+            return Ok(None);
+        }
+        Ok(Some(Config {
             sink,
             bucket_override,
             otlp_headers,
@@ -776,7 +785,11 @@ pub fn init(
         })
     }
     let traces = match &config.sink {
-        SinkChoice::Bucket => {
+        None => {
+            tracing::info!("telemetry on; traces off, logs to the bucket");
+            SinkRuntime::Drop
+        }
+        Some(SinkChoice::Bucket) => {
             let bucket = bucket.clone().expect("the bucket sink needs a bucket");
             tracing::info!(
                 retention = %config.retention.label(),
@@ -789,7 +802,7 @@ pub fn init(
                 retention: config.retention.label(),
             }
         }
-        SinkChoice::Otlp { endpoint } => {
+        Some(SinkChoice::Otlp { endpoint }) => {
             tracing::info!(
                 endpoint = %endpoint,
                 sample_ratio = config.sample_ratio,
@@ -891,6 +904,10 @@ enum SinkRuntime {
         logs_url: String,
         headers: Vec<(String, String)>,
     },
+    /// No traces sink (`CELLO_OTEL` unset or `0` with
+    /// `CELLO_OTEL_LOGS=bucket`): spans are counted dropped, like an OTLP
+    /// permanent refusal, so the shed counter stays honest.
+    Drop,
 }
 
 impl SinkRuntime {
@@ -901,6 +918,7 @@ impl SinkRuntime {
         let span_count = spans.len() as u64;
         let log_count = logs.len() as u64;
         match self {
+            SinkRuntime::Drop => span_count + log_count,
             SinkRuntime::Bucket { bucket, retention } => {
                 let node_ = scope.node.to_string();
                 let region_ = scope.region.to_string();
@@ -1612,6 +1630,41 @@ mod tests {
             .is_err(),
             "an unknown logs sink must fail startup, not silently follow"
         );
+    }
+
+    #[test]
+    fn bucket_logs_without_traces_stay_on() {
+        // CELLO_OTEL_LOGS=bucket alone keeps telemetry on with no traces
+        // sink: spans drop, logs export to the bucket. Fails before the
+        // fix (`from_lookup` returned None and the setting was dead).
+        for otel in [None, Some("0")] {
+            let mut env = vec![("CELLO_OTEL_LOGS", "bucket")];
+            if let Some(otel) = otel {
+                env.push(("CELLO_OTEL", otel));
+            }
+            let config = config_with(&env)
+                .expect("valid config")
+                .expect("bucket-only logging keeps telemetry on");
+            assert!(config.sink.is_none(), "no traces sink selected");
+            assert_eq!(config.logs_sink, LogsSink::Bucket);
+        }
+    }
+
+    #[test]
+    fn no_traces_and_no_bucket_logs_stay_off() {
+        // Without a traces sink, anything but bucket logs leaves telemetry
+        // fully off — the zero-cost default is unchanged.
+        for env in [
+            vec![],
+            vec![("CELLO_OTEL", "0")],
+            vec![("CELLO_OTEL_LOGS", "0")],
+            vec![("CELLO_OTEL", "0"), ("CELLO_OTEL_LOGS", "0")],
+        ] {
+            assert!(
+                config_with(&env).expect("valid config").is_none(),
+                "telemetry stays off for {env:?}"
+            );
+        }
     }
 
     /// Traces and logs flush to their own sinks: with a split, the traces
