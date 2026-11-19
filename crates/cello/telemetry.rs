@@ -47,8 +47,8 @@ const SCHEMA_VERSION: &str = "v0-unstable";
 /// Frozen: old batches must keep decoding under new binaries, so these
 /// spellings never change. See `rename-frozen.md`. (The OTLP resource
 /// attributes such as `cello.version` are a different surface and do rename.)
-pub(crate) const RETENTION_META_KEY: &str = "celld-retention";
-pub(crate) const SCHEMA_META_KEY: &str = "celld-schema";
+pub(crate) const RETENTION_META_KEY: &str = "cello-retention";
+pub(crate) const SCHEMA_META_KEY: &str = "cello-schema";
 
 /// Queue between the hot path and the pump; a full queue sheds, counted.
 /// The pump drains continuously and the size trigger bounds its batch, so
@@ -1512,8 +1512,8 @@ mod tests {
     /// `rename-frozen.md`. Never rename these without a migration.
     #[test]
     fn batch_object_metadata_keys_stay_frozen() {
-        assert_eq!(RETENTION_META_KEY, "celld-retention");
-        assert_eq!(SCHEMA_META_KEY, "celld-schema");
+        assert_eq!(RETENTION_META_KEY, "cello-retention");
+        assert_eq!(SCHEMA_META_KEY, "cello-schema");
     }
 
     #[test]

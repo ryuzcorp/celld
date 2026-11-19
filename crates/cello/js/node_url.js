@@ -120,5 +120,5 @@
   };
 
   const { URL, URLSearchParams } = globalThis;
-  __celld.__urlModule = { URL, URLSearchParams, pathToFileURL, fileURLToPath };
+  __cello.__urlModule = { URL, URLSearchParams, pathToFileURL, fileURLToPath };
 })();

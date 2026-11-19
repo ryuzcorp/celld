@@ -148,7 +148,7 @@
         algorithm: { value: algorithm, enumerable: true },
         extractable: { value: Boolean(extractable), enumerable: true },
         usages: { value: Object.freeze(Array.from(usages || [])), enumerable: true },
-        __celldMaterial: { value: material },
+        __celloMaterial: { value: material },
       });
     }
     get [Symbol.toStringTag]() { return "CryptoKey"; }
@@ -237,7 +237,7 @@
     const run = encrypting ? _aesEncrypt : _aesDecrypt;
     const out = run(
       name,
-      key.__celldMaterial.bytes,
+      key.__celloMaterial.bytes,
       _toBuf(name === "AES-CTR" ? algorithm.counter : algorithm.iv),
       _toBuf(data),
       name === "AES-GCM"
@@ -452,33 +452,33 @@
       // X25519 peer key exports as 44 bytes that no counterpart can read,
       // and an EC key as 91 bytes of SPKI, and nothing reports an error.
       if (format === "raw" && key?.type === "public" &&
-          (key.__celldMaterial?.keyType === "ed25519" ||
-            key.__celldMaterial?.keyType === "x25519" ||
-            key.__celldMaterial?.keyType === "ec")) {
+          (key.__celloMaterial?.keyType === "ed25519" ||
+            key.__celloMaterial?.keyType === "x25519" ||
+            key.__celloMaterial?.keyType === "ec")) {
         if (!key.extractable) {
           throw new DOMException("key is not extractable", "InvalidAccessError");
         }
         return Uint8Array.from(_extra("asym-key-raw-public", {
-          der: Array.from(key.__celldMaterial.bytes),
+          der: Array.from(key.__celloMaterial.bytes),
         }).bytes).buffer;
       }
-      if (format === "raw" && key?.__celldMaterial?.bytes) {
+      if (format === "raw" && key?.__celloMaterial?.bytes) {
         if (!key.extractable) {
           throw new DOMException("key is not extractable", "InvalidAccessError");
         }
-        const raw = key.__celldMaterial.bytes;
+        const raw = key.__celloMaterial.bytes;
         return raw.buffer.slice(raw.byteOffset, raw.byteOffset + raw.byteLength);
       }
       // A symmetric key exports as `{"kty":"oct",...}` from its bytes, with
       // the JOSE `alg` for its algorithm and length. Lengths with no JOSE
       // name export without one rather than with a wrong one.
       if (format === "jwk" && key?.type === "secret" &&
-          key?.__celldMaterial?.bytes !== undefined &&
-          key?.__celldMaterial?.keyType === undefined) {
+          key?.__celloMaterial?.bytes !== undefined &&
+          key?.__celloMaterial?.keyType === undefined) {
         if (!key.extractable) {
           throw new DOMException("key is not extractable", "InvalidAccessError");
         }
-        const bytes = key.__celldMaterial.bytes;
+        const bytes = key.__celloMaterial.bytes;
         const name = key.algorithm?.name;
         const jwk = {
           kty: "oct",
@@ -492,15 +492,15 @@
         if (alg !== undefined) jwk.alg = alg;
         return jwk;
       }
-      if (format === "jwk" && key?.__celldMaterial?.jwk) {
+      if (format === "jwk" && key?.__celloMaterial?.jwk) {
         if (!key.extractable) {
           throw new DOMException("key is not extractable", "InvalidAccessError");
         }
-        return structuredClone(key.__celldMaterial.jwk);
+        return structuredClone(key.__celloMaterial.jwk);
       }
       // Asymmetric keys export from their normalized DER: spki and pkcs8 as
       // they are stored, jwk through the host.
-      const material = key?.__celldMaterial;
+      const material = key?.__celloMaterial;
       if (material?.keyType !== undefined) {
         if (!key.extractable) {
           throw new DOMException("key is not extractable", "InvalidAccessError");
@@ -550,7 +550,7 @@
         if (!_DIGEST_ALGS.has(hash)) {
           throw _notSupported("unsupported " + name + " hash: " + hash);
         }
-        const ikm = baseKey.__celldMaterial.bytes;
+        const ikm = baseKey.__celloMaterial.bytes;
         const salt = _toBuf(algorithm?.salt ?? new Uint8Array());
         let out;
         if (name === "HKDF") {
@@ -583,8 +583,8 @@
       // answer the raw shared secret, so everything below is shared.
       const shared = Uint8Array.from(_extra(
         name === "X25519" ? "x25519-derive" : "ecdh-derive", {
-          private: Array.from(_toBuf(baseKey.__celldMaterial.bytes)),
-          public: Array.from(_toBuf(publicKey.__celldMaterial.bytes)),
+          private: Array.from(_toBuf(baseKey.__celloMaterial.bytes)),
+          public: Array.from(_toBuf(publicKey.__celloMaterial.bytes)),
         }).bytes);
       if (length === null || length === undefined) return shared.buffer;
       const bytes = Number(length) / 8;
@@ -740,7 +740,7 @@
       const bytes = _toBuf(data);
       if (name === "HMAC") {
         const hash = _hashName(key?.algorithm?.hash);
-        const sig = _hmacSign(hash, key.__celldMaterial.bytes, bytes);
+        const sig = _hmacSign(hash, key.__celloMaterial.bytes, bytes);
         if (!sig) throw _operationError("HMAC sign failed");
         return sig.buffer.slice(sig.byteOffset, sig.byteOffset + sig.byteLength);
       }
@@ -763,7 +763,7 @@
         }
       }
       const result = _extra(operation, {
-        key: Array.from(key?.__celldMaterial?.bytes || []),
+        key: Array.from(key?.__celloMaterial?.bytes || []),
         data: Array.from(bytes),
         // RSA carries its hash on the key; the others ignore the field.
         hash: _hashName(key?.algorithm?.hash),
@@ -777,7 +777,7 @@
       if (name === "HMAC") {
         return _hmacVerify(
           _hashName(key?.algorithm?.hash),
-          key.__celldMaterial.bytes,
+          key.__celloMaterial.bytes,
           _toBuf(signature),
           _toBuf(data),
         );
@@ -798,7 +798,7 @@
       if (!operation) {
         throw _notSupported("unsupported verify algorithm: " + name);
       }
-      const material = key?.__celldMaterial?.bytes;
+      const material = key?.__celloMaterial?.bytes;
       if (!material) throw _notSupported("verify needs an spki public key");
       if (name === "ECDSA") {
         if (_canonicalEcCurve(key?.algorithm?.namedCurve) !== "P-256") {
@@ -830,7 +830,7 @@
           throw _notSupported("unsupported RSA-OAEP hash: " + hash);
         }
         const result = _extra("rsa-oaep-encrypt", {
-          key: Array.from(key?.__celldMaterial?.bytes || []),
+          key: Array.from(key?.__celloMaterial?.bytes || []),
           data: Array.from(_toBuf(data)),
           hash,
           label: _rsaOaepLabel(algorithm),
@@ -861,7 +861,7 @@
         }
         try {
           const out = _extra("aes-kw-wrap", {
-            key: Array.from(wrappingKey.__celldMaterial.bytes),
+            key: Array.from(wrappingKey.__celloMaterial.bytes),
             data: Array.from(_toBuf(raw)),
           });
           return Uint8Array.from(out.bytes).buffer;
@@ -886,7 +886,7 @@
         let raw;
         try {
           const out = _extra("aes-kw-unwrap", {
-            key: Array.from(unwrappingKey.__celldMaterial.bytes),
+            key: Array.from(unwrappingKey.__celloMaterial.bytes),
             data: Array.from(_toBuf(wrapped)),
           });
           raw = Uint8Array.from(out.bytes);
@@ -916,7 +916,7 @@
           throw _notSupported("unsupported RSA-OAEP hash: " + hash);
         }
         const result = _extra("rsa-oaep-decrypt", {
-          key: Array.from(key?.__celldMaterial?.bytes || []),
+          key: Array.from(key?.__celloMaterial?.bytes || []),
           data: Array.from(_toBuf(data)),
           hash,
           label: _rsaOaepLabel(algorithm),
@@ -1032,11 +1032,11 @@
         digest: { value: digest, enumerable: true },
         bytesWritten: { get: () => BigInt(state.written), enumerable: true },
       });
-      this.__celldDigestState = state;
+      this.__celloDigestState = state;
     }
     get [Symbol.toStringTag]() { return "DigestStream"; }
     [Symbol.dispose]() {
-      const state = this.__celldDigestState;
+      const state = this.__celloDigestState;
       if (state.disposed) return; // disposing twice is a no-op
       state.disposed = true;
       state.chunks.length = 0;
@@ -1058,6 +1058,6 @@
   // a second one by hand, which drifted: it named every EC curve P-256 and
   // left the exponent off an RSA key. The loop below hides this name, and
   // the module is lazy, so it always resolves after this script runs.
-  __celld.$$keyAlgorithm = _keyAlgorithm;
-  __celld.$$canonicalEcCurve = _canonicalEcCurve;
+  __cello.$$keyAlgorithm = _keyAlgorithm;
+  __cello.$$canonicalEcCurve = _canonicalEcCurve;
 })();

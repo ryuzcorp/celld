@@ -136,7 +136,7 @@
       .map((name) => [name, 0]),
   );
 
-  __celld.__asyncHooksModule = {
+  __cello.__asyncHooksModule = {
     AsyncLocalStorage,
     AsyncResource,
     asyncWrapProviders,

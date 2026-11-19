@@ -588,23 +588,23 @@ fn stub_source(spec: &str, names: &std::collections::BTreeSet<String>) -> String
     let lazy = LAZY_MODULES.iter().find(|m| m.specs.contains(&spec));
     let eager = eager_module_global(spec);
     let base = if cf {
-        "__celld.__cf".to_string()
+        "__cello.__cf".to_string()
     } else if cf_sockets {
-        "__celld.__cfSockets".to_string()
+        "__cello.__cfSockets".to_string()
     } else if cf_workflows {
-        "__celld.__cfWorkflows".to_string()
+        "__cello.__cfWorkflows".to_string()
     } else if python_host {
-        "__celld.__pythonHost".to_string()
+        "__cello.__pythonHost".to_string()
     } else if let Some(m) = lazy {
-        format!("__celld.{}", m.global)
+        format!("__cello.{}", m.global)
     } else if let Some(global) = eager {
-        format!("__celld.{global}")
+        format!("__cello.{global}")
     } else {
         // Unsupported: a path-carrying stub whose property walks stay
         // inert but whose calls throw, so first use fails loudly with the
         // specifier in the message instead of silently passing through.
         format!(
-            "__celld.__nodeStubFor({})",
+            "__cello.__nodeStubFor({})",
             serde_json::to_string(spec).unwrap()
         )
     };
@@ -623,7 +623,7 @@ fn stub_source(spec: &str, names: &std::collections::BTreeSet<String>) -> String
 
 /// The first line of every host-generated stub.
 fn internals_import() -> String {
-    format!("import __celld from {INTERNALS_SPECIFIER:?};\n")
+    format!("import __cello from {INTERNALS_SPECIFIER:?};\n")
 }
 
 /// Compile one stub module per external specifier into the isolate's module
@@ -763,7 +763,7 @@ fn compile_wasm<'s>(
 /// whose default export is the compiled `WebAssembly.Module` — the shape
 /// workerd gives a `CompiledWasm` module import, which is what
 /// wasm-bindgen/workers-rs bundles expect from `import x from "./x.wasm"`.
-/// Each stub reads its compiled module from `__celld.__wasmModules`, and
+/// Each stub reads its compiled module from `__cello.__wasmModules`, and
 /// its one-time evaluation consumes that entry.
 pub(super) fn register_wasm_modules(scope: &mut v8::PinScope, modules: &[(String, ModuleSource)]) {
     static COMPILED: OnceLock<Mutex<CompiledWasmCache>> = OnceLock::new();
@@ -803,8 +803,8 @@ pub(super) fn register_wasm_modules(scope: &mut v8::PinScope, modules: &[(String
                 table.set(scope, key.into(), module.into());
                 let mut source = internals_import();
                 source.push_str(&format!(
-                    "const m = __celld.__wasmModules[{quoted}];\n\
-                     delete __celld.__wasmModules[{quoted}];\n\
+                    "const m = __cello.__wasmModules[{quoted}];\n\
+                     delete __cello.__wasmModules[{quoted}];\n\
                      export default m;"
                 ));
                 source
@@ -942,26 +942,26 @@ fn resolve_relative_specifier(referrer: &str, spec: &str) -> Option<String> {
 /// is not one. A lazy module is materialized from its external source first.
 fn builtin_source(scope: &mut v8::PinScope, spec: &str) -> Option<String> {
     if spec == "cloudflare:workers" {
-        return Some("__celld.__cf".into());
+        return Some("__cello.__cf".into());
     }
     if spec == "cloudflare:sockets" {
-        return Some("__celld.__cfSockets".into());
+        return Some("__cello.__cfSockets".into());
     }
     if spec == "cloudflare:workflows" {
-        return Some("__celld.__cfWorkflows".into());
+        return Some("__cello.__cfWorkflows".into());
     }
     if spec == PYTHON_HOST_SPECIFIER {
-        return Some("__celld.__pythonHost".into());
+        return Some("__cello.__pythonHost".into());
     }
     if let Some(module) = install_lazy_module(scope, spec) {
-        return Some(format!("__celld.{}", module.global));
+        return Some(format!("__cello.{}", module.global));
     }
     if let Some(global) = eager_module_global(spec) {
-        return Some(format!("__celld.{global}"));
+        return Some(format!("__cello.{global}"));
     }
     is_external(spec).then(|| {
         format!(
-            "__celld.__nodeStubFor({})",
+            "__cello.__nodeStubFor({})",
             serde_json::to_string(spec).unwrap()
         )
     })

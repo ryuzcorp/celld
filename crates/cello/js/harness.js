@@ -1,4 +1,4 @@
-// Modified by Ryuz Corp (Cello): ctx.container.images; clone() of streaming and disturbed bodies; __celld$do on the service-binding RPC path; container exec pty/resize; cross-isolate RPC stubs and streams; container exec AbortSignal; test-only fake kill completion; exec reads survive their subscribing event; context end aborts finished uploads; tenant egress policy; D1 export; D1 export operator gate; D1 batch; test-only fake close/signal completion; binding-forgery enforcement; Queue/KV operator fetch gate; Queue/KV stub-RPC allowlists; Queue DLQ host-op forward; Queue send/DLQ cell-side validation; trusted-RPC target pin; Queue operator internal re-checks; receiver-held RPC streams.; dropped timer ops fire their callback early so sleepers settle (upstream #317); unrefed AbortSignal.timeout timer (upstream #306); loader-fetch 101 webSocket join (upstream #305); nodejs process.env population (upstream #296); writable request /tmp files (upstream #280); Worker WebSocket close codes (upstream #279); Symbol.dispose on plain RPC results (upstream #260); workflow alarm forgets budget-orphaned drives (upstream #299); env.CELLO_NODE host-wins re-assertion on loader env (upstream #219); getCurrentTraceparent handler trace context (upstream #313).
+// Modified by Ryuz Corp (Cello): ctx.container.images; clone() of streaming and disturbed bodies; __cello$do on the service-binding RPC path; container exec pty/resize; cross-isolate RPC stubs and streams; container exec AbortSignal; test-only fake kill completion; exec reads survive their subscribing event; context end aborts finished uploads; tenant egress policy; D1 export; D1 export operator gate; D1 batch; test-only fake close/signal completion; binding-forgery enforcement; Queue/KV operator fetch gate; Queue/KV stub-RPC allowlists; Queue DLQ host-op forward; Queue send/DLQ cell-side validation; trusted-RPC target pin; Queue operator internal re-checks; receiver-held RPC streams.; dropped timer ops fire their callback early so sleepers settle (upstream #317); unrefed AbortSignal.timeout timer (upstream #306); loader-fetch 101 webSocket join (upstream #305); nodejs process.env population (upstream #296); writable request /tmp files (upstream #280); Worker WebSocket close codes (upstream #279); Symbol.dispose on plain RPC results (upstream #260); workflow alarm forgets budget-orphaned drives (upstream #299); env.CELLO_NODE host-wins re-assertion on loader env (upstream #219); getCurrentTraceparent handler trace context (upstream #313).
 // The DO object model and the Cloudflare-compatible runtime surface, run
 // once per isolate by `js.rs::install_harness` after the Web-API prelude.
 // Lived as a 4,000-line raw string inside js.rs until 2026-07-29; it is a
@@ -43,8 +43,8 @@ const __startsWith = (s, prefix) =>
   __primReflectApply(__primStartsWith, s, [prefix]);
 function __bodyBytes(body) {
   if (body == null) return new Uint8Array();
-  if (body && body.__celldBodyBytes instanceof Uint8Array)
-    return body.__celldBodyBytes.slice();
+  if (body && body.__celloBodyBytes instanceof Uint8Array)
+    return body.__celloBodyBytes.slice();
   if (body instanceof ArrayBuffer) return new Uint8Array(body.slice(0));
   if (ArrayBuffer.isView(body))
     return new Uint8Array(body.buffer, body.byteOffset, body.byteLength).slice();
@@ -221,12 +221,12 @@ class CelloBodyStream extends ReadableStream {
       },
     }, { highWaterMark: 0 });
     this._st = st;
-    this.__celldBodyBytes = bytes;
+    this.__celloBodyBytes = bytes;
     // Known length, so re-using this stream as a subrequest body
     // still advertises Content-Length.
     this._expectedLength = bytes.byteLength;
   }
-  get __celldBodyText() { return new TextDecoder().decode(this.__celldBodyBytes); }
+  get __celloBodyText() { return new TextDecoder().decode(this.__celloBodyBytes); }
   // Workerd body streams are internal streams, so BYOB readers
   // work on them. Naming ReadableStreamBYOBReader compiles the
   // lazy byte-stream prelude; a worker that never asks for byob
@@ -262,14 +262,14 @@ class CelloHttpBodyStream extends ReadableStream {
       },
       cancel() { __http_stream_cancel(id); },
     }, { highWaterMark: 0 });
-    this.__celldStreamId = id;
+    this.__celloStreamId = id;
   }
   tee() {
     if (this.locked) throw new TypeError("ReadableStream is locked");
     this._locked = true;
     this._disturbed = true;
     const [left, right] = JSON.parse(
-      __http_stream_tee(this.__celldStreamId),
+      __http_stream_tee(this.__celloStreamId),
     );
     return [
       new CelloHttpBodyStream(left),
@@ -391,7 +391,7 @@ globalThis.Response = class Response {
     // sequence in a binary file part with one U+FFFD, so both the bytes and
     // the length change.
     this.bodyUsed = true;
-    return __celld.__parseFormData(
+    return __cello.__parseFormData(
       await this._consume(), this.headers.get('content-type'));
   }
   async arrayBuffer() {
@@ -496,7 +496,7 @@ globalThis.Request = class Request {
       // combines, so forwarding a request whose headers were read would
       // undo the wire shape the outbound paths preserve.
       this._headersInit = prior._headers
-        ? prior._headers.__celldHeaderList
+        ? prior._headers.__celloHeaderList
         : prior._headersInit;
     } else {
       this._headersJson = undefined;
@@ -531,7 +531,7 @@ globalThis.Request = class Request {
     this.signal = suppliedSignal
       ? init.signal
       : (prior ? prior.signal : new AbortController().signal);
-    this._signalForSubrequests = init.__celldIncomingSignal
+    this._signalForSubrequests = init.__celloIncomingSignal
       ? null
       : suppliedSignal
         ? this.signal
@@ -574,7 +574,7 @@ globalThis.Request = class Request {
     // sequence in a binary file part with one U+FFFD, so both the bytes and
     // the length change.
     this.bodyUsed = true;
-    return __celld.__parseFormData(
+    return __cello.__parseFormData(
       await this._consume(), this.headers.get('content-type'));
   }
   async arrayBuffer() {
@@ -597,7 +597,7 @@ globalThis.Request = class Request {
     return new Request(this);
   }
 };
-const __makeRequest = __celld.__makeRequest = (
+const __makeRequest = __cello.__makeRequest = (
   url, method, body, headersJson = "[]", signal = undefined,
   incomingSignal = false, operatorIngress = false,
 ) => {
@@ -609,7 +609,7 @@ const __makeRequest = __celld.__makeRequest = (
     // In particular, no client-controlled header becomes a country or a colo;
     // the forwarded-authority trust flag does not establish geolocation trust.
     method, body, __headersJson: headersJson, signal, cf: {},
-    __celldIncomingSignal: incomingSignal,
+    __celloIncomingSignal: incomingSignal,
   });
   // Marked here, on the host-built server-side Request only: no
   // tenant-visible init field exists, so tenant script cannot forge it.
@@ -658,7 +658,7 @@ const __subrequestBody = async (req, absent = false) => {
   if (absent) return { body: undefined, streamId: undefined };
   if (req._bodyBytes !== null)
     return { body: req._bodyBytes, streamId: undefined };
-  const streamId = req.body?.__celldStreamId;
+  const streamId = req.body?.__celloStreamId;
   if (streamId === undefined) {
     req.bodyUsed = true;
     return { body: await req._consume(), streamId: undefined };
@@ -744,7 +744,7 @@ globalThis.fetch = async (input, init) => {
   try {
     const dispatch = __op_fetch(
       req.method, req.url, body,
-      JSON.stringify(req.headers.__celldHeaderList), req.redirect,
+      JSON.stringify(req.headers.__celloHeaderList), req.redirect,
       streamId, signal != null,
     );
     if (signal) {
@@ -790,7 +790,7 @@ globalThis.fetch = async (input, init) => {
   response.url = req.url;
   return response;
 };
-const __fetchWebSocketUpgrade = __celld.__fetchWebSocketUpgrade =
+const __fetchWebSocketUpgrade = __cello.__fetchWebSocketUpgrade =
   async (req) => {
   const scope = __currentActorScope();
   const id = __ws_alloc();
@@ -837,7 +837,7 @@ const __fetchWebSocketUpgrade = __celld.__fetchWebSocketUpgrade =
   response.url = req.url;
   return response;
 };
-__celld.__makeAssetsBinding = (script) => ({
+__cello.__makeAssetsBinding = (script) => ({
   async fetch(input, init) {
     const req = input instanceof Request ? new Request(input, init) : new Request(input, init);
     const r = JSON.parse(await __asset_fetch(
@@ -1200,7 +1200,7 @@ const __r2Multipart = (binding, bucketName, key, id) => ({
     await __r2_mp_abort(await id.host);
   },
 });
-__celld.__makeR2Bucket = (binding, bucketName) => ({
+__cello.__makeR2Bucket = (binding, bucketName) => ({
   async head(key) {
     const name = __r2Key(binding, "head", key);
     const r = JSON.parse(await __r2_head(bucketName, name));
@@ -2129,7 +2129,7 @@ globalThis.DurableObjectRoutingError = class DurableObjectRoutingError
   }
 };
 const __durableObjectRoutingError = (error) => {
-  const marker = "__CELLD_DO_ROUTING_ERROR__:";
+  const marker = "__CELLO_DO_ROUTING_ERROR__:";
   const message = String(error && error.message || error);
   const offset = message.indexOf(marker);
   if (offset < 0) return null;
@@ -2299,7 +2299,7 @@ class DurableObjectFacets {
     target.fetch = async function(input, init) {
       return invoke(async ([loader, className, id, propsSc]) => {
         const req = new Request(input, init);
-        const headers = JSON.stringify(req.headers.__celldHeaderList);
+        const headers = JSON.stringify(req.headers.__celloHeaderList);
         const { body, streamId } = await __subrequestBody(req);
         const response = JSON.parse(await __facet_fetch(
           loader, className, manager._state._scope, record.owner, name, id,
@@ -2561,7 +2561,7 @@ class ContainerPort {
         "Connencting to a container using TLS is not currently supported. It is " +
         "unnecessary anyway, as the connection is already secure by default.",
       );
-    return __celld.__cfSockets.connect(
+    return __cello.__cfSockets.connect(
       __container_address(this._scope, this._port), options);
   }
 }
@@ -2953,7 +2953,7 @@ class DurableObjectState {
     else
       __storage_drop_pending_puts_reset(this._scope);
     const instance = __cell.instances[this._scope];
-    if (instance && instance.__celldState === this)
+    if (instance && instance.__celloState === this)
       delete __cell.instances[this._scope];
     // Under a stub-mediated caller (this scope is not the current
     // event) the failure breaks the actor, as Workerd joins it
@@ -2974,7 +2974,7 @@ class DurableObjectState {
     else
       __storage_drop_pending_puts_reset(this._scope);
     const instance = __cell.instances[this._scope];
-    if (instance && instance.__celldState === this)
+    if (instance && instance.__celloState === this)
       delete __cell.instances[this._scope];
     const message = reason instanceof Error
       ? reason.message
@@ -3071,7 +3071,7 @@ function _instance(scope) {
     if (!cls) throw new Error("no DO class " + className);
     const state = new DurableObjectState(scope);
     inst = new cls(state, __cell.env);
-    Object.defineProperty(inst, "__celldState", { value: state });
+    Object.defineProperty(inst, "__celloState", { value: state });
     // Workerd worker-rpc.c++ getTargetInfo(): RPC needs `extends
     // DurableObject` unless the js_rpc compat flag is on. Decided
     // once here; dispatch reads a boolean.
@@ -3083,7 +3083,7 @@ function _instance(scope) {
 }
 async function _readyInstance(scope) {
   const inst = _instance(scope);
-  await inst.__celldState._ready();
+  await inst.__celloState._ready();
   return inst;
 }
 const __actorEventStack = [];
@@ -3121,7 +3121,7 @@ const __abortSignal = (signal, reason) => {
   signal.reason = reason;
   signal.dispatchEvent(new Event("abort"));
 };
-const __abortIncomingRequest = __celld.__abortIncomingRequest = (requestId) => {
+const __abortIncomingRequest = __cello.__abortIncomingRequest = (requestId) => {
   const signal = __incomingRequestSignals.get(String(requestId));
   if (signal && !signal.aborted) {
     __abortSignal(signal, new Error("The client has disconnected"));
@@ -3129,13 +3129,13 @@ const __abortIncomingRequest = __celld.__abortIncomingRequest = (requestId) => {
   }
   return false;
 };
-__celld.__registerIncomingRequest = (requestId, request) => {
+__cello.__registerIncomingRequest = (requestId, request) => {
   __incomingRequestSignals.set(String(requestId), request.signal);
 };
-__celld.__finishIncomingRequest = (requestId) => {
+__cello.__finishIncomingRequest = (requestId) => {
   __incomingRequestSignals.delete(String(requestId));
 };
-__celld.__retireInputGateContext = (context) => {
+__cello.__retireInputGateContext = (context) => {
   for (const [scope, block] of __cellBlocks) {
     const retired = [...block.events].filter(([, record]) =>
       record.owner === context || record.reaction === context
@@ -3167,7 +3167,7 @@ __celld.__retireInputGateContext = (context) => {
       "the cell's critical section ended without releasing",
     );
     const instance = __cell.instances[scope];
-    if (instance !== undefined) instance.__celldState._aborted = true;
+    if (instance !== undefined) instance.__celloState._aborted = true;
     __storage_drop_pending_puts(scope);
     if (instance !== undefined && __cell.instances[scope] === instance)
       delete __cell.instances[scope];
@@ -3215,11 +3215,11 @@ const __raceCallerAbort = (dispatch, signal, abandon) =>
   });
 const __awaitCancellableDoCall = (operation, signal) => {
   if (signal.aborted) {
-    __do_call_cancel(operation.__celldCancelId);
+    __do_call_cancel(operation.__celloCancelId);
     return Promise.reject(signal.reason);
   }
   return __raceCallerAbort(operation, signal,
-    () => __do_call_cancel(operation.__celldCancelId));
+    () => __do_call_cancel(operation.__celloCancelId));
 };
 // Workerd semantics: a Response crossing a service binding is a fresh
 // fetch-shaped Response -- immutable headers, default reason phrase,
@@ -3334,7 +3334,7 @@ const __CROSS_ORIGIN_SENSITIVE_HEADERS = [
 // receives the Request itself and can consume or mutate it before it redirects.
 const __serviceRedirectState = (req) => ({
   method: req.method,
-  headers: req.headers.__celldHeaderList,
+  headers: req.headers.__celloHeaderList,
   body: req.body === null ? undefined
     : req._bodyBytes === null ? null : req._bodyBytes.slice(),
   signal: req._signalForSubrequests,
@@ -3391,8 +3391,8 @@ const __finishServiceFetch = async (res, req, replay) => {
 // Reading properties from a Proxy is not a trustworthy brand check, so the
 // metadata lives in a side table that application objects cannot forge.
 const __outboundMeta = new WeakMap();
-const __loaderServiceMarker = "__celld$loaderSvc";
-__celld.__makeLoader = () => {
+const __loaderServiceMarker = "__cello$loaderSvc";
+__cello.__makeLoader = () => {
   // A name weakly caches a shared load; `load()` is anonymous. Keep the load
   // promise itself on every derived capability, including a running facet,
   // so collection cannot evict a Worker while that capability still uses it.
@@ -3445,7 +3445,7 @@ __celld.__makeLoader = () => {
         // The verbatim header list; see the note on the outbound `fetch`.
         // The loaded worker rebuilds a `Headers` from these pairs, so a
         // repeat and its casing survive the isolate boundary.
-        const headers = JSON.stringify(req.headers.__celldHeaderList);
+        const headers = JSON.stringify(req.headers.__celloHeaderList);
         const { body, streamId } = await __subrequestBody(req);
         const loaded = __loader_fetch(
           id, req.url, req.method, body, headers, streamId, entrypoint,
@@ -3725,7 +3725,7 @@ __celld.__makeLoader = () => {
   };
 };
 
-const __makeServiceBinding = __celld.__makeServiceBinding =
+const __makeServiceBinding = __cello.__makeServiceBinding =
   (script, entrypoint = null, propsSc = undefined) => {
   const target = {
   async fetch(input, init) {
@@ -3759,7 +3759,7 @@ const __makeServiceBinding = __celld.__makeServiceBinding =
         entrypoint,
         new Request(req, {
           signal: requestController.signal,
-          __celldIncomingSignal: true,
+          __celloIncomingSignal: true,
         }));
       const response = signal
         ? await __raceCallerAbort(dispatch, signal, () =>
@@ -3796,7 +3796,7 @@ const __makeServiceBinding = __celld.__makeServiceBinding =
     // The verbatim header list; see the note on the outbound `fetch`. The
     // target isolate rebuilds a `Headers` from these pairs, so a repeat and
     // its casing survive the crossing.
-    const headers = JSON.stringify(req.headers.__celldHeaderList);
+    const headers = JSON.stringify(req.headers.__celloHeaderList);
     // Cross-isolate calls carry exact bytes. A host-backed stream transfers
     // its one source to the target, and another stream uses the byte fallback.
     const { body, streamId } = await __subrequestBody(req);
@@ -3884,10 +3884,10 @@ const __makeServiceBinding = __celld.__makeServiceBinding =
 // follows the same compat gate `populate_process_env` checks, carries only
 // string entries, and never carries the reserved host-owned name
 // (denoland/celld#296).
-__celld.__installLoaderProcessEnv = (bytes, reservedName) => {
+__cello.__installLoaderProcessEnv = (bytes, reservedName) => {
   const env = __sc_decode(bytes);
   if (env === null || typeof env !== "object") return;
-  if (__celld.__cell.compat?.nodejsProcessEnv &&
+  if (__cello.__cell.compat?.nodejsProcessEnv &&
       globalThis.process && globalThis.process.env) {
     for (const key of Object.keys(env)) {
       if (key === reservedName) continue;
@@ -3901,7 +3901,7 @@ __celld.__installLoaderProcessEnv = (bytes, reservedName) => {
   }
 };
 
-__celld.__installLoaderEnv = (bytes, routes) => {
+__cello.__installLoaderEnv = (bytes, routes) => {
   const env = __sc_decode(bytes);
   const seen = new Set();
   const revive = (v) => {
@@ -3947,12 +3947,12 @@ __celld.__installLoaderEnv = (bytes, routes) => {
   // host built without an identity (dynamic Workers) keep what the loader
   // passed: they run wherever their loader runs, so its value is already
   // the honest one.
-  if (__celld.__cell.node !== undefined && __celld.__cell.node !== "") {
-    __cell.env[__celld.__nodeIdentityEnv] = __celld.__cell.node;
+  if (__cello.__cell.node !== undefined && __cello.__cell.node !== "") {
+    __cell.env[__cello.__nodeIdentityEnv] = __cello.__cell.node;
   }
   // Handler-time parity for the pre-evaluation copy: the same strings land
   // in `process.env` after `__cell.env` installs.
-  __celld.__installLoaderProcessEnv(bytes, __celld.__nodeIdentityEnv);
+  __cello.__installLoaderProcessEnv(bytes, __cello.__nodeIdentityEnv);
 };
 // RPC marshalling: V8 structured clone (Workerd js-rpc semantics), so
 // undefined, Date, Map, Set, BigInt, typed arrays, and cycles survive.
@@ -4613,7 +4613,7 @@ const __writableBridge = (writer) => {
 };
 const __liftStream = (v, host = false, collector = null) => {
   const readable = v instanceof ReadableStream;
-  const key = readable ? "__celld$rs" : "__celld$ws";
+  const key = readable ? "__cello$rs" : "__cello$ws";
   const meta = __rpcStreamMeta.get(v);
   if (meta !== undefined && !meta.disposed && !v.locked) {
     // Re-serializing a received, untouched stream forwards the
@@ -4791,7 +4791,7 @@ const __rpcSignalSubscribe = (receiver) => {
   const signal = receiver.signal.deref();
   if (signal === undefined) return false;
   const pending = __rpc_signal_wait(receiver.id);
-  receiver.subscription = pending.__celldRpcSignalSubscription;
+  receiver.subscription = pending.__celloRpcSignalSubscription;
   pending.then((reason) => {
     const target = receiver.signal.deref();
     if (target !== undefined && reason.byteLength !== 0)
@@ -4820,7 +4820,7 @@ const __liftSignal = (signal) => {
       }, { once: true });
     }
   }
-  const marker = { "__celld$sig": meta.id, a: signal.aborted };
+  const marker = { "__cello$sig": meta.id, a: signal.aborted };
   if (signal.aborted) marker.r = __rpcSignalReasonOut(signal.reason);
   return marker;
 };
@@ -5126,7 +5126,7 @@ const __stubLift = (value, allowCapabilities = true, originals, collector = null
         try {
           __stub_handoff(coords.id);
         } catch {}
-        const marker = { "__celld$stub": coords.id,
+        const marker = { "__cello$stub": coords.id,
                          t: __stubIsolate, h: 1,
                          scope: coords.scope, epoch: coords.epoch,
                          gen: coords.gen, c: meta.callable };
@@ -5136,7 +5136,7 @@ const __stubLift = (value, allowCapabilities = true, originals, collector = null
       if (host) {
         const coords = __exportHostStub(meta.entry, "target");
         if (coords !== null) {
-          const marker = { "__celld$stub": coords.id,
+          const marker = { "__cello$stub": coords.id,
                            t: __stubIsolate, h: 1,
                            scope: coords.scope, epoch: coords.epoch,
                            gen: coords.generation, c: meta.callable };
@@ -5144,7 +5144,7 @@ const __stubLift = (value, allowCapabilities = true, originals, collector = null
           return marker;
         }
       }
-      const marker = { "__celld$stub": meta.entry.id,
+      const marker = { "__cello$stub": meta.entry.id,
                        t: __stubIsolate, c: meta.callable };
       __mapSet(seen, v, marker);
       return marker;
@@ -5158,7 +5158,7 @@ const __stubLift = (value, allowCapabilities = true, originals, collector = null
       // nested channel tokens).
       lifted = true;
       caps = true;
-      const marker = { "__celld$svc": svc.name, t: __stubIsolate };
+      const marker = { "__cello$svc": svc.name, t: __stubIsolate };
       __mapSet(seen, v, marker);
       if (svc.props !== undefined) marker.p = lift(svc.props, __arrConcat(path, "p"));
       return marker;
@@ -5180,7 +5180,7 @@ const __stubLift = (value, allowCapabilities = true, originals, collector = null
       if (host) {
         const coords = __exportHostStub(entry, "target");
         if (coords !== null) {
-          const marker = { "__celld$stub": coords.id,
+          const marker = { "__cello$stub": coords.id,
                            t: __stubIsolate, h: 1,
                            scope: coords.scope, epoch: coords.epoch,
                            gen: coords.generation, c: callable };
@@ -5188,7 +5188,7 @@ const __stubLift = (value, allowCapabilities = true, originals, collector = null
           return marker;
         }
       }
-      const marker = { "__celld$stub": entry.id,
+      const marker = { "__cello$stub": entry.id,
                        t: __stubIsolate,
                        c: callable };
       __mapSet(seen, v, marker);
@@ -5202,22 +5202,22 @@ const __stubLift = (value, allowCapabilities = true, originals, collector = null
     let marker;
     if (v instanceof Headers) {
       if (!allowAll && !host) return v;
-      marker = { "__celld$hdr": [...v] };
+      marker = { "__cello$hdr": [...v] };
     } else if (v instanceof Blob) {
       if (!allowAll && !host) return v;
-      marker = { "__celld$blob": v._bytes, y: v.type };
+      marker = { "__cello$blob": v._bytes, y: v.type };
       if (v instanceof File) {
         marker.n = v.name;
         marker.m = v.lastModified;
       }
     } else if (v instanceof Request) {
       if (!allowAll && !host) return v;
-      marker = { "__celld$req": v.url, m: v.method,
+      marker = { "__cello$req": v.url, m: v.method,
                  h: [...v.headers], r: v.redirect, c: v.cf,
                  b: liftBody(v) };
     } else if (v instanceof Response) {
       if (!allowAll && !host) return v;
-      marker = { "__celld$res": v.status,
+      marker = { "__cello$res": v.status,
                  t: v.statusText ||
                     __STATUS_TEXT[v.status] || "",
                  h: [...v.headers], c: v.cf,
@@ -5261,7 +5261,7 @@ const __stubLift = (value, allowCapabilities = true, originals, collector = null
       // revive path. Durable Object stubs additionally record in the
       // host-side table, so even a shape that reaches the tree grants
       // nothing.
-      if (__startsWith(key, "__celld$"))
+      if (__startsWith(key, "__cello$"))
         throw new DOMException(
           'Could not serialize object with reserved key "' + key + '".',
           "DataCloneError");
@@ -5281,12 +5281,12 @@ const __stubLift = (value, allowCapabilities = true, originals, collector = null
       // a bare id up and drops a shape it cannot use (fail-closed).
       if (host) {
         const coords = __exportHostStub(entry, "disposer");
-        out["__celld$disp"] = coords === null ? entry.id
+        out["__cello$disp"] = coords === null ? entry.id
           : { h: 1, id: coords.id,
               scope: coords.scope, epoch: coords.epoch,
               gen: coords.generation };
       } else {
-        out["__celld$disp"] = entry.id;
+        out["__cello$disp"] = entry.id;
       }
     }
     return out;
@@ -5321,7 +5321,7 @@ const __adoptBody = (target, bytes) => {
   const body = target.body;
   if (body !== null) {
     body._st.bytes = bytes;
-    body.__celldBodyBytes = bytes;
+    body.__celloBodyBytes = bytes;
     body._expectedLength = bytes.byteLength;
   }
 };
@@ -5341,7 +5341,7 @@ const __reviveResponse = (marker, revive) => {
   const bytes = marker.b instanceof Uint8Array;
   const res = new Response(
     marker.b === null ? null : bytes ? "" : revive(marker.b), {
-      status: marker["__celld$res"], statusText: marker.t,
+      status: marker["__cello$res"], statusText: marker.t,
       headers: marker.h, cf: marker.c });
   if (bytes) __adoptBody(res, marker.b);
   if (marker.e) res.type = "error";
@@ -5541,7 +5541,7 @@ const __reviveSignal = (marker, id) => {
 // revived stubs (for call-end param disposal or result-tree
 // disposal); `disposers` collects remote Symbol.dispose entries.
 // `doTable` is the lift's side table: Durable Object stubs install only
-// from listed paths before shape revival runs. A `__celld$do`-shaped
+// from listed paths before shape revival runs. A `__cello$do`-shaped
 // object in the payload is inert data in every path -- including legacy
 // envelopes from unpatched senders, which grant nothing.
 const __stubRevive = (value, doTable) => {
@@ -5557,7 +5557,7 @@ const __stubRevive = (value, doTable) => {
     // Own-property shape reads only: an inherited marker (smuggled via
     // the shared prototype) must not revive -- plain data falls through.
     const stubId =
-      __primHasOwn(v, "__celld$stub") ? v["__celld$stub"] : undefined;
+      __primHasOwn(v, "__cello$stub") ? v["__cello$stub"] : undefined;
     if (stubId !== undefined) {
       // A host marker revives over the stub channel, whichever isolate
       // this is -- including the minting one. The revive acquires this
@@ -5591,38 +5591,38 @@ const __stubRevive = (value, doTable) => {
       return stub;
     }
     const svcName =
-      __primHasOwn(v, "__celld$svc") ? v["__celld$svc"] : undefined;
+      __primHasOwn(v, "__cello$svc") ? v["__cello$svc"] : undefined;
     if (svcName !== undefined)
       return v.t === __stubIsolate
         ? __entrypointStub(svcName, revive(v.p))
         : __foreignStub();
-    // No `__celld$do` shape branch: Durable Object stubs install only
+    // No `__cello$do` shape branch: Durable Object stubs install only
     // from the side table above. Marker-shaped payload objects fall
     // through to plain-data revival and grant nothing.
     const hdr =
-      __primHasOwn(v, "__celld$hdr") ? v["__celld$hdr"] : undefined;
+      __primHasOwn(v, "__cello$hdr") ? v["__cello$hdr"] : undefined;
     if (hdr !== undefined) return new Headers(hdr);
     const blobBytes =
-      __primHasOwn(v, "__celld$blob") ? v["__celld$blob"] : undefined;
+      __primHasOwn(v, "__cello$blob") ? v["__cello$blob"] : undefined;
     if (blobBytes !== undefined) return __reviveBlob(v, blobBytes);
     const reqUrl =
-      __primHasOwn(v, "__celld$req") ? v["__celld$req"] : undefined;
+      __primHasOwn(v, "__cello$req") ? v["__cello$req"] : undefined;
     if (reqUrl !== undefined)
       return __reviveRequest(v, reqUrl, revive);
     const resMarker =
-      __primHasOwn(v, "__celld$res") ? v["__celld$res"] : undefined;
+      __primHasOwn(v, "__cello$res") ? v["__cello$res"] : undefined;
     if (resMarker !== undefined)
       return __reviveResponse(v, revive);
     const rsId =
-      __primHasOwn(v, "__celld$rs") ? v["__celld$rs"] : undefined;
+      __primHasOwn(v, "__cello$rs") ? v["__cello$rs"] : undefined;
     if (rsId !== undefined)
       return __reviveStream(v, rsId, true, handles);
     const wsId =
-      __primHasOwn(v, "__celld$ws") ? v["__celld$ws"] : undefined;
+      __primHasOwn(v, "__cello$ws") ? v["__cello$ws"] : undefined;
     if (wsId !== undefined)
       return __reviveStream(v, wsId, false, handles);
     const sigId =
-      __primHasOwn(v, "__celld$sig") ? v["__celld$sig"] : undefined;
+      __primHasOwn(v, "__cello$sig") ? v["__cello$sig"] : undefined;
     if (sigId !== undefined) return __reviveSignal(v, sigId);
     if (__setHas(seen, v)) return v;
     __setAdd(seen, v);
@@ -5635,7 +5635,7 @@ const __stubRevive = (value, doTable) => {
     const keys = __primObjectKeys(v);
     for (let ki = 0; ki < keys.length; ki++) {
       const key = keys[ki];
-      if (key === "__celld$disp") {
+      if (key === "__cello$disp") {
         const disp = v[key];
         // A host disposer crosses as its coordinates; invoking it is a
         // stub op with an empty path, then a release. The revive
@@ -6136,7 +6136,7 @@ const __storedLift = (value) => {
     const svc = __weakGet(__svcMeta, v);
     if (svc !== undefined) {
       lifted = true;
-      const marker = { "__celld$svc": svc.name };
+      const marker = { "__cello$svc": svc.name };
       __mapSet(seen, v, marker);
       if (svc.props !== undefined) marker.p = lift(svc.props, __arrConcat(path, "p"));
       return marker;
@@ -6157,7 +6157,7 @@ const __storedLift = (value) => {
       const ekeys = __primObjectKeys(v);
       for (let ei = 0; ei < ekeys.length; ei++) {
         const key = ekeys[ei];
-        if (__startsWith(key, "__celld$"))
+        if (__startsWith(key, "__cello$"))
           throw new DOMException(
             'Could not serialize object with reserved key "' + key + '".',
             "DataCloneError");
@@ -6175,7 +6175,7 @@ const __storedLift = (value) => {
       const key = keys[ki];
       // As in __stubLift: a user value shaped like a wire marker would
       // revive as a live stub on read. Refuse it while lifting.
-      if (__startsWith(key, "__celld$"))
+      if (__startsWith(key, "__cello$"))
         throw new DOMException(
           'Could not serialize object with reserved key "' + key + '".',
           "DataCloneError");
@@ -6217,7 +6217,7 @@ const __storedBytes = (value, error) => {
 // globals; production isolates never define it (H4). Planting 0x01 is
 // safe by construction -- those rows decode as plain data.
 if (__test_wait_enabled())
-  globalThis.__celldPlantStoredV1ForTestOnly = (scope, key, tree) => {
+  globalThis.__celloPlantStoredV1ForTestOnly = (scope, key, tree) => {
     __storage_put_serialized(String(scope), String(key),
       __bytes_tagged(1, __sc_encode(tree)));
   };
@@ -6230,10 +6230,10 @@ const __storedRevive = (pair) => {
     if (v === null || typeof v !== "object") return v;
     if (__do_is_stub(v)) return v;
     const svcName =
-      __primHasOwn(v, "__celld$svc") ? v["__celld$svc"] : undefined;
+      __primHasOwn(v, "__cello$svc") ? v["__cello$svc"] : undefined;
     if (svcName !== undefined)
       return __entrypointStub(svcName, revive(v.p));
-    // No `__celld$do` shape branch: stored stubs install only from the
+    // No `__cello$do` shape branch: stored stubs install only from the
     // side table above. Marker-shaped payload objects -- including any
     // smuggled through a class instance -- stay inert data.
     if (__setHas(seen, v)) return v;
@@ -6540,8 +6540,8 @@ class DurableObjectNamespace {
     // Fetch and native RPC use the same host routing/activation seam.
     // Never expose `.then`: a DO stub is not itself a promise.
     const target = { id, name: dispatchName };
-    const abortMarker = "__CELLD_ACTOR_ABORT__:";
-    const processExitMarker = "__CELLD_PROCESS_EXIT__:";
+    const abortMarker = "__CELLO_ACTOR_ABORT__:";
+    const processExitMarker = "__CELLO_PROCESS_EXIT__:";
     let brokenReason = null;
     const invoke = async (operation) => {
       if (brokenReason !== null) throw new Error(brokenReason);
@@ -6568,8 +6568,8 @@ class DurableObjectNamespace {
         // local cell and collects it only to sign a cross-node frame. A held
         // body -- or a stream with no host id -- crosses as its bytes.
         const bodyStreamId =
-          req._bodyBytes === null && req.body && req.body.__celldStreamId !== undefined
-            ? req.body.__celldStreamId
+          req._bodyBytes === null && req.body && req.body.__celloStreamId !== undefined
+            ? req.body.__celloStreamId
             : undefined;
         const body_ = bodyStreamId !== undefined
           ? new Uint8Array()
@@ -6597,7 +6597,7 @@ class DurableObjectNamespace {
         // to change what the cell received.
         const headersJson = req._headersJson !== undefined
           ? req._headersJson
-          : JSON.stringify(req.headers.__celldHeaderList);
+          : JSON.stringify(req.headers.__celloHeaderList);
         const r = JSON.parse(await invoke(() => {
           if (!signal) return __do_call(
             scope, dispatchName ?? null, req.url, req.method, body_,
@@ -6664,18 +6664,18 @@ const __attachResponseRequestCancellation = (
     return;
   }
   const requestControllers = Array.isArray(
-    response.__celldRequestControllers,
+    response.__celloRequestControllers,
   )
-    ? response.__celldRequestControllers
+    ? response.__celloRequestControllers
     : [requestController];
-  if (requestControllers !== response.__celldRequestControllers) {
-    Object.defineProperty(response, "__celldRequestControllers", {
+  if (requestControllers !== response.__celloRequestControllers) {
+    Object.defineProperty(response, "__celloRequestControllers", {
       value: requestControllers,
     });
   } else {
     requestControllers.push(requestController);
   }
-  if (!wrapBody || response.__celldCancellationWrapped) return;
+  if (!wrapBody || response.__celloCancellationWrapped) return;
   const reader = response.body.getReader();
   response.body = new ReadableStream({
     async pull(controller) {
@@ -6693,7 +6693,7 @@ const __attachResponseRequestCancellation = (
       } catch {}
     },
   }, { highWaterMark: 0 });
-  Object.defineProperty(response, "__celldCancellationWrapped", {
+  Object.defineProperty(response, "__celloCancellationWrapped", {
     value: true,
   });
 };
@@ -6706,13 +6706,13 @@ const __attachResponseRequestCancellation = (
 // not as bytes. The handler then pulls the body off the socket as it
 // reads, so the whole body is never resident. `request.body` is a stream
 // in both cases.
-__celld.__makeIncomingRequest = (
+__cello.__makeIncomingRequest = (
   url, method, body, headersJson, streamId,
 ) => __makeRequest(
   url, method,
   streamId === undefined ? body : new CelloHttpBodyStream(streamId),
   headersJson, undefined, true);
-const __dispatchTo = __celld.__dispatchTo = async (
+const __dispatchTo = __cello.__dispatchTo = async (
   scope, url, method, body, headersJson, requestId = null, bodyStreamId = null,
   operatorIngress = false,
 ) => {
@@ -6826,7 +6826,7 @@ const __rpcMethodAllowlist = (className) => {
 };
 const __rpcResolveInstance = async (scope) => {
   const inst = await _readyInstance(scope);
-  if (!inst.__celldState._rpcOk)
+  if (!inst.__celloState._rpcOk)
     throw new TypeError(
       "The receiving Durable Object does not support RPC, because " +
       "its class was not declared with `extends DurableObject`. In " +
@@ -6868,7 +6868,7 @@ const __rpcTrustedTargetMethod = async (scope, method) => {
 // host-routable ids: they revive over the stub channel in any isolate
 // on this node, including this one. Callee exceptions cross in
 // the error envelope on every flavor.
-__celld.__dispatchRpc = async (scope, method, args, trusted) => {
+__cello.__dispatchRpc = async (scope, method, args, trusted) => {
   const resolve = (scope, method) =>
     trusted === true
       ? __rpcTrustedTargetMethod(scope, method)
@@ -6922,7 +6922,7 @@ __celld.__dispatchRpc = async (scope, method, args, trusted) => {
 // the walk in the entry's context. Answers envelope bytes, never throws:
 // errors cross in the 0x00 tag, so the caller decodes them like any RPC
 // reply.
-__celld.__dispatchStubOp = async (scope, hostId, path, args) => {
+__cello.__dispatchStubOp = async (scope, hostId, path, args) => {
   const actorEvent = __beginActorEvent(scope);
   try {
     const local = __hostStubs.get(hostId);
@@ -7007,7 +7007,7 @@ __celld.__dispatchStubOp = async (scope, hostId, path, args) => {
 // dispose the local entry. A disposer entry is deleted without running its
 // target -- the caller already invoked it remotely -- mirroring the local
 // disposer path, which deletes the entry and calls the target directly.
-__celld.__disposeHostStub = async (scope, hostId) => {
+__cello.__disposeHostStub = async (scope, hostId) => {
   const actorEvent = __beginActorEvent(scope);
   try {
     const local = __hostStubs.get(hostId);
@@ -7037,7 +7037,7 @@ __celld.__disposeHostStub = async (scope, hostId) => {
 // production isolates never define it, so tenant code cannot probe
 // neighbor-invocation liveness on a shared heap. The fixture tolerates
 // its absence and reports { unavailable: true }.
-__celld.__stubStats = () => {
+__cello.__stubStats = () => {
   let ctxHandles = 0;
   for (const set of __ctxStubs.values()) ctxHandles += set.size;
   let ctxUploads = 0;
@@ -7053,14 +7053,14 @@ __celld.__stubStats = () => {
   };
 };
 if (__test_stub_stats_enabled())
-  globalThis.__celldStubStatsForTestOnly = __celld.__stubStats;
+  globalThis.__celloStubStatsForTestOnly = __cello.__stubStats;
 // Test-only retained waits: `makeWait` holds one native unrefed wait
 // across native-event retirements (standing in for a container exec
 // wait, which needs an engine the test environment has not got), and
 // `fire` resolves it. Defined only on nodes booted with
 // CELLO_TEST_WAIT=1 (the cross-event wait conformance suite).
 if (__test_wait_enabled())
-  globalThis.__celldTestWaitForTestOnly = {
+  globalThis.__celloTestWaitForTestOnly = {
     makeWait(id) {
       return { promise: __retainedWait(() => __testwait_await(id)), id };
     },
@@ -7073,7 +7073,7 @@ if (__test_wait_enabled())
 // table beneath the ops. Defined only on nodes booted with
 // CELLO_TEST_WAIT=1 (the exec-signal conformance suite).
 if (__test_wait_enabled())
-  globalThis.__celldTestExecForTestOnly = {
+  globalThis.__celloTestExecForTestOnly = {
     attach(scope) { __testexec_attach(scope); },
     exec(scope, cmd, options) {
       // The real exec on a scope-only Container: the receiver inherits
@@ -7105,7 +7105,7 @@ if (__test_wait_enabled())
 // where no container engine exists. Defined only on nodes booted with
 // CELLO_TEST_WAIT=1 (the cross-event conformance suites).
 if (__test_wait_enabled())
-  globalThis.__celldTestProcForTestOnly = {
+  globalThis.__celloTestProcForTestOnly = {
     spawn() { return __testproc_spawn(); },
     emit(id, which, bytes) { __testproc_emit(id, which, bytes); },
     eof(id, which) { __testproc_eof(id, which); },
@@ -7227,7 +7227,7 @@ const __dispatchEntrypointMethodInCurrentEvent = async (name, method, arg) => {
     __ctxEnd(ctxId);
   }
 };
-const __dispatchEntrypointFetch = __celld.__dispatchEntrypointFetch =
+const __dispatchEntrypointFetch = __cello.__dispatchEntrypointFetch =
   (name, request, propsSc = null) =>
   __dispatchEntrypointMethod(
     name, "fetch", request,
@@ -7240,7 +7240,7 @@ const __dispatchEntrypointFetch = __celld.__dispatchEntrypointFetch =
 // its context to the response reader (which ends it once the body no
 // longer needs it), anything else ends here, and a throw ends before
 // it propagates.
-__celld.__dispatchDefaultFetch = (fetchFn, req, env, executionCtx) => {
+__cello.__dispatchDefaultFetch = (fetchFn, req, env, executionCtx) => {
   const ctxId = __ctxNext();
   const endValue = (value) => {
     if (value instanceof Response) __fetchCtxs.set(value, ctxId);
@@ -7267,12 +7267,12 @@ __celld.__dispatchDefaultFetch = (fetchFn, req, env, executionCtx) => {
     },
   );
 };
-__celld.__dispatchEntrypointScheduled = (name, ctrl) =>
+__cello.__dispatchEntrypointScheduled = (name, ctrl) =>
   __dispatchEntrypointMethod(name, "scheduled", ctrl);
 // A queue batch owns mutable settlement state only while its handler runs.
 // Keeping a batch alive after dispatch must not keep authority to settle its
 // lease, because that lease can have expired and been handed out again.
-__celld.__dispatchEntrypointQueue = async (name, incoming) => {
+__cello.__dispatchEntrypointQueue = async (name, incoming) => {
   let active = true;
   let ackAll = false;
   const explicitAcks = new Set();
@@ -7405,7 +7405,7 @@ const __pendingEventError = () => new Error(
 // The host calls this only when the request has no native operation that can
 // resume JavaScript. Reject the entrypoint call itself, so its caller can
 // catch the cancellation and continue the enclosing event.
-__celld.__cancelPendingEvents = (ids) => {
+__cello.__cancelPendingEvents = (ids) => {
   for (const id of ids) __pendingEvents.get(id)?.(__pendingEventError());
 };
 // One entrypoint op (a call, or a property GET when argsSc is
@@ -7511,7 +7511,7 @@ const __entrypointOp = (name, path, argsSc, local, makeInst, props) => {
 // `propsSc` carries getEntrypoint(name, {props}) as structured-clone bytes,
 // the same encoding as `argsSc`. It is empty when the caller sent no props,
 // which no encoded value can be, so an empty buffer is an unambiguous absent.
-__celld.__dispatchEntrypointRpc =
+__cello.__dispatchEntrypointRpc =
   (name, path, argsSc, local = false, propsSc = null) => __entrypointOp(
     name, typeof path === "string" ? [path] : path, argsSc, local,
     undefined,
@@ -7520,7 +7520,7 @@ __celld.__dispatchEntrypointRpc =
 // WebSocket: the host holds the socket; these deliver events into the DO.
 // `ws` is a lightweight stub whose send/close route back to the host task
 // by wsId -- so the isolate can be hibernated between messages.
-const __wsStub = __celld.__wsStub = (wsId) => ({
+const __wsStub = __cello.__wsStub = (wsId) => ({
   _hibernatable: true,
   send: (data) => {
     if (data instanceof ArrayBuffer)
@@ -7533,7 +7533,7 @@ const __wsStub = __celld.__wsStub = (wsId) => ({
   },
   close: (code = 1000, reason = "") => __ws_close(wsId, code, reason),
 });
-__celld.__wsOpen = async (scope, wsId, protocol) => {
+__cello.__wsOpen = async (scope, wsId, protocol) => {
   const actorEvent = __beginActorEvent(scope);
   // Socket events are invocations too: a stub the handler revives dies
   // with the event. Without a context the handle would register
@@ -7541,7 +7541,7 @@ __celld.__wsOpen = async (scope, wsId, protocol) => {
   const ctxId = __ctxNext();
   try {
     const inst = await _readyInstance(scope);
-    const socket = inst.__celldState._socket(wsId);
+    const socket = inst.__celloState._socket(wsId);
     if (socket.readyState !== WebSocket.READY_STATE_CONNECTING) return;
     await __ctxRun(ctxId, async () => {
       socket.protocol = protocol;
@@ -7553,12 +7553,12 @@ __celld.__wsOpen = async (scope, wsId, protocol) => {
     __endActorEvent(actorEvent);
   }
 };
-__celld.__wsMessage = async (scope, wsId, msg) => {
+__cello.__wsMessage = async (scope, wsId, msg) => {
   const actorEvent = __beginActorEvent(scope);
   const ctxId = __ctxNext();
   try {
     const inst = await _readyInstance(scope);
-    const socket = inst.__celldState._socket(wsId);
+    const socket = inst.__celloState._socket(wsId);
     await __ctxRun(ctxId, async () => {
       if (!socket._hibernatable && typeof socket._dispatchMessage === "function")
         socket._dispatchMessage(msg);
@@ -7570,12 +7570,12 @@ __celld.__wsMessage = async (scope, wsId, msg) => {
     __endActorEvent(actorEvent);
   }
 };
-__celld.__wsBinary = async (scope, wsId, data) => {
+__cello.__wsBinary = async (scope, wsId, data) => {
   const actorEvent = __beginActorEvent(scope);
   const ctxId = __ctxNext();
   try {
     const inst = await _readyInstance(scope);
-    const socket = inst.__celldState._socket(wsId);
+    const socket = inst.__celloState._socket(wsId);
     const bytes = data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
     await __ctxRun(ctxId, async () => {
       if (!socket._hibernatable && typeof socket._dispatchMessage === "function")
@@ -7588,12 +7588,12 @@ __celld.__wsBinary = async (scope, wsId, data) => {
     __endActorEvent(actorEvent);
   }
 };
-__celld.__wsClosed = async (scope, wsId, code, reason, wasClean) => {
+__cello.__wsClosed = async (scope, wsId, code, reason, wasClean) => {
   const actorEvent = __beginActorEvent(scope);
   const ctxId = __ctxNext();
   try {
     const inst = await _readyInstance(scope);
-    const socket = inst.__celldState._socket(wsId);
+    const socket = inst.__celloState._socket(wsId);
     await __ctxRun(ctxId, async () => {
       if (!socket._hibernatable && typeof socket._dispatchClose === "function")
         socket._dispatchClose(code, reason, wasClean);
@@ -7614,7 +7614,7 @@ __celld.__wsClosed = async (scope, wsId, code, reason, wasClean) => {
   }
 };
 // called by cello's scheduler when an alarm is due. Returns a promise.
-__celld.__fireAlarm = async (scope, scheduledTime, retryCount, isRedrive) => {
+__cello.__fireAlarm = async (scope, scheduledTime, retryCount, isRedrive) => {
   const actorEvent = __beginActorEvent(scope);
   // An alarm is an invocation: a stub the handler revives dies with it.
   const ctxId = __ctxNext();
@@ -7743,7 +7743,7 @@ class CelloCronSchedule {
     else await this._state.storage.setAlarm(plan.armAt);
   }
 }
-const __cell = __celld.__cell = {
+const __cell = __cello.__cell = {
   entrypoints: {},
   objectEntrypoints: {},
   doExports: {},
@@ -7803,7 +7803,7 @@ const {
 
 __runtimeClass("__KvNamespace", __KvNamespaceCell);
 
-const __makeKvNamespace = __celld.__makeKvNamespace = (id, cellName) =>
+const __makeKvNamespace = __cello.__makeKvNamespace = (id, cellName) =>
   new __KvNamespace(() => __cell.makeNamespace("__KvNamespace"), cellName);
 
 // ---- Queues --------------------------------------------------------------
@@ -9492,7 +9492,7 @@ class Queue {
   }
 }
 
-__celld.__makeQueue = (queue, cellName, deliveryDelay) =>
+__cello.__makeQueue = (queue, cellName, deliveryDelay) =>
   new Queue(queue, cellName, deliveryDelay);
 
 // ---- D1 -----------------------------------------------------------------
@@ -9859,7 +9859,7 @@ class D1Database {
   }
 }
 
-const __makeD1Database = __celld.__makeD1Database =
+const __makeD1Database = __cello.__makeD1Database =
   (databaseName) => new D1Database(databaseName);
 // ---- Workflows ----------------------------------------------------------
 // A workflow instance is one cell of the runtime-supplied `__Workflow` class,
@@ -10658,7 +10658,7 @@ const __wfMakeStep = (driver) => {
             // A crash can therefore expose both or neither, so an
             // acknowledged event cannot disappear between them.
             storage.kv.delete(eventKey);
-            /*__CELLD_TEST_WORKFLOW_EVENT_CONSUMED__*/
+            /*__CELLO_TEST_WORKFLOW_EVENT_CONSUMED__*/
             storage.kv.put(key, {
               kind: "event",
               status: "completed",
@@ -10752,7 +10752,7 @@ const __WorkflowCell = (() => {
       // The metadata and alarm are one SQLite commit. A committed creation
       // therefore always has the wake that can start or recover its drive.
       transaction.setAlarm(Date.now());
-      /*__CELLD_TEST_WORKFLOW_META_CREATED__*/
+      /*__CELLO_TEST_WORKFLOW_META_CREATED__*/
       return { id: instanceId, created: true };
     });
     return result;
@@ -10911,7 +10911,7 @@ const __WorkflowCell = (() => {
       meta.status = "terminated";
       __wfFinishRetention(meta, transaction);
       transaction.kv.put("__wf.meta", meta);
-      /*__CELLD_TEST_WORKFLOW_TERMINAL_ALARM_SET__*/
+      /*__CELLO_TEST_WORKFLOW_TERMINAL_ALARM_SET__*/
     });
   }
   async __wfSendEvent(options) {
@@ -11082,7 +11082,7 @@ const __WorkflowCell = (() => {
               "WorkflowEntrypoint",
         };
         __wfFinishRetention(current, transaction);
-        /*__CELLD_TEST_WORKFLOW_TERMINAL_ALARM_SET__*/
+        /*__CELLO_TEST_WORKFLOW_TERMINAL_ALARM_SET__*/
       });
       return;
     }
@@ -11188,7 +11188,7 @@ const __WorkflowCell = (() => {
       (value) => driver.finish({ kind: "complete", value }),
       (error) => driver.finish({ kind: "error", error }),
     );
-    /*__CELLD_TEST_WORKFLOW_AFTER_RUN_STARTED__*/
+    /*__CELLO_TEST_WORKFLOW_AFTER_RUN_STARTED__*/
     let result = await outcome;
     // The workflow can catch a rejected step promise, but it cannot turn an
     // engine storage failure into a successful run. Preserve the alarm so
@@ -11203,7 +11203,7 @@ const __WorkflowCell = (() => {
         currentMeta.generation === meta.generation &&
         currentMeta.status === "waitingForPause")
     ) {
-      /*__CELLD_TEST_WORKFLOW_BEFORE_PAUSE_SETTLE__*/
+      /*__CELLO_TEST_WORKFLOW_BEFORE_PAUSE_SETTLE__*/
       settle((current, transaction) => {
         // A resume can cancel waitingForPause after this drive selected its
         // pause result. Preserve that newer running state and its alarm, or
@@ -11260,7 +11260,7 @@ const __WorkflowCell = (() => {
           // The terminal commit installs the expiry wake with the retained
           // state, so a crash can expose neither without the other.
           __wfFinishRetention(current, transaction);
-          /*__CELLD_TEST_WORKFLOW_TERMINAL_ALARM_SET__*/
+          /*__CELLO_TEST_WORKFLOW_TERMINAL_ALARM_SET__*/
         });
         return;
       }
@@ -11269,7 +11269,7 @@ const __WorkflowCell = (() => {
       current.status = "errored";
       current.error = __wfErrorRecord(result.error);
       __wfFinishRetention(current, transaction);
-      /*__CELLD_TEST_WORKFLOW_TERMINAL_ALARM_SET__*/
+      /*__CELLO_TEST_WORKFLOW_TERMINAL_ALARM_SET__*/
     });
   }
   };
@@ -11283,9 +11283,9 @@ class NonRetryableError extends Error {
   }
 }
 // Backing object for the `cloudflare:workflows` builtin module.
-__celld.__cfWorkflows = { NonRetryableError };
+__cello.__cfWorkflows = { NonRetryableError };
 // `cello:python`, imported only by the Python Worker bundle.
-__celld.__pythonHost = {
+__cello.__pythonHost = {
   condemnIsolate: (reason) => __isolate_condemn(String(reason)),
 };
 
@@ -11477,11 +11477,11 @@ class Workflow {
   }
 }
 
-const __makeWorkflow = __celld.__makeWorkflow =
+const __makeWorkflow = __cello.__makeWorkflow =
   (workflowName) => new Workflow(workflowName);
 // `cloudflare:workers` module surface. The DO base class sets ctx/env the
 // way `class X extends DurableObject` expects; env aliases the cell env.
-const __cf = __celld.__cf = {
+const __cf = __cello.__cf = {
   DurableObject: class DurableObject {
     constructor(ctx, env) { this.ctx = ctx; this.env = env; }
   },
@@ -11491,7 +11491,7 @@ const __cf = __celld.__cf = {
   // from plain serialization outright).
   RpcTarget: class RpcTarget {
     constructor() {
-      Object.defineProperty(this, "__celldRpcTarget", {
+      Object.defineProperty(this, "__celloRpcTarget", {
         value: __rpcNoClone, enumerable: true,
       });
     }
@@ -11550,7 +11550,7 @@ const __cf = __celld.__cf = {
 // wrong result far from the cause. Memoized by dotted path so repeated
 // reads keep identity (`mod.foo === mod.foo`).
 const __stubCache = new Map();
-const __nodeStubFor = __celld.__nodeStubFor = (path) => {
+const __nodeStubFor = __cello.__nodeStubFor = (path) => {
   let stub = __stubCache.get(path);
   if (stub) return stub;
   stub = new Proxy(function () {}, {
@@ -11572,7 +11572,7 @@ const __nodeStubFor = __celld.__nodeStubFor = (path) => {
   __stubCache.set(path, stub);
   return stub;
 };
-__celld.__nodeStub = __nodeStubFor("node builtin");
+__cello.__nodeStub = __nodeStubFor("node builtin");
 if (!globalThis.Event) {
   globalThis.Event = class Event {
     // Private fields: stored in the object itself, so an Event costs no
@@ -11869,7 +11869,7 @@ if (!globalThis.AbortSignal) {
       super();
       this.aborted = false;
       this.reason = undefined;
-      this.__celldHost = __rpcNoClone;
+      this.__celloHost = __rpcNoClone;
     }
     throwIfAborted() { if (this.aborted) throw this.reason; }
     static abort(reason = new DOMException("This operation was aborted", "AbortError")) {
@@ -11938,7 +11938,7 @@ if (!globalThis.Blob) {
       const rawType = String(options.type || "");
       this.type = /^[\u0020-\u007e]*$/.test(rawType)
         ? rawType.toLowerCase() : "";
-      this.__celldHost = __blobNoClone;
+      this.__celloHost = __blobNoClone;
       // Two passes. First convert every part in order -- string
       // conversion runs user code (Symbol.toPrimitive), which may
       // resize a backing buffer. Buffers and views are carried through
@@ -12087,7 +12087,7 @@ const __CD_FILENAME =
 // that arrived: decoding the body first and slicing part bodies out of the
 // string replaced every non-UTF-8 sequence with U+FFFD, and the re-encode in
 // the `Blob` constructor then wrote those replacement bytes into the file.
-__celld.__parseFormData = (bytes, contentType) => {
+__cello.__parseFormData = (bytes, contentType) => {
   const ct = String(contentType || "");
   if (/^\s*application\/x-www-form-urlencoded/i.test(ct)) {
     // This form is decoded as UTF-8, so a declared charset that is not UTF-8
@@ -12340,7 +12340,7 @@ for (const n of ["BroadcastChannel", "FileReader"]) {
     }
   };
 }
-const __sockets = __celld.__sockets = new Map();
+const __sockets = __cello.__sockets = new Map();
 globalThis.WebSocket = class WebSocket extends EventTarget {
   // The spec names, which workerd exposes and real bundles use. cello only
   // had the READY_STATE_* aliases, which no other runtime defines.
@@ -12680,8 +12680,8 @@ globalThis.WebSocket = class WebSocket extends EventTarget {
     this.dispatchEvent(event);
   }
 };
-const __makeSocket = __celld.__makeSocket = (id) => new WebSocket(id);
-const __socketFromRow = __celld.__socketFromRow = (row) => {
+const __makeSocket = __cello.__makeSocket = (id) => new WebSocket(id);
+const __socketFromRow = __cello.__socketFromRow = (row) => {
   let ws = __sockets.get(Number(row.id));
   if (!ws) {
     ws = __makeSocket(row.id);
@@ -12774,7 +12774,7 @@ globalThis.performance = {
   mark() {},
   measure() {},
 };
-__celld.__advanceIoTime = (timestamp) => {
+__cello.__advanceIoTime = (timestamp) => {
   __ioTimestamp = timestamp;
 };
 // Workerd ServiceWorkerGlobalScope: `self` is the global scope, as a writable,
@@ -12870,7 +12870,7 @@ if (!globalThis.structuredClone) {
         return {
           type: "CryptoKey", keyType: this.type,
           algorithm: this.algorithm, extractable: this.extractable,
-          usages: this.usages, material: this.__celldMaterial,
+          usages: this.usages, material: this.__celloMaterial,
         };
       });
     for (const constructor of [
@@ -12898,7 +12898,7 @@ if (!globalThis.structuredClone) {
 // `Buffer` is read at call time, which materializes the lazy global.
 const __zlibSync = (mode, data) =>
   Buffer.from(__zlib(mode, Buffer.from(data)));
-__celld.__zlibModule = {
+__cello.__zlibModule = {
   constants: {
     Z_NO_FLUSH: 0,
     Z_PARTIAL_FLUSH: 1,
@@ -12955,8 +12955,8 @@ globalThis.process.exit = (code = 0) => {
   const actorScope = __currentActorScope();
   if (actorScope) {
     const instance = __cell.instances[actorScope];
-    if (instance?.__celldState)
-      instance.__celldState._resetAfterConcurrencyFailure();
+    if (instance?.__celloState)
+      instance.__celloState._resetAfterConcurrencyFailure();
   }
   __process_exit(Number(code) || 0, actorScope);
 };
@@ -12965,13 +12965,13 @@ globalThis.process.getBuiltinModule =
 // `node:process` (and bare `process`) is the global process object itself:
 // the same object, not a copy, so `nodeProcess === globalThis.process` and
 // a named `env` import stays live. Set before any user module links.
-__celld.__processGlobal = globalThis.process;
+__cello.__processGlobal = globalThis.process;
 if (!globalThis.global) globalThis.global = globalThis;
 // Events belong to the request, and the host owns the request. `__event_*`
 // and `__wait_until` operate on whichever context the host has made current
 // for this turn, so nothing here has to know which request is running -- and
 // two requests sharing an isolate cannot pop each other's events.
-const __registerWaitUntil = __celld.__registerWaitUntil = (promise) => {
+const __registerWaitUntil = __cello.__registerWaitUntil = (promise) => {
   const tracked = Promise.resolve(promise).catch((error) => {
     console.error("waitUntil rejected", error);
   });
@@ -12987,13 +12987,13 @@ const __entrypointContext = (props = __defaultProps) => ({
   props,
   get exports() { return __ctxExports(); },
 });
-const __beginEvent = __celld.__beginEvent = (props = __defaultProps) => {
+const __beginEvent = __cello.__beginEvent = (props = __defaultProps) => {
   __rpcSignalRefresh();
   __refreshRetainedWaits("");
   __event_begin();
   return __entrypointContext(props);
 };
-const __endEvent = __celld.__endEvent = () => __event_end();
+const __endEvent = __cello.__endEvent = () => __event_end();
 // Workerd's writable filesystem is memory-backed and request-scoped. The
 // native IoContext owns the directory tree; this facade supplies Node's path,
 // error, Promise, and Stats shapes without exposing a host filesystem.
@@ -13570,7 +13570,7 @@ const __fsNamespaceProxy = (surface, path, names, enoentNames = []) => {
           : undefined),
   });
 };
-const __fsPromises = __celld.__fsPromises = __fsNamespaceProxy(
+const __fsPromises = __cello.__fsPromises = __fsNamespaceProxy(
   __fsPromisesSurface,
   "node:fs/promises",
   [
@@ -13623,7 +13623,7 @@ const __fsNamespaceNames = [
 // Writable file contents and every mutation remain explicit unsupported
 // surfaces until a failing application seam requires them. These two reads
 // use ENOENT so dependencies can take their no-filesystem fallback path.
-__celld.__fs = __fsNamespaceProxy(
+__cello.__fs = __fsNamespaceProxy(
   __fsSurface,
   "node:fs",
   __fsNamespaceNames,
@@ -13693,7 +13693,7 @@ const __bridgeResponseStream = (body, requestControllers, onSettle) => {
   __registerWaitUntil(pump);
   return streamId;
 };
-__celld.__readResponse = (r) => {
+__cello.__readResponse = (r) => {
   // The fetch context that produced this response, if any: end it once
   // the body no longer needs it. Bytes bodies end here; a live body ends
   // when its bridge pump settles (below); a host-stream body needs no JS
@@ -13744,13 +13744,13 @@ __celld.__readResponse = (r) => {
   let bodyStreamId;
   let pumpEndsCtx = false;
   if (r._bodyBytes === null) {
-    if (typeof r.body?.__celldStreamId === "number" &&
-        !r.__celldRequestControllers) {
-      bodyStreamId = r.body.__celldStreamId;
+    if (typeof r.body?.__celloStreamId === "number" &&
+        !r.__celloRequestControllers) {
+      bodyStreamId = r.body.__celloStreamId;
     } else {
       bodyStreamId = __bridgeResponseStream(
         r.body,
-        r.__celldRequestControllers,
+        r.__celloRequestControllers,
         endFetchCtx,
       );
       pumpEndsCtx = true;

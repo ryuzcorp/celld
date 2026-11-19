@@ -11,7 +11,7 @@
 // Web APIs accept it naturally. Encoding, validation, and error-code
 // semantics follow Node's lib/buffer.js, with the argument dances
 // adapted from Deno's ext/node/polyfills/internal/buffer.mjs (MIT).
-if (!__celld.__buffer) (() => {
+if (!__cello.__buffer) (() => {
   const __kMaxLength = 2147483647;
   const __kStringMaxLength = 536870888;
   const __bufErr = (E, code, msg) => {
@@ -732,7 +732,7 @@ if (!__celld.__buffer) (() => {
     throw __bufType("input",
       "an instance of ArrayBuffer or ArrayBufferView", input);
   };
-  __celld.__buffer = {
+  __cello.__buffer = {
     Buffer: __bufferCallable,
     SlowBuffer,
     INSPECT_MAX_BYTES: 50,
@@ -795,4 +795,4 @@ if (!__celld.__buffer) (() => {
   };
 })();
 // The lazy-global getter's exports.
-return { Buffer: __celld.__buffer.Buffer };
+return { Buffer: __cello.__buffer.Buffer };

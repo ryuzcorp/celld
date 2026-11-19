@@ -325,7 +325,7 @@
       this.info = info;
       // key: bytes, or a CryptoKey (from a KeyObject or WebCrypto).
       this.key = copyU8(
-        key instanceof CryptoKey ? key.__celldMaterial.bytes : key);
+        key instanceof CryptoKey ? key.__celloMaterial.bytes : key);
       this.chunks = [];
     }
     update(data) {
@@ -484,14 +484,14 @@
   const keyEquals = (a, b) => {
     if (a === b) return true;
     if (!a.extractable || !b.extractable) return false;
-    const ab = a.__celldMaterial?.bytes, bb = b.__celldMaterial?.bytes;
+    const ab = a.__celloMaterial?.bytes, bb = b.__celloMaterial?.bytes;
     if (!ab || !bb || ab.byteLength !== bb.byteLength) return false;
     let diff = 0;
     for (let i = 0; i < ab.byteLength; i++) diff |= ab[i] ^ bb[i];
     return diff === 0;
   };
   const keyMaterial = (key) => {
-    const bytes = key.__celldMaterial?.bytes;
+    const bytes = key.__celloMaterial?.bytes;
     if (!bytes) {
       throw new Error(
         "key material is not exportable through node:crypto yet");
@@ -632,7 +632,7 @@
         String(error?.message ?? error).replace(/^crypto: /, ""));
     }
   };
-  const asymmetricMaterial = (key) => key.__celldMaterial ?? {};
+  const asymmetricMaterial = (key) => key.__celloMaterial ?? {};
   // The generation op does not carry a curve yet, so it always generates
   // P-256. Keep that limitation separate from imported-key conversion, which
   // accepts every curve that the shared Web Crypto implementation parses.
@@ -682,7 +682,7 @@
     // arrives through node:crypto reports what the same key reports after
     // crypto.subtle.importKey(). There is no request dictionary here, so
     // an RSA key takes the SHA-256 that builder defaults to.
-    const algorithm = __celld.$$keyAlgorithm(
+    const algorithm = __cello.$$keyAlgorithm(
       WEB_CRYPTO_ALGORITHM[result.keyType], null, result.keyType,
       result.details);
     return KeyObject.from(
@@ -714,9 +714,9 @@
       }
       if (material.keyType === "ec" && typeof algorithm === "object" &&
           algorithm?.namedCurve !== undefined) {
-        const requestedCurve = __celld.$$canonicalEcCurve(
+        const requestedCurve = __cello.$$canonicalEcCurve(
           algorithm.namedCurve);
-        const keyCurve = __celld.$$canonicalEcCurve(
+        const keyCurve = __cello.$$canonicalEcCurve(
           material.details?.namedCurve);
         if (requestedCurve === undefined || requestedCurve !== keyCurve) {
           throw new DOMException("Named curve mismatch", "DataError");
@@ -736,7 +736,7 @@
       }
       return new CryptoKey(
         this.type,
-        __celld.$$keyAlgorithm(
+        __cello.$$keyAlgorithm(
           requestedName, algorithm, material.keyType, material.details),
         extractable,
         requestedUsages,
@@ -1728,7 +1728,7 @@
   };
   cryptoModule.default = cryptoModule;
 
-  __celld.__cryptoModule = cryptoModule;
+  __cello.__cryptoModule = cryptoModule;
   // node:util's types.isKeyObject checks against this class if it exists.
-  __celld.__nodeKeyObjectClass = KeyObject;
+  __cello.__nodeKeyObjectClass = KeyObject;
 })();

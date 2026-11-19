@@ -54,7 +54,7 @@ pub mod __asyncrt_select_support {
 }
 
 #[macro_export]
-macro_rules! __celld_domain_select {
+macro_rules! __cello_domain_select {
     (@reason $reason:literal) => {{
         const _: () = {
             let reason: &str = $reason;
@@ -68,7 +68,7 @@ macro_rules! __celld_domain_select {
         $crate::asyncrt::select_start($branches)
     };
     (@start (biased $reason:literal) $_branches:expr) => {{
-        $crate::__celld_domain_select!(@reason $reason);
+        $crate::__cello_domain_select!(@reason $reason);
         0_u32
     }};
     (@ {
@@ -78,18 +78,18 @@ macro_rules! __celld_domain_select {
         ; $else:expr
     }) => {{
         #[doc(hidden)]
-        mod __celld_select_util {
+        mod __cello_select_util {
             $crate::__asyncrt_select_support::select_priv_declare_output_enum!(
                 ( $($count)* )
             );
         }
 
         const BRANCHES: u32 = $crate::__asyncrt_select_support::count!($($count)*);
-        let mut disabled: __celld_select_util::Mask = Default::default();
+        let mut disabled: __cello_select_util::Mask = Default::default();
 
         $(
             if !$condition {
-                let mask: __celld_select_util::Mask =
+                let mask: __cello_select_util::Mask =
                     1 << $crate::__asyncrt_select_support::count!($($skip)*);
                 disabled |= mask;
             }
@@ -114,7 +114,7 @@ macro_rules! __celld_domain_select {
                 );
 
                 let mut is_pending = false;
-                let start = $crate::__celld_domain_select!(@start $mode BRANCHES);
+                let start = $crate::__cello_domain_select!(@start $mode BRANCHES);
 
                 for offset in 0..BRANCHES {
                     let branch;
@@ -158,7 +158,7 @@ macro_rules! __celld_domain_select {
 
                                 return $crate::__asyncrt_select_support::Poll::Ready(
                                     $crate::__asyncrt_select_support::select_variant!(
-                                        __celld_select_util::Out,
+                                        __cello_select_util::Out,
                                         ($($skip)*)
                                     )(value),
                                 );
@@ -172,7 +172,7 @@ macro_rules! __celld_domain_select {
                     $crate::__asyncrt_select_support::Poll::Pending
                 } else {
                     $crate::__asyncrt_select_support::Poll::Ready(
-                        __celld_select_util::Out::Disabled,
+                        __cello_select_util::Out::Disabled,
                     )
                 }
             })
@@ -183,28 +183,28 @@ macro_rules! __celld_domain_select {
         match output {
             $(
                 $crate::__asyncrt_select_support::select_variant!(
-                    __celld_select_util::Out,
+                    __cello_select_util::Out,
                     ($($skip)*) ($bind)
                 ) => $handler,
             )*
-            __celld_select_util::Out::Disabled => $else,
+            __cello_select_util::Out::Disabled => $else,
             _ => unreachable!("the select output does not match a branch"),
         }
     }};
 
     (@ { mode=$mode:tt; $($tokens:tt)* }) => {
-        $crate::__celld_domain_select!(@ {
+        $crate::__cello_domain_select!(@ {
             mode=$mode;
             $($tokens)*;
             panic!("all branches are disabled and there is no else branch")
         })
     };
     (@ { mode=$mode:tt; $($tokens:tt)* } else => $else:expr $(,)?) => {
-        $crate::__celld_domain_select!(@ { mode=$mode; $($tokens)*; $else })
+        $crate::__cello_domain_select!(@ { mode=$mode; $($tokens)*; $else })
     };
     (@ { mode=$mode:tt; ($($skip:tt)*) $($tokens:tt)* }
         $pattern:pat = $future:expr, if $condition:expr => $handler:block, $($rest:tt)*) => {
-        $crate::__celld_domain_select!(@ {
+        $crate::__cello_domain_select!(@ {
             mode=$mode;
             ($($skip)* _)
             $($tokens)*
@@ -213,7 +213,7 @@ macro_rules! __celld_domain_select {
     };
     (@ { mode=$mode:tt; ($($skip:tt)*) $($tokens:tt)* }
         $pattern:pat = $future:expr => $handler:block, $($rest:tt)*) => {
-        $crate::__celld_domain_select!(@ {
+        $crate::__cello_domain_select!(@ {
             mode=$mode;
             ($($skip)* _)
             $($tokens)*
@@ -222,7 +222,7 @@ macro_rules! __celld_domain_select {
     };
     (@ { mode=$mode:tt; ($($skip:tt)*) $($tokens:tt)* }
         $pattern:pat = $future:expr, if $condition:expr => $handler:block $($rest:tt)*) => {
-        $crate::__celld_domain_select!(@ {
+        $crate::__cello_domain_select!(@ {
             mode=$mode;
             ($($skip)* _)
             $($tokens)*
@@ -231,7 +231,7 @@ macro_rules! __celld_domain_select {
     };
     (@ { mode=$mode:tt; ($($skip:tt)*) $($tokens:tt)* }
         $pattern:pat = $future:expr => $handler:block $($rest:tt)*) => {
-        $crate::__celld_domain_select!(@ {
+        $crate::__cello_domain_select!(@ {
             mode=$mode;
             ($($skip)* _)
             $($tokens)*
@@ -240,7 +240,7 @@ macro_rules! __celld_domain_select {
     };
     (@ { mode=$mode:tt; ($($skip:tt)*) $($tokens:tt)* }
         $pattern:pat = $future:expr, if $condition:expr => $handler:expr) => {
-        $crate::__celld_domain_select!(@ {
+        $crate::__cello_domain_select!(@ {
             mode=$mode;
             ($($skip)* _)
             $($tokens)*
@@ -249,7 +249,7 @@ macro_rules! __celld_domain_select {
     };
     (@ { mode=$mode:tt; ($($skip:tt)*) $($tokens:tt)* }
         $pattern:pat = $future:expr => $handler:expr) => {
-        $crate::__celld_domain_select!(@ {
+        $crate::__cello_domain_select!(@ {
             mode=$mode;
             ($($skip)* _)
             $($tokens)*
@@ -258,7 +258,7 @@ macro_rules! __celld_domain_select {
     };
     (@ { mode=$mode:tt; ($($skip:tt)*) $($tokens:tt)* }
         $pattern:pat = $future:expr, if $condition:expr => $handler:expr, $($rest:tt)*) => {
-        $crate::__celld_domain_select!(@ {
+        $crate::__cello_domain_select!(@ {
             mode=$mode;
             ($($skip)* _)
             $($tokens)*
@@ -267,7 +267,7 @@ macro_rules! __celld_domain_select {
     };
     (@ { mode=$mode:tt; ($($skip:tt)*) $($tokens:tt)* }
         $pattern:pat = $future:expr => $handler:expr, $($rest:tt)*) => {
-        $crate::__celld_domain_select!(@ {
+        $crate::__cello_domain_select!(@ {
             mode=$mode;
             ($($skip)* _)
             $($tokens)*
@@ -282,7 +282,7 @@ macro_rules! __celld_domain_select {
     };
     (else => $else:expr $(,)?) => {{ $else }};
     ($pattern:pat = $($tokens:tt)*) => {
-        $crate::__celld_domain_select!(@ {
+        $crate::__cello_domain_select!(@ {
             mode=fair;
             ()
         } $pattern = $($tokens)*)
@@ -294,13 +294,13 @@ macro_rules! __celld_domain_select {
 
 #[doc(hidden)]
 #[macro_export]
-macro_rules! __celld_domain_select_biased {
+macro_rules! __cello_domain_select_biased {
     ($reason:literal; else => $else:expr $(,)?) => {{
-        $crate::__celld_domain_select!(@reason $reason);
+        $crate::__cello_domain_select!(@reason $reason);
         $else
     }};
     ($reason:literal; $pattern:pat = $($tokens:tt)*) => {{
-        $crate::__celld_domain_select!(@ {
+        $crate::__cello_domain_select!(@ {
             mode=(biased $reason);
             ()
         } $pattern = $($tokens)*)

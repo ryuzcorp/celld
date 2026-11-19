@@ -26,7 +26,7 @@
 // - MIMEType/MIMEParams (native in Workerd) are a compact JS equivalent.
 // - getCallSites uses Error.prepareStackTrace instead of a C++ stack walk.
 // - `types.isKeyObject` checks node:crypto's KeyObject class through
-//   `__celld.__nodeKeyObjectClass` (false until node:crypto loads -- no
+//   `__cello.__nodeKeyObjectClass` (false until node:crypto loads -- no
 //   KeyObject can exist before that).
 //
 // Injected lazily into the generated stub module, so an isolate that never
@@ -107,8 +107,8 @@
     typeof CryptoKey === "function" && v instanceof CryptoKey;
   // node:crypto (lazy) publishes its KeyObject class on this hidden global.
   const isKeyObject = (v) =>
-    typeof __celld.__nodeKeyObjectClass === "function" &&
-    v instanceof __celld.__nodeKeyObjectClass;
+    typeof __cello.__nodeKeyObjectClass === "function" &&
+    v instanceof __cello.__nodeKeyObjectClass;
 
   // Byte compare for internal_comparisons (Workerd imports Buffer.compare).
   const compare = (a, b) => globalThis.Buffer.compare(a, b);
@@ -4529,7 +4529,7 @@ stamp(globalThis.ReadableStream, {
     ["state", (v) =>
       v._errored ? "errored" : v._closed ? "closed" : "readable"],
     ["supportsBYOB", (v) =>
-      v.__celldBodyBytes !== undefined || v.__celldStreamId !== undefined],
+      v.__celloBodyBytes !== undefined || v.__celloStreamId !== undefined],
     ["length", (v) =>
       v._expectedLength === undefined
         ? undefined
@@ -4628,6 +4628,6 @@ const utilModule = {
   isUndefined: eolIsUndefined,
 };
 utilModule.default = utilModule;
-__celld.__utilModule = utilModule;
-__celld.__utilTypesModule = { ...types, default: types };
+__cello.__utilModule = utilModule;
+__cello.__utilTypesModule = { ...types, default: types };
 })();

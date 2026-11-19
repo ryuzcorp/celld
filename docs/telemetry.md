@@ -8,7 +8,7 @@ OpenTelemetry collector.
 
 The schema is version `v0-unstable`, so column names can change before a
 stable release. Each file carries the version in the object metadata name
-`celld-schema`, or `celld_schema` on an `az://` bucket.
+`cello-schema`, or `cello_schema` on an `az://` bucket.
 
 ## Configuration
 

@@ -8,7 +8,7 @@ backstop, so the process is strict on purpose.
 
 - PRs target `main`. The repo allows rebase merges only; keep history
   linear and rebase instead of merging `main` into your branch.
-- `upstream/main` mirrors upstream celld and carries no patches. Fixes
+- `upstream/main` mirrors upstream denoland/celld and carries no patches. Fixes
   from upstream are ported by hand, one commit per fix, never merged.
 - Releases are cut from tags: pushing `v<semver>` runs the release
   pipeline (build, provenance, image publish). The tag must be

@@ -604,5 +604,5 @@
     },
   });
 
-  __celld.__eventsModule = EventEmitter;
+  __cello.__eventsModule = EventEmitter;
 })();

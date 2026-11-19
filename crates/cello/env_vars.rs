@@ -593,7 +593,7 @@ mod renamed_prefix_tests {
     }
 
     #[test]
-    fn stale_celld_setting_refuses_to_start_and_names_the_cello_spelling() {
+    fn stale_prefix_setting_refuses_to_start_and_names_the_cello_spelling() {
         // Pure over explicit vars: no process environment is touched, so
         // this test can never race a sibling test or the harness env.
         let message = refuse_renamed(

@@ -12,7 +12,7 @@
 //! Conformance for Durable Object stubs over cross-isolate service bindings
 //! (R7): a `WorkerEntrypoint` method can return (and accept) a DO stub, while
 //! `RpcTarget` and stream values keep today's `DataCloneError` both ways and
-//! forged `__celld$do` markers are refused. The two-hop case drives the
+//! forged `__cello$do` markers are refused. The two-hop case drives the
 //! returned stub over DO RPC (0007): the managed-sandbox two-hop path.
 //!
 //! One `cello dev` boots the app fixture; the controller fixture is

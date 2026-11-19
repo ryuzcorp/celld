@@ -155,7 +155,7 @@ The `tail` and `email` handlers are unavailable.
   Object stores on its instance does not survive into a later invocation;
   a stub does not survive a socket upgrade. Each fails closed with a
   disposed error instead of leaking.
-- `globalThis.__celldStubStatsForTestOnly()` reports this isolate's stub
+- `globalThis.__celloStubStatsForTestOnly()` reports this isolate's stub
   counts for the conformance suite. It exists only on nodes booted with
   `CELLO_TEST_STUB_STATS=1` (a process environment variable, which tenant
   code cannot set); production isolates never define it. It is test

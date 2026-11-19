@@ -143,7 +143,7 @@ class Headers {
   }
 
   constructor(init) {
-    this.__celldHost = _noClone;
+    this.__celloHost = _noClone;
     if (init === undefined) return;
     if (init === null || typeof init !== "object")
       throw new TypeError("Invalid Headers init");
@@ -266,7 +266,7 @@ class Headers {
   // `Headers` never picks it up. Fresh pairs, so a caller that writes into
   // what it received cannot rewrite the header list or desynchronize it
   // from the parallel lower-cased names.
-  get __celldHeaderList() {
+  get __celloHeaderList() {
     const list = this.#list.list;
     const out = new Array(list.length);
     for (let i = 0; i < list.length; i++)

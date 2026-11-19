@@ -439,9 +439,9 @@ release, so keep operator tooling and Cello releases together.
   refuses to start against a v0.5.1 follower. A `bucket` durability fleet
   can roll.
 - **v0.6.0 to v0.6.1: rolling.** Until every node runs v0.6.1, do not set
-  `CELLD_LTX_RETENTION_SECS`, do not deploy a Python Worker, and do not
-  raise `CELLD_MAX_ASSET_FILE_BYTES` above 25 MiB. A rollback to v0.6.0
-  can roll after you unset `CELLD_LTX_RETENTION_SECS` on every node.
+  `CELLO_LTX_RETENTION_SECS`, do not deploy a Python Worker, and do not
+  raise `CELLO_MAX_ASSET_FILE_BYTES` above 25 MiB. A rollback to v0.6.0
+  can roll after you unset `CELLO_LTX_RETENTION_SECS` on every node.
 - **v0.6.1 to v0.6.2: rolling.** Until every node runs v0.6.2, a handler
   failure on the owner of a forwarded Durable Object fetch can reach the
   caller as a 500 response. A v0.6.2 pair rejects the caller's `stub.fetch()`
@@ -526,7 +526,7 @@ calls, commits at most 64 in one transaction, and overlaps up to four
 transactions.
 
 Over the limit, Cello returns `503` with `Retry-After: 1` and
-`x-celld-overload: cell`, and does not start the event. The Queue response
+`x-cello-overload: cell`, and does not start the event. The Queue response
 body is `{"error":"cell admission refused"}`, and a caught Queue producer
 error contains `cell overload: admission refused`. A load generator must
 count these responses as rejected work. Cello logs `cell_overload_refused`

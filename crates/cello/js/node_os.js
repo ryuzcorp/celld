@@ -220,7 +220,7 @@
   Object.freeze(constants.signals);
   Object.freeze(constants.priority);
 
-  __celld.__osModule = {
+  __cello.__osModule = {
     EOL: "\n",
     devNull: "/dev/null",
     constants,

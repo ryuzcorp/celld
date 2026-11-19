@@ -32,7 +32,7 @@ const decodeCarrier = (abort) => {
 // open past the call that delivered it.
 export class CarrierDO extends DurableObject {
   async startExec(scope, options) {
-    const test = globalThis.__celldTestExecForTestOnly;
+    const test = globalThis.__celloTestExecForTestOnly;
     test.attach(scope);
     const decoded = decodeCarrier(options?.abort);
     const proc = await test.exec(
@@ -46,12 +46,12 @@ export class CarrierDO extends DurableObject {
   }
 
   async statusExec() {
-    const test = globalThis.__celldTestExecForTestOnly;
+    const test = globalThis.__celloTestExecForTestOnly;
     return { kills: test.kills(this._run.id) };
   }
 
   async finishExec(code) {
-    const test = globalThis.__celldTestExecForTestOnly;
+    const test = globalThis.__celloTestExecForTestOnly;
     test.exit(this._run.id, code);
     const exitCode = await this._run.proc.exitCode;
     this._run.finish();
@@ -86,7 +86,7 @@ export default {
     const scope = `exec-carrier:${url.searchParams.get('scope') ?? t}`;
     const run = async () => {
       if (t === 'health') return { ok: true };
-      const test = globalThis.__celldTestExecForTestOnly;
+      const test = globalThis.__celloTestExecForTestOnly;
       if (test === undefined) {
         throw new Error('test exec hooks missing (boot without CELLO_TEST_WAIT=1?)');
       }

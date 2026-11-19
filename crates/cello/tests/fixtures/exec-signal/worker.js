@@ -12,7 +12,7 @@ let nextScope = 0;
 // envelopes, so the event succeeds.)
 export class SignalDO extends DurableObject {
   async fetch() {
-    const test = globalThis.__celldTestExecForTestOnly;
+    const test = globalThis.__celloTestExecForTestOnly;
     const fixed = 'signal-fail';
     test.attach(fixed);
     test.signal(fixed, 15);
@@ -25,7 +25,7 @@ export default {
     const t = new URL(req.url).pathname.slice(1);
     const run = async () => {
       if (t === 'health') return { ok: true };
-      const test = globalThis.__celldTestExecForTestOnly;
+      const test = globalThis.__celloTestExecForTestOnly;
       if (test === undefined)
         throw new Error('test exec hooks missing (boot without CELLO_TEST_WAIT=1?)');
       // A fresh scope per request, so fake processes never leak across cases.

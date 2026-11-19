@@ -27,7 +27,7 @@ deployment mode.
 ## Specification: exhaustive at small size
 
 The coordination protocol is specified in TLA+. Heyang Zhou wrote the
-specifications against celld v0.1.0. His model checking found four bugs and a
+specifications against cello v0.1.0. His model checking found four bugs and a
 split-brain that lost an acknowledged write. All are fixed. None had surfaced
 in our own review or testing.
 

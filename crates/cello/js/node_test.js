@@ -72,7 +72,7 @@
   };
 
   const test = notImplemented("test");
-  __celld.__nodeTest = {
+  __cello.__nodeTest = {
     mock,
     test,
     default: test,

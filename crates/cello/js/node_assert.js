@@ -297,6 +297,6 @@
   strict.strict = strict;
   assert.strict = strict;
 
-  __celld.__assertModule = assert;
-  __celld.__assertStrictModule = strict;
+  __cello.__assertModule = assert;
+  __cello.__assertStrictModule = strict;
 })();

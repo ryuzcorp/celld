@@ -12,10 +12,10 @@ pub const STALE_ROUTE_HEADER: &str = "x-cells-route-error";
 pub const STALE_ROUTE_VALUE: &str = "stale-owner";
 
 /// The node-to-node overload signal on peer RPC responses. Frozen: a bucket
-/// written by celld `.13` is not involved, but mixed-version fleets exchange
+/// written by cello `.13` is not involved, but mixed-version fleets exchange
 /// this header while they upgrade, so the spelling never changes.
 /// See `rename-frozen.md`.
-pub const OVERLOAD_HEADER: &str = "x-celld-overload";
+pub const OVERLOAD_HEADER: &str = "x-cello-overload";
 
 use crate::bucket::Bucket;
 use anyhow::{anyhow, Context};
@@ -408,6 +408,6 @@ mod frozen_names_tests {
 
     #[test]
     fn overload_header_stays_frozen() {
-        assert_eq!(OVERLOAD_HEADER, "x-celld-overload");
+        assert_eq!(OVERLOAD_HEADER, "x-cello-overload");
     }
 }

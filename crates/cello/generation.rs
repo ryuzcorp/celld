@@ -822,7 +822,7 @@ pub struct GenerationTag(pub GenerationId);
 /// and no tenant pool can collide with the runtime pool in `cell_isolates`.
 /// The shared classes address fleet-wide namespace keys, so their cells
 /// resolve identically whichever script name hosts them.
-pub(crate) const RUNTIME_SCRIPT: &str = "__celld-runtime";
+pub(crate) const RUNTIME_SCRIPT: &str = "__cello-runtime";
 
 /// The entry module of a runtime isolate. The harness plus this fixed inert
 /// module is the whole realm: no tenant bundle is compiled or evaluated, so
@@ -1141,11 +1141,11 @@ mod tests {
 
     /// The runtime isolate pool's script name is frozen: stored deployment
     /// graphs and cell-to-script resolution reference it, so a bucket
-    /// written by celld `.13` keeps working under Cello. See
+    /// written by cello `.13` keeps working under Cello. See
     /// `rename-frozen.md`. Never rename this without a migration.
     #[test]
     fn runtime_script_name_stays_frozen() {
-        assert_eq!(RUNTIME_SCRIPT, "__celld-runtime");
+        assert_eq!(RUNTIME_SCRIPT, "__cello-runtime");
     }
 
     fn identity() -> ServingIdentity {

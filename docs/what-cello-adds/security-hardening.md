@@ -1,6 +1,6 @@
 ---
 title: Security and hardening
-description: Binding isolation, operator token, egress policy, deploy confinement, and credential hygiene over upstream celld.
+description: Binding isolation, operator token, egress policy, deploy confinement, and credential hygiene over upstream denoland/celld.
 ---
 
 Patches that shrink what a Worker — or a stolen credential, or a

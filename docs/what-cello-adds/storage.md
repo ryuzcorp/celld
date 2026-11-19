@@ -1,6 +1,6 @@
 ---
 title: Storage
-description: Eviction savings, dev-store throughput, repair, and SQL bounds over upstream celld.
+description: Eviction savings, dev-store throughput, repair, and SQL bounds over upstream denoland/celld.
 ---
 
 Patches to what Cello stores and how it reads it back: cheaper

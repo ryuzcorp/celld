@@ -1,6 +1,6 @@
 ---
 title: Runtime
-description: JavaScript runtime, RPC, container exec, isolate concurrency, and cancellation fixes over upstream celld.
+description: JavaScript runtime, RPC, container exec, isolate concurrency, and cancellation fixes over upstream denoland/celld.
 ---
 
 Patches to the JavaScript runtime: Fetch and RPC semantics, container

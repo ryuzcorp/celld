@@ -267,7 +267,7 @@ impl std::fmt::Display for RemoteHandlerFailure {
 }
 
 impl std::error::Error for RemoteHandlerFailure {}
-const DURABLE_OBJECT_ROUTING_ERROR_MARKER: &str = "__CELLD_DO_ROUTING_ERROR__:";
+const DURABLE_OBJECT_ROUTING_ERROR_MARKER: &str = "__CELLO_DO_ROUTING_ERROR__:";
 
 fn owner_unreachable(scope: &str, owner: &str, source: anyhow::Error) -> anyhow::Error {
     // Record how the attempt failed, not just that it did. `connect` is the
@@ -6241,7 +6241,7 @@ mod internal_log_wire_tests {
     /// See `rename-frozen.md`.
     #[test]
     fn log_stream_upgrade_stays_frozen() {
-        assert_eq!(cello::node_log::LOG_STREAM_UPGRADE, "celld-log-stream");
+        assert_eq!(cello::node_log::LOG_STREAM_UPGRADE, "cello-log-stream");
     }
 
     /// The process-wide Tokio runtime these tests boot node state on, with

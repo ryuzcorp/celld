@@ -5,7 +5,7 @@
 // binding. Each override is surgical — it misbehaves only for the shapes the
 // runtime cells use — so this script's own fetch path keeps working and any
 // probe failure pins the shared cells, not the forwarding.
-const MARK = "__celld_probe_marker";
+const MARK = "__cello_probe_marker";
 
 // Captured before overriding, and every override delegates through the
 // captured originals only, so the overrides never re-enter each other.
