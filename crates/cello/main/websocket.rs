@@ -1134,46 +1134,46 @@ where
 }
 
 async fn write_ws_out<S>(ws: &PumpWriter<S>, out: cello::js::WsOut) -> bool
- where
-     S: tokio::io::AsyncWrite + Unpin,
- {
-     use fastwebsockets::Frame;
-     let keep_open = matches!(out, cello::js::WsOut::Text(_) | cello::js::WsOut::Binary(_));
-     let frame = match out {
-         cello::js::WsOut::Text(text) => Frame::text(text.into_bytes().into()),
-         cello::js::WsOut::Binary(data) => Frame::binary(data.into()),
-         cello::js::WsOut::Close(code, reason) => Frame::close(code, reason.as_bytes()),
-         // A pre-registration burst flushes its overload marker into this
-         // never-budgeted pipe: end the socket loudly with the 1011 the
-         // isolate forwarder would have sent.
-         cello::js::WsOut::Overload => Frame::close(
-             cello::js::WS_PIPE_OVERLOAD_CODE,
-             cello::js::WS_PIPE_OVERLOAD_REASON.as_bytes(),
-         ),
-     };
+where
+    S: tokio::io::AsyncWrite + Unpin,
+{
+    use fastwebsockets::Frame;
+    let keep_open = matches!(out, cello::js::WsOut::Text(_) | cello::js::WsOut::Binary(_));
+    let frame = match out {
+        cello::js::WsOut::Text(text) => Frame::text(text.into_bytes().into()),
+        cello::js::WsOut::Binary(data) => Frame::binary(data.into()),
+        cello::js::WsOut::Close(code, reason) => Frame::close(code, reason.as_bytes()),
+        // A pre-registration burst flushes its overload marker into this
+        // never-budgeted pipe: end the socket loudly with the 1011 the
+        // isolate forwarder would have sent.
+        cello::js::WsOut::Overload => Frame::close(
+            cello::js::WS_PIPE_OVERLOAD_CODE,
+            cello::js::WS_PIPE_OVERLOAD_REASON.as_bytes(),
+        ),
+    };
     pump_write_frame(ws, frame).await.is_ok() && keep_open
- }
- 
+}
+
 async fn echo_websocket_close<S>(
     writer: &PumpWriter<S>,
-     close: &CloseState,
-     application_sent_close: bool,
- ) where
-     S: tokio::io::AsyncWrite + Unpin,
- {
-     if let Some(code) =
-         cello_logic::schedule::websocket_echo_close(close.0, close.2, application_sent_close)
-     {
-         // Bounded like every other pump socket write: a peer that stopped
-         // reading must not park teardown. The echo is best-effort; the cell
-         // already learned the close through its own dispatch.
-         let _ = cello::asyncrt::timeout(
-             PUMP_SEND_PROGRESS_TIMEOUT,
-             write_ws_out(writer, cello::js::WsOut::Close(code, close.1.clone())),
-         )
-         .await;
-     }
- }
+    close: &CloseState,
+    application_sent_close: bool,
+) where
+    S: tokio::io::AsyncWrite + Unpin,
+{
+    if let Some(code) =
+        cello_logic::schedule::websocket_echo_close(close.0, close.2, application_sent_close)
+    {
+        // Bounded like every other pump socket write: a peer that stopped
+        // reading must not park teardown. The echo is best-effort; the cell
+        // already learned the close through its own dispatch.
+        let _ = cello::asyncrt::timeout(
+            PUMP_SEND_PROGRESS_TIMEOUT,
+            write_ws_out(writer, cello::js::WsOut::Close(code, close.1.clone())),
+        )
+        .await;
+    }
+}
 
 /// One frame's staged bytes, charged the way the pull queue charges its own
 /// frames: payload plus the frame value itself.
@@ -1767,8 +1767,7 @@ where
         }
         handler_sent_close |= matches!(output, cello::js::WsOut::Close(_, _));
         let written =
-            cello::asyncrt::timeout(PUMP_SEND_PROGRESS_TIMEOUT, write_ws_out(writer, output))
-                .await;
+            cello::asyncrt::timeout(PUMP_SEND_PROGRESS_TIMEOUT, write_ws_out(writer, output)).await;
         if !matches!(written, Ok(true)) {
             break;
         }
@@ -2456,10 +2455,12 @@ mod pump_tests {
             // Under a deadline of its own: without the pump's close the
             // frame never arrives, and the read must fail rather than stall
             // the test run ahead of the join timeout below.
-            let (opcode, payload) =
-                tokio::time::timeout(std::time::Duration::from_secs(30), read_server_frame(&mut reader))
-                    .await
-                    .expect("the loud close must arrive");
+            let (opcode, payload) = tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                read_server_frame(&mut reader),
+            )
+            .await
+            .expect("the loud close must arrive");
             assert_eq!(opcode, 0x8, "the flood ends in a close frame");
             assert_eq!(
                 u16::from_be_bytes([payload[0], payload[1]]),
@@ -2731,9 +2732,8 @@ mod pump_tests {
         entered: mpsc::UnboundedSender<Vec<u8>>,
         permits: std::sync::Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<()>>>,
         order: std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
-    ) -> impl FnMut(
-        cello::js::WsIn,
-    ) -> std::pin::Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send>> {
+    ) -> impl FnMut(cello::js::WsIn) -> std::pin::Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send>>
+    {
         move |data: cello::js::WsIn| {
             let entered = entered.clone();
             let permits = permits.clone();
@@ -2835,7 +2835,9 @@ mod pump_tests {
                 cello::js::WsPipeBudget::new(ISOLATE_PIPE_MAX_STAGED_BYTES),
             ));
             let (_reader, mut writer) = tokio::io::split(client_stream);
-            write_masked_frame(&mut writer, 0x2, b"first").await.expect("client data");
+            write_masked_frame(&mut writer, 0x2, b"first")
+                .await
+                .expect("client data");
             // The first dispatch parks on its withheld permit only after it
             // started: entering proves the pump read and staged it.
             permit_tx.send(()).expect("release the first dispatch");
@@ -2844,7 +2846,9 @@ mod pump_tests {
                 .expect("the first dispatch must start")
                 .expect("entered signals");
             assert_eq!(first, b"first", "the first frame dispatches first");
-            write_masked_frame(&mut writer, 0x2, b"second").await.expect("client data");
+            write_masked_frame(&mut writer, 0x2, b"second")
+                .await
+                .expect("client data");
             write_masked_frame(&mut writer, 0x8, &[0x03, 0xe8, b'b', b'y', b'e'])
                 .await
                 .expect("peer closes");
@@ -2853,10 +2857,11 @@ mod pump_tests {
             // dispatch; releasing it drains everything in order before the
             // pending close ends the pump.
             permit_tx.send(()).expect("release the second dispatch");
-            let second = tokio::time::timeout(std::time::Duration::from_secs(30), entered_rx.recv())
-                .await
-                .expect("the second dispatch must start")
-                .expect("entered signals");
+            let second =
+                tokio::time::timeout(std::time::Duration::from_secs(30), entered_rx.recv())
+                    .await
+                    .expect("the second dispatch must start")
+                    .expect("entered signals");
             assert_eq!(second, b"second", "queued data flushes before the close");
             let (close, _, _, _) = tokio::time::timeout(std::time::Duration::from_secs(30), pump)
                 .await
@@ -2904,7 +2909,9 @@ mod pump_tests {
                 cello::js::WsPipeBudget::new(ISOLATE_PIPE_MAX_STAGED_BYTES),
             ));
             let mut client_stream = client_stream;
-            write_masked_frame(&mut client_stream, 0x2, b"aaa").await.expect("client data");
+            write_masked_frame(&mut client_stream, 0x2, b"aaa")
+                .await
+                .expect("client data");
             // The first dispatch parks on its withheld permit only after it
             // started: entering proves the pump read and staged it.
             permit_tx.send(()).expect("release the first dispatch");
@@ -2918,7 +2925,9 @@ mod pump_tests {
             // the EOF that follows it in stream order. Dropping the whole
             // stream ends the write side: dropping only a split write half
             // would leave the peer open and the pump would never see EOF.
-            write_masked_frame(&mut client_stream, 0x2, b"bbb").await.expect("client data");
+            write_masked_frame(&mut client_stream, 0x2, b"bbb")
+                .await
+                .expect("client data");
             drop(client_stream);
             // The pump must wait for the drain: the first dispatch is still
             // parked, so a pump that drops the staged queue with the
@@ -2929,10 +2938,11 @@ mod pump_tests {
                 "the pump must wait for the staged drain, not report the transport close early"
             );
             permit_tx.send(()).expect("release the second dispatch");
-            let second = tokio::time::timeout(std::time::Duration::from_secs(30), entered_rx.recv())
-                .await
-                .expect("the second dispatch must start")
-                .expect("entered signals");
+            let second =
+                tokio::time::timeout(std::time::Duration::from_secs(30), entered_rx.recv())
+                    .await
+                    .expect("the second dispatch must start")
+                    .expect("entered signals");
             assert_eq!(second, b"bbb", "the staged frame dispatches after EOF");
             let (close, _, _, _) = tokio::time::timeout(std::time::Duration::from_secs(30), pump)
                 .await
@@ -3001,16 +3011,20 @@ mod pump_tests {
             // attempted on the contended mutex would have timed out instead.
             // Under a deadline of its own: a regressed pump that never drains
             // must fail rather than stall the test run.
-            let (opcode, payload) =
-                tokio::time::timeout(std::time::Duration::from_secs(30), read_server_frame(&mut reader))
-                    .await
-                    .expect("the parked data must drain");
+            let (opcode, payload) = tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                read_server_frame(&mut reader),
+            )
+            .await
+            .expect("the parked data must drain");
             assert_eq!(opcode, 0x2, "the parked data drains, not a terminal");
             assert_eq!(payload, data, "the drained frame is intact");
-            let (opcode, payload) =
-                tokio::time::timeout(std::time::Duration::from_secs(30), read_server_frame(&mut reader))
-                    .await
-                    .expect("the loud close must arrive");
+            let (opcode, payload) = tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                read_server_frame(&mut reader),
+            )
+            .await
+            .expect("the loud close must arrive");
             assert_eq!(opcode, 0x8, "the terminal is a close frame");
             assert_eq!(
                 u16::from_be_bytes([payload[0], payload[1]]),
@@ -3182,8 +3196,10 @@ mod pump_tests {
         test_runtime().block_on(async {
             // Every write fails fast on the failing stream, so the drain
             // removes one data frame, refunds it, and stops.
-            let socket =
-                fastwebsockets::WebSocket::after_handshake(FailingStream, fastwebsockets::Role::Server);
+            let socket = fastwebsockets::WebSocket::after_handshake(
+                FailingStream,
+                fastwebsockets::Role::Server,
+            );
             let (_reader, writer) = socket.split(tokio::io::split);
             let pump_writer = PumpWriter {
                 writer: std::sync::Arc::new(tokio::sync::Mutex::new(writer)),
@@ -3205,8 +3221,7 @@ mod pump_tests {
                 .send(cello::js::WsOut::Close(1000, "done".into()))
                 .expect("stage close");
             drop(outbound);
-            let handler_sent_close =
-                drain_close_outputs(&pump_writer, &mut outputs, &budget).await;
+            let handler_sent_close = drain_close_outputs(&pump_writer, &mut outputs, &budget).await;
             assert!(
                 !handler_sent_close,
                 "the close marker is never reached on a failed drain"
@@ -3265,14 +3280,12 @@ mod pump_tests {
                 .send(cello::js::WsOut::Close(1000, "done".into()))
                 .expect("stage close");
             drop(outbound);
-            let handler_sent_close =
-                drain_close_outputs(&pump_writer, &mut outputs, &budget).await;
+            let handler_sent_close = drain_close_outputs(&pump_writer, &mut outputs, &budget).await;
+            assert!(handler_sent_close, "the handler's close marker is reported");
             assert!(
-                handler_sent_close,
-                "the handler's close marker is reported"
-            );
-            assert!(
-                budget.charge(cello::js::ws_out_bytes(&cello::js::WsOut::Text("three".into()))),
+                budget.charge(cello::js::ws_out_bytes(&cello::js::WsOut::Text(
+                    "three".into()
+                ))),
                 "every removed frame is refunded"
             );
             // The frames crossed in order ahead of the terminal.
@@ -3295,8 +3308,10 @@ mod pump_tests {
             use tokio::io::AsyncReadExt;
             for poisoned in [false, true] {
                 let (mut client_stream, server) = tokio::io::duplex(64 * 1024);
-                let socket =
-                    fastwebsockets::WebSocket::after_handshake(server, fastwebsockets::Role::Server);
+                let socket = fastwebsockets::WebSocket::after_handshake(
+                    server,
+                    fastwebsockets::Role::Server,
+                );
                 let (_reader, writer) = socket.split(tokio::io::split);
                 let pump_writer = PumpWriter {
                     writer: std::sync::Arc::new(tokio::sync::Mutex::new(writer)),
@@ -3342,5 +3357,4 @@ mod pump_tests {
             }
         });
     }
-
 }

@@ -110,27 +110,27 @@ enum SettleOutcome {
     Expired,
 }
 
- /// Settle a parked sink send under the closing progress bound before the
- /// direction reports an end that drops the pipe: the parked send owns the
- /// head frame, and dropping it mid socket-write would tear that frame ahead
- /// of the terminal the teardown reports (the loud 1011 for an overload,
- /// nothing for a retirement). The end stands either way — only the head
- /// frame's delivery is at stake — so an expired bound still returns
- /// promptly. A shutdown observed mid-wait does not drop the send: it stays
- /// alive for the remainder of the bound, and the caller stops at a frame
- /// boundary instead of starting the next queued frame. No-op when nothing
- /// is parked, reporting whether the shutdown is already set.
- ///
- /// Delivery only: the producer budget was released when the frame was
- /// received, and the staged-bytes ledger drops with the direction, so the
- /// outcome only decides whether the head frame crossed whole.
+/// Settle a parked sink send under the closing progress bound before the
+/// direction reports an end that drops the pipe: the parked send owns the
+/// head frame, and dropping it mid socket-write would tear that frame ahead
+/// of the terminal the teardown reports (the loud 1011 for an overload,
+/// nothing for a retirement). The end stands either way — only the head
+/// frame's delivery is at stake — so an expired bound still returns
+/// promptly. A shutdown observed mid-wait does not drop the send: it stays
+/// alive for the remainder of the bound, and the caller stops at a frame
+/// boundary instead of starting the next queued frame. No-op when nothing
+/// is parked, reporting whether the shutdown is already set.
+///
+/// Delivery only: the producer budget was released when the frame was
+/// received, and the staged-bytes ledger drops with the direction, so the
+/// outcome only decides whether the head frame crossed whole.
 async fn settle_parked_send<SendFut>(
     sending: &mut Option<(std::pin::Pin<Box<SendFut>>, usize)>,
     shutdown: &mut tokio::sync::watch::Receiver<bool>,
 ) -> (SettleOutcome, bool)
- where
-     SendFut: Future<Output = PipeSendOutcome>,
- {
+where
+    SendFut: Future<Output = PipeSendOutcome>,
+{
     let Some((mut send_head, bytes)) = sending.take() else {
         return (SettleOutcome::Idle, *shutdown.borrow());
     };
@@ -160,7 +160,7 @@ async fn settle_parked_send<SendFut>(
         },
         Err(_) => (SettleOutcome::Expired, *shutdown.borrow()),
     }
- }
+}
 
 /// One direction of a WebSocket pipe: data frames staged from `from` cross
 /// into the sink one at a time, in channel order.
