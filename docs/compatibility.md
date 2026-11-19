@@ -86,8 +86,10 @@ deployments record `cello-fence…`.
    `latest`). Consumers pin by digest as before.
 3. **Local state.** `cello dev` keeps its state in `.cello/dev`
    instead of `.celld/dev` (same `--state DIR` / `CELLO_DEV_STATE`
-   override). The old directory is not migrated: point `--state` at it
-   only to inspect it, and start clean state for the renamed binary.
+   override). The old directory is not migrated and cannot be opened:
+   `cello dev` refuses an explicit `--state` directory it did not
+   create, and a `.13` state directory carries no marker — so keep it
+   aside for reference and start clean state for the renamed binary.
 4. **Bucket and wire.** No migration step: the fleet bucket, its
    prefixes, and the node-to-node protocol are unchanged, so a `.13`
    bucket opens under 0.1.0 directly. The only new bucket-side artifact

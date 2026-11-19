@@ -15,10 +15,13 @@ export default {
 };
 ```
 
-`cello deploy` uploads each imported wasm file beside the bundle and marks the
-deployment with the `wasm-v1` feature. A node that predates this feature
-refuses the deployment, so a mixed fleet fails at deploy time, not at request
-time.
+`cello deploy` uploads each imported wasm file beside the bundle, marks the
+deployment with the `wasm-v1` feature, and reports success once the upload
+lands. A node that predates this feature refuses the manifest when it polls
+the deployment pointer, so a mixed fleet surfaces the failure at adoption
+time, after the command has already succeeded — check that the nodes adopted
+the deployment (node logs, or `POST /reload` to adopt now) rather than
+relying on the command result.
 
 Cello compiles each wasm module once per process, so later isolates and cell
 activations reuse it.

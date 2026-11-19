@@ -14,6 +14,7 @@ on:
       - blume.config.ts
       - package.json
       - package-lock.json
+      - .github/workflows/docs.yml
   push:
     branches: [main]
     paths:
@@ -23,6 +24,7 @@ on:
       - blume.config.ts
       - package.json
       - package-lock.json
+      - .github/workflows/docs.yml
   workflow_dispatch:
 
 permissions:

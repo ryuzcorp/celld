@@ -11,8 +11,10 @@ backstop, so the process is strict on purpose.
 - `upstream/main` mirrors upstream celld and carries no patches. Fixes
   from upstream are ported by hand, one commit per fix, never merged.
 - Releases are cut from tags: pushing `v<semver>` runs the release
-  pipeline (build, provenance, image publish). Never reuse a version,
-  never move a tag.
+  pipeline (build, provenance, image publish). The tag must be
+  annotated, name the version in `crates/cello/Cargo.toml` exactly, and
+  point at a commit on `main` — anything else is refused before the
+  build. Never reuse a version, never move a tag.
 - Direct pushes, force-pushes, and deletions on protected branches are
   blocked by ruleset.
 
