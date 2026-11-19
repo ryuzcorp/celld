@@ -12559,11 +12559,6 @@ fn tmp_max_bytes() -> usize {
     })
 }
 
-/// Test-only count of `/bundle` materializations, for the sharing test at
-/// the bottom of this file.
-#[cfg(test)]
-static PROJECT_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
 /// The read-only `/bundle` projection of a worker's own modules.
 ///
 /// This is deployment-generation state, not isolate or request state. The
@@ -12613,8 +12608,6 @@ impl BundleTree {
     /// intervening directory. The entry module is projected under the name it
     /// compiles as, matching workerd's `mainScriptName` entry.
     fn project(config: &WorkerConfig) -> Self {
-        #[cfg(test)]
-        PROJECT_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut nodes = HashMap::new();
         nodes.insert("/bundle".to_string(), BundleNode::Directory);
         let entry = std::iter::once((
@@ -14937,7 +14930,6 @@ include!(env!("CELLO_INTERNAL_JS_OBSERVERS"));
 #[cfg(test)]
 mod bundle_tree_tests {
     use super::*;
-    use std::sync::atomic::Ordering;
 
     fn test_config(src: &str) -> Arc<WorkerConfig> {
         Arc::new(WorkerConfig::new(WorkerConfigOptions {
@@ -14963,12 +14955,11 @@ mod bundle_tree_tests {
 
     /// Two isolates built from one config share one projection: the first
     /// `/bundle` use projects, the second reuses. A distinct config
-    /// projects again. Revert the sharing and the second `tree()` projects
-    /// a second time. One test, not three: the counter is process-global
-    /// and parallel tests would race it.
+    /// projects again. Sharing is pinned by pointer identity, not by a
+    /// process-global projection count: parallel tests project their own
+    /// configs on other threads, so an exact global count would race.
     #[test]
     fn bundle_tree_is_shared_per_config() {
-        PROJECT_COUNT.store(0, Ordering::Relaxed);
         let config = test_config("export default { fetch() { return new Response('hi'); } }");
         // One `BundleFs` per isolate, as `load_config` installs: two
         // isolates, one generation.
@@ -14983,13 +14974,11 @@ mod bundle_tree_tests {
         assert!(Arc::ptr_eq(&first, &second));
         assert!(first.nodes.contains_key("/bundle/worker.js"));
         assert!(first.nodes.contains_key("/bundle/helper"));
-        assert_eq!(PROJECT_COUNT.load(Ordering::Relaxed), 1);
         let other = BundleFs {
             config: test_config("export default { fetch() { return new Response('bye'); } }"),
         }
         .tree();
         assert!(!Arc::ptr_eq(&first, &other));
-        assert_eq!(PROJECT_COUNT.load(Ordering::Relaxed), 2);
     }
 }
 
