@@ -840,12 +840,12 @@ impl WsRegistry {
             // Buffered frames already charged against the existing budget;
             // keep their accounting, including a trip, instead of charging
             // twice. Otherwise the passed budget polices live sends.
-            Some(budget) => self.budgets.entry(id).or_insert(budget).clone(),
+            Some(budget) => Some(self.budgets.entry(id).or_insert(budget).clone()),
             // The plain `register` path stays unpoliced: drop any accounting
             // the buffered backlog created, now that it has flushed.
             None => {
                 self.budgets.remove(&id);
-                return None;
+                None
             }
         };
         let pending = if let Some(meta) = self.metadata.get_mut(&id) {
@@ -857,7 +857,7 @@ impl WsRegistry {
             let _ = tx.send(frame);
         }
         self.outputs.insert(id, tx);
-        Some(effective)
+        effective
     }
 
     /// Admit one frame onto `tx`, charging the direction's budget when it has
@@ -886,7 +886,22 @@ impl WsRegistry {
                 }
             }
         }
-        let _ = tx.send(out);
+        // Only a charged data frame holds budget: closes, the marker, and
+        // unpoliced directions bypassed the charge above.
+        let charged = !matches!(out, WsOut::Close(..) | WsOut::Overload)
+            && self.budgets.get(&id).is_some();
+        let bytes = if charged { ws_out_bytes(&out) } else { 0 };
+        if tx.send(out).is_err() {
+            // The frame never reached its channel: release the admission
+            // charge, or a retired receiver trips the budget for live sends
+            // that will never be received either.
+            if charged {
+                if let Some(budget) = self.budgets.get(&id) {
+                    budget.release(bytes);
+                }
+            }
+            return false;
+        }
         true
     }
 
