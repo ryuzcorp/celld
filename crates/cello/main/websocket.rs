@@ -2342,18 +2342,22 @@ mod pump_tests {
                 },
                 "the pump reports the queued application close"
             );
-            for want in ["one", "two", "three"] {
-                let (opcode, payload) = read_server_frame(&mut client_stream).await;
-                assert_eq!(opcode, 0x1, "data crosses before the close");
-                assert_eq!(payload, want.as_bytes(), "frames keep channel order");
-            }
             // The reported close goes out behind the flushed data, as the
-            // cell task's echo does after the pump returns.
+            // cell task's echo does after the pump returns. Written before
+            // the reads, and the write half dropped after it, so the reads
+            // terminate on EOF instead of parking on an open socket when a
+            // reverted flush drops the data.
             assert!(
                 !write_ws_out(&writer, cello::js::WsOut::Close(1000, "done".into()))
                     .await,
                 "the terminal ends the socket"
             );
+            drop(writer);
+            for want in ["one", "two", "three"] {
+                let (opcode, payload) = read_server_frame(&mut client_stream).await;
+                assert_eq!(opcode, 0x1, "data crosses before the close");
+                assert_eq!(payload, want.as_bytes(), "frames keep channel order");
+            }
             let (opcode, payload) = read_server_frame(&mut client_stream).await;
             assert_eq!(opcode, 0x8, "the terminal is a close frame");
             assert_eq!(
