@@ -97,6 +97,42 @@ fn stage_pipe_frame(
     }
 }
 
+/// Settle a parked sink send under the closing progress bound before the
+/// direction reports an end that drops the pipe: the parked send owns the
+/// head frame, and dropping it mid socket-write would tear that frame ahead
+/// of the terminal the teardown reports (the loud 1011 for an overload,
+/// nothing for a retirement). The end stands either way — only the head
+/// frame's delivery is at stake — so an expired bound or a freshly observed
+/// shutdown still returns promptly. No-op when nothing is parked.
+///
+/// Delivery only: the producer budget was released when the frame was
+/// received, and the staged-bytes ledger drops with the direction, so the
+/// outcome only decides whether the head frame crossed whole.
+async fn settle_parked_send<SendFut>(
+    sending: &mut Option<(std::pin::Pin<Box<SendFut>>, usize)>,
+    shutdown: &mut tokio::sync::watch::Receiver<bool>,
+) where
+    SendFut: Future<Output = PipeSendOutcome>,
+{
+    let Some((send_head, _)) = sending.take() else {
+        return;
+    };
+    enum Settle {
+        Sent(PipeSendOutcome),
+        Shutdown,
+    }
+    let _ = crate::asyncrt::timeout(
+        ISOLATE_PIPE_CLOSE_FLUSH_TIMEOUT,
+        async {
+            crate::asyncrt::select! {
+                outcome = send_head => Settle::Sent(outcome),
+                _ = shutdown.changed() => Settle::Shutdown,
+            }
+        },
+    )
+    .await;
+}
+
 /// One direction of a WebSocket pipe: data frames staged from `from` cross
 /// into the sink one at a time, in channel order.
 ///
@@ -120,7 +156,9 @@ fn stage_pipe_frame(
 /// Staged frames are accounted against [`ISOLATE_PIPE_MAX_STAGED_BYTES`]:
 /// past the cap the direction reports [`PipeDirectionEnd::OverLimit`] so
 /// the teardown closes both ends loudly instead of growing host memory
-/// without bound behind a peer that never reads.
+/// without bound behind a peer that never reads. An end that drops the pipe
+/// first settles a parked send under the same progress bound, so the head
+/// frame still crosses whole ahead of the terminal the teardown reports.
 pub async fn forward_pipe_direction<SendFn, SendFut>(
     mut from: tokio::sync::mpsc::UnboundedReceiver<crate::js::WsOut>,
     mut send: SendFn,
@@ -141,8 +179,10 @@ where
     let mut staged_bytes: usize = 0;
     // A parked sink send with the head frame's staged bytes: stored rather
     // than awaited so the loop keeps receiving while it is pending.
-    // Re-polling a parked send is cancel-safe, and dropping it ends the
-    // pipe, so nothing already delivered is lost.
+    // Re-polling a parked send is cancel-safe. An end that drops the pipe
+    // settles it under the closing progress bound instead of tearing the
+    // head frame; dropping it outright would leave a partial frame ahead
+    // of the terminal the teardown reports.
     let mut sending: Option<(
         std::pin::Pin<Box<SendFut>>,
         usize,
@@ -287,10 +327,20 @@ where
                     &mut pending_close,
                     true,
                 ) {
+                    // The end drops the pipe while a send owns the head
+                    // frame: settle it under the closing progress bound
+                    // instead of tearing it ahead of the terminal the
+                    // teardown reports. The end stands either way.
+                    settle_parked_send(&mut sending, &mut shutdown).await;
                     return (end, from);
                 }
             }
-            _ = shutdown.changed() => return (PipeDirectionEnd::Retired, from),
+            _ = shutdown.changed() => {
+                // Same settle on the shutdown path: the other direction
+                // ending must not tear a live peer's in-flight frame.
+                settle_parked_send(&mut sending, &mut shutdown).await;
+                return (PipeDirectionEnd::Retired, from);
+            }
             outcome = async {
                 sending
                     .as_mut()
@@ -702,4 +752,164 @@ mod tests {
             );
         });
     }
+    /// An overload marker that lands while a sink send is parked settles the
+    /// parked send under the closing progress bound before reporting
+    /// `OverLimit`: the head frame still crosses whole ahead of the loud
+    /// 1011 the teardown writes. Dropping the parked send (the pre-fix
+    /// behavior) loses the head frame, so the drain finds a closed sink and
+    /// this fails before the fix. No sleeps or timeouts: the marker is sent
+    /// only after the entry gate observes the parked send, and the drain
+    /// frees it, so the bound never fires.
+    #[test]
+    fn overload_settles_parked_send_before_over_limit() {
+        let runtime = crate::asyncrt::shared_test_runtime();
+        runtime.block_on(async {
+            let (sink_tx, mut sink_rx) = tokio::sync::mpsc::channel(1);
+            // Fill the sink before the direction starts, so the first
+            // forward parks with the queue empty behind it.
+            sink_tx
+                .send(WsOut::Text("pre".into()))
+                .await
+                .expect("pre-fill the sink");
+            let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+            let (tx, from) = tokio::sync::mpsc::unbounded_channel();
+            tx.send(WsOut::Text("head".into())).expect("stage data");
+            let (_shutdown_tx, shutdown) = tokio::sync::watch::channel(false);
+            let sink = {
+                let entered_tx = entered_tx.clone();
+                move |frame: WsOut| {
+                    let entered_tx = entered_tx.clone();
+                    let tx = sink_tx.clone();
+                    Box::pin(async move {
+                        let _ = entered_tx.send(());
+                        if tx.send(frame).await.is_err() {
+                            PipeSendOutcome::Gone
+                        } else {
+                            PipeSendOutcome::Sent
+                        }
+                    })
+                        as std::pin::Pin<
+                            Box<dyn Future<Output = PipeSendOutcome> + Send + 'static>,
+                        >
+                }
+            };
+            let direction = crate::asyncrt::spawn(forward_pipe_direction(
+                from,
+                sink,
+                shutdown,
+                WsPipeBudget::new(ISOLATE_PIPE_MAX_STAGED_BYTES),
+            ));
+            // The marker lands only after the entry gate observes the parked
+            // send: the direction is committed to settling it, so no
+            // scheduling lets the drain free the sink first.
+            entered_rx.recv().await.expect("the send parks on the sink");
+            tx.send(WsOut::Overload).expect("stage marker");
+            // Drain concurrently: the settle parks behind the pre-filled
+            // sink until the test consumes the head, so awaiting the
+            // direction before draining would park the test instead.
+            let drain = crate::asyncrt::spawn(async move {
+                let mut seen = Vec::new();
+                for _ in 0..2 {
+                    seen.push(sink_rx.recv().await.expect("sink drains in order"));
+                }
+                seen
+            });
+            let (end, _from) = direction.await.expect("direction joins");
+            assert!(
+                matches!(end, PipeDirectionEnd::OverLimit),
+                "the refusal marker must end OverLimit, got {end:?}"
+            );
+            let seen = drain.await.expect("drain joins");
+            let mut texts = Vec::new();
+            for frame in seen {
+                match frame {
+                    WsOut::Text(text) => texts.push(text),
+                    _ => panic!("data frames cross before the overload end"),
+                }
+            }
+            assert_eq!(
+                texts,
+                vec!["pre".to_string(), "head".to_string()],
+                "the parked frame crosses whole before the overload end"
+            );
+        });
+    }
+
+    /// A shutdown observed while a sink send is parked retires the direction
+    /// only after the parked frame crosses: same settle, `Retired` instead
+    /// of `OverLimit`. Without the settle the shutdown drops the parked
+    /// send, so the drain finds a closed sink and this fails before the fix.
+    /// The gate orders the shutdown behind the parked send — observed
+    /// through the sink entry, not through timing — so the settle, not the
+    /// shutdown race, is what the direction takes.
+    #[test]
+    fn shutdown_settles_parked_send_before_retire() {
+        let runtime = crate::asyncrt::shared_test_runtime();
+        runtime.block_on(async {
+            let (sink_tx, mut sink_rx) = tokio::sync::mpsc::channel(1);
+            sink_tx
+                .send(WsOut::Text("pre".into()))
+                .await
+                .expect("pre-fill the sink");
+            let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+            let (tx, from) = tokio::sync::mpsc::unbounded_channel();
+            tx.send(WsOut::Text("head".into())).expect("stage data");
+            let (shutdown_tx, shutdown) = tokio::sync::watch::channel(false);
+            let sink = {
+                let entered_tx = entered_tx.clone();
+                move |frame: WsOut| {
+                    let entered_tx = entered_tx.clone();
+                    let tx = sink_tx.clone();
+                    Box::pin(async move {
+                        let _ = entered_tx.send(());
+                        if tx.send(frame).await.is_err() {
+                            PipeSendOutcome::Gone
+                        } else {
+                            PipeSendOutcome::Sent
+                        }
+                    })
+                        as std::pin::Pin<
+                            Box<dyn Future<Output = PipeSendOutcome> + Send + 'static>,
+                        >
+                }
+            };
+            let direction = crate::asyncrt::spawn(forward_pipe_direction(
+                from,
+                sink,
+                shutdown,
+                WsPipeBudget::new(ISOLATE_PIPE_MAX_STAGED_BYTES),
+            ));
+            // The first forward is parked on the pre-filled sink; only then
+            // does the other direction end. No timing: the entry gate orders
+            // the shutdown behind the parked send.
+            entered_rx.recv().await.expect("the send parks on the sink");
+            shutdown_tx.send(true).expect("the other direction ended");
+            let drain = crate::asyncrt::spawn(async move {
+                let mut seen = Vec::new();
+                for _ in 0..2 {
+                    seen.push(sink_rx.recv().await.expect("sink drains in order"));
+                }
+                seen
+            });
+            let (end, _from) = direction.await.expect("direction joins");
+            assert!(
+                matches!(end, PipeDirectionEnd::Retired),
+                "shutdown during a parked send retires the direction, got {end:?}"
+            );
+            let seen = drain.await.expect("drain joins");
+            let mut texts = Vec::new();
+            for frame in seen {
+                match frame {
+                    WsOut::Text(text) => texts.push(text),
+                    _ => panic!("data frames cross before the retire"),
+                }
+            }
+            assert_eq!(
+                texts,
+                vec!["pre".to_string(), "head".to_string()],
+                "the parked frame crosses whole before the retire"
+            );
+        });
+    }
+
 }
