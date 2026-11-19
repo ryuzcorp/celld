@@ -2528,6 +2528,7 @@ mod start_order_tests {
 #[cfg(test)]
 mod pty_tests {
     use super::*;
+    use super::kill_tests::ensure_domain;
 
     fn params(pty: bool) -> ExecParams {
         ExecParams {
@@ -2660,6 +2661,10 @@ mod pty_tests {
     /// validation message, never as a connection error.
     #[tokio::test]
     async fn exec_rejects_pty_size_before_start() {
+        // The valid-size probe reaches `asyncrt::timeout`, which needs the
+        // process domain handle; install it here instead of inheriting it
+        // from whatever test ran first.
+        ensure_domain();
         let engine = test_engine();
         let cell = Arc::new(test_cell());
         let run = cell.begin_run();
@@ -2724,6 +2729,11 @@ mod pty_tests {
     /// the daemon; valid dims reach it.
     #[tokio::test]
     async fn resize_refuses_non_pty_and_zero_dims() {
+        // The valid-dims probe reaches the daemon through
+        // `asyncrt::timeout`, which needs the process domain handle;
+        // install it here instead of inheriting it from whatever test ran
+        // first.
+        ensure_domain();
         let plain = test_process(false);
         let err = plain.resize(80, 24).await.unwrap_err();
         assert!(err.to_string().contains("requires a PTY"), "{err:#}");
