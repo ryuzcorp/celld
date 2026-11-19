@@ -31,6 +31,7 @@ deltas over upstream celld. Each entry names its fork patch number.
 - `0136` — `CELLO_OTEL_LOGS` splits the log sink from traces: unset
   means logs follow the traces sink (the historical behavior);
   `bucket` sends logs to bucket Parquet whatever the traces sink is;
-  any other value refuses startup. A fleet can point its collector at
-  traces while its logs land in the bucket
+  `0` drops logs while traces keep exporting; any other value refuses
+  startup. A fleet can point its collector at traces while its logs
+  land in the bucket
   ([upstream #153](https://github.com/denoland/celld/issues/153)).

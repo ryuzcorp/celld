@@ -12,6 +12,11 @@ SQLite, stored values, and the node-to-node wire stay `celld`-spelled
 (see [Compatibility with celld](compatibility.md)). Includes everything
 below; no behavior change beyond the rename.
 
+Releases `v0.6.3-ryuzcorp.4` through `.13` shipped as celld, so their
+entries below use the historical spellings they shipped with —
+`CELLD_*`, `.celld/dev`, and the `celld` binary — not the current
+`CELLO_*` names.
+
 ## v0.6.3-ryuzcorp.13
 
 Adds `0079`–`0136`. No bucket format bump and no wire protocol change
@@ -24,16 +29,16 @@ version instead of Cello's build (`0132`), and WebSocket close codes
 1001–1014 (other than the reserved no-status codes) now close instead
 of throwing (`0113`).
 
-New CLI: `cello versions [SCRIPT]` lists deployed versions (`0123`);
-`cello d1 --local` runs execute, export, and migrations against the
-running `cello dev` (`0121`); `cello dev --state DIR` (or
-`CELLO_DEV_STATE`) keeps local state outside the project (`0124`).
+New CLI: `celld versions [SCRIPT]` lists deployed versions (`0123`);
+`celld d1 --local` runs execute, export, and migrations against the
+running `celld dev` (`0121`); `celld dev --state DIR` (or
+`CELLD_DEV_STATE`) keeps local state outside the project (`0124`).
 
 - Runtime and cancellation: `0079`, `0080`, `0081`, `0083`, `0084`,
   `0085`, `0086`, `0087`, `0118` settle shared, waiter-owned, and
-  background work loudly instead of hanging; `CELLO_MAX_CELLS_PER_ISOLATE`
+  background work loudly instead of hanging; `CELLD_MAX_CELLS_PER_ISOLATE`
   caps cells per isolate (default 32) (`0135`);
-  `CELLO_BACKGROUND_BUDGET_S` ends post-response background work past
+  `CELLD_BACKGROUND_BUDGET_S` ends post-response background work past
   the budget (default 30 s) without failing the answered request
   (`0101`); a poisoned cell restarts on a fresh isolate (`0104`);
   `AbortSignal.timeout` frees its slot (`0106`); the budget-orphaned
@@ -48,17 +53,17 @@ running `cello dev` (`0121`); `cello dev --state DIR` (or
 - Storage: `0098`, `0105`, `0099`, `0122`, `0100` cover compaction
   retention, unclean-restart pruning, the single-writer dev store,
   indexed local LISTs, and the repaired facet-image import;
-  `CELLO_SQL_STATEMENT_MS` bounds per-statement time (unset means
+  `CELLD_SQL_STATEMENT_MS` bounds per-statement time (unset means
   unbounded) (`0128`); hydration counting is O(1) (`0102`).
 - Workers compatibility: `0109`–`0117`, `0108`, `0107`, `0130`, `0113`;
   `0119` refuses foreign-`script_name` bindings at deploy time; `0131`
-  reserves the host-injected `CELLO_NODE` name.
+  reserves the host-injected `CELLD_NODE` name.
 - Telemetry: `0132`–`0134`, `0136`.
-- New env knobs and their defaults: `CELLO_BACKGROUND_BUDGET_S` (30),
-  `CELLO_MAX_CELLS_PER_ISOLATE` (32), `CELLO_SQL_STATEMENT_MS` (unset),
-  `CELLO_TMP_MAX_BYTES` (67108864, 64 MiB), `CELLO_OTEL_LOGS` (unset),
-  `OTEL_RESOURCE_ATTRIBUTES` (unset), `CELLO_DEV_STATE`
-  (`PROJECT/.cello/dev`), `CELLO_NODE` (generated and pinned to
+- New env knobs and their defaults: `CELLD_BACKGROUND_BUDGET_S` (30),
+  `CELLD_MAX_CELLS_PER_ISOLATE` (32), `CELLD_SQL_STATEMENT_MS` (unset),
+  `CELLD_TMP_MAX_BYTES` (67108864, 64 MiB), `CELLD_OTEL_LOGS` (unset),
+  `OTEL_RESOURCE_ATTRIBUTES` (unset), `CELLD_DEV_STATE`
+  (`PROJECT/.celld/dev`), `CELLD_NODE` (generated and pinned to
   `node-id` in the data dir).
 
 ## v0.6.3-ryuzcorp.12
@@ -88,7 +93,7 @@ format 3, which `.10` nodes read, so `.10` and `.11` nodes share a
 bucket.
 
 - Bucket-posture group commit (`0059`–`0064`, `0070`, `0071`) is in the
-  binary but off by default (`0075`); `CELLO_BUCKET_BUNDLES=1` turns it
+  binary but off by default (`0075`); `CELLD_BUCKET_BUNDLES=1` turns it
   on. It needs every live lease to read format 3 (every node on `.11`)
   and falls back to per-cell uploads at once otherwise. Measured on 200
   agents × 6 writes: Class A 1934 → 1140 with grouping on, but write-ack
@@ -99,9 +104,9 @@ bucket.
 - An eviction proves a journaled epoch with one HEAD instead of a
   prefix LIST (`0061`).
 - The C heap is trimmed sooner after evictions (`0065`,
-  `CELLO_C_TRIM_MB`, default 8). Post-drain RSS fell ~10 MiB on the
+  `CELLD_C_TRIM_MB`, default 8). Post-drain RSS fell ~10 MiB on the
   agent-50 shape.
-- `CELLO_SQLITE_CACHE_KB` caps the per-connection SQLite page cache
+- `CELLD_SQLITE_CACHE_KB` caps the per-connection SQLite page cache
   (`0066`; default 2000 KiB is unchanged).
 - A deployment generation projects its `/bundle` tree once instead of
   once per isolate (`0067`).
@@ -132,7 +137,7 @@ or API change, so `.9` and `.10` nodes share a bucket.
 
 Adds `0052`–`0053`.
 
-- No behavior change with `CELLO_DEPLOY_AWS_*` unset. A platform that
+- No behavior change with `CELLD_DEPLOY_AWS_*` unset. A platform that
   sets the trio must give the deployment credential read access to both
   `deploy/` and `deploy-blobs/`, and keep the ordinary `AWS_*` grant
   read-write over the state prefixes (`cells/`, `log/`, `nodes/`,
@@ -142,7 +147,7 @@ Adds `0052`–`0053`.
   it), and lists and deletes the `node-cells/` markers (that prefix
   stays read-write). The deploy command keeps the ordinary credential
   with write access to the deployment prefixes. A control-plane node,
-  managed (`CELLO_CLOUD`) or BYO bucket alike, must not set the trio:
+  managed (`CELLD_CLOUD`) or BYO bucket alike, must not set the trio:
   it publishes `deploy/` itself, so it refuses the trio at boot.
 - A serving process is non-dumpable: no core dump comes out of a node,
   and a non-root debugger or profiler cannot attach (`ptrace`
@@ -155,7 +160,7 @@ Adds `0052`–`0053`.
 
 ## v0.6.3-ryuzcorp.8
 
-Adds `0051`: `cello deploy --read-root DIR` (repeatable) names
+Adds `0051`: `celld deploy --read-root DIR` (repeatable) names
 directories beyond the project that esbuild's inputs and
 `containers[].image` Dockerfiles with their build contexts may come
 from. A platform that deploys a built subdirectory of a checkout, or a
@@ -166,7 +171,7 @@ checkout. Without the flag, `.7`'s project-only bounds are unchanged.
 
 Adds `0043`–`0050`.
 
-- `cello deploy` and `cello d1` refuse a project path that resolves
+- `celld deploy` and `celld d1` refuse a project path that resolves
   outside the project directory — the config file's own directory
   (`0050`). That covers the config, `main`, assets, Dockerfiles and
   build contexts, `migrations_dir`, Python sources, and every file
@@ -175,21 +180,21 @@ Adds `0043`–`0050`.
   `migrations_dir` entries must be regular files, and a
   `containers[].image` that is an absolute or `..` path is refused.
 - On Linux, esbuild runs under Landlock with reads confined to the
-  project, so `CELLO_ESBUILD` (or `esbuild` on `PATH`) must be the
+  project, so `CELLD_ESBUILD` (or `esbuild` on `PATH`) must be the
   self-contained release binary, not a wrapper script (`0050`). A
   kernel or seccomp profile without Landlock runs it unconfined with a
   warning; Docker's, containerd's, and podman's default profiles allow
   it.
-- `cello r2 head` and `cello r2 get --json` print a
+- `celld r2 head` and `celld r2 get --json` print a
   `{"error":"not_found",…}` object on stdout for an absent key (`0044`);
   exit code and stderr unchanged.
-- `cello --version` reports the full build version (`0046`).
-- New, opt-in: `CELLO_CACHE_SCOPE=deployment` (`0045`); `cello invoke`
-  runs one request against a staged version before `cello activate`
+- `celld --version` reports the full build version (`0046`).
+- New, opt-in: `CELLD_CACHE_SCOPE=deployment` (`0045`); `celld invoke`
+  runs one request against a staged version before `celld activate`
   (`0048`), with `--header-env` for secret headers (`0049`);
-  `cello deploy --sourcemap` collects a `no_bundle` entry's sibling map
+  `celld deploy --sourcemap` collects a `no_bundle` entry's sibling map
   (`0047`).
-- `cello invoke` needs every node on this release. A stream received
+- `celld invoke` needs every node on this release. A stream received
   over RPC now stays open while the receiver holds it (`0043`), ending
   the spurious aborts of signal-carrying container execs.
 
@@ -214,14 +219,14 @@ Adds `0009`–`0042`.
   request (`0022`, `0040`, `0041`, `0042`). Declare every binding a
   Worker uses, and run operator actions through the `cello` CLIs.
 - The Workers Cache API takes up to 64 MiB of memory per node by
-  default; `CELLO_CACHE_MAX_BYTES=0` turns it off (`0018`).
+  default; `CELLD_CACHE_MAX_BYTES=0` turns it off (`0018`).
 - Shared D1, KV, and Queue cells move to a runtime pool that `/state`
   reports as `__celld-runtime` (`0037`).
-- Opt-in hardening stays off by default: `CELLO_EGRESS` is `open`
-  (`0021`), `CELLO_FENCE_NODE_NETNS` is `off` (`0014`),
-  `CELLO_MEMORY_SCOPE` is `container` (`0011`), and
-  `CELLO_OPERATOR_TOKEN` is unset (`0013`).
-- Set `CELLO_OPERATOR_TOKEN` only once every node runs this release:
+- Opt-in hardening stays off by default: `CELLD_EGRESS` is `open`
+  (`0021`), `CELLD_FENCE_NODE_NETNS` is `off` (`0014`),
+  `CELLD_MEMORY_SCOPE` is `container` (`0011`), and
+  `CELLD_OPERATOR_TOKEN` is unset (`0013`).
+- Set `CELLD_OPERATOR_TOKEN` only once every node runs this release:
   older nodes send no token, so a mixed fleet with the token set fails
   internal calls with 401 (`0013`). Set it in the environment of every
   `cello` CLI too; liveness and readiness probes use the public health

@@ -14,7 +14,7 @@ for the complete surface.
   `--sourcemap=external`, so the deployed module bytes are byte-identical
   with or without the flag, and the map's `sources` are rebased to
   project-root-relative paths. Only the bundled JS entry is mapped;
-  asset-only, `no_bundle`, and Python projects warn and write nothing.
+  asset-only and Python projects warn and write nothing.
 - `0047` — `--sourcemap` collects the `no_bundle` entry's sibling
   `<entry>.map`: the entry deploys as written, and the sibling (which
   must be a regular non-symlink file under 64 MiB of v3 JSON inside the
@@ -23,7 +23,7 @@ for the complete surface.
   which host files exist.
 - `0046` — `cello --version` reports the full build version
   (`0.1.0`, `<version>-ryuzcorp.<n>` on the old line): `build.rs` bakes
-  `CELLO_VERSION` into the binary from the Docker build stage, and a
+  `CELLD_VERSION` into the binary from the Docker build stage, and a
   plain `cargo build` without it reports the crate version.
 - `0049` — `cello invoke --header-env NAME=VAR` sends header NAME with
   the value of environment variable VAR, so a secret header never sits

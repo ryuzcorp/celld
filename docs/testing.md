@@ -5,7 +5,8 @@ Cello makes three promises:
 - An acknowledged write is durable.
 - A cell has one writer at a time.
 - Code written for Cloudflare Workers and Durable Objects operates the same on
-  Cello.
+  Cello, within the supported APIs ([compatibility](cloudflare-compat.md)
+  lists what BroadcastChannel and the other gaps do instead).
 
 We test the API contract by differential execution against workerd, the
 coordination protocol by model checking and deterministic simulation, and the
@@ -26,7 +27,7 @@ deployment mode.
 ## Specification: exhaustive at small size
 
 The coordination protocol is specified in TLA+. Heyang Zhou wrote the
-specifications against Cello v0.1.0. His model checking found four bugs and a
+specifications against celld v0.1.0. His model checking found four bugs and a
 split-brain that lost an acknowledged write. All are fixed. None had surfaced
 in our own review or testing.
 
