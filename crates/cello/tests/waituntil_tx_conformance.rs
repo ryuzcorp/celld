@@ -29,7 +29,7 @@
 
 mod common;
 
-use common::{NO_EXTRA_ENV, announced, cello_command, forward_announce};
+use common::{announced, cello_command, forward_announce, NO_EXTRA_ENV};
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};

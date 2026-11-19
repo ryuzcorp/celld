@@ -91,17 +91,17 @@ impl TestNode {
                 ("CELLO_OPERATOR_TOKEN", TOKEN),
             ],
         )
-            .arg("dev")
-            .arg(project)
-            .arg("--port")
-            .arg("0")
-            .arg("--no-watch")
-            .arg("--clean")
-            .arg("--logs")
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("spawn cello dev");
+        .arg("dev")
+        .arg(project)
+        .arg("--port")
+        .arg("0")
+        .arg("--no-watch")
+        .arg("--clean")
+        .arg("--logs")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn cello dev");
         let mut stdout = child.stdout.take().expect("piped stdout");
         let stderr = child.stderr.take().expect("piped stderr");
         // Drain stdout so a chatty child can never block on a full pipe;

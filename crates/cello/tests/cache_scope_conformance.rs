@@ -500,17 +500,20 @@ fn cache_scope_rejects_garbage() {
     copy_dir(&fixture_dir().join("probe"), &probe_src);
     preseed_probe(&app_project, &probe_src);
 
-    let mut child = cello_command(&app_project, [("NO_COLOR", "1"), ("CELLO_CACHE_SCOPE", "zone")])
-        .arg("dev")
-        .arg(&app_project)
-        .arg("--port")
-        .arg("0")
-        .arg("--no-watch")
-        .arg("--logs")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn cello dev");
+    let mut child = cello_command(
+        &app_project,
+        [("NO_COLOR", "1"), ("CELLO_CACHE_SCOPE", "zone")],
+    )
+    .arg("dev")
+    .arg(&app_project)
+    .arg("--port")
+    .arg("0")
+    .arg("--no-watch")
+    .arg("--logs")
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()
+    .expect("spawn cello dev");
     let mut stdout = child.stdout.take().expect("piped stdout");
     std::thread::spawn(move || {
         let mut sink = Vec::new();

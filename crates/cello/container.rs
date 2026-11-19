@@ -2527,8 +2527,8 @@ mod start_order_tests {
 
 #[cfg(test)]
 mod pty_tests {
-    use super::*;
     use super::kill_tests::ensure_domain;
+    use super::*;
 
     fn params(pty: bool) -> ExecParams {
         ExecParams {

@@ -76,16 +76,16 @@ impl TestNode {
                 ("ALL_PROXY", proxy),
             ],
         )
-            .arg("dev")
-            .arg(app_project)
-            .arg("--port")
-            .arg("0")
-            .arg("--no-watch")
-            .arg("--logs")
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("spawn cello dev");
+        .arg("dev")
+        .arg(app_project)
+        .arg("--port")
+        .arg("0")
+        .arg("--no-watch")
+        .arg("--logs")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn cello dev");
         let mut stdout = child.stdout.take().expect("piped stdout");
         let stderr = child.stderr.take().expect("piped stderr");
         // Drain stdout so a chatty child can never block on a full pipe.
