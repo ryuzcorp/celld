@@ -1,25 +1,18 @@
-# Telemetry
+---
+title: Ship telemetry
+description: Record traces and logs to a collector or Parquet files, then query them with DuckDB.
+---
 
-Cello can record traces and logs for the requests it serves. Telemetry is off
-by default and costs nothing when off. `CELLO_OTEL=1` writes Parquet files
-under the `telemetry/` prefix of the fleet bucket, which DuckDB can query
-directly. `CELLO_OTEL=http://collector:4318` sends the same data to an
-OpenTelemetry collector.
+Cello can record traces and logs for the requests it serves. Telemetry is off by default and costs nothing when off. `CELLO_OTEL=1` writes Parquet files under the `telemetry/` prefix of the fleet bucket, which DuckDB can query directly. `CELLO_OTEL=http://collector:4318` sends the same data to an OpenTelemetry collector.
 
-The schema is version `v0-unstable`, so column names can change before a
-stable release. Each file carries the version in the object metadata name
-`cello-schema`, or `cello_schema` on an `az://` bucket. Files a celld
-node wrote carry `celld-schema` (`celld_schema` on Azure) and keep their
-lifecycle; readers of the stamp itself must accept both spellings.
+The schema is version `v0-unstable`, so column names can change before a stable release. Each file carries the version in the object metadata name `cello-schema` (`cello_schema` on `az://`). Files a celld node wrote carry `celld-schema` (`celld_schema` on Azure) and keep their lifecycle; readers of the stamp itself must accept both spellings.
 
 ## Configuration
 
-| variable | default | effect |
+| Variable | Default | Effect |
 | --- | --- | --- |
 | `CELLO_OTEL` | `0` | `0` disables telemetry. `1` writes Parquet to the fleet bucket. An HTTP(S) collector base URL selects OTLP/HTTP protobuf. |
 | `CELLO_OTEL_BUCKET` | the fleet bucket | A different bucket for the Parquet files, on the same endpoint and credentials. |
-| `CELLO_OTEL_RETENTION` | `30d` | Cello deletes telemetry files older than this. `none` disables the deletion, so your own lifecycle rules can control the data. In the fleet bucket, such a rule must select only the `telemetry/` prefix, after the key prefix if the bucket value has one. [Guarantees](../concepts/durability.md) lists the reserved prefixes that a rule must not select. |
-| `CELLO_OTEL_FLUSH_MS` | `300000` | Cello writes a Parquet file after this many milliseconds of buffered events. |
 | `CELLO_OTEL_FLUSH_BYTES` | `5242880` | The estimated buffered bytes that trigger a flush before the interval ends. |
 | `OTEL_TRACES_SAMPLER` | `parentbased_always_on` | A standard sampler name. `traceidratio` with `OTEL_TRACES_SAMPLER_ARG` records a fraction of the traces. |
 | `OTEL_EXPORTER_OTLP_HEADERS` | unset | A comma-separated list of `name=value` headers for the collector. |
@@ -30,54 +23,30 @@ lifecycle; readers of the stamp itself must accept both spellings.
 
 The bucket sink requires `CELLO_BUCKET`. The OTLP sink does not.
 
-A collector URL must have no query or fragment. Cello appends `/v1/traces` and
-`/v1/logs` to its path and ignores `OTEL_EXPORTER_OTLP_ENDPOINT`.
-
-`CELLO_OTEL_SINK` is removed, and a node with it set does not start. Put the
-collector base URL in `CELLO_OTEL`, or keep `CELLO_OTEL=1` for the bucket.
+A collector URL must have no query or fragment. Cello appends `/v1/traces` and `/v1/logs` to its path and ignores `OTEL_EXPORTER_OTLP_ENDPOINT`.
 
 ## What Cello records
 
-Cello records a span for each stateless Worker request, each cell event (a
-fetch, an alarm, an RPC, a WebSocket message), each outbound `fetch()`, and
-each cell start. A span carries the request id, the cell, the isolate, the
-queue wait, the outbound URL and status, the incoming request method and
-response status, and the known durability facts. A handler that answers 5xx
-without throwing still marks its span an error.
+Cello records a span for each stateless Worker request, each cell event (a fetch, an alarm, an RPC, a WebSocket message), each outbound `fetch()`, and each cell start. A span carries the request id, the cell, the isolate, the queue wait, the outbound URL and status, the incoming request method and response status, and the known durability facts. A handler that answers 5xx without throwing still marks its span an error.
 
-Each `console.log` line becomes a log record with the trace id and span id of
-its handler, across `await`. The record carries the console method's severity
-in `severity_number` and `severity_text` (OTLP fields and Parquet columns). The
-body holds only the message.
+Each `console.log` line becomes a log record with the trace id and span id of its handler, across `await`. The record carries the console method's severity in `severity_number` and `severity_text` (OTLP fields and Parquet columns). The body holds only the message.
 
-| method | severity number | severity text |
+| Method | Severity number | Severity text |
 | --- | --- | --- |
 | `console.debug` | `5` | `DEBUG` |
 | `console.log`, `console.info` | `9` | `INFO` |
 | `console.warn` | `13` | `WARN` |
 | `console.error` | `17` | `ERROR` |
 
-Log files from earlier Cello versions have no severity columns. Read a mix of
-versions with `union_by_name = true`.
+Log files from earlier Cello versions have no severity columns. Read a mix of versions with `union_by_name = true`.
 
-Cello reads the W3C `traceparent` header on incoming requests and sends it on
-outbound `fetch()`. A malformed header starts a new trace. A Worker call to a
-Durable Object stays in one trace.
+Cello reads the W3C `traceparent` header on incoming requests and sends it on outbound `fetch()`. A malformed header starts a new trace. A Worker call to a Durable Object stays in one trace.
 
-A handler reads the traceparent of the span it runs in through
-`getCurrentTraceparent()` from `cloudflare:workers`, so it can return the
-trace id to the caller or record it with the data it writes. The answer is
-`undefined` when telemetry is off or the request is unsampled.
+A handler reads the traceparent of the span it runs in through `getCurrentTraceparent()` from `cloudflare:workers`, so it can return the trace id to the caller or record it with the data it writes. The answer is `undefined` when telemetry is off or the request is unsampled.
 
-The sampler decides at the start of a request, and an unsampled request
-records nothing. A ratio of `0` records no traces and `1` records all. An
-intermediate ratio makes the same trace-id decision on each node. Cello keeps
-a valid incoming context that the sampler rejects: an outbound `fetch()` or
-Durable Object call keeps the trace id, uses a new span id, and keeps the
-sampled flag clear.
+The sampler decides at the start of a request, and an unsampled request records nothing. A ratio of `0` records no traces and `1` records all. An intermediate ratio makes the same trace-id decision on each node. Cello keeps a valid incoming context that the sampler rejects: an outbound `fetch()` or Durable Object call keeps the trace id, uses a new span id, and keeps the sampled flag clear.
 
-Under load, telemetry sheds before requests do, and Cello counts what it
-sheds. Cello records no metrics yet.
+Under load, telemetry sheds before requests do, and Cello counts what it sheds. Cello records no metrics yet.
 
 ## Query the bucket with DuckDB
 
@@ -104,41 +73,25 @@ SELECT l.body, t.name, t.duration_us FROM logs l
   JOIN traces t ON l.trace_id = t.trace_id AND l.span_id = t.span_id;
 ```
 
-A non-AWS S3-compatible endpoint needs `URL_STYLE 'path'`. A plain-HTTP
-endpoint also needs `USE_SSL false`.
+A non-AWS S3-compatible endpoint needs `URL_STYLE 'path'`. A plain-HTTP endpoint also needs `USE_SSL false`.
 
-Files are partitioned by node and hour:
-`telemetry/traces/<node>/<yyyy>/<mm>/<dd>/<hh>/<id>.parquet`.
+Files are partitioned by node and hour: `telemetry/traces/<node>/<yyyy>/<mm>/<dd>/<hh>/<id>.parquet`.
 
 ## Flushing and delivery
 
-Cello writes one Parquet file per flush, at 5 minutes
-(`CELLO_OTEL_FLUSH_MS=300000`) or 5 MiB of estimated buffered events
-(`CELLO_OTEL_FLUSH_BYTES=5242880`), whichever comes first. The event that
-reaches the target can take the batch past it.
+Cello writes one Parquet file per flush, at 5 minutes (`CELLO_OTEL_FLUSH_MS=300000`) or 5 MiB of estimated buffered events (`CELLO_OTEL_FLUSH_BYTES=5242880`), whichever comes first. The event that reaches the target can take the batch past it.
 
-Keep the defaults if you run no compaction job. They produce large files, but
-data can arrive up to 5 minutes late. `CELLO_OTEL_FLUSH_MS=5000` gives a
-five-second interval, plus upload or collector delay. A short interval makes
-many small files and slows queries within hours, so start the compaction job
-first. For a near-live view, use the OTLP sink with the same short interval.
+Keep the defaults if you run no compaction job. They produce large files, but data can arrive up to 5 minutes late. `CELLO_OTEL_FLUSH_MS=5000` gives a five-second interval, plus upload or collector delay. A short interval makes many small files and slows queries within hours, so start the compaction job first. For a near-live view, use the OTLP sink with the same short interval.
 
-The OTLP sink makes at most five attempts per batch on a transient failure
-(HTTP 408, 429, 502, 503, or 504). It uses exponential backoff with jitter and
-honors `Retry-After`, with each delay capped at 30 seconds. A permanent
-refusal drops the batch.
+The OTLP sink makes at most five attempts per batch on a transient failure (HTTP 408, 429, 502, 503, or 504). It uses exponential backoff with jitter and honors `Retry-After`, with each delay capped at 30 seconds. A permanent refusal drops the batch.
 
-The exporter holds one retrying batch, and the input channel holds 8192 new
-events. When the channel is full, Cello drops and counts new telemetry, so
-request handling continues.
+The exporter holds one retrying batch, and the input channel holds 8192 new events. When the channel is full, Cello drops and counts new telemetry, so request handling continues.
 
 The retention sweep runs at startup and six hours after each completed sweep.
 
 ## Compaction
 
-Cello does not compact its own files. Run a compaction job on a maintenance
-node once an hour, for the hour that just ended. Do not compact the current
-hour, because a node still writes to it.
+Cello does not compact its own files. Run a compaction job on a maintenance node once an hour, for the hour that just ended. Do not compact the current hour, because a node still writes to it.
 
 ```sql
 COPY (
