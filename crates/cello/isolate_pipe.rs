@@ -72,21 +72,21 @@ fn stage_pipe_frame(
     }
     match frame {
         Some(data @ (WsOut::Text(_) | WsOut::Binary(_))) => {
-            // An otherwise-empty stage admits one message up to the message
-            // cap outright, so a single 16-32 MiB message passes an idle pipe
-            // instead of ending it loudly; a backlog past the cap still ends
-            // OverLimit, as does a frame larger than one message even on
-            // empty. The parked send owns the head's bytes while it is
-            // pending, so a stage with a send in flight is never empty here.
-            let was_empty = queued.is_empty() && *staged_bytes == 0;
+            // The cap polices only bytes already held ahead of this frame:
+            // one message up to the message cap is staged whatever small
+            // backlog precedes it, so a heartbeat staged ahead never dooms
+            // the large message behind it. A backlog already at the cap
+            // still ends OverLimit, as does a frame larger than one message.
+            // The parked send owns the head's bytes while it is pending, so
+            // they count as held ahead here.
             let bytes = ws_out_bytes(&data);
-            *staged_bytes = staged_bytes.saturating_add(bytes);
-            queued.push_back(data);
-            let head =
-                was_empty && bytes <= crate::ws_message::single_message_stage_bytes::<WsOut>();
-            if !head && *staged_bytes > ISOLATE_PIPE_MAX_STAGED_BYTES {
+            let fits_one_message =
+                bytes <= crate::ws_message::single_message_stage_bytes::<WsOut>();
+            if !fits_one_message || *staged_bytes >= ISOLATE_PIPE_MAX_STAGED_BYTES {
                 return Some(PipeDirectionEnd::OverLimit);
             }
+            *staged_bytes = staged_bytes.saturating_add(bytes);
+            queued.push_back(data);
             None
         }
         Some(WsOut::Close(code, reason)) => {
@@ -193,13 +193,13 @@ where
 /// queued frame.
 ///
 /// Staged frames are accounted against [`ISOLATE_PIPE_MAX_STAGED_BYTES`]:
-/// past the cap the direction reports [`PipeDirectionEnd::OverLimit`] so
-/// the teardown closes both ends loudly instead of growing host memory
-/// without bound behind a peer that never reads. An otherwise-empty stage
-/// still admits one message up to the message cap (see
-/// [`crate::ws_message::single_message_stage_bytes`]), so a single 16-32
-/// MiB message passes an idle pipe; a backlog past the cap still ends
-/// loudly. An end that drops the pipe
+/// the cap polices only bytes already held ahead of each frame, so one
+/// message up to the message cap (see
+/// [`crate::ws_message::single_message_stage_bytes`]) stages whatever small
+/// backlog precedes it; a backlog already at the cap still reports
+/// [`PipeDirectionEnd::OverLimit`], and the teardown closes both ends
+/// loudly instead of growing host memory without bound behind a peer that
+/// never reads. An end that drops the pipe
 /// first settles a parked send under the same progress bound, so the head
 /// frame still crosses whole ahead of the terminal the teardown reports.
 pub async fn forward_pipe_direction<SendFn, SendFut>(
@@ -623,6 +623,64 @@ mod tests {
             assert!(
                 matches!(end, PipeDirectionEnd::Retired),
                 "one message on an idle stage must not end OverLimit, got {end:?}"
+            );
+        });
+    }
+
+    /// A small message staged ahead never dooms the large message behind it:
+    /// the cap polices only bytes already held ahead, so a 20 MiB message
+    /// queued behind a parked small send still crosses whole, in order.
+    /// Ending the large message whenever anything is held (the timing cliff)
+    /// ends this OverLimit, so it fails before that fix. Deterministic
+    /// without sleeps: both frames sit in the channel before the direction
+    /// first runs, so channel order stages the large message behind the
+    /// parked small head — no scheduling can stage it first — and the test
+    /// drains the pre-filled sink frame by frame before retiring the
+    /// direction.
+    #[test]
+    fn large_message_behind_small_backlog_still_crosses() {
+        let runtime = crate::asyncrt::shared_test_runtime();
+        runtime.block_on(async {
+            const BIG: usize = 20 * 1024 * 1024;
+            let (sink_tx, mut sink_rx) = tokio::sync::mpsc::channel::<WsOut>(1);
+            // Fill the sink before the direction starts, so the small head
+            // parks with the large message queued behind it.
+            sink_tx
+                .send(WsOut::Text("pre".into()))
+                .await
+                .expect("pre-fill the sink");
+            let (tx, from) = tokio::sync::mpsc::unbounded_channel();
+            // Both frames queue before the direction first runs: the large
+            // message necessarily lands behind the held small head.
+            tx.send(WsOut::Text("small".into())).expect("stage data");
+            tx.send(WsOut::Binary(vec![0xCDu8; BIG]))
+                .expect("stage data");
+            let (_shutdown_tx, shutdown) = tokio::sync::watch::channel(false);
+            let direction = crate::asyncrt::spawn(forward_pipe_direction(
+                from,
+                boxed_test_sink(sink_tx),
+                shutdown,
+                WsPipeBudget::new(ISOLATE_PIPE_MAX_STAGED_BYTES),
+            ));
+            // The pre-fill, then both frames in order; the large one crosses
+            // whole behind the parked small head.
+            assert!(matches!(sink_rx.recv().await, Some(WsOut::Text(pre)) if pre == "pre"));
+            assert!(matches!(sink_rx.recv().await, Some(WsOut::Text(head)) if head == "small"));
+            match sink_rx.recv().await {
+                Some(WsOut::Binary(bytes)) => {
+                    assert_eq!(bytes.len(), BIG, "the message crosses intact");
+                    assert!(
+                        bytes.iter().all(|byte| *byte == 0xCD),
+                        "every payload byte crosses intact"
+                    );
+                }
+                _ => panic!("the large message must cross whole behind the small head"),
+            }
+            drop(tx);
+            let (end, _from) = direction.await.expect("direction joins");
+            assert!(
+                matches!(end, PipeDirectionEnd::Retired),
+                "the backlog must drain, not end OverLimit, got {end:?}"
             );
         });
     }

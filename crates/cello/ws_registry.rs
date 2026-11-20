@@ -766,10 +766,13 @@ impl WsPipeBudget {
     /// wrapping the count. Terminal once tripped: after the first refusal
     /// ends the pipe loudly, every later data frame refuses even when
     /// releases refill the count, so no data accepted after the refusal
-    /// reaches the peer. An otherwise-empty budget admits one message up to
-    /// the message cap outright, so a single 16-32 MiB message passes an
-    /// idle pipe instead of ending it loudly; a backlog past the cap still
-    /// trips. Exactly balances with `release`: every admitted data frame is
+    /// reaches the peer. The cap polices only bytes already held ahead of
+    /// this frame: one message up to the message cap is admitted whatever
+    /// small backlog precedes it, so a heartbeat staged ahead never dooms
+    /// the large message behind it; a backlog already at the cap still
+    /// trips, as does a frame larger than one message. Floods of small
+    /// messages trip at essentially the same point as a total-based cap.
+    /// Exactly balances with `release`: every admitted data frame is
     /// received once, even when the pipe later drops it while closing.
     pub fn charge(&self, bytes: usize) -> bool {
         use std::sync::atomic::Ordering::Relaxed;
@@ -778,15 +781,12 @@ impl WsPipeBudget {
         }
         self.used
             .fetch_update(Relaxed, Relaxed, |used| {
-                let total = used.saturating_add(bytes);
-                // The head-of-line exemption: nothing is staged, so this frame
-                // is one message on its own, admitted when it fits one
-                // message. Checked inside the atomic update, so two racers
-                // cannot both see the empty stage: the loser's retry observes
-                // the winner's charge.
-                let head =
-                    used == 0 && bytes <= crate::ws_message::single_message_stage_bytes::<WsOut>();
-                (head || total <= self.cap).then_some(total)
+                // Checked inside the atomic update, so racers serialize on
+                // the same count: only bytes already held decide, never a
+                // frame that has not been admitted yet.
+                let fits_one_message =
+                    bytes <= crate::ws_message::single_message_stage_bytes::<WsOut>();
+                (fits_one_message && used < self.cap).then_some(used.saturating_add(bytes))
             })
             .is_ok()
     }
@@ -2504,12 +2504,14 @@ mod join_handoff_tests {
         assert!(isolate_join_handoffs().lock().unwrap().is_empty());
     }
 
-    /// The producer budget bounds one direction's output channel: the first
-    /// frame past the cap is refused and queues the overload marker behind
-    /// the admitted data instead of leaving a silent gap, and no later data
-    /// frame is admitted even when releases refill the count, while closes
-    /// still enqueue. Reverting the marker to a silent drop leaves the
-    /// channel without its terminal, so this fails before the fix.
+    /// The producer budget bounds one direction's output channel: the cap
+    /// polices only bytes already held ahead of each frame, so the third
+    /// frame lands on a backlog already at the cap and is refused, queuing
+    /// the overload marker behind the admitted data instead of leaving a
+    /// silent gap; no later data frame is admitted even when releases refill
+    /// the count, while closes still enqueue. Reverting the marker to a
+    /// silent drop leaves the channel without its terminal, so this fails
+    /// before the fix.
     #[test]
     fn pipe_budget_bounds_output_and_spares_closes() {
         let id: u64 = 1 << 61;
@@ -2523,12 +2525,20 @@ mod join_handoff_tests {
         {
             let services = ws_registry();
             let mut registry = services.lock().unwrap();
+            // Two frames stage below the cap; the third arrives on a backlog
+            // already at it.
+            registry.emit(id, frame());
             registry.emit(id, frame());
             registry.emit(id, frame());
         }
-        // The first frame fits the budget; the second passes the cap, so it
-        // is refused and the overload marker follows it onto the channel.
+        // The first two frames fit ahead of the cap; the third finds the
+        // backlog at it, so it is refused and the overload marker follows
+        // it onto the channel.
         assert!(rx.try_recv().is_ok(), "the first frame fits the budget");
+        assert!(
+            rx.try_recv().is_ok(),
+            "the second frame fits ahead of the cap"
+        );
         assert!(
             matches!(rx.try_recv(), Ok(WsOut::Overload)),
             "the first refusal must queue the overload marker"
@@ -2564,10 +2574,11 @@ mod join_handoff_tests {
         assert!(!tripped.trip(), "a trip reports only once");
     }
 
-    /// An otherwise-empty budget admits one message up to the message cap: a
-    /// 20 MiB charge lands on empty, and a byte behind it still refuses, as
-    /// does a frame larger than one message even on empty. Reverting the head
-    /// exemption refuses the first charge, so this fails before the fix.
+    /// The cap polices only bytes already held ahead of each frame: a 20 MiB
+    /// charge lands on empty, a byte behind it still trips once the backlog
+    /// reaches the cap, and a frame larger than one message trips even on
+    /// empty. Admitting the first charge only when nothing is held (the
+    /// empty-stage rule) refuses it, so this fails before that fix.
     #[test]
     fn empty_budget_admits_one_message_up_to_the_cap() {
         let budget = WsPipeBudget::new(crate::isolate_pipe::ISOLATE_PIPE_MAX_STAGED_BYTES);
@@ -2583,6 +2594,27 @@ mod join_handoff_tests {
         assert!(
             !budget.charge(ws_out_bytes(&huge)),
             "past one message still trips on empty"
+        );
+    }
+
+    /// A small backlog ahead never dooms the large message behind it: with a
+    /// heartbeat charged, a 20 MiB charge still lands, and only a byte behind
+    /// that message trips. Refusing the large charge whenever anything is
+    /// held (the timing cliff) fails this, so it fails before that fix.
+    #[test]
+    fn small_backlog_admits_one_large_message() {
+        let budget = WsPipeBudget::new(crate::isolate_pipe::ISOLATE_PIPE_MAX_STAGED_BYTES);
+        let small = WsOut::Text("heartbeat".into());
+        assert!(budget.charge(ws_out_bytes(&small)), "the heartbeat charges");
+        let big = WsOut::Binary(vec![0u8; 20 * 1024 * 1024]);
+        let bytes = ws_out_bytes(&big);
+        assert!(
+            budget.charge(bytes),
+            "a small backlog must not doom one large message"
+        );
+        assert!(
+            !budget.charge(1),
+            "a byte behind the large message still trips"
         );
     }
 
