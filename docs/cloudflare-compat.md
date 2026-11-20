@@ -190,7 +190,12 @@ The `tail` and `email` handlers are unavailable.
   released when the pipe's forwarder receives a frame, and staged bytes when
   its send completes, so a direction with a full staging queue can still
   admit up to another 16 MiB into its output channel: the two limits are
-  separate, not one 16 MiB aggregate. A flood past either cap ends the pipe
+  separate, not one 16 MiB aggregate. An otherwise-empty stage still admits
+  one message up to the 32 MiB message cap below, so a single 16-32 MiB
+  message passes an idle pipe instead of ending it loudly; a backlog past
+  either cap still ends the pipe loudly. Each ledger holds at most its cap
+  plus one message, so the transient worst case per direction is about
+  96 MiB. A flood past either cap ends the pipe
   loudly instead of growing host memory without bound: both ends observe
   close code 1011 with `wasClean: false`, an abnormal host-originated close
   no peer sent. Only staged bytes count against the cap: handler runtime
@@ -205,11 +210,14 @@ The `tail` and `email` handlers are unavailable.
   Too Big) instead of growing host memory without bound, and the cell
   observes the 1009 as an abnormal application close. Each frame is held
   to what its message has left, so a frame that would pass the cap is
-  refused from its header before its payload is read. Bytes held while a
+  refused from its header before its payload is read. A single message up
+  to this cap also passes each 16 MiB pipe stage above when that stage is
+  otherwise empty. Bytes held while a
   message is read do not count against the 16 MiB staging cap above: up
   to 32 MiB of assembly plus the WebSocket parser's read buffer, which can
   keep about twice the largest frame (about 64 MiB). The worst case per
-  socket is therefore under about 100 MiB plus one full staged budget.
+  socket is therefore under about 100 MiB plus one staged budget and its
+  headroom (16 MiB plus one message).
 - Socket delivery is best-effort: if a 1011 attempt times out, the local
   pipe still reports 1011 but the wire peer may see an abnormal disconnect
   with no Close frame. Likewise, a write that stops mid-frame poisons the

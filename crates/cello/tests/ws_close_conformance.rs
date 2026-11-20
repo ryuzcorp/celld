@@ -253,3 +253,77 @@ fn server_close_reaches_the_client() {
     assert_eq!(code, 1008, "close code");
     assert_eq!(reason, "refused", "close reason");
 }
+
+/// One 20 MiB binary message through the tenant pump echoes intact instead of
+/// ending the socket loudly with 1011: the otherwise-empty read stage and the
+/// output channel each admit one message up to the message cap. Reverting
+/// the head exemption ends this with 1011, so it fails before the fix.
+#[test]
+fn large_message_passes_an_idle_pump() {
+    const PATH: &str = "/big-echo";
+    const BIG: usize = 20 * 1024 * 1024;
+    let fixture = fixture_dir();
+    let project = fixture_tempdir("cello-ws-big-");
+    copy_dir(&fixture, project.path());
+    let node = TestNode::boot(project.path());
+
+    let mut stream = TcpStream::connect(node.public.as_str()).expect("connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(180)))
+        .expect("read timeout");
+    let wire = format!(
+        "GET {PATH} HTTP/1.1\r\nHost: {addr}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
+         Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n",
+        addr = node.public,
+    );
+    stream.write_all(wire.as_bytes()).expect("write handshake");
+    let head = read_head(&mut stream, PATH);
+    assert!(
+        head.lines().next().is_some_and(|line| line.contains("101")),
+        "{PATH}: expected 101 upgrade, got: {head}"
+    );
+    // One masked binary frame with a 64-bit length and a checkable pattern.
+    let mask = [0x11u8, 0x22, 0x33, 0x44];
+    let mut frame = vec![0x82u8, 0xFF];
+    frame.extend_from_slice(&(BIG as u64).to_be_bytes());
+    frame.extend_from_slice(&mask);
+    frame.reserve(BIG);
+    for i in 0..BIG {
+        frame.push((i % 251) as u8 ^ mask[i % 4]);
+    }
+    stream.write_all(&frame).expect("write frame");
+    drop(frame);
+    // The echo arrives whole; a close frame first means the pump ended the
+    // socket loudly instead of staging the message.
+    loop {
+        let hdr = read_exact(&mut stream, 2, "frame header", PATH);
+        let opcode = hdr[0] & 0x0f;
+        let mut len = (hdr[1] & 0x7f) as u64;
+        if len == 126 {
+            let ext = read_exact(&mut stream, 2, "frame length", PATH);
+            len = u16::from_be_bytes([ext[0], ext[1]]) as u64;
+        } else if len == 127 {
+            let ext = read_exact(&mut stream, 8, "frame length", PATH);
+            len = u64::from_be_bytes([
+                ext[0], ext[1], ext[2], ext[3], ext[4], ext[5], ext[6], ext[7],
+            ]);
+        }
+        assert_eq!(hdr[1] & 0x80, 0, "{PATH}: server frame must not be masked");
+        let body = read_exact(&mut stream, len as usize, "frame body", PATH);
+        match opcode {
+            0x2 => {
+                assert_eq!(body.len(), BIG, "{PATH}: echo length");
+                assert!(
+                    body.iter().enumerate().all(|(i, b)| *b == (i % 251) as u8),
+                    "{PATH}: echo payload is intact"
+                );
+                return;
+            }
+            0x8 => {
+                let code = u16::from_be_bytes([body[0], body[1]]);
+                panic!("{PATH}: pump closed the socket with {code} instead of echoing");
+            }
+            _ => continue,
+        }
+    }
+}

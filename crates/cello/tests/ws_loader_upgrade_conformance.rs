@@ -315,6 +315,28 @@ fn overloaded_pipe_closes_with_1011() {
 }
 
 #[test]
+fn large_message_passes_an_idle_isolate_pipe() {
+    let fixture = fixture_dir();
+    let project = fixture_tempdir("cello-ws-loader-big-");
+    copy_dir(&fixture, project.path());
+    let node = TestNode::boot(project.path());
+
+    // One 20 MiB message each way through the isolate-to-isolate pipe echoes
+    // intact instead of ending loudly with 1011: the otherwise-empty
+    // admission budget and staging queue each admit one message up to the
+    // message cap. Reverting the head exemption ends this with 1011, so it
+    // fails before the fix.
+    let (status, body) = plain_get(&node.public, "/big-echo").expect("GET /big-echo");
+    assert_eq!(status, 200, "GET /big-echo: {body}");
+    let info: serde_json::Value = serde_json::from_str(&body).expect("echo JSON");
+    assert_eq!(
+        info.get("length").and_then(|value| value.as_u64()),
+        Some(20 * 1024 * 1024 + "echo:".len() as u64),
+        "the 20 MiB message must echo intact: {body}"
+    );
+}
+
+#[test]
 fn closing_pipe_flushes_queued_frames_first() {
     let fixture = fixture_dir();
     let project = fixture_tempdir("cello-ws-loader-order-");

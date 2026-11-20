@@ -766,7 +766,11 @@ impl WsPipeBudget {
     /// wrapping the count. Terminal once tripped: after the first refusal
     /// ends the pipe loudly, every later data frame refuses even when
     /// releases refill the count, so no data accepted after the refusal
-    /// reaches the peer.
+    /// reaches the peer. An otherwise-empty budget admits one message up to
+    /// the message cap outright, so a single 16-32 MiB message passes an
+    /// idle pipe instead of ending it loudly; a backlog past the cap still
+    /// trips. Exactly balances with `release`: every admitted data frame is
+    /// received once, even when the pipe later drops it while closing.
     pub fn charge(&self, bytes: usize) -> bool {
         use std::sync::atomic::Ordering::Relaxed;
         if self.tripped.load(Relaxed) {
@@ -775,7 +779,14 @@ impl WsPipeBudget {
         self.used
             .fetch_update(Relaxed, Relaxed, |used| {
                 let total = used.saturating_add(bytes);
-                (total <= self.cap).then_some(total)
+                // The head-of-line exemption: nothing is staged, so this frame
+                // is one message on its own, admitted when it fits one
+                // message. Checked inside the atomic update, so two racers
+                // cannot both see the empty stage: the loser's retry observes
+                // the winner's charge.
+                let head =
+                    used == 0 && bytes <= crate::ws_message::single_message_stage_bytes::<WsOut>();
+                (head || total <= self.cap).then_some(total)
             })
             .is_ok()
     }
@@ -2551,6 +2562,28 @@ mod join_handoff_tests {
         let tripped = WsPipeBudget::new(10);
         assert!(tripped.trip(), "the first trip reports");
         assert!(!tripped.trip(), "a trip reports only once");
+    }
+
+    /// An otherwise-empty budget admits one message up to the message cap: a
+    /// 20 MiB charge lands on empty, and a byte behind it still refuses, as
+    /// does a frame larger than one message even on empty. Reverting the head
+    /// exemption refuses the first charge, so this fails before the fix.
+    #[test]
+    fn empty_budget_admits_one_message_up_to_the_cap() {
+        let budget = WsPipeBudget::new(crate::isolate_pipe::ISOLATE_PIPE_MAX_STAGED_BYTES);
+        let big = WsOut::Binary(vec![0u8; 20 * 1024 * 1024]);
+        let bytes = ws_out_bytes(&big);
+        assert!(budget.charge(bytes), "one message fits an empty budget");
+        assert!(
+            !budget.charge(1),
+            "a byte staged behind the message still trips"
+        );
+        budget.release(bytes);
+        let huge = WsOut::Binary(vec![0u8; 33 * 1024 * 1024]);
+        assert!(
+            !budget.charge(ws_out_bytes(&huge)),
+            "past one message still trips on empty"
+        );
     }
 
     /// The byte budget exists before pre-registration frames are retained: a

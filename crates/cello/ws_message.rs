@@ -50,6 +50,17 @@ use fastwebsockets::{Frame, OpCode, Payload, WebSocketError, WebSocketRead};
 /// left.
 pub const WS_MAX_MESSAGE_BYTES: usize = 32 * 1024 * 1024;
 
+/// Largest counted bytes an otherwise-empty backpressure stage admits outright
+/// for one frame: one message up to [`WS_MAX_MESSAGE_BYTES`] plus the frame
+/// wrapper the byte ledgers charge (see `ws_out_bytes` and the tenant pump's
+/// own counter). The pipe ledgers trip only past it on a non-empty stage, so
+/// a single 16-32 MiB message passes an idle pipe instead of ending it
+/// loudly, while a backlog past the 16 MiB cap still ends with 1011 — and a
+/// frame larger than one message still trips even on empty, as before.
+pub fn single_message_stage_bytes<T>() -> usize {
+    WS_MAX_MESSAGE_BYTES.saturating_add(std::mem::size_of::<T>())
+}
+
 /// Largest control-frame payload (RFC 6455 §5.5). Control frames interleave
 /// a fragmented message and never count toward it, so the per-frame limit
 /// never drops below this even when the message has no room left.
