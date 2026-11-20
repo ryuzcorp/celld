@@ -450,11 +450,16 @@ fn loaded_queued_close_reaches_the_loaded() {
 
     // The caller floods a slow reader and closes at once: the loaded
     // socket's close event must carry the caller's code even though text
-    // was queued ahead of the terminal when the pipe tore down.
+    // was queued ahead of the terminal when the pipe tore down. The caller's
+    // own close only proves the pipe echoed the close back — a direct fetch
+    // takes a shorter path than the queued close event, so the read
+    // rendezvouses with the close (`?wait-close=1`, bounded, explicit error)
+    // instead of asserting an ordering the platform does not guarantee.
     let (status, body) =
         plain_get(&node.public, "/loaded-queued-close").expect("GET /loaded-queued-close");
     assert_eq!(status, 200, "GET /loaded-queued-close: {body}");
-    let (status, body) = plain_get(&node.public, "/room-messages").expect("GET /room-messages");
+    let (status, body) =
+        plain_get(&node.public, "/room-messages?wait-close=1").expect("GET /room-messages");
     assert_eq!(status, 200, "GET /room-messages: {body}");
     let recorded: serde_json::Value = serde_json::from_str(&body).expect("messages JSON");
     let messages = recorded
