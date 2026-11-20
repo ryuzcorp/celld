@@ -34,12 +34,18 @@ pub(crate) static NEXT_HTTP_STREAM_ID: AtomicU64 = AtomicU64::new(1);
 pub(crate) const HTTP_STREAM_DONE: &str = "__cello_http_stream_end__";
 pub(crate) const HTTP_STREAM_IDLE_TIMEOUT_MS: u64 = 60_000;
 pub(crate) const HTTP_STREAM_REGISTRATION_CLOSED: &str = "the HTTP stream service is closed";
-pub(crate) const HTTP_TEE_BRANCH_CAPACITY: usize = 16;
 const RESPONSE_STREAM_CONSUMER_CANCELED: &str = "response stream consumer canceled";
 const RESPONSE_STREAM_CLOSE_IN_PROGRESS: &str = "response stream close is already in progress";
 pub(crate) enum HttpStreamSource {
     Response(reqwest::Response),
     Receiver(tokio::sync::mpsc::Receiver<Result<Vec<u8>, String>>),
+    /// One branch of a host tee. Unbounded, unlike `Receiver`: a tee's
+    /// branches are independent — a consumer may drain one fully before
+    /// touching the other — so a bounded fan-out deadlocks once the lagging
+    /// branch's buffer fills while the drained branch starves for the
+    /// pump's next item. Skewed tee data rests in memory, as for a WHATWG
+    /// tee; ingress bodies are size-capped upstream.
+    TeeBranch(tokio::sync::mpsc::UnboundedReceiver<Result<Vec<u8>, String>>),
     Stream(HttpChunkStream),
 }
 
@@ -1880,6 +1886,11 @@ pub(crate) async fn next_http_stream_chunk(
             Some(Err(error)) => Err(error),
             None => Ok(None),
         },
+        HttpStreamSource::TeeBranch(receiver) => match receiver.recv().await {
+            Some(Ok(bytes)) => Ok(Some(bytes)),
+            Some(Err(error)) => Err(error),
+            None => Ok(None),
+        },
         HttpStreamSource::Stream(stream) => stream.next().await.transpose(),
     }
 }
@@ -2259,13 +2270,21 @@ fn http_chunk_stream(source: HttpStreamSource) -> HttpChunkStream {
         HttpStreamSource::Receiver(receiver) => {
             Box::pin(tokio_stream::wrappers::ReceiverStream::new(receiver))
         }
+        HttpStreamSource::TeeBranch(receiver) => Box::pin(
+            tokio_stream::wrappers::UnboundedReceiverStream::new(receiver),
+        ),
         HttpStreamSource::Stream(stream) => stream,
     }
 }
 
-/// Host-native tee for an outbound response. Both branches are represented by
-/// stream IDs, so one can be returned through Axum while JS independently
-/// scans the other for observability or usage accounting.
+/// Host-native tee for a request body stream. Both branches are represented
+/// by stream IDs, so one can cross a subrequest seam while JS reads the other.
+///
+/// The branches are unbounded: they are independent by contract — a consumer
+/// may drain one fully before touching the other — so a bounded fan-out
+/// deadlocks once the lagging branch's buffer fills while the drained branch
+/// starves for the pump's next item. Skewed tee data rests in memory, as for
+/// a WHATWG tee; ingress bodies are size-capped upstream.
 pub(crate) type HttpTeePump = Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2275,43 +2294,34 @@ enum HttpTeeSendOutcome {
     SourceTerminated,
 }
 
-async fn reserve_http_tee_send(
-    sender: &tokio::sync::mpsc::Sender<Result<Vec<u8>, String>>,
+fn send_http_tee_item(
+    sender: &tokio::sync::mpsc::UnboundedSender<Result<Vec<u8>, String>>,
     item: Result<Vec<u8>, String>,
     termination: &HttpStreamTermination,
 ) -> HttpTeeSendOutcome {
-    // Sender::send enqueues before it resolves, so a select cannot retract a
-    // value after cancellation wins. Reserve capacity first, then recheck the
-    // committed source reason before the permit makes the value visible.
-    let reservation = asyncrt::select_biased! {
-        "a capacity reservation wins a tie because termination is rechecked before the send";
-        reservation = sender.reserve() => Some(reservation),
-        _ = futures_util::future::poll_fn(|context| termination.poll_reason(context)) => None,
-    };
+    // An unbounded send never waits for the other branch, so a lagging
+    // branch cannot stall the pump. Recheck the committed source reason
+    // before the value becomes visible, as the bounded reserve did.
     if termination.reason() != HttpStreamTerminationReason::Live {
         return HttpTeeSendOutcome::SourceTerminated;
     }
-    match reservation {
-        Some(Ok(permit)) => {
-            permit.send(item);
-            HttpTeeSendOutcome::Sent
-        }
-        Some(Err(_)) => HttpTeeSendOutcome::BranchClosed,
-        None => HttpTeeSendOutcome::SourceTerminated,
+    match sender.send(item) {
+        Ok(()) => HttpTeeSendOutcome::Sent,
+        Err(_) => HttpTeeSendOutcome::BranchClosed,
     }
 }
 
-async fn fan_out_http_tee_item(
-    tx1: &tokio::sync::mpsc::Sender<Result<Vec<u8>, String>>,
-    tx2: &tokio::sync::mpsc::Sender<Result<Vec<u8>, String>>,
+fn fan_out_http_tee_item(
+    tx1: &tokio::sync::mpsc::UnboundedSender<Result<Vec<u8>, String>>,
+    tx2: &tokio::sync::mpsc::UnboundedSender<Result<Vec<u8>, String>>,
     item: Result<Vec<u8>, String>,
     termination: &HttpStreamTermination,
 ) -> Option<(bool, bool)> {
-    let first = reserve_http_tee_send(tx1, item.clone(), termination).await;
+    let first = send_http_tee_item(tx1, item.clone(), termination);
     if first == HttpTeeSendOutcome::SourceTerminated {
         return None;
     }
-    let second = reserve_http_tee_send(tx2, item, termination).await;
+    let second = send_http_tee_item(tx2, item, termination);
     if second == HttpTeeSendOutcome::SourceTerminated {
         return None;
     }
@@ -2322,8 +2332,8 @@ async fn fan_out_http_tee_item(
 }
 
 async fn both_http_tee_receivers_closed(
-    tx1: &tokio::sync::mpsc::Sender<Result<Vec<u8>, String>>,
-    tx2: &tokio::sync::mpsc::Sender<Result<Vec<u8>, String>>,
+    tx1: &tokio::sync::mpsc::UnboundedSender<Result<Vec<u8>, String>>,
+    tx2: &tokio::sync::mpsc::UnboundedSender<Result<Vec<u8>, String>>,
 ) {
     tx1.closed().await;
     tx2.closed().await;
@@ -2333,12 +2343,12 @@ pub(crate) fn prepare_http_stream_tee(
     service: &Arc<HttpStreamService>,
     mut source: HttpTransferredStream,
 ) -> Result<((u64, u64), HttpTeePump), &'static str> {
-    let (tx1, rx1) = tokio::sync::mpsc::channel(HTTP_TEE_BRANCH_CAPACITY);
-    let (tx2, rx2) = tokio::sync::mpsc::channel(HTTP_TEE_BRANCH_CAPACITY);
-    let Some(id1) = service.register_source(HttpStreamSource::Receiver(rx1)) else {
+    let (tx1, rx1) = tokio::sync::mpsc::unbounded_channel();
+    let (tx2, rx2) = tokio::sync::mpsc::unbounded_channel();
+    let Some(id1) = service.register_source(HttpStreamSource::TeeBranch(rx1)) else {
         return Err(HTTP_STREAM_REGISTRATION_CLOSED);
     };
-    let Some(id2) = service.register_source(HttpStreamSource::Receiver(rx2)) else {
+    let Some(id2) = service.register_source(HttpStreamSource::TeeBranch(rx2)) else {
         service.cancel_source(id1);
         return Err(HTTP_STREAM_REGISTRATION_CLOSED);
     };
@@ -2359,7 +2369,7 @@ pub(crate) fn prepare_http_stream_tee(
             match event {
                 HttpTransferredEvent::Chunk(bytes) => {
                     let Some((first, second)) =
-                        fan_out_http_tee_item(&tx1, &tx2, Ok(bytes), &termination).await
+                        fan_out_http_tee_item(&tx1, &tx2, Ok(bytes), &termination)
                     else {
                         break;
                     };
@@ -2368,10 +2378,7 @@ pub(crate) fn prepare_http_stream_tee(
                     }
                 }
                 HttpTransferredEvent::Error(error) => {
-                    if fan_out_http_tee_item(&tx1, &tx2, Err(error), &termination)
-                        .await
-                        .is_some()
-                    {
+                    if fan_out_http_tee_item(&tx1, &tx2, Err(error), &termination).is_some() {
                         source.finish(HttpStreamTerminationReason::Finished);
                     }
                     break;
