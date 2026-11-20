@@ -373,7 +373,15 @@ export default {
         const read = drain(poisoned.readable).then(() => "resolved", (e) => e.name);
         const wrote = await writer.write(new Uint8Array(16).fill(7))
           .then(() => "resolved", (e) => e.name);
-        return Response.json({ wrote, read: await read });
+        // A non-BufferSource chunk fails before any push, so the transform
+        // must still release its native entry.
+        const invalid = new CompressionStream("gzip");
+        held.push(invalid);
+        const iwriter = invalid.writable.getWriter();
+        const iread = drain(invalid.readable).then(() => "resolved", (e) => e.name);
+        const iwrote = await iwriter.write(123)
+          .then(() => "resolved", (e) => e.name);
+        return Response.json({ wrote, read: await read, iwrote, iread: await iread });
       }
       case "/fill":
         for (let i = 0; i < n; i++) held.push(new DecompressionStream("deflate-raw"));
@@ -489,8 +497,8 @@ export default {
         });
     }
 
-    /// Cancel, abort and a poisoning push each release the native stream
-    /// while JS still holds the stream object.
+    /// Cancel, abort, a poisoning push and an invalid chunk each release
+    /// the native stream while JS still holds the stream object.
     #[test]
     fn cancel_abort_and_push_error_release_while_held() {
         on_engine_thread(|| {
@@ -498,6 +506,8 @@ export default {
             let report = fetch(&mut worker, "/release");
             assert_eq!(report["wrote"], "TypeError", "{report}");
             assert_eq!(report["read"], "TypeError", "{report}");
+            assert_eq!(report["iwrote"], "TypeError", "{report}");
+            assert_eq!(report["iread"], "TypeError", "{report}");
             assert_eq!(live(&worker), 0);
         });
     }
