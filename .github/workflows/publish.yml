@@ -5,11 +5,15 @@
 # tarball bytes provably equal the tested image contents.
 #
 #   `verify`   the tag is annotated, names a valid semver whose version
-#              exactly matches `crates/cello/Cargo.toml`, and points at a
-#              commit on `main` (reachable from `origin/main`)
+#              exactly matches `crates/cello/Cargo.toml`, points at a
+#              commit on `main` (reachable from `origin/main`), and carries
+#              a passing `ci-ok` check from the `ci` workflow on that exact
+#              commit (native CI covers the suite and clippy; the image no
+#              longer re-runs them, so this gate is what keeps "what ships
+#              was tested")
 #   `push`     per architecture: refuse an already-published `<version>`
-#              (only a confirmed "not found" lets it publish), then run
-#              the Dockerfile's test stage, push the arch image by digest
+#              (only a confirmed "not found" lets it publish), then build
+#              the release image (no test stage) and push it by digest
 #              only (no arch tags, so no namespace collision), record
 #              its digest, and package the matching release tarball by
 #              copying the binary and license files out of that digest
@@ -93,6 +97,18 @@ jobs:
             echo "refusing tag $GITHUB_REF_NAME: $sha is not on origin/main" >&2
             exit 1
           fi
+          # The tagged commit must carry a passing `ci-ok` check from the
+          # `ci` workflow. Native CI tests and lints every main commit and
+          # the image no longer re-runs the suite, so without this gate a
+          # tag could ship an untested tree.
+          command -v jq >/dev/null 2>&1 || { echo "refusing: jq is required" >&2; exit 1; }
+          ok=$(gh api "repos/$GITHUB_REPOSITORY/commits/$sha/check-runs?per_page=100" \
+            --jq '[.check_runs[] | select(.name == "ci-ok" and .status == "completed" and .conclusion == "success")] | length')
+          if [ "${ok:-0}" -eq 0 ]; then
+            echo "refusing tag $GITHUB_REF_NAME: no passing ci-ok check on $sha" >&2
+            exit 1
+          fi
+          echo "ci-ok passed on $sha"
           prerelease="false"
           if [[ $version == *-* ]]; then
             prerelease="true"
@@ -105,7 +121,7 @@ jobs:
           echo "tag $GITHUB_REF_NAME is $sha on origin/main (prerelease: $prerelease)"
 
   push:
-    name: Test, build and push (${{ matrix.suffix }})
+    name: Build and push (${{ matrix.suffix }})
     needs: verify
     strategy:
       fail-fast: false
@@ -132,7 +148,7 @@ jobs:
         run: |
           printf '%s' "$GHCR_TOKEN" |
             docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
-      - name: Test, build and push
+      - name: Build and push
         id: build
         env:
           VERSION: ${{ needs.verify.outputs.version }}
@@ -183,7 +199,8 @@ jobs:
           mkdir -p dist
           printf '%s' "$digest" > "dist/arch-digest-${{ matrix.suffix }}.txt"
       # The tarball is copied out of this run's pushed arch image (by digest),
-      # so its bytes provably equal the tested image contents (no second build).
+      # so its bytes provably equal the image built from the CI-tested commit
+      # (no second build).
       - name: Package the release tarball
         env:
           VERSION: ${{ needs.verify.outputs.version }}

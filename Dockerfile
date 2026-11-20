@@ -1,5 +1,8 @@
 # syntax=docker/dockerfile:1.7
-# Modified by Ryuz Corp (Cello): the test stage's clippy loads the workspace clippy.toml; the test stage installs esbuild for the deploy --sourcemap tests; the build stage bakes CELLO_VERSION into the binary for --version.
+# Modified by Ryuz Corp (Cello): the build stage bakes CELLO_VERSION into the binary for --version.
+# Tests and clippy run natively in CI (ci.yml, `--profile ci`); the image only builds the
+# release binary. publish.yml keeps the "what ships was tested" guarantee by refusing a
+# tag whose commit lacks a passing `ci-ok` check.
 
 ARG RUST_VERSION=1.98.1
 ARG CELLO_COMMIT=unknown
@@ -23,46 +26,6 @@ RUN --mount=type=cache,id=cello-cargo-registry,target=/usr/local/cargo/registry,
     CELLO_VERSION="${CELLO_VERSION}" cargo build --profile "${CELLO_PROFILE}" --locked -p cello && \
     install -m 755 "target/${CELLO_PROFILE}/cello" /out/cello
 
-# The final image depends on this stage, so a break in the engine's tests or
-# lints stops the build.
-FROM build AS test
-ARG TARGETARCH
-RUN rustup component add clippy
-# The ltx fault-injection oracle diffs databases with the sqlite3 CLI.
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends sqlite3 curl ca-certificates && \
-    rm -rf /var/lib/apt/lists/*
-# The deploy `--sourcemap` tests bundle a fixture through esbuild, like a
-# Worker deploy does. Pinned by version and by the npm tarballs' sha512
-# (this stage builds the shipped binary, so nothing unverified runs here);
-# test stage only, the shipped image has no esbuild, as before.
-ARG ESBUILD_VERSION=0.28.2
-ARG ESBUILD_SHA512_AMD64=e314d9af5154992a105b85c85a68addedcd0ad44d933e3773f45d5f3144e298179d177c8ef178ef74fb56d9bcdc3122e7d0f610d0551247e588603d517c03f1d
-ARG ESBUILD_SHA512_ARM64=a56e000b43f78adf1cedda3d315338a79d45cc7cdd33f4d9adeaeeae045c1c9d964dad55435088ab5f319dc7e9049c38a23922659aca5b6c8805604ff768fa52
-RUN case "${TARGETARCH}" in \
-      amd64) ESBUILD_PKG=linux-x64 ESBUILD_SHA512="${ESBUILD_SHA512_AMD64}" ;; \
-      arm64) ESBUILD_PKG=linux-arm64 ESBUILD_SHA512="${ESBUILD_SHA512_ARM64}" ;; \
-      *) echo "unsupported arch ${TARGETARCH} for esbuild" >&2; exit 1 ;; \
-    esac && \
-    curl -fsSL -o /tmp/esbuild.tgz "https://registry.npmjs.org/@esbuild/${ESBUILD_PKG}/-/${ESBUILD_PKG}-${ESBUILD_VERSION}.tgz" && \
-    echo "${ESBUILD_SHA512}  /tmp/esbuild.tgz" | sha512sum -c - && \
-    tar -xzf /tmp/esbuild.tgz -C /tmp package/bin/esbuild && \
-    install -m 755 /tmp/package/bin/esbuild /usr/local/bin/esbuild && \
-    rm -rf /tmp/esbuild.tgz /tmp/package && \
-    esbuild --version
-# clippy reads the workspace's disallowed methods, types and macros from here.
-COPY clippy.toml ./
-# Tests run under a hostile env: a stale CELLD_* (cello refuses to start) and
-# a CELLO_DEV_STATE pointing nowhere writable. A test whose outcome depends on
-# the harness env, or a `cello` spawn that bypasses tests/common's cleared
-# env, fails here instead of on a developer machine.
-RUN --mount=type=cache,id=cello-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
-    --mount=type=cache,id=cello-cargo-git,target=/usr/local/cargo/git,sharing=locked \
-    --mount=type=cache,id=cello-target-${TARGETARCH},target=/src/target,sharing=locked \
-    CELLD_HERMETIC_CANARY=1 CELLO_DEV_STATE=/proc/cello-canary \
-    cargo test --profile "${CELLO_PROFILE}" --locked && \
-    cargo clippy --profile "${CELLO_PROFILE}" --all-targets --locked -- -D warnings
-
 FROM debian:bookworm-slim
 RUN apt-get update && \
     apt-get install -y --no-install-recommends ca-certificates && \
@@ -73,5 +36,5 @@ LABEL org.opencontainers.image.title="cello" \
       org.opencontainers.image.revision="${CELLO_COMMIT}" \
       org.opencontainers.image.version="${CELLO_VERSION}"
 COPY LICENSE NOTICE /usr/share/doc/cello/
-COPY --from=test /out/cello /usr/local/bin/cello
+COPY --from=build /out/cello /usr/local/bin/cello
 ENTRYPOINT ["/usr/local/bin/cello"]
