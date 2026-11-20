@@ -43,12 +43,18 @@ pub fn cello_binary() -> PathBuf {
 
 /// Build the `cello` command with a hermetic environment: the inherited
 /// environment is cleared, then rebuilt from an explicit allowlist —
-/// `PATH` and `TMPDIR` pass through when set, `HOME` points at a fresh
-/// `.test-home` inside the test's own temp `project` (docker socket
-/// discovery and certificate stores consult it, and scoping it to the
-/// fixture keeps the developer's real home out of reach) — plus exactly
-/// the `extra_env` the test passes. Entries applied last win, so a test
-/// can still override an allowlisted key deliberately.
+/// `PATH`, `TMPDIR`, and `CELLO_ESBUILD` pass through when set, `HOME`
+/// points at a fresh `.test-home` inside the test's own temp `project`
+/// (docker socket discovery and certificate stores consult it, and scoping
+/// it to the fixture keeps the developer's real home out of reach) — plus
+/// exactly the `extra_env` the test passes. Entries applied last win, so a
+/// test can still override an allowlisted key deliberately.
+///
+/// `CELLO_ESBUILD` is allowlisted (and nothing else is) so a developer or
+/// CI run whose `esbuild` on `PATH` is a wrapper script can point the
+/// `cello dev` child at the real binary without breaking hermeticity: the
+/// `CELLD_HERMETIC_CANARY` tripwire stays cleared, so a spawn that leaked
+/// the ambient environment would still refuse to start.
 #[allow(dead_code)] // Each test binary uses only the helpers it needs.
 pub fn cello_command(
     project: &Path,
@@ -80,6 +86,15 @@ pub fn apply_hermetic_env<'a>(
     if let Some(tmpdir) = std::env::var_os("TMPDIR") {
         command.env("TMPDIR", tmpdir);
     }
+    // `deploy`/`dev` bundle through `CELLO_ESBUILD` when it names the esbuild
+    // binary, falling back to `esbuild` on `PATH`. Forward it when set so a
+    // developer whose `PATH` esbuild is a wrapper script can still run the
+    // suite; everything else ambient stays cleared (in particular the
+    // `CELLD_HERMETIC_CANARY` tripwire, which keeps proving the child sees
+    // nothing ambient).
+    if let Some(esbuild) = std::env::var_os("CELLO_ESBUILD") {
+        command.env("CELLO_ESBUILD", esbuild);
+    }
     command.env("HOME", &home);
     for (name, value) in extra_env {
         command.env(name, value);
@@ -90,6 +105,7 @@ pub fn apply_hermetic_env<'a>(
 /// One address of a `cello dev` node, from the announce line the supervisor
 /// forwards to its stderr: `cello listening on <addr> (` names the public
 /// listener, `cello internal listening on <addr> (` the internal one.
+#[allow(dead_code)] // Each test binary uses only the helpers it needs.
 pub fn announced(lines: &Mutex<Vec<String>>, prefix: &str) -> Option<String> {
     lines
         .lock()
@@ -104,6 +120,7 @@ pub fn announced(lines: &Mutex<Vec<String>>, prefix: &str) -> Option<String> {
 /// Collect the supervisor's stderr lines, which carry the node's announce
 /// lines. If the child exits before announcing, the caller panics with the
 /// lines collected so far, so a future boot failure stays diagnosable.
+#[allow(dead_code)] // Each test binary uses only the helpers it needs.
 pub fn forward_announce(stderr: std::process::ChildStderr, lines: Arc<Mutex<Vec<String>>>) {
     std::thread::spawn(move || {
         let mut reader = BufReader::new(stderr);
