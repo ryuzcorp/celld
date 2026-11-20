@@ -8,7 +8,7 @@ and static assets, deployed from the `wrangler.json` you already have.
 Each object is a cell: a named server with its own SQLite database.
 Cello stores the long-term state in your S3-compatible, Google Cloud
 Storage, or Azure Blob Storage bucket. It needs no serving control
-plane or consensus service, and an inactive cell costs almost nothing.
+plane or consensus service, and an inactive cell costs almost nothing. One 8 GB node holds about 1,000 resident cells, about $0.05 each per month.
 
 ## Install
 

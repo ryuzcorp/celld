@@ -11,7 +11,9 @@ curl -fsSL https://cello.ryuz.eu/install.sh | sh
 
 The installer downloads the `cello` binary for Linux amd64 or arm64 from [GitHub Releases](https://github.com/ryuzcorp/cello/releases). It installs the latest stable release. Set `CELLO_INSTALL_DIR` to choose the directory; otherwise the binary goes to `/usr/local/bin`, or to `~/.local/bin` when that directory is not writable. Put the directory on your `PATH` if the installer asks you to.
 
-To install a different release, set `CELLO_VERSION` (for example `0.2.1` or `v0.2.1`) or `CELLO_CHANNEL=beta` for prereleases. Verify a release tarball with `gh attestation verify cello-<version>-linux-<arch>.tar.gz --repo ryuzcorp/cello`.
+To install a different release, pass `--beta` or set `CELLO_CHANNEL=beta` for prereleases, or set `CELLO_VERSION` (for example `0.2.1` or `v0.2.1`) for one exact release.
+
+Every release carries build provenance. Verify a release tarball with `gh attestation verify cello-<version>-linux-<arch>.tar.gz --repo ryuzcorp/cello`. Verify the container image with `gh attestation verify oci://ghcr.io/ryuzcorp/cello@<digest> --repo ryuzcorp/cello`. The digest is printed in the GitHub Release body (`Image: ghcr.io/ryuzcorp/cello:<version> (<digest>)`). On stable releases one attestation covers the `<version>`, `<major>.<minor>`, `beta`, and `latest` tags, which all point at the same index digest. Prereleases attest `<version>` plus `beta`.
 
 Check the install:
 
@@ -21,7 +23,7 @@ cello --version
 
 ## Docker
 
-The release image is published for Linux amd64 and arm64 at `ghcr.io/ryuzcorp/cello`. The `latest` tag moves on stable releases only; `beta` also moves on prereleases. Pin by digest for production.
+The release image is published for Linux amd64 and arm64 at `ghcr.io/ryuzcorp/cello`. The `latest` tag moves on stable releases only; `beta` also moves on prereleases. Pin by digest for production, and verify the SLSA provenance attestation as described in [Binary](#binary).
 
 ```sh
 docker run --rm ghcr.io/ryuzcorp/cello:latest --version
