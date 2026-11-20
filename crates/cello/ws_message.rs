@@ -219,13 +219,13 @@ mod tests {
     #[tokio::test]
     async fn fragmented_message_at_exactly_cap_delivered_intact() {
         let (mut client, mut reader) = client_pair().await;
-        // 32 × 1 MiB fragments: the total lands exactly on the cap. The
-        // writer runs alongside the read: a 1 MiB fragment never fits the
-        // 64 KiB duplex buffer whole, so sequential writes would park
-        // forever with nobody reading.
+        // 32 × 1 MiB fragments: the total lands exactly on the cap. Writer
+        // and reader run joined in this one task: a 1 MiB fragment never
+        // fits the 64 KiB duplex buffer whole, so sequential writes would
+        // park forever with nobody reading.
         const CHUNK: usize = 1024 * 1024;
         const FRAGMENTS: usize = 32;
-        let writer = tokio::spawn(async move {
+        let write_all = async {
             client
                 .write_frame(Frame::new(
                     false,
@@ -255,15 +255,17 @@ mod tests {
                 ))
                 .await
                 .expect("final fragment writes");
-        });
+        };
         // The reader only answers once the final frame lands: the whole
         // 32 MiB comes back, since the cap trips past — not at — the limit.
-        let mut send = null_send;
-        let frame = reader
-            .read_frame(&mut send)
-            .await
-            .expect("message at exactly the cap delivers");
-        writer.await.expect("sender joins");
+        let read_all = async {
+            let mut send = null_send;
+            reader
+                .read_frame(&mut send)
+                .await
+                .expect("message at exactly the cap delivers")
+        };
+        let (_, frame) = tokio::join!(write_all, read_all);
         assert_eq!(frame.opcode, OpCode::Binary);
         assert!(frame.fin);
         assert_eq!(frame.payload.len(), WS_MAX_MESSAGE_BYTES);
@@ -276,10 +278,12 @@ mod tests {
     async fn assembly_past_cap_fails_without_buffering_more() {
         let (mut client, mut reader) = client_pair().await;
         // 33 × 1 MiB fragments with no FIN: the 33rd byte past the cap
-        // fails the read. The writer runs alongside, as above; it parks
-        // once the failed read stops consuming, and is left parked.
+        // fails the read. Writer and reader run joined in this one task,
+        // as above; the writer's flood is finite, so after the failed
+        // read the drain consumes to EOF — the writer's end, which drops
+        // its client half — and the join always completes.
         const CHUNK: usize = 1024 * 1024;
-        let writer = tokio::spawn(async move {
+        let write_all = async move {
             client
                 .write_frame(Frame::new(
                     false,
@@ -290,7 +294,7 @@ mod tests {
                 .await
                 .expect("first fragment writes");
             for _ in 1..=32 {
-                if client
+                client
                     .write_frame(Frame::new(
                         false,
                         OpCode::Continuation,
@@ -298,14 +302,25 @@ mod tests {
                         vec![0u8; CHUNK].into(),
                     ))
                     .await
-                    .is_err()
-                {
-                    break;
+                    .expect("continuation writes");
+            }
+            // Dropping the client ends the drain below: its next read sees
+            // EOF instead of parking on a half the writer already left.
+            drop(client);
+        };
+        let read_all = async {
+            let error = read_error(&mut reader).await;
+            let mut send = null_send;
+            loop {
+                match reader.read_frame(&mut send).await {
+                    Err(WebSocketError::UnexpectedEOF) => break,
+                    Err(_) => {}
+                    Ok(_) => panic!("no complete message can arrive without FIN"),
                 }
             }
-        });
-        let error = read_error(&mut reader).await;
-        writer.abort();
+            error
+        };
+        let (_, error) = tokio::join!(write_all, read_all);
         assert!(
             matches!(error, WebSocketError::FrameTooLarge),
             "over-cap assembly reports FrameTooLarge: {error:?}"
