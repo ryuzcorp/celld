@@ -30,7 +30,8 @@
 //! buffer is bounded by this cap on its own, and it is released into the
 //! staged queue — where the staged cap does count it — the moment the
 //! message completes. The worst case per socket is therefore the read bound
-//! above plus one full staged budget (under 100 MiB + 16 MiB), never an
+//! above plus the inbound staged ledger (just under 16 MiB plus one
+//! message, under 100 MiB + 48 MiB), never an
 //! unbounded flood. Counting the same bytes in both ledgers would need a
 //! charge transfer at completion and risk the double-release the pipe
 //! budgets exist to avoid.
