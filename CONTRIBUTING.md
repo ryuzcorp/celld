@@ -28,6 +28,22 @@ must explicitly diff `.github/` and `Dockerfile` on every PR: a PR runs
 its own CI, so a patch that neuters its own tests still shows green
 checks.
 
+## Testing locally
+
+- Test spawns of the `cello` binary go through the hermetic helper in
+  `crates/cello/tests/common/mod.rs`: the inherited environment is
+  cleared and rebuilt from `PATH`, `TMPDIR`, a fixture-scoped `HOME`,
+  and `CELLO_ESBUILD` when set — nothing else. A stray `CELLD_*` in the
+  ambient environment makes `cello` refuse to start, which is how the
+  harness proves the child sees nothing ambient; CI runs the suite with
+  `CELLD_HERMETIC_CANARY=1` set for exactly this reason.
+- If the `esbuild` on your `PATH` is a wrapper script (for example a
+  mise shim), bundling tests fail with a permission error. Point the
+  child at the real binary instead:
+  `CELLO_ESBUILD=/path/to/real/esbuild cargo test --profile release`.
+  The Docker test stage needs no knob: it installs the real esbuild at
+  `/usr/local/bin/esbuild`.
+
 ## What to change where
 
 - Rust, Docker, CI, tools, examples: this repo, same PR as its tests.
