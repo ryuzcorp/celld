@@ -61,6 +61,13 @@ services, APIs, and Wrangler configuration.
   reading.
 - A streamed body keeps its event, isolate, and cell resident until it ends,
   so a retiring generation waits for open streams before it frees its heaps.
+- A `TransformStream` applies backpressure: while nobody reads the readable
+  side, `await writer.write(...)` stays pending and `writer.ready` does not
+  settle, so a response body built from one stops producing when the HTTP
+  client stops reading instead of buffering in the isolate's heap. A
+  producer that writes without awaiting either, or that writes after
+  `writer.desiredSize` says 0, still queues its chunks in memory — Cello
+  cannot bound a stream you keep feeding.
 
 ## Run on Linux or Apple Silicon
 

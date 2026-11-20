@@ -527,10 +527,11 @@ fn stalled_client_ends_the_blocked_write_at_the_stream_deadline() {
         .write_all(wire.as_bytes())
         .expect("write stalled request");
     // Never read: the frames fill the socket buffers and the pump's next
-    // host write blocks. (The producer itself keeps ticking: its writes land
-    // in the TransformStream queue, so the tick count is no stall signal.)
-    // The stream deadline (60 s without progress) must end that blocked
-    // write; the pump then cancels the producer through its request signal.
+    // host write blocks. (The producer parks in `writer.write()`, which the
+    // TransformStream holds until the pump reads, so its tick count is no
+    // stall signal either way.) The stream deadline (60 s without progress)
+    // must end that blocked write; the pump then cancels the producer
+    // through its request signal.
     let started = Instant::now();
     poll_until(
         "the stalled stream's producer is cancelled",

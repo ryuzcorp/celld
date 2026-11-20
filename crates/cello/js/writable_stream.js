@@ -214,6 +214,11 @@ class WritableStream {
   _backpressure = false;
   _hwm = 1;
   _started = false;
+  // TransformStream hook: its sink write parks on the readable's
+  // backpressure promise, so entering 'erroring' has to release it
+  // (the write then rejects with the stored error) or an abort, a
+  // readable cancel, or a controller error could never settle.
+  _unblockWrite = null;
 
   constructor(underlyingSink, queuingStrategy) {
     // Per spec: extract strategy fields first. Size is
@@ -370,6 +375,7 @@ class WritableStream {
   _startErroring(reason) {
     this._storedError = reason;
     this._state = 'erroring';
+    if (this._unblockWrite) this._unblockWrite();
     if (this._writer) this._writer._rejectReady(reason);
     if (this._started && !this._inFlightWrite &&
         !this._inFlightClose)
@@ -556,12 +562,27 @@ class WritableStream {
 class TransformStreamDefaultController {
   #rsc;
   #onError;
-  constructor(rsc, onError) {
+  #onEnqueue;
+  #onTerminate;
+  constructor(rsc, onError, onEnqueue, onTerminate) {
     this.#rsc = rsc;
     this.#onError = onError;
+    this.#onEnqueue = onEnqueue;
+    this.#onTerminate = onTerminate;
   }
-  enqueue(chunk) { this.#rsc.enqueue(chunk); }
-  terminate() { this.#rsc.close(); }
+  enqueue(chunk) {
+    // Per spec the backpressure flag follows the enqueue, not
+    // precedes it: the chunk may have satisfied a pending read.
+    this.#rsc.enqueue(chunk);
+    this.#onEnqueue();
+  }
+  terminate() {
+    this.#rsc.close();
+    // Spec: terminate also errors the writable side. Without it a write
+    // the closed readable will never pull again would park forever.
+    this.#onTerminate(
+      new TypeError('The transform stream was terminated.'));
+  }
   error(e) {
     this.#onError(e);
     this.#rsc.error(e);
@@ -570,6 +591,15 @@ class TransformStreamDefaultController {
 }
 
 // TransformStream -- pairs a readable + writable
+//
+// The pair runs the spec's backpressure handshake: the readable
+// defaults to a highWaterMark of 0, so it holds the writable side
+// back until a consumer pulls. A queued write waits on
+// [[backpressureChangePromise]] before its transform runs, which is
+// what keeps `await writer.write(...)` (and `writer.ready`) pending
+// while nobody reads -- and, end to end, keeps a Worker writing a
+// streamed Response, whose HTTP client stopped reading, from
+// buffering the body in the isolate's heap.
 class TransformStream {
   readable;
   writable;
@@ -591,6 +621,24 @@ class TransformStream {
     let cancelled = false;
     let flushing = false;
     let writable;
+    // [[backpressure]] and [[backpressureChangePromise]]. Flipping the
+    // flag settles the promise the other side is parked on and installs
+    // the one it must wait on next: a parked write waits for a pull, and
+    // a pull waits for the write that stalls the readable again.
+    let backpressure = false;
+    let backpressureChangeResolve = null;
+    let backpressureChangePromise = null;
+    const setBackpressure = (value) => {
+      if (backpressure === value) return;
+      backpressure = value;
+      if (backpressureChangeResolve) backpressureChangeResolve();
+      backpressureChangePromise = new Promise((resolve) => {
+        backpressureChangeResolve = resolve;
+      });
+    };
+    // Spec: TransformStreamSetBackpressure(stream, true) before the
+    // writable side exists, so the first write waits for a consumer.
+    setBackpressure(true);
     const runCancel = (reason) => {
       if (cancelled) return Promise.resolve();
       cancelled = true;
@@ -600,15 +648,20 @@ class TransformStream {
     };
     this.readable = new ReadableStream({
       start(c) { rsc = c; },
+      pull() {
+        // The consumer wants data: release the parked write and hand
+        // the readable the promise for the next stall. A second read
+        // while a write is in flight reuses that promise.
+        setBackpressure(false);
+        return backpressureChangePromise;
+      },
       async cancel(reason) {
         if (flushing) return;
-        try {
-          await runCancel(reason);
-          writable?._errorStream(reason);
-        } catch (e) {
-          writable?._errorStream(e);
-          throw e;
-        }
+        // The readable is closed by now, so nothing will pull again:
+        // error the writable before awaiting the transformer's cancel,
+        // or a write parked on the handshake would wait on it forever.
+        writable?._errorStream(reason);
+        await runCancel(reason);
       },
     }, {
       // Spec: the readable side defaults to a highWaterMark of 0,
@@ -628,7 +681,11 @@ class TransformStream {
     let readableError = null;
     const ctrl = new TransformStreamDefaultController(rsc, (e) => {
       if (readableError === null) readableError = e;
-    });
+    }, () => {
+      // Spec: TransformStreamDefaultControllerEnqueue sets the
+      // backpressure flag when the readable no longer needs data.
+      setBackpressure(!(rsc.desiredSize > 0));
+    }, (e) => { writable?._errorStream(e); });
     // start runs once at construction per spec. A throw -- sync or
     // async -- must error both sides rather than escape the
     // constructor, so wrap it: the executor turns a sync throw into
@@ -638,17 +695,40 @@ class TransformStream {
       ? new Promise((res) => res(startFn.call(transformer, ctrl)))
       : undefined;
     started?.catch((e) => rsc.error(e));
+    // The transform itself, once the readable has asked for it. A throw
+    // or rejection errors both sides and settles the write.
+    const performTransform = (chunk) => {
+      let result;
+      try {
+        result = transformFn
+          ? transformFn.call(transformer, chunk, ctrl)
+          : ctrl.enqueue(chunk);
+      } catch (e) {
+        rsc.error(e);
+        throw e;
+      }
+      return Promise.resolve(result).catch((e) => {
+        rsc.error(e);
+        throw e;
+      });
+    };
     writable = new WritableStream({
       start() { return started; },
-      async write(chunk) {
-        if (!transformFn) { rsc.enqueue(chunk); return; }
-        try {
-          await transformFn.call(transformer, chunk, ctrl);
-        } catch (e) {
-          // Transform failure errors both sides.
-          rsc.error(e);
-          throw e;
-        }
+      write(chunk) {
+        // The default sink-write algorithm: stay parked while the
+        // readable is full, so the producer's write -- and with it the
+        // producer's `await` -- waits for the consumer to pull.
+        if (!backpressure) return performTransform(chunk);
+        const change = backpressureChangePromise;
+        return change.then(() => {
+          // Abort, controller.error(), or a failed flush may have
+          // errored the stream while this write was parked: fail it
+          // with the stored error instead of transforming into a dead
+          // readable.
+          if (writable._state === 'erroring')
+            throw writable._storedError;
+          return performTransform(chunk);
+        });
       },
       close() {
         if (cancelled) return;
@@ -687,6 +767,10 @@ class TransformStream {
         }
       },
     }, writableStrategy);
+    // An abort or a readable failure enters 'erroring'; the hook wakes a
+    // write parked on the handshake so it can reject with the stored
+    // error instead of waiting for a pull that will never come.
+    writable._unblockWrite = () => setBackpressure(false);
     this.writable = writable;
   }
 }

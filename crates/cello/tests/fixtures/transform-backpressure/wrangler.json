@@ -1,0 +1,8 @@
+{
+  "name": "transform-backpressure",
+  "main": "index.js",
+  "compatibility_date": "2026-01-01",
+  "no_bundle": true,
+  "durable_objects": { "bindings": [{ "name": "BLOCKED", "class_name": "Blocked" }] },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Blocked"] }]
+}
