@@ -628,61 +628,56 @@ mod tests {
     }
 
     /// A small message staged ahead never dooms the large message behind it:
-    /// the cap polices only bytes already held ahead, so a 20 MiB message
-    /// queued behind a parked small send still crosses whole, in order.
-    /// Ending the large message whenever anything is held (the timing cliff)
-    /// ends this OverLimit, so it fails before that fix. Deterministic
-    /// without sleeps: both frames sit in the channel before the direction
-    /// first runs, so channel order stages the large message behind the
-    /// parked small head — no scheduling can stage it first — and the test
-    /// drains the pre-filled sink frame by frame before retiring the
-    /// direction.
+    /// the staging cap polices only bytes already held ahead, so a 20 MiB
+    /// message stages behind a small head, a frame behind that backlog
+    /// trips, and a backlog already at the cap trips even for a small frame.
+    /// Driven on `stage_pipe_frame` directly, so no scheduling can drain
+    /// the head first. Refusing the large message whenever anything is held
+    /// (the timing cliff) or whenever the total passes the cap fails this.
     #[test]
-    fn large_message_behind_small_backlog_still_crosses() {
-        let runtime = crate::asyncrt::shared_test_runtime();
-        runtime.block_on(async {
-            const BIG: usize = 20 * 1024 * 1024;
-            let (sink_tx, mut sink_rx) = tokio::sync::mpsc::channel::<WsOut>(1);
-            // Fill the sink before the direction starts, so the small head
-            // parks with the large message queued behind it.
-            sink_tx
-                .send(WsOut::Text("pre".into()))
-                .await
-                .expect("pre-fill the sink");
-            let (tx, from) = tokio::sync::mpsc::unbounded_channel();
-            // Both frames queue before the direction first runs: the large
-            // message necessarily lands behind the held small head.
-            tx.send(WsOut::Text("small".into())).expect("stage data");
-            tx.send(WsOut::Binary(vec![0xCDu8; BIG]))
-                .expect("stage data");
-            let (_shutdown_tx, shutdown) = tokio::sync::watch::channel(false);
-            let direction = crate::asyncrt::spawn(forward_pipe_direction(
-                from,
-                boxed_test_sink(sink_tx),
-                shutdown,
-                WsPipeBudget::new(ISOLATE_PIPE_MAX_STAGED_BYTES),
-            ));
-            // The pre-fill, then both frames in order; the large one crosses
-            // whole behind the parked small head.
-            assert!(matches!(sink_rx.recv().await, Some(WsOut::Text(pre)) if pre == "pre"));
-            assert!(matches!(sink_rx.recv().await, Some(WsOut::Text(head)) if head == "small"));
-            match sink_rx.recv().await {
-                Some(WsOut::Binary(bytes)) => {
-                    assert_eq!(bytes.len(), BIG, "the message crosses intact");
-                    assert!(
-                        bytes.iter().all(|byte| *byte == 0xCD),
-                        "every payload byte crosses intact"
-                    );
-                }
-                _ => panic!("the large message must cross whole behind the small head"),
-            }
-            drop(tx);
-            let (end, _from) = direction.await.expect("direction joins");
+    fn large_message_behind_small_backlog_stages() {
+        let budget = WsPipeBudget::new(ISOLATE_PIPE_MAX_STAGED_BYTES);
+        let mut queued = std::collections::VecDeque::new();
+        let mut staged_bytes = 0usize;
+        let mut pending_close = None;
+        let mut stage = |frame: WsOut, staged_bytes: &mut usize| {
             assert!(
-                matches!(end, PipeDirectionEnd::Retired),
-                "the backlog must drain, not end OverLimit, got {end:?}"
+                budget.charge(crate::js::ws_out_bytes(&frame)),
+                "the producer admits it"
             );
-        });
+            stage_pipe_frame(
+                Some(frame),
+                &mut queued,
+                staged_bytes,
+                &budget,
+                &mut pending_close,
+                true,
+            )
+        };
+        assert!(
+            stage(WsOut::Text("heartbeat".into()), &mut staged_bytes).is_none(),
+            "the small head stages"
+        );
+        let big = WsOut::Binary(vec![0xCDu8; 20 * 1024 * 1024]);
+        assert!(
+            stage(big, &mut staged_bytes).is_none(),
+            "a small backlog must not doom one large message"
+        );
+        assert!(
+            matches!(
+                stage(WsOut::Text("behind".into()), &mut staged_bytes),
+                Some(PipeDirectionEnd::OverLimit)
+            ),
+            "a frame behind a backlog past the cap still trips"
+        );
+        let mut at_cap = ISOLATE_PIPE_MAX_STAGED_BYTES;
+        assert!(
+            matches!(
+                stage(WsOut::Text("late".into()), &mut at_cap),
+                Some(PipeDirectionEnd::OverLimit)
+            ),
+            "a backlog already at the cap trips even a small frame"
+        );
     }
 
     /// A bounded test sink: one frame of capacity, drained by the test. A
