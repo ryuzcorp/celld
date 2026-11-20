@@ -41,8 +41,14 @@ function make(format, decompress) {
   // reachable any more.
   const transformer = {
     transform(chunk, controller) {
-      const out = __zlib_stream_push(id, bytes(chunk));
-      if (out.byteLength) controller.enqueue(out);
+      let out;
+      try {
+        out = __zlib_stream_push(id, bytes(chunk));
+        if (out.byteLength) controller.enqueue(out);
+      } catch (e) {
+        __zlib_stream_drop(id);
+        throw e;
+      }
     },
     flush(controller) {
       const out = __zlib_stream_end(id);
