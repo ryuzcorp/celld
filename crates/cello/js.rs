@@ -14646,10 +14646,10 @@ fn op_btoa(
 /// Live streaming decoders for one isolate, keyed by an id JS holds across
 /// awaits.
 ///
-/// An isolate slot rather than a process-wide `Mutex<HashMap<..>>` like
-/// [`zlib_streams`]. The reason that one is process-wide holds here too — a
-/// `TextDecoder` in streaming mode outlives the turn that made it, and the
-/// next turn can run on a different tokio worker — but it argues against a
+/// An isolate slot rather than a process-wide `Mutex<HashMap<..>>`; the
+/// compression streams in `zlib.rs` follow the same rule. A `TextDecoder`
+/// in streaming mode outlives the turn that made it, and the next turn can
+/// run on a different tokio worker — but that argues against a
 /// *thread-local*, not against this. A `TextDecoder` is a JS object, so it
 /// never leaves the isolate that made it, and every op that touches its
 /// decoder runs under that isolate's `v8::Locker`. The lock the embedder
