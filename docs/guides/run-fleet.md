@@ -91,7 +91,7 @@ A positive `capacity_waiting` or a `pressured` lease is the signal to add a node
 
 Cello shuts down gracefully on SIGTERM or SIGINT. The health path reports 503, new public requests receive 503 with the connection closed, and accepted requests finish. The node hands its cells off in batches: it cancels running alarms (the successor retries them), proves the data durable, publishes a final snapshot, and releases each ownership record to a peer. The peer keeps the cell dormant until a request arrives. A database larger than the durability deadline can upload (80 MiB at the default 10 seconds) hands off without the snapshot. Busy cells move first. `POST /shutdown` on the internal listener starts the same handoff.
 
-Concurrent demand-driven restores and startup work are bounded by `CELLO_ACTIVATIONS`, and concurrent complete handoffs by `CELLO_RELEASES` (default 128) (see [configuration](../reference/configuration.md)).
+You must set the orchestrator stop grace (systemd `TimeoutStopSec`, Kubernetes `terminationGracePeriodSeconds`) above `CELLO_SHUTDOWN_TOTAL_MS` (default 40000), or SIGKILL can interrupt the handoff. The drain-token wait is 3/4 of it and the handoff no-progress interval is 5/8. Concurrent demand-driven restores and startup work are bounded by `CELLO_ACTIVATIONS`, and concurrent complete handoffs by `CELLO_RELEASES` (default 128) (see [configuration](../reference/configuration.md)).
 
 Concurrent stops do not flood the survivors: a draining node claims a fleet drain token, so nodes hand off one at a time. A node that cannot claim the token within its wait proceeds without it.
 
