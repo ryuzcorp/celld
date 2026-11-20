@@ -182,6 +182,10 @@ The `tail` and `email` handlers are unavailable.
 - Cello expires an unclaimed and inactive HTTP stream after 60 seconds. A
   successful stream operation starts a new 60-second period.
 - An expired or unknown stream reports an error instead of EOF.
+- A `TransformStream` applies backpressure, as in Workerd: its readable side
+  defaults to a highWaterMark of 0, and `writer.write()` / `writer.ready`
+  stay pending until a consumer reads. `IdentityTransformStream` and
+  `FixedLengthStream` resolve a write only once its bytes have been read.
 - Byte streams cross isolate boundaries on the same node as part of
   Durable Object RPC, in both directions: a `ReadableStream` your cell
   returns reads chunk by chunk, and a `WritableStream` it returns accepts

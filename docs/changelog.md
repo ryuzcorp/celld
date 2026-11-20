@@ -2,6 +2,24 @@
 title: Changelog
 description: What shipped in each Cello release, from v0.6.3-ryuzcorp.4 to v0.2.3.
 ---
+## Unreleased
+
+A `TransformStream` now applies backpressure. No configuration, data, or
+bucket-format changes.
+
+- **`TransformStream` applies backpressure** (#105). Its writable side used to
+  resolve `write()` as soon as the transform returned, whether or not
+  anything read the readable side, so a Worker streaming a
+  `TransformStream` into a response buffered the whole body in the
+  isolate's heap while its HTTP client did not read -- and `near_heap_limit`
+  grows the heap rather than failing, so one non-reading client could run
+  the process out of memory. The writable side now waits for the readable
+  side to be read, as Workerd does: `await writer.write(...)` and
+  `writer.ready` stay pending until a consumer pulls, end to end through
+  the response-body pump. A producer that writes without awaiting either,
+  or that writes past `writer.desiredSize` 0, still queues in memory;
+  `writer.ready` is the signal to honor.
+
 ## v0.2.3
 
 Streamed responses no longer die after 30 seconds. No configuration,
