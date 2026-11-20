@@ -386,6 +386,8 @@ filled cell reads only its local file. A chain smaller than
 
 ### Epoch GC
 
+Each activation can add a new epoch prefix to the bucket. Cello deletes the older prefixes only when `CELLO_LTX_RETENTION_SECS` enables epoch GC, so without it the bytes of a cell increase with each activation.
+
 When `CELLO_LTX_RETENTION_SECS` is positive, the owner of a cell deletes the
 epoch prefixes that no restore reads, in both `CELLO_DURABILITY` modes:
 

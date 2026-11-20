@@ -1,3 +1,8 @@
+---
+title: Limitations
+description: "The operational limits of a Cello fleet: one application, external TLS, credentials, and reconnects."
+---
+
 # Limitations
 
 Cello v0.6.3 is a beta release with these operational limits. See
@@ -29,7 +34,7 @@ services, APIs, and Wrangler configuration.
 ## Match credentials to your provider
 
 - The credential methods differ by provider. See
-  [Configure object storage](../guides/run-fleet.md#configure-object-storage).
+  [Configure storage](../guides/storage.md).
 - Azure identity works only in the public Azure cloud. A managed identity
   from Azure App Service or Azure Container Apps does not work. Use a
   workload identity or a storage account key there.

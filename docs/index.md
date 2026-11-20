@@ -14,7 +14,7 @@ In Cloudflare terms, a **cell** is a Durable Object: a named server with its own
 
 Each cell runs on one thread and owns its database alone. Exactly one node serves a cell at a time: a node claims a cell with a conditional write to the bucket, so the bucket decides who wins. When a node stops, another node takes its cells over and recovers the writes the stopped node had not uploaded yet.
 
-An idle cell leaves memory after `CELLO_IDLE_EVICT_S` seconds, or earlier under memory pressure. A cell that no node holds is **inactive**: it is only objects in the bucket and costs almost nothing. One 8 GB node holds about 1,000 resident cells.
+An idle cell leaves memory after `CELLO_IDLE_EVICT_S` seconds, or earlier under memory pressure. A cell that no node holds is **inactive**: it is only objects in the bucket and costs almost nothing. One 8 GB node holds about 1,000 resident cells, about $0.05 each per month.
 
 ## Writes survive failure
 

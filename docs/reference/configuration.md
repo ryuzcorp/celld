@@ -19,7 +19,7 @@ Telemetry variables (`CELLO_OTEL*`, `OTEL_*`) live on the [telemetry](../guides/
 | `GOOGLE_APPLICATION_CREDENTIALS`, `GOOGLE_SERVICE_ACCOUNT_KEY` | unset | Google credentials for a `gs://` bucket. Application Default Credentials are also available. |
 | `AZURE_STORAGE_ACCOUNT_NAME` | unset | The storage account for an `az://` bucket. |
 | `AZURE_STORAGE_ACCOUNT_KEY` | unset | The storage account key. Do not combine it with an identity selector. |
-| `AZURE_AUTHORITY_HOST`, `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, `AZURE_FEDERAL_TOKEN_FILE` | unset | The AKS workload identity environment. The authority must be the public Azure host. |
+| `AZURE_AUTHORITY_HOST`, `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, `AZURE_FEDERATED_TOKEN_FILE` | unset | The AKS workload identity environment. The authority must be the public Azure host. |
 | `AZURE_STORAGE_USE_EMULATOR` | unset | Set to `true` to develop against Azurite. |
 
 ## Listeners and identity
@@ -107,6 +107,7 @@ Telemetry variables (`CELLO_OTEL*`, `OTEL_*`) live on the [telemetry](../guides/
 | `CELLO_RECOVERY_RETRY_MS` | `1000` | Dead-owner recovery retry backoff in milliseconds. |
 | `CELLO_RECOVERY_RETRIES` | `240` | Recovery retries before a request fails. |
 | `CELLO_SHUTDOWN_TOTAL_MS` | `40000` | The complete stop bound. The drain-token wait is 3/4 of it and the handoff no-progress interval is 5/8. |
+| `CELLO_RELEASES` | `128` | Concurrent complete handoffs. |
 | `CELLO_READY_FLEET_GATE_MS` | `120000` | The first-readiness gate deadline; `0` disables the gate. |
 | `CELLO_MAX_ASSET_FILE_BYTES` | `25 MiB` | Per-file static asset limit. |
 | `CELLO_MAX_DYNAMIC_WORKER_CODE_BYTES` | `64 MiB` | Loaded dynamic module total. |
@@ -115,7 +116,7 @@ An L1 compaction merges at most 256 source objects within a 64 MiB buffer. A lar
 
 ## Removed settings
 
-Remove these from the environment, including an empty value or the former default. Cello rejects `CELLO_SHUTDOWN_DRAIN_MS` and `CELLO_DRAIN_TOKEN_WAIT_MS` at startup; the rest are ignored or replaced:
+Remove these from the environment, including an empty value or the former default. Cello refuses to start when any one of them is set:
 
 | Removed setting | Current behavior |
 | --- | --- |

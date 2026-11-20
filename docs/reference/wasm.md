@@ -1,3 +1,8 @@
+---
+title: WebAssembly
+description: Import .wasm modules, ship prebuilt bundles, build with workers-rs, and pass wasm to dynamic workers.
+---
+
 # WebAssembly
 
 A Worker bundle can import a `.wasm` file. As in Wrangler, the import

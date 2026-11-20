@@ -57,6 +57,6 @@ The first argument is the `bucket_name`, not the binding name. `--metadata` beco
 
 `cello kv list` and `cello r2 list` print at most 1000 keys and, on stderr, the flag that continues the listing: `--after KEY` for kv, `--cursor CURSOR` for r2. Pass `--all` for every key. `cello kv list --json` prints one JSON object per key. `cello r2 list` takes `--prefix` and `--delimiter`; with `--page` it prints one page object — objects with `httpMetadata` and `customMetadata`, plus `delimitedPrefixes`, `truncated` and `cursor` — a Worker's `list()` page without `version`, `checksums` and `storageClass`.
 
-Append `--local` to a `cello d1` command to target the `cello dev` node instead of the fleet. It resolves the same state directory, so pass the same `--state DIR` (or `CELLO_DEV_STATE`) when the node runs with an explicit state directory. See [CLI reference](../reference/cli.md) for every subcommand and flag.
+Append `--local` to a `cello d1` command to target the `cello dev` node instead of the fleet. It resolves the same state directory, which carries that node's leases and secret, so pass the same `--state DIR` (or `CELLO_DEV_STATE`) when the node runs with an explicit state directory. See [CLI reference](../reference/cli.md) for every subcommand and flag.
 
 Every Cello command writes data to stdout and messages to stderr. A closed stdout pipe is a successful stop.
