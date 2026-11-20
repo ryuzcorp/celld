@@ -26,6 +26,18 @@ incremental = true
 # the shipped release profile stays stripped.
 strip = false
 debug = "line-tables-only"
+
+# CI profile: release optimization (some tests are timing/perf sensitive)
+# minus the fat-LTO relink that dominates rebuild time. `panic = "abort"`
+# is inherited from `release`, so what CI tests is what ships. Shipped
+# artifacts stay on `release`.
+[profile.ci]
+inherits = "release"
+lto = false
+codegen-units = 16
+incremental = false
+debug = false
+
 [profile.dev.package.sha2]
 opt-level = 3
 [profile.dev.package.rsa]

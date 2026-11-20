@@ -7851,11 +7851,7 @@ mod evict_trim_tests {
             trim_idle(&repl).await;
             assert_eq!(artifact, EvictionRestoreArtifact::L0Chain);
             let (puts, lists) = store.counts();
-            assert_eq!(
-                puts - puts_before,
-                0,
-                "the policy skip PUTs no L9 snapshot"
-            );
+            assert_eq!(puts - puts_before, 0, "the policy skip PUTs no L9 snapshot");
             assert_eq!(
                 (lists - lists_before, store.heads() - heads_before),
                 (0, 1),

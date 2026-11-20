@@ -1,0 +1,6 @@
+# Pinned toolchain: the Dockerfile builds with `rust:1.98.1-bookworm`, and CI
+# tests and lints with 1.98.1. Keep the three in lockstep.
+[toolchain]
+channel = "1.98.1"
+profile = "minimal"
+components = ["clippy", "rustfmt"]

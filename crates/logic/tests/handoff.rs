@@ -7,7 +7,7 @@
 //! overflowed skips it. The boundary (16 skips, 17 snapshots) is pinned so a
 //! later constant change re-examines the restore-amplification budget.
 
-use cello_logic::handoff::{HANDOFF_CHAIN_MAX_OBJECTS, HandoffChain, handoff_snapshot_needed};
+use cello_logic::handoff::{handoff_snapshot_needed, HandoffChain, HANDOFF_CHAIN_MAX_OBJECTS};
 
 fn fresh_short_chain() -> HandoffChain {
     HandoffChain {

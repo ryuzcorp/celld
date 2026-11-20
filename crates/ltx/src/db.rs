@@ -1340,8 +1340,8 @@ impl Db {
             return Ok(true);
         }
         let wal_hdr = self.wal_header_bytes()?;
-        let salt_match = be_u32(&wal_hdr[16..]) == hdr.wal_salt1
-            && be_u32(&wal_hdr[20..]) == hdr.wal_salt2;
+        let salt_match =
+            be_u32(&wal_hdr[16..]) == hdr.wal_salt1 && be_u32(&wal_hdr[20..]) == hdr.wal_salt2;
         if !salt_match {
             // New generation (or a foreign overwrite) with unknown content.
             return Ok(true);
@@ -1402,18 +1402,13 @@ impl Db {
         };
         window[..WAL_HEADER_SIZE].copy_from_slice(&hdr);
         window[WAL_HEADER_SIZE..].copy_from_slice(&tail);
-        let mut reader = match WalReader::new_with_offset_over_tail(
-            &window,
-            tail_base,
-            offset,
-            salt1,
-            salt2,
-        ) {
-            // The previous frame no longer matches, or the header is garbage:
-            // the WAL changed under us. Unknown.
-            Err(_) => return Ok(true),
-            Ok(reader) => reader,
-        };
+        let mut reader =
+            match WalReader::new_with_offset_over_tail(&window, tail_base, offset, salt1, salt2) {
+                // The previous frame no longer matches, or the header is garbage:
+                // the WAL changed under us. Unknown.
+                Err(_) => return Ok(true),
+                Ok(reader) => reader,
+            };
         let mut page = vec![0u8; page_size as usize];
         match reader.read_frame(&mut page) {
             // A checksum-valid frame past the capture: a real pending commit.
