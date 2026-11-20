@@ -3063,13 +3063,19 @@ mod pump_tests {
     }
 
     /// Shutdown still ends the pump while a socket send is parked: the
-    /// 1 MiB write parks at once on a client that never reads, the peer's
+    /// 1 MiB write parks at once on a client that goes silent, the peer's
     /// close ends the read on the independent direction, and the parked write
     /// retires instead of holding the pump open. A parked send that ignores
     /// the shutdown parks forever, so the guard fails before the change.
     /// The settle drops the parked send mid-frame and poisons the writer, so
     /// the close reply can never cross: the pump still ends on the peer
     /// close, but reports it unclean with the peer's code and reason.
+    /// Sequenced, not timed: the client reads the data frame's head first —
+    /// proving the send holds the writer — and only then sends the close, so
+    /// the settle below always drops a live parked send. A close written
+    /// before the write direction's first poll can retire the idle direction
+    /// clean instead, which is a different (also correct) outcome, not this
+    /// test's parked-send case.
     #[test]
     fn shutdown_during_parked_send_ends_pump() {
         test_runtime().block_on(async {
@@ -3090,15 +3096,26 @@ mod pump_tests {
                 |_: cello::js::WsIn| std::future::pending::<anyhow::Result<()>>(),
                 cello::js::WsPipeBudget::new(ISOLATE_PIPE_MAX_STAGED_BYTES),
             ));
-            let mut client = fastwebsockets::WebSocket::after_handshake(
-                client_stream,
-                fastwebsockets::Role::Client,
+            let (mut reader, mut writer) = tokio::io::split(client_stream);
+            // The 1 MiB write holds the writer from its first poll: reading
+            // only the frame's head proves the send parked holding the lock,
+            // and the client then goes silent, so no further byte can drain.
+            // Only then does the close cross on the independent read
+            // direction: the two duplex directions buffer separately. Without
+            // this order a close racing the write direction's first poll
+            // retires the still-idle direction instead — unpoisoned and
+            // clean — and the assertions below fail on the wrong case.
+            use tokio::io::AsyncReadExt;
+            let mut head = [0u8; 10];
+            reader.read_exact(&mut head).await.expect("data frame head");
+            assert_eq!(head[0], 0x82, "the data frame's write starts first");
+            assert_eq!(head[1], 127, "1 MiB uses the 64-bit length form");
+            assert_eq!(
+                u64::from_be_bytes(head[2..].try_into().expect("length")),
+                1024 * 1024,
+                "the parked frame is the staged megabyte"
             );
-            // The 1 MiB write parks at once — the client never reads — while
-            // the close crosses on the independent read direction: the two
-            // duplex directions buffer separately.
-            client
-                .write_frame(fastwebsockets::Frame::close(1000, b"bye"))
+            write_masked_frame(&mut writer, 0x8, &[0x03, 0xe8, b'b', b'y', b'e'])
                 .await
                 .expect("peer closes");
             let (close, writer, _, _) =
