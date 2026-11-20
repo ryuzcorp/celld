@@ -10,6 +10,10 @@ A Durable Object is a single-threaded actor with its own SQLite database. Cello 
 
 This example keeps one counter per name, and `idFromName()` gives each name a separate counter. It runs unchanged on `cello dev` (verified with cello 0.2.1).
 
+The full runnable version is in [`examples/counter`](https://github.com/ryuzcorp/cello/tree/main/examples/counter).
+
+<!-- cello-example: counter -->
+
 ```jsonc
 // wrangler.jsonc
 {

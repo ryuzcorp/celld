@@ -7,7 +7,11 @@ description: Send messages from a producer and handle them in batches in a consu
 
 ## Run a minimal example
 
-This project sends one job per request and acknowledges each job in the consumer. A job for a path ending in `/fail` retries instead.
+This project sends one job per request and handles each job in the consumer. A job for a path ending in `/fail` retries, then lands in the dead-letter queue.
+
+The full runnable version is in [`examples/queues`](https://github.com/ryuzcorp/cello/tree/main/examples/queues).
+
+<!-- cello-example: queues -->
 
 ```jsonc
 // wrangler.jsonc
@@ -35,16 +39,27 @@ This project sends one job per request and acknowledges each job in the consumer
 // index.js
 export default {
   async fetch(request, env) {
-    await env.JOBS.send({ path: new URL(request.url).pathname });
-    return Response.json({ queued: true });
+    const job = {
+      path: new URL(request.url).pathname,
+      createdAt: new Date().toISOString(),
+    };
+    await env.JOBS.send(job);
+    return Response.json({ queued: job });
   },
 
   async queue(batch) {
     for (const message of batch.messages) {
+      if (batch.queue === "example-jobs-dead-letter") {
+        console.log("dead job", message.body);
+        message.ack();
+        continue;
+      }
       if (message.body.path.endsWith("/fail")) {
+        console.log("retrying job", message.body, message.attempts);
         message.retry({ delaySeconds: 1 });
         continue;
       }
+      console.log("processing job", message.body);
       message.ack();
     }
   },
