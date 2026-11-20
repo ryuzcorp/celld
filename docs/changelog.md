@@ -16,7 +16,12 @@ bucket-format changes.
   the process out of memory. The writable side now waits for the readable
   side to be read, as Workerd does: `await writer.write(...)` and
   `writer.ready` stay pending until a consumer pulls, end to end through
-  the response-body pump. A producer that writes without awaiting either,
+  the response-body pump. Cancelling the readable, aborting the writable,
+  `controller.error()`, and `controller.terminate()` release a write parked
+  on the handshake (with the stored error, or a `TypeError` for
+  `terminate`), and an error or terminate issued from inside `start()` is
+  applied as soon as the writable exists, so a later write rejects instead
+  of parking. A producer that writes without awaiting either,
   or that writes past `writer.desiredSize` 0, still queues in memory;
   `writer.ready` is the signal to honor.
 

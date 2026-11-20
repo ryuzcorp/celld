@@ -184,7 +184,9 @@ The `tail` and `email` handlers are unavailable.
 - An expired or unknown stream reports an error instead of EOF.
 - A `TransformStream` applies backpressure, as in Workerd: its readable side
   defaults to a highWaterMark of 0, and `writer.write()` / `writer.ready`
-  stay pending until a consumer reads. `IdentityTransformStream` and
+  stay pending until a consumer reads. A cancelled readable, `abort()`,
+  `controller.error()`, and `controller.terminate()` release a parked write.
+  `IdentityTransformStream` and
   `FixedLengthStream` resolve a write only once its bytes have been read.
 - Byte streams cross isolate boundaries on the same node as part of
   Durable Object RPC, in both directions: a `ReadableStream` your cell
