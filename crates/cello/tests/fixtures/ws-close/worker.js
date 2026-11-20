@@ -15,7 +15,15 @@ export default {
         return Response.json({ threw: e.name + ": " + e.message });
       }
     }
-    // A WebSocket whose server end refuses the first message with 1008.
+    if (url.pathname === "/big-echo") {
+      // Echo one message of any size back: a single 16-32 MiB message must
+      // pass an idle tenant pump intact instead of ending the socket loudly
+      // with 1011.
+      const [client, server] = Object.values(new WebSocketPair());
+      server.accept();
+      server.addEventListener("message", (e) => server.send(e.data));
+      return new Response(null, { status: 101, webSocket: client });
+    }
     const [client, server] = Object.values(new WebSocketPair());
     server.accept();
     server.addEventListener("message", () => server.close(1008, "refused"));

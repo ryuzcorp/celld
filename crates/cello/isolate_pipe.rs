@@ -72,9 +72,19 @@ fn stage_pipe_frame(
     }
     match frame {
         Some(data @ (WsOut::Text(_) | WsOut::Binary(_))) => {
-            *staged_bytes = staged_bytes.saturating_add(ws_out_bytes(&data));
+            // An otherwise-empty stage admits one message up to the message
+            // cap outright, so a single 16-32 MiB message passes an idle pipe
+            // instead of ending it loudly; a backlog past the cap still ends
+            // OverLimit, as does a frame larger than one message even on
+            // empty. The parked send owns the head's bytes while it is
+            // pending, so a stage with a send in flight is never empty here.
+            let was_empty = queued.is_empty() && *staged_bytes == 0;
+            let bytes = ws_out_bytes(&data);
+            *staged_bytes = staged_bytes.saturating_add(bytes);
             queued.push_back(data);
-            if *staged_bytes > ISOLATE_PIPE_MAX_STAGED_BYTES {
+            let head =
+                was_empty && bytes <= crate::ws_message::single_message_stage_bytes::<WsOut>();
+            if !head && *staged_bytes > ISOLATE_PIPE_MAX_STAGED_BYTES {
                 return Some(PipeDirectionEnd::OverLimit);
             }
             None
@@ -185,7 +195,11 @@ where
 /// Staged frames are accounted against [`ISOLATE_PIPE_MAX_STAGED_BYTES`]:
 /// past the cap the direction reports [`PipeDirectionEnd::OverLimit`] so
 /// the teardown closes both ends loudly instead of growing host memory
-/// without bound behind a peer that never reads. An end that drops the pipe
+/// without bound behind a peer that never reads. An otherwise-empty stage
+/// still admits one message up to the message cap (see
+/// [`crate::ws_message::single_message_stage_bytes`]), so a single 16-32
+/// MiB message passes an idle pipe; a backlog past the cap still ends
+/// loudly. An end that drops the pipe
 /// first settles a parked send under the same progress bound, so the head
 /// frame still crosses whole ahead of the terminal the teardown reports.
 pub async fn forward_pipe_direction<SendFn, SendFut>(
@@ -568,6 +582,48 @@ mod tests {
                     "{direction} direction: staged flood must end OverLimit, got {end:?}"
                 );
             }
+        });
+    }
+
+    /// A single message larger than the staged cap still crosses an idle
+    /// direction whole: the otherwise-empty stage admits one message up to
+    /// the message cap, and only a backlog past the cap ends OverLimit.
+    /// Reverting the head exemption ends this OverLimit, so it fails before
+    /// the fix. No sleeps: the immediate sink settles every send, and the
+    /// dropped sender retires the direction once the frame crosses.
+    #[test]
+    fn idle_direction_forwards_one_large_message() {
+        let runtime = crate::asyncrt::shared_test_runtime();
+        runtime.block_on(async {
+            const BIG: usize = 20 * 1024 * 1024;
+            let (tx, from) = tokio::sync::mpsc::unbounded_channel();
+            tx.send(WsOut::Binary(vec![0xABu8; BIG]))
+                .expect("stage data");
+            drop(tx);
+            let (_shutdown_tx, shutdown) = tokio::sync::watch::channel(false);
+            let (end, _from) = forward_pipe_direction(
+                from,
+                |frame| async move {
+                    match frame {
+                        WsOut::Binary(bytes) => {
+                            assert_eq!(bytes.len(), BIG, "the message crosses intact");
+                            assert!(
+                                bytes.iter().all(|byte| *byte == 0xAB),
+                                "every payload byte crosses intact"
+                            );
+                        }
+                        _ => panic!("expected the staged Binary"),
+                    }
+                    PipeSendOutcome::Sent
+                },
+                shutdown,
+                WsPipeBudget::new(ISOLATE_PIPE_MAX_STAGED_BYTES),
+            )
+            .await;
+            assert!(
+                matches!(end, PipeDirectionEnd::Retired),
+                "one message on an idle stage must not end OverLimit, got {end:?}"
+            );
         });
     }
 

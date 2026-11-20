@@ -1218,7 +1218,9 @@ enum ReadEnd {
     /// Frames staged past the cap behind a cell or isolate that never reads
     /// its inbound queue: end loudly with 1011 instead of growing host
     /// memory without bound. A slow handler never trips this: dispatches
-    /// run without any time bound, and reads only stage what fits.
+    /// run without any time bound, and reads only stage what fits. An
+    /// otherwise-empty stage still admits one message up to the message
+    /// cap, so a lone 16-32 MiB message never ends here.
     OverLimit,
     /// One message's fragments passed the message cap (or a single frame
     /// reached it): end loudly with 1009 instead of growing the assembly
@@ -1336,11 +1338,14 @@ type PumpReadInFlight<S> =
 ///
 /// Reads stage ahead of a slow cell instead of parking behind its dispatch:
 /// dispatches run without any time bound, so a slow handler never trips the
-/// pipe — only frames staged past the cap end it loudly. Fragments assemble
+/// pipe — only frames staged past the cap end it loudly. An otherwise-empty
+/// stage still admits one message up to the message cap, so a single 16-32
+/// MiB message passes an idle pump. Fragments assemble
 /// in the reader under the message cap, uncharged against the staged
 /// budget: the worst case per socket is the reader's bound (the assembly
-/// plus the parser's read buffer, under about 100 MiB) plus one full staged
-/// budget (see `cello::ws_message`), and a message whose fragments
+/// plus the parser's read buffer, under about 100 MiB) plus one staged
+/// budget and its headroom (16 MiB plus one message, see
+/// `cello::ws_message`), and a message whose fragments
 /// pass the cap ends the socket loudly with 1009 instead of staging
 /// anything. A peer close
 /// pending behind a stuck dispatch ends the read with the pending close
@@ -1535,9 +1540,29 @@ where
                         reading = None;
                         match event {
                             PumpReadEvent::Data(data) => {
-                                staged_bytes = staged_bytes
-                                    .saturating_add(ws_in_staged_bytes(&data));
+                                // An otherwise-empty stage admits one message
+                                // outright, so a single 16-32 MiB message
+                                // passes an idle pump instead of ending it
+                                // loudly; a backlog past the cap still ends
+                                // OverLimit. The assembler already holds each
+                                // message to the message cap, and the bound
+                                // below re-checks it, so a larger frame can
+                                // never arrive exempt here.
+                                let was_empty =
+                                    staged.is_empty() && staged_bytes == 0;
+                                let bytes = ws_in_staged_bytes(&data);
+                                staged_bytes =
+                                    staged_bytes.saturating_add(bytes);
                                 staged.push_back(data);
+                                let head = was_empty
+                                    && bytes <= cello::ws_message::single_message_stage_bytes::<
+                                        cello::js::WsIn,
+                                    >();
+                                if !head
+                                    && staged_bytes > ISOLATE_PIPE_MAX_STAGED_BYTES
+                                {
+                                    return ReadEnd::OverLimit;
+                                }
                             }
                             PumpReadEvent::PeerClose(code, reason) => {
                                 // First close wins; anything later is dropped
@@ -1555,9 +1580,6 @@ where
                             PumpReadEvent::Transport => {
                                 return ReadEnd::Transport;
                             }
-                        }
-                        if staged_bytes > ISOLATE_PIPE_MAX_STAGED_BYTES {
-                            return ReadEnd::OverLimit;
                         }
                     }
                     result = async {

@@ -174,6 +174,33 @@ export default {
         return Response.json({ error: "overload close never arrived" }, { status: 500 });
       return Response.json(result);
     }
+    if (p === "/big-echo") {
+      // One 20 MiB message each way through the isolate-to-isolate pipe: the
+      // otherwise-empty admission budget and staging queue each admit one
+      // message up to the message cap, so it echoes intact instead of ending
+      // loudly with 1011.
+      const w = env.LOADER.get("big-echo", () => ({
+        compatibilityDate: "2026-01-01",
+        mainModule: "m.js",
+        modules: { "m.js": SELF },
+        env: {},
+      }));
+      const res = await w.getEntrypoint().fetch(new Request("http://x/"));
+      const ws = res.webSocket;
+      if (!ws) return Response.json({ error: "no webSocket" }, { status: 500 });
+      const settled = new Promise((resolve) => {
+        ws.addEventListener("message", (e) => resolve({ length: e.data.length }));
+        ws.addEventListener("close", (e) => resolve({ code: e.code, wasClean: e.wasClean }));
+      });
+      const timedOut = new Promise((resolve) =>
+        setTimeout(() => resolve({ timedOut: true }), 120000));
+      ws.accept();
+      ws.send("y".repeat(20 * 1024 * 1024));
+      const result = await Promise.race([settled, timedOut]);
+      if (result.timedOut)
+        return Response.json({ error: "big echo never arrived" }, { status: 500 });
+      return Response.json(result);
+    }
     if (p === "/order-close") {
       // The caller floods a slow reader, then sends one text and closes: the
       // close queued behind the flood must still deliver every frame first,
