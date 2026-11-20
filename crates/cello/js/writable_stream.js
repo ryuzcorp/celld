@@ -576,13 +576,26 @@ class TransformStreamDefaultController {
     this.#onTerminate = onTerminate;
   }
   enqueue(chunk) {
+    try {
+      this.#rsc.enqueue(chunk);
+    } catch (e) {
+      // Spec TransformStreamDefaultControllerEnqueue: a strategy size()
+      // that throws (or returns a bad value) errors the readable; the
+      // writable must follow, or a write parked on the handshake waits
+      // for a pull the dead readable will never make. An enqueue on an
+      // already closed or errored readable leaves desiredSize as it was.
+      if (this.#rsc.desiredSize === null) this.#onError(e);
+      throw e;
+    }
     // Per spec the backpressure flag follows the enqueue, not
     // precedes it: the chunk may have satisfied a pending read.
-    this.#rsc.enqueue(chunk);
     this.#onEnqueue();
   }
   terminate() {
-    this.#rsc.close();
+    // Spec ReadableStreamDefaultControllerClose returns quietly when the
+    // readable can no longer close (already closed or errored); the
+    // writable side is still errored below.
+    try { this.#rsc.close(); } catch {}
     // Spec: terminate also errors the writable side. Without it a write
     // the closed readable will never pull again would park forever.
     this.#onTerminate(
@@ -694,7 +707,7 @@ class TransformStream {
     let startWindowError = null;
     const errorWritable = (e) => {
       if (writable) writable._errorStream(e);
-      else startWindowError = e;
+      else if (startWindowError === null) startWindowError = e;
     };
     const ctrl = new TransformStreamDefaultController(rsc, (e) => {
       if (readableError === null) readableError = e;

@@ -394,6 +394,40 @@ const conformance = async () => {
     );
   }
 
+  // 14. A readable strategy size() that throws errors the readable from an
+  //     out-of-band enqueue; the writable must follow so a parked write
+  //     rejects, and a later terminate() on the dead readable stays quiet.
+  {
+    let ctrl;
+    const failure = new Error('size failed');
+    const { readable, writable } = new TransformStream(
+      { start(c) { ctrl = c; } },
+      undefined,
+      { highWaterMark: 0, size() { throw failure; } },
+    );
+    const writer = writable.getWriter();
+    const write = writer.write('parked');
+    write.catch(() => {});
+    check('size parked write', (await settled(write)) === 'pending', 'the write did not park');
+    let thrown = null;
+    try { ctrl.enqueue('out of band'); } catch (e) { thrown = e; }
+    check('size enqueue throws', thrown === failure, `enqueue threw ${String(thrown)}`);
+    const released = await outcome(write);
+    check(
+      'size unblocks write',
+      released.state === 'rejected' && released.value === failure,
+      `the parked write settled as ${released.state}:${String(released.value)}`,
+    );
+    let terminateError = null;
+    try { ctrl.terminate(); } catch (e) { terminateError = e; }
+    check('size terminate quiet', terminateError === null, `terminate threw ${String(terminateError)}`);
+    check(
+      'size errors readable',
+      (await settled(readable.getReader().read())) === 'rejected:Error: size failed',
+      'the readable did not error',
+    );
+  }
+
   return { failures };
 };
 
