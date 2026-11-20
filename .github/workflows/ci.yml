@@ -83,12 +83,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: 1.98.1
-      # The ltx fault-injection oracle diffs databases with the sqlite3 CLI.
-      - name: Install sqlite3
-        run: |
-          set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends sqlite3
       # The deploy `--sourcemap` tests bundle a fixture through esbuild, like
       # a Worker deploy does. Pinned by version and by the npm tarballs'
       # sha512 (the same pins the Dockerfile test stage carried); installed
@@ -100,7 +94,7 @@ jobs:
             amd64) pkg=linux-x64
                    sha=e314d9af5154992a105b85c85a68addedcd0ad44d933e3773f45d5f3144e298179d177c8ef178ef74fb56d9bcdc3122e7d0f610d0551247e588603d517c03f1d ;;
             arm64) pkg=linux-arm64
-                   sha=a56e000b43f78adf1cedda3d315338a79d45cc7cdd33f4d9adea045c1c9d964dad5543504b88af5b319dc7e9049c38a23922659aca5b6c8805604ff768fa52 ;;
+                   sha=a56e000b43f78adf1cedda3d315338a79d45cc7cdd33f4d9adeaeeae045c1c9d964dad55435088ab5f319dc7e9049c38a23922659aca5b6c8805604ff768fa52 ;;
             *) echo "unsupported arch ${{ matrix.suffix }} for esbuild" >&2; exit 1 ;;
           esac
           curl -fsSL -o /tmp/esbuild.tgz \
