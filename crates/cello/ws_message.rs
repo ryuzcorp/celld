@@ -16,18 +16,21 @@
 //!
 //! Before each frame the parser's per-frame limit is narrowed to what the
 //! message has left, so an over-cap frame is refused from its header,
-//! before its payload is read. Reading one message therefore holds at most
-//! the assembly (length and capacity both within the cap) plus the one
-//! frame being copied into it, and frame plus assembly never pass the cap
-//! by more than a control frame: about 2 × 32 MiB transient during a copy,
-//! 32 MiB once it lands.
+//! before its payload is read. The assembly (length and capacity) stays
+//! within the cap. The parser's own read buffer is fastwebsockets'
+//! (`BytesMut`): it reserves room for each frame, keeps that allocation
+//! after handing the payload out, and a later reservation may grow it to
+//! about twice the largest frame. A payload is copied out of it before it
+//! joins the assembly. Reading one socket's messages therefore holds up to
+//! about 32 MiB of assembly plus about 64 MiB in the parser: under 100 MiB,
+//! where an uncapped peer could previously grow it without bound.
 //!
 //! Bytes held mid-assembly are deliberately *not* charged against
 //! [`crate::isolate_pipe::ISOLATE_PIPE_MAX_STAGED_BYTES`]: the assembly
 //! buffer is bounded by this cap on its own, and it is released into the
 //! staged queue — where the staged cap does count it — the moment the
 //! message completes. The worst case per socket is therefore the read bound
-//! above plus one full staged budget (about 64 MiB + 16 MiB), never an
+//! above plus one full staged budget (under 100 MiB + 16 MiB), never an
 //! unbounded flood. Counting the same bytes in both ledgers would need a
 //! charge transfer at completion and risk the double-release the pipe
 //! budgets exist to avoid.

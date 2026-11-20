@@ -205,11 +205,11 @@ The `tail` and `email` handlers are unavailable.
   Too Big) instead of growing host memory without bound, and the cell
   observes the 1009 as an abnormal application close. Each frame is held
   to what its message has left, so a frame that would pass the cap is
-  refused from its header before its payload is read. Bytes held
-  mid-assembly do not count against the 16 MiB staging cap above: reading
-  a message holds up to 32 MiB of assembly plus the frame being copied
-  into it (about 64 MiB at the peak of that copy), so the worst case per
-  socket is about 64 MiB plus one full staged budget.
+  refused from its header before its payload is read. Bytes held while a
+  message is read do not count against the 16 MiB staging cap above: up
+  to 32 MiB of assembly plus the WebSocket parser's read buffer, which can
+  keep about twice the largest frame (about 64 MiB). The worst case per
+  socket is therefore under about 100 MiB plus one full staged budget.
 - Socket delivery is best-effort: if a 1011 attempt times out, the local
   pipe still reports 1011 but the wire peer may see an abnormal disconnect
   with no Close frame. Likewise, a write that stops mid-frame poisons the
