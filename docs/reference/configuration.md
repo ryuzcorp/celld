@@ -55,7 +55,7 @@ Telemetry variables (`CELLO_OTEL*`, `OTEL_*`) live on the [telemetry](../guides/
 | `CELLO_MAX_REQUEST_BODY_BYTES` | `1 GiB` | The body limit for a public Worker request or a direct Durable Object request. |
 | `CELLO_TMP_MAX_BYTES` | `67108864` (64 MiB) | The per-request `/tmp` size limit in bytes. A write past it fails with `ENOSPC`. |
 | `CELLO_HANDLER_BUDGET_S` | `300` | The JavaScript handler budget in seconds. |
-| `CELLO_BACKGROUND_BUDGET_S` | `30` | Post-response background budget in seconds. Past it the driver ends leftover timers and `waitUntil` work. A streaming response body is not background work and is never charged to it: it runs while the client stays connected and the body keeps producing. |
+| `CELLO_BACKGROUND_BUDGET_S` | `30` | Post-response background budget in seconds. Past it the driver ends leftover timers and `waitUntil` work. A streaming response body is not background work and is never charged to it: it runs while the client stays connected and the body keeps producing. While a body streams, expiry ends the `waitUntil` claim, but timers that work already started keep running until one budget window after the body ends. |
 | `CELLO_FETCH_TIMEOUT_S` | `120` | Outbound fetch timeout in seconds. |
 | `CELLO_SQL_STATEMENT_MS` | unset (unbounded) | The per-statement SQL time bound in milliseconds. A timed-out statement fails with a catchable timeout error and rolls back. |
 | `CELLO_V8_HEAP_LIMIT_MB` | unset | Per-isolate V8 heap limit in MiB. |
