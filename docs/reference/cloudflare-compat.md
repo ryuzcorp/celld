@@ -83,6 +83,11 @@ use. An unsupported feature that stays silent is a defect.
   read both branches concurrently`, and the other copies keep flowing to
   completion. Workerd buffers for the slower copy within the isolate's
   128 MB limit instead of failing it.
+- A streamed response body that produces no bytes for 60 seconds ends,
+  even while the client stays connected. Workerd keeps an idle body open.
+  Send a keepalive (an SSE comment line such as `: ping`) at least once a
+  minute. A body that keeps producing streams for as long as the client
+  listens; `CELLO_BACKGROUND_BUDGET_S` never ends it.
 - A remote Durable Object call cannot retry after request-body
   transmission starts, because Cello keeps no replay copy.
 - A remote Durable Object call waits for a rejected owner generation to

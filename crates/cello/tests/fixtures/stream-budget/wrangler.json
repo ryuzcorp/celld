@@ -1,0 +1,8 @@
+{
+  "name": "stream-budget",
+  "main": "index.js",
+  "compatibility_date": "2026-01-01",
+  "no_bundle": true,
+  "durable_objects": { "bindings": [{ "name": "STREAMER", "class_name": "Streamer" }] },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Streamer"] }]
+}

@@ -1,4 +1,4 @@
-// Modified by Ryuz Corp (Cello): cross-isolate RPC stubs and streams; D1 export operator-ingress marker; ported from meln1k/cello: report wake coverage after maintenance (e6cb9a3); wake coverage follow-ups: startup observation ordering, installation comparison; trusted cell RPC; deployment cache scope purge on generation free; staged invoke joins the driver past the reply.; answered drivers poll while waitUntil background is outstanding (upstream #300); drivers take the mailbox once more before retiring (upstream #309); post-response background budget ends orphaned drives (upstream #275); storage-poisoned cells restart on a fresh isolate (upstream #291); restore fails a vanished class before touching disk (upstream #276); incoming spans carry HTTP method/status and 5xx without exception marks error (upstream #285); CELLO_MAX_CELLS_PER_ISOLATE knob (upstream #278).
+// Modified by Ryuz Corp (Cello): cross-isolate RPC stubs and streams; D1 export operator-ingress marker; ported from meln1k/cello: report wake coverage after maintenance (e6cb9a3); wake coverage follow-ups: startup observation ordering, installation comparison; trusted cell RPC; deployment cache scope purge on generation free; staged invoke joins the driver past the reply.; answered drivers poll while waitUntil background is outstanding (upstream #300); drivers take the mailbox once more before retiring (upstream #309); post-response background budget ends orphaned drives (upstream #275); storage-poisoned cells restart on a fresh isolate (upstream #291); restore fails a vanished class before touching disk (upstream #276); incoming spans carry HTTP method/status and 5xx without exception marks error (upstream #285); CELLO_MAX_CELLS_PER_ISOLATE knob (upstream #278); response bodies stream past the background budget (upstream #275).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 // RuntimeManager is the V8 cell-host arm, so its executor and observability
@@ -2451,20 +2451,9 @@ async fn drive_worker(
                     Vec::new()
                 }
                 Wake::BackgroundExpired => {
-                    let background_budget = crate::engine_api::background_budget();
+                    let streaming = entry.has_response_stream();
                     entry.expire_background();
-                    if entry.keeps_native_ops() {
-                        tracing::warn!(
-                            budget_s = background_budget.as_secs(),
-                            "background work outlived its budget but keeps native ops; not ending it"
-                        );
-                    } else {
-                        tracing::info!(
-                            event = "cell_background_expired",
-                            budget_s = background_budget.as_secs(),
-                            "post-response work outlived its budget; ending it"
-                        );
-                    }
+                    log_background_expired(streaming, entry.keeps_native_ops(), None);
                     Vec::new()
                 }
                 Wake::Idle => {
@@ -2549,6 +2538,38 @@ enum Wake {
     Poll,
 }
 
+/// Report a post-response background phase the budget ended (upstream #275).
+///
+/// A streaming response body is not background work, so its expiry ends only
+/// the `waitUntil` claim the entry happens to share with the body: the body
+/// keeps streaming, and its own ops stay polled. Nothing is unhealthy there,
+/// so it is not a warning.
+fn log_background_expired(streaming: bool, keeps_native_ops: bool, scope: Option<&str>) {
+    let budget_s = crate::engine_api::background_budget().as_secs();
+    let scope = scope.unwrap_or("");
+    if streaming {
+        tracing::info!(
+            event = "cell_background_expired",
+            budget_s,
+            scope,
+            "post-response work outlived its budget while a response body streams; ended the background claim, the body keeps streaming"
+        );
+    } else if keeps_native_ops {
+        tracing::warn!(
+            budget_s,
+            scope,
+            "background work outlived its budget but keeps native ops; not ending it"
+        );
+    } else {
+        tracing::info!(
+            event = "cell_background_expired",
+            budget_s,
+            scope,
+            "post-response work outlived its budget; ending it"
+        );
+    }
+}
+
 fn take_cancellation_wake(request_id: Option<js::RequestId>) -> Option<Wake> {
     js::take_request_cancellation(request_id).then(|| Wake::Cancelled {
         shutdown: js::take_shutdown_cancellation(request_id),
@@ -2572,8 +2593,17 @@ async fn wake_with_cross_entry_gate(
     // ends the background work, so a retiring generation drains instead of
     // pinning a heap per deploy. The clock starts when the response is
     // fully released (past the output gate), not when the handler settles.
+    //
+    // An open response body is not background work: it streams for as long
+    // as the client stays connected and the body keeps producing, so the
+    // budget never ends it. The `waitUntil` claim it shares the entry with is
+    // still bounded: expiry drops that claim, and the body keeps the ops it
+    // is made of (see the `BackgroundExpired` arm). Once that claim is gone,
+    // a streaming entry has nothing left to expire, so the gate stays quiet
+    // instead of re-expiring (and logging) every budget window per stream.
     if entry.remaining(budget).is_none()
         && entry.gated_reply_and_io_context().0.is_none()
+        && (entry.has_background() || !entry.has_response_stream())
         && entry.background_expired(crate::engine_api::background_budget())
     {
         return Wake::BackgroundExpired;
@@ -2672,9 +2702,10 @@ async fn wake(ops: &mut Ops, entry: &mut js::InFlight, budget: Duration) -> Wake
                 }
                 continue;
             }
-            // The reply arrived, so only waitUntil work remains. A client
-            // disconnect no longer matters, but a lifecycle cancellation
-            // must still retire the background work before the runtime stops.
+            // The reply arrived, so only waitUntil work and any streaming
+            // response body remain. A client disconnect no longer matters to
+            // the handler, but a lifecycle cancellation must still retire
+            // that work before the runtime stops.
             let Some(request_id) = request_id else {
                 let context = entry.io_context();
                 let next = asyncrt::select_biased! {
@@ -2685,13 +2716,14 @@ async fn wake(ops: &mut Ops, entry: &mut js::InFlight, budget: Duration) -> Wake
                 match next {
                     Some(Some((op, result))) => return Wake::Op(op, result),
                     Some(None) => {
-                        if entry.has_background() {
-                            // Answered, driving `waitUntil` work, with no
-                            // native op of its own: the background can settle
-                            // through another event, so look in instead of
-                            // concluding the entry waits on nothing and
-                            // abandoning the work (denoland/celld#300).
-                            // Throttled like the unanswered empty-ops path.
+                        if entry.has_background() || entry.has_response_stream() {
+                            // Answered, driving `waitUntil` work or a
+                            // response body, with no native op of its own:
+                            // either can settle through another event, so
+                            // look in instead of concluding the entry waits
+                            // on nothing and abandoning the work
+                            // (denoland/celld#300). Throttled like the
+                            // unanswered empty-ops path.
                             asyncrt::sleep(CANCELLATION_TICK).await;
                             return Wake::Poll;
                         }
@@ -2714,14 +2746,14 @@ async fn wake(ops: &mut Ops, entry: &mut js::InFlight, budget: Duration) -> Wake
                         return cancelled;
                     }
                 }
-                if entry.has_background() {
-                    // Answered, driving `waitUntil` work with no native op
-                    // of its own: the background can settle through another
-                    // event (a shared promise it awaited, resolved
-                    // elsewhere), and no turn would otherwise observe that.
-                    // Look in so settle() sees it and the entry retires,
-                    // instead of spinning here past its purpose
-                    // (denoland/celld#289). Already throttled above.
+                if entry.has_background() || entry.has_response_stream() {
+                    // Answered, driving `waitUntil` work or a response body
+                    // with no native op of its own: either can settle
+                    // through another event (a shared promise it awaited,
+                    // resolved elsewhere), and no turn would otherwise
+                    // observe that. Look in so settle() sees it and the
+                    // entry retires, instead of spinning here past its
+                    // purpose (denoland/celld#289). Already throttled above.
                     return Wake::Poll;
                 }
                 None
@@ -3890,23 +3922,12 @@ async fn drive_cell_inner(
                 // background claim, and lets the abort pass below release
                 // the isolate. An event still holding the cell's input
                 // gate or running another event's critical section keeps
-                // its ops by design, and stays loud about it.
-                let background_budget = crate::engine_api::background_budget();
+                // its ops by design, and stays loud about it — and so does
+                // one whose response body is still streaming, which keeps
+                // the ops the body is made of.
+                let streaming = entry.has_response_stream();
                 entry.expire_background();
-                if entry.keeps_native_ops() {
-                    tracing::warn!(
-                        scope = %scope,
-                        budget_s = background_budget.as_secs(),
-                        "background work outlived its budget but keeps native ops; not ending it"
-                    );
-                } else {
-                    tracing::info!(
-                        event = "cell_background_expired",
-                        scope = %scope,
-                        budget_s = background_budget.as_secs(),
-                        "post-response work outlived its budget; ending it"
-                    );
-                }
+                log_background_expired(streaming, entry.keeps_native_ops(), Some(&scope));
                 (Vec::new(), Vec::new())
             }
             Wake::Idle => {

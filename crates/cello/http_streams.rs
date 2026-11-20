@@ -180,6 +180,11 @@ impl HttpStreamTerminationReason {
 
 pub(crate) struct HttpStreamTermination {
     reason: AtomicU8,
+    /// One waker, but a response entry has two observers: the host's
+    /// transferred stream and a pump send blocked on backpressure. A wake
+    /// reaches the last registrant only; the blocked send still ends because
+    /// the transferred stream owns the receiver and drops it when it sees the
+    /// termination. Keep that ownership, or give the send its own waker.
     waiter: futures_util::task::AtomicWaker,
 }
 
@@ -253,6 +258,13 @@ pub(crate) struct HttpStreamEntry {
     active_writes: usize,
     active_closes: usize,
     closing: bool,
+    /// Whether this entry carries a response body writer (upstream #275).
+    /// The host consumes such a stream through a transfer lease for its whole
+    /// life, so the lease is not "an owner that can still read": the deadline
+    /// must still apply, or a stalled body (a producer that stops, or a
+    /// client that stops reading and holds a write) would pin the node
+    /// indefinitely.
+    response: bool,
 }
 
 pub(crate) struct ResponseStreamWriter {
@@ -261,7 +273,12 @@ pub(crate) struct ResponseStreamWriter {
 }
 
 impl HttpStreamEntry {
-    pub(crate) fn new(generation: u64, deadline_ms: u64, source: HttpStreamSource) -> Self {
+    pub(crate) fn new(
+        generation: u64,
+        deadline_ms: u64,
+        source: HttpStreamSource,
+        response: bool,
+    ) -> Self {
         Self {
             generation,
             deadline_ms,
@@ -271,6 +288,7 @@ impl HttpStreamEntry {
             active_writes: 0,
             active_closes: 0,
             closing: false,
+            response,
         }
     }
 
@@ -281,8 +299,30 @@ impl HttpStreamEntry {
             && self.active_closes == 0
     }
 
+    /// Whether this entry's deadline is a wake the sweeper must schedule.
+    ///
+    /// A response body is transferred to the host for its whole life, so its
+    /// source stays leased; it still needs the deadline watched (upstream
+    /// #275).
+    fn watches_deadline(&self) -> bool {
+        self.is_expiry_eligible() || self.response
+    }
+
     fn is_due(&self, now_ms: u64) -> bool {
-        self.is_expiry_eligible() && now_ms >= self.deadline_ms
+        if now_ms < self.deadline_ms {
+            return false;
+        }
+        if self.response {
+            // A response body's deadline is refreshed by every successful
+            // write and every chunk the host transfers, so reaching it means
+            // the body really is stalled: no producer output, or a client
+            // that stopped reading and left a write or an error close
+            // blocked on backpressure. Expire it whatever holds the entry;
+            // the blocked write or close observes the termination and ends
+            // the pump.
+            return true;
+        }
+        self.is_expiry_eligible()
     }
 }
 
@@ -747,9 +787,15 @@ impl HttpStreamService {
                 );
                 let generation = Self::next_sequence(&mut state.next_generation);
                 let deadline_ms = now_ms.saturating_add(HTTP_STREAM_IDLE_TIMEOUT_MS);
+                let response = candidate_writer.is_some();
                 state.sources.insert(
                     stream_id,
-                    HttpStreamEntry::new(generation, deadline_ms, candidate_source.take().unwrap()),
+                    HttpStreamEntry::new(
+                        generation,
+                        deadline_ms,
+                        candidate_source.take().unwrap(),
+                        response,
+                    ),
                 );
                 if let Some(writer) = candidate_writer.take() {
                     state.response_writers.insert(stream_id, writer);
@@ -767,7 +813,7 @@ impl HttpStreamService {
 
         if !accepted {
             if let Some(source) = candidate_source.take() {
-                let rejected = HttpStreamEntry::new(0, 0, source);
+                let rejected = HttpStreamEntry::new(0, 0, source, false);
                 rejected
                     .termination
                     .commit(HttpStreamTerminationReason::Cancelled);
@@ -1260,7 +1306,12 @@ impl HttpStreamService {
                                         entry.closing = true;
                                     }
                                 }
-                                acquired = Some((writer, finished, entry.generation));
+                                acquired = Some((
+                                    writer,
+                                    finished,
+                                    entry.termination.clone(),
+                                    entry.generation,
+                                ));
                             }
                         }
                     }
@@ -1271,12 +1322,13 @@ impl HttpStreamService {
         }
         self.sweeper_notify.notify_one();
         drain.dispose_propagating();
-        let Some((writer, finished, generation)) = acquired else {
+        let Some((writer, finished, termination, generation)) = acquired else {
             return Err(error.unwrap_or(HttpStreamActivityError::Gone));
         };
         Ok(HttpStreamActivity {
             writer,
             finished,
+            termination,
             lease: HttpStreamActivityLease {
                 service: self.clone(),
                 stream_id,
@@ -1418,7 +1470,7 @@ impl HttpStreamService {
                 } else if let Some(deadline_ms) = state
                     .sources
                     .values()
-                    .filter(|entry| entry.is_expiry_eligible())
+                    .filter(|entry| entry.watches_deadline())
                     .map(|entry| entry.deadline_ms)
                     .min()
                 {
@@ -1643,7 +1695,25 @@ struct HttpStreamActivityLease {
 pub(crate) struct HttpStreamActivity {
     writer: tokio::sync::mpsc::Sender<Result<Vec<u8>, String>>,
     finished: tokio::sync::watch::Sender<bool>,
+    /// The entry's termination: a send blocked on a consumer that stopped
+    /// reading must end when the entry expires, because dropping the
+    /// registry's senders cannot wake it (only the receiver's drop does, and
+    /// the receiver sits in a transfer nobody polls).
+    termination: Arc<HttpStreamTermination>,
     lease: HttpStreamActivityLease,
+}
+
+impl HttpStreamActivity {
+    /// Queue `item` for the consumer, or give up when the entry terminates
+    /// first. `false` means the item was not delivered.
+    async fn send(&self, item: Result<Vec<u8>, String>) -> bool {
+        let termination = self.termination.clone();
+        let sent = crate::asyncrt::select! {
+            result = self.writer.send(item) => result.is_ok(),
+            _ = futures_util::future::poll_fn(|context| termination.poll_reason(context)) => false,
+        };
+        sent
+    }
 }
 
 impl HttpStreamActivityLease {
@@ -2124,7 +2194,7 @@ pub(crate) async fn response_stream_write(
     let activity = service
         .begin_activity(stream_id, HttpStreamActivityKind::Write)
         .map_err(|error| error.write_message().to_string())?;
-    if activity.writer.send(Ok(bytes)).await.is_err() {
+    if !activity.send(Ok(bytes)).await {
         activity.lease.cancel_pair();
         return Err(RESPONSE_STREAM_CONSUMER_CANCELED.into());
     }
@@ -2151,7 +2221,7 @@ pub(crate) async fn response_stream_close(
     if error.is_empty() {
         let _ = activity.finished.send(true);
     } else {
-        if activity.writer.send(Err(error)).await.is_err() {
+        if !activity.send(Err(error)).await {
             activity.lease.cancel_pair();
             return Ok(());
         }

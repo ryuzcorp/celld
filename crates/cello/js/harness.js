@@ -12977,6 +12977,16 @@ const __registerWaitUntil = __cello.__registerWaitUntil = (promise) => {
   });
   __wait_until(tracked);
 };
+// A response body is response work, not `waitUntil` work: it streams for as
+// long as the client stays connected and the body keeps producing, which
+// outlasts the post-response background budget by design. Its own hold keeps
+// the event (and the ops its body needs) alive, so the budget never seals the
+// pump the response is made of.
+const __holdResponseStream = (promise) => {
+  __response_stream_hold(Promise.resolve(promise).catch((error) => {
+    console.error("response body pump failed", error);
+  }));
+};
 // `props` are the per-stub props a loopback service stub carries
 // (ctx.props); `exports` is built once, on first access.
 const __defaultProps = {};
@@ -13649,10 +13659,13 @@ const __bridgeResponseStream = (body, requestControllers, onSettle) => {
         for (const controller of requestControllers || []) {
           if (!controller.signal.aborted) controller.abort(reason);
         }
-        try {
-          await reader.cancel(reason);
-        } catch {}
+        // The consumer is already gone, so the host stream closes first: a
+        // body whose cancel() never settles must not keep this pump (and the
+        // entry behind it) alive, and the close is the host work the driver
+        // can still drive. The producer's cancel still runs; nothing awaits
+        // it past this point.
         await __response_stream_close(streamId, "");
+        void reader.cancel(reason).catch(() => {});
       };
       try {
         for (;;) {
@@ -13690,7 +13703,10 @@ const __bridgeResponseStream = (body, requestControllers, onSettle) => {
       onSettle?.();
     }
   })();
-  __registerWaitUntil(pump);
+  // Response work, not background work: the pump outlives the response head
+  // and the post-response budget, and ends when the body ends, the client
+  // disconnects, or the runtime stops.
+  __holdResponseStream(pump);
   return streamId;
 };
 __cello.__readResponse = (r) => {
