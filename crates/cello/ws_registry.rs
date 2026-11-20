@@ -809,6 +809,15 @@ impl WsPipeBudget {
             .tripped
             .swap(true, std::sync::atomic::Ordering::Relaxed)
     }
+
+    /// Whether the direction tripped: the registry queued the overload marker
+    /// on the first refusal, even when the forwarder has not read it yet. The
+    /// pump's terminal arbitration reads this instead of only the forwarder's
+    /// `OverLimit` outcome, so a marker still queued behind admitted data
+    /// when the other direction wins the race still ends the pipe loudly.
+    pub fn is_tripped(&self) -> bool {
+        self.tripped.load(std::sync::atomic::Ordering::Relaxed)
+    }
 }
 
 #[derive(Default)]

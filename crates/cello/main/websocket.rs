@@ -1177,11 +1177,21 @@ where
     pump_write_frame(ws, frame, None).await.is_ok() && keep_open
 }
 
+/// Answer a peer close on the wire, reporting whether the reply was sent.
+///
+/// True when no reply is required (the handler already answered, or the end
+/// was abnormal) or the reply crossed; false when the reply was skipped or
+/// failed — a poisoned writer, or a peer that stopped reading mid-drain. A
+/// caller that reports a peer-initiated close marks it unclean when the
+/// reply never crossed: the handshake did not complete, however clean the
+/// peer's frame was. Application-initiated closes keep their own
+/// `close_reached_wire` handling.
 async fn echo_websocket_close<S>(
     writer: &PumpWriter<S>,
     close: &CloseState,
     application_sent_close: bool,
-) where
+) -> bool
+where
     S: tokio::io::AsyncWrite + Unpin,
 {
     if let Some(code) =
@@ -1190,11 +1200,22 @@ async fn echo_websocket_close<S>(
         // Bounded like every other pump socket write: a peer that stopped
         // reading must not park teardown. The echo is best-effort; the cell
         // already learned the close through its own dispatch.
-        let _ = cello::asyncrt::timeout(
-            PUMP_SEND_PROGRESS_TIMEOUT,
-            write_ws_out(writer, cello::js::WsOut::Close(code, close.1.clone())),
+        // `write_ws_out` reports channel order, not delivery — a Close
+        // always reads back false — so the frame write itself decides.
+        matches!(
+            cello::asyncrt::timeout(
+                PUMP_SEND_PROGRESS_TIMEOUT,
+                pump_write_frame(
+                    writer,
+                    fastwebsockets::Frame::close(code, close.1.as_bytes()),
+                    None,
+                ),
+            )
+            .await,
+            Ok(Ok(()))
         )
-        .await;
+    } else {
+        true
     }
 }
 
@@ -1335,6 +1356,12 @@ type PumpReadInFlight<S> =
 /// in any case, because it answers an unclean end with its own protocol
 /// echo after the pump returns.
 /// The initiator remains separate because only a peer close needs that echo.
+/// The mirror image holds for a peer close: when the writer is poisoned at
+/// the pump's return, the reply can never cross, so the peer's code and
+/// reason report `wasClean: false` — the abnormal end the peer observes.
+/// And a tripped outbound budget reports the loud 1011 even when its marker
+/// is still unread: the trip means the marker was queued, so the peer's
+/// clean close must not mask the flood that already tripped it.
 ///
 /// Reads stage ahead of a slow cell instead of parking behind its dispatch:
 /// dispatches run without any time bound, so a slow handler never trips the
@@ -1709,7 +1736,17 @@ where
                     // loud 1011 — the peer's clean close must not mask an
                     // outbound flood — and the wire attempt below runs when
                     // the parked write settled intact.
-                    if matches!(write_end, PipeDirectionEnd::OverLimit) {
+                    //
+                    // The marker itself can still be unread: a trip queues it
+                    // behind admitted data while the forwarder is settling a
+                    // parked send, and the shutdown then retires the direction
+                    // with the marker still in the channel. A tripped budget
+                    // means the marker was queued, so the loud 1011 still
+                    // wins; the peer's clean close is preserved only when
+                    // neither direction tripped.
+                    let write_overload = matches!(write_end, PipeDirectionEnd::OverLimit)
+                        || budget_out.is_tripped();
+                    if write_overload {
                         close = PumpClose {
                             state: (
                                 cello::js::WS_PIPE_OVERLOAD_CODE,
@@ -1719,8 +1756,7 @@ where
                             initiator: CloseInitiator::Application,
                         };
                     }
-                    let loud_1011 =
-                        read_loud_1011 || matches!(write_end, PipeDirectionEnd::OverLimit);
+                    let loud_1011 = read_loud_1011 || write_overload;
                     if loud_1011 && !writer.poisoned() {
                         let _ = cello::asyncrt::timeout(
                             PUMP_SEND_PROGRESS_TIMEOUT,
@@ -1837,6 +1873,19 @@ where
             }
         };
     }
+    // A peer close the pump could not answer is unclean: a write abandoned
+    // mid-frame — a timed-out parked send, a loud attempt that never
+    // acquired the writer — poisons it, and no further frame may follow, so
+    // the closing handshake never completed on the wire. The cell must see
+    // `wasClean: false`, like the 1011 and 1009 application closes and like
+    // workerd, which reports the abnormal end the peer observes instead of
+    // the clean frame it sent. The code and reason stay the peer's; only a
+    // peer close whose reply can still cross stays clean. This runs before
+    // the return so both callers report it: the cell path dispatches the
+    // close before its echo, and the worker path echoes before it reports.
+    if close.initiator == CloseInitiator::Peer && writer.poisoned() {
+        close.state.2 = false;
+    }
     (close, writer, receiver, budget_out)
 }
 
@@ -1881,8 +1930,17 @@ async fn worker_websocket_task<S>(
         budget,
     )
     .await;
-    if close.initiator == CloseInitiator::Peer {
-        echo_websocket_close(&writer, &close.state, false).await;
+    // A peer close whose reply never crossed is unclean: the handshake did
+    // not complete, so the worker observes the abnormal end the peer sees
+    // instead of the clean frame it sent. The code and reason stay the
+    // peer's. The pump already marks the poisoned case; the echo covers a
+    // reply that fails on a live writer — a peer that stopped reading
+    // mid-drain.
+    let mut close = close;
+    if close.initiator == CloseInitiator::Peer
+        && !echo_websocket_close(&writer, &close.state, false).await
+    {
+        close.state.2 = false;
     }
     let _ = worker
         .inbound()
@@ -3009,6 +3067,9 @@ mod pump_tests {
     /// close ends the read on the independent direction, and the parked write
     /// retires instead of holding the pump open. A parked send that ignores
     /// the shutdown parks forever, so the guard fails before the change.
+    /// The settle drops the parked send mid-frame and poisons the writer, so
+    /// the close reply can never cross: the pump still ends on the peer
+    /// close, but reports it unclean with the peer's code and reason.
     #[test]
     fn shutdown_during_parked_send_ends_pump() {
         test_runtime().block_on(async {
@@ -3040,17 +3101,22 @@ mod pump_tests {
                 .write_frame(fastwebsockets::Frame::close(1000, b"bye"))
                 .await
                 .expect("peer closes");
-            let (close, _, _, _) = tokio::time::timeout(std::time::Duration::from_secs(30), pump)
-                .await
-                .expect("shutdown must end the parked send")
-                .expect("pump joins");
+            let (close, writer, _, _) =
+                tokio::time::timeout(std::time::Duration::from_secs(30), pump)
+                    .await
+                    .expect("shutdown must end the parked send")
+                    .expect("pump joins");
+            assert!(
+                writer.poisoned(),
+                "the settled-away write poisons the writer"
+            );
             assert_eq!(
                 close,
                 PumpClose {
-                    state: (1000, "bye".to_string(), true),
+                    state: (1000, "bye".to_string(), false),
                     initiator: CloseInitiator::Peer,
                 },
-                "the pump ends on the peer close, not on the parked write"
+                "the pump ends on the peer close, but the unanswered reply reports unclean"
             );
         });
     }
@@ -3506,6 +3572,60 @@ mod pump_tests {
             // direction, so an instant EOF must not win the race and report
             // a transport end the test never staged.
             std::task::Poll::Pending
+        }
+    }
+    /// A test stream with a gated write side and a live read side: writes
+    /// park while the gate is closed (exactly like `GateStream`), while
+    /// reads come from a duplex the test feeds. Lets a test park an outbound
+    /// write holding the pump's writer lock and only then deliver the peer's
+    /// close — proving what the pump reports when its reply can never cross,
+    /// or what wins when a trip marker is still queued — with no timing
+    /// involved: the parked write is observed through the gate's attempt
+    /// count, and the peer close is written only after it parks.
+    struct ScriptedStream {
+        gate: Gate,
+        reader: tokio::io::DuplexStream,
+    }
+    impl tokio::io::AsyncRead for ScriptedStream {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            context: &mut std::task::Context<'_>,
+            buffer: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.get_mut().reader).poll_read(context, buffer)
+        }
+    }
+    impl tokio::io::AsyncWrite for ScriptedStream {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _context: &mut std::task::Context<'_>,
+            buffer: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            use std::sync::atomic::Ordering::SeqCst;
+            self.gate.attempts.fetch_add(1, SeqCst);
+            self.gate
+                .lengths
+                .lock()
+                .expect("gate lengths")
+                .push(buffer.len());
+            if self.gate.open.load(SeqCst) {
+                self.gate.bytes.fetch_add(buffer.len(), SeqCst);
+                std::task::Poll::Ready(Ok(buffer.len()))
+            } else {
+                std::task::Poll::Pending
+            }
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _context: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _context: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
         }
     }
     impl tokio::io::AsyncWrite for GateStream {
@@ -4084,7 +4204,13 @@ mod pump_tests {
                 };
                 // A clean peer close the handler did not answer: the echo
                 // would carry the peer's own code back.
-                echo_websocket_close(&pump_writer, &(1000, "bye".to_string(), true), false).await;
+                let reply_sent =
+                    echo_websocket_close(&pump_writer, &(1000, "bye".to_string(), true), false)
+                        .await;
+                assert_eq!(
+                    reply_sent, !poisoned,
+                    "the echo reports whether the reply crossed"
+                );
                 // Drop the whole server side: dropping only the write half
                 // would leave the peer open and the client would never see
                 // EOF below.
@@ -4120,6 +4246,151 @@ mod pump_tests {
                     );
                 }
             }
+        });
+    }
+
+    /// A peer close the pump cannot answer is unclean: the outbound data
+    /// parks on the closed gate holding the writer, the peer's close ends
+    /// the read, and the shutdown settles the parked send out its progress
+    /// bound — dropping it mid-frame and poisoning the writer — so the close
+    /// reply can never cross. The cell must see `wasClean: false` with the
+    /// peer's code and reason, like the 1011 and 1009 application closes.
+    /// Reporting the peer's clean close anyway (the pre-fix behavior) fails
+    /// the close assertion below. Sequenced through the gate and the duplex,
+    /// not the clock: the peer close is written only after the parked write
+    /// is observed, and the pump's own bound ends the settle.
+    #[test]
+    fn peer_close_with_poisoned_writer_reports_unclean() {
+        test_runtime().block_on(async {
+            let gate = Gate::closed();
+            let (mut peer, reader) = tokio::io::duplex(64 * 1024);
+            let mut socket = fastwebsockets::WebSocket::after_handshake(
+                ScriptedStream {
+                    gate: gate.clone(),
+                    reader,
+                },
+                fastwebsockets::Role::Server,
+            );
+            socket.set_auto_close(false);
+            // Held, not dropped: a channel close racing the parked send
+            // would retire the write direction before the peer close lands.
+            let (_outbound, outputs) = mpsc::unbounded_channel();
+            _outbound
+                .send(cello::js::WsOut::Binary(vec![9u8; 64 * 1024]))
+                .expect("stage frame");
+            let pump = tokio::spawn(pump_cell_socket(
+                socket,
+                outputs,
+                false,
+                |_: cello::js::WsIn| std::future::pending::<anyhow::Result<()>>(),
+                cello::js::WsPipeBudget::new(ISOLATE_PIPE_MAX_STAGED_BYTES),
+            ));
+            // The data write parks holding the writer; only then may the
+            // peer close arrive, so the settle below always drops a live
+            // parked send instead of racing an idle direction.
+            while gate.attempts() == 0 {
+                tokio::task::yield_now().await;
+            }
+            write_masked_frame(&mut peer, 0x8, &[0x03, 0xe8, b'b', b'y', b'e'])
+                .await
+                .expect("peer closes");
+            let (close, writer, _, _) =
+                tokio::time::timeout(std::time::Duration::from_secs(30), pump)
+                    .await
+                    .expect("the settle bound must end the pump")
+                    .expect("pump joins");
+            assert!(
+                writer.poisoned(),
+                "the settled-away write poisons the writer"
+            );
+            assert_eq!(
+                close,
+                PumpClose {
+                    state: (1000, "bye".to_string(), false),
+                    initiator: CloseInitiator::Peer,
+                },
+                "a peer close with no reply on the wire reports unclean"
+            );
+        });
+    }
+
+    /// An overload trip still wins when its marker is unread: the outbound
+    /// data parks on the closed gate, the cell's close arrives behind it and
+    /// pushes the forwarder into its settle — which stops polling the channel
+    /// — and the tripped marker queues behind both, still unread when the
+    /// peer's close ends the read first and the shutdown retires the
+    /// direction. The pump must still end loudly with the 1011 instead of
+    /// the peer's clean close. Keeping the clean close (the pre-fix
+    /// behavior) fails the close assertion below. Sequenced, not timed: the
+    /// channel order puts the marker behind the close, so the forwarder can
+    /// only meet the shutdown with the marker still queued.
+    #[test]
+    fn unread_overload_marker_still_wins_over_peer_close() {
+        test_runtime().block_on(async {
+            let gate = Gate::closed();
+            let (mut peer, reader) = tokio::io::duplex(64 * 1024);
+            let mut socket = fastwebsockets::WebSocket::after_handshake(
+                ScriptedStream {
+                    gate: gate.clone(),
+                    reader,
+                },
+                fastwebsockets::Role::Server,
+            );
+            socket.set_auto_close(false);
+            // Held, not dropped: a channel close racing the parked send
+            // would retire the write direction before the trip lands.
+            let (_outbound, outputs) = mpsc::unbounded_channel();
+            let budget = cello::js::WsPipeBudget::new(ISOLATE_PIPE_MAX_STAGED_BYTES);
+            _outbound
+                .send(cello::js::WsOut::Binary(vec![9u8; 1024 * 1024]))
+                .expect("stage frame");
+            let pump = tokio::spawn(pump_cell_socket(
+                socket,
+                outputs,
+                false,
+                |_: cello::js::WsIn| std::future::pending::<anyhow::Result<()>>(),
+                budget.clone(),
+            ));
+            // The data write parks holding the writer; the close behind it
+            // moves the forwarder into its settle, which no longer polls the
+            // channel, so the marker queued after it stays unread.
+            while gate.attempts() == 0 {
+                tokio::task::yield_now().await;
+            }
+            _outbound
+                .send(cello::js::WsOut::Close(1000, "done".into()))
+                .expect("stage close");
+            // Mirrors the registry's refusal path: the first refused frame
+            // trips the budget and queues the marker behind the admitted
+            // data, even though this test admits through the raw channel.
+            assert!(budget.trip(), "the test trip records");
+            _outbound
+                .send(cello::js::WsOut::Overload)
+                .expect("stage marker");
+            write_masked_frame(&mut peer, 0x8, &[0x03, 0xe8, b'b', b'y', b'e'])
+                .await
+                .expect("peer closes");
+            let (close, writer, _, _) =
+                tokio::time::timeout(std::time::Duration::from_secs(30), pump)
+                    .await
+                    .expect("the settle bound must end the pump")
+                    .expect("pump joins");
+            assert!(
+                writer.poisoned(),
+                "the settled-away write poisons the writer"
+            );
+            assert_eq!(
+                close,
+                PumpClose {
+                    state: (
+                        cello::js::WS_PIPE_OVERLOAD_CODE,
+                        cello::js::WS_PIPE_OVERLOAD_REASON.to_string(),
+                        false,
+                    ),
+                    initiator: CloseInitiator::Application,
+                },
+                "the tripped marker still ends the pump loudly"
+            );
         });
     }
 }
