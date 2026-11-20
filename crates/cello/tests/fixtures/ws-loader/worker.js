@@ -16,6 +16,7 @@ function echo() {
 // the wall clock, which does not advance mid-turn in the sandbox.
 const ROOM_MESSAGES = [];
 const ROOM_CLOSES = [];
+const ROOM_CLOSE_WAITERS = [];
 let ROOM_SPIN = 0;
 function roomSlow() {
   let x = 0;
@@ -23,9 +24,31 @@ function roomSlow() {
   ROOM_SPIN = (ROOM_SPIN + x) % 1000000007;
 }
 export class Room extends DurableObject {
-  fetch(req) {
+  async fetch(req) {
     const url = new URL(req.url);
     if (url.pathname === "/messages") {
+      // With `?wait-close=1` the Room rendezvouses with the close instead of
+      // racing it: the caller's own close event only proves the pipe echoed
+      // the close back, not that the Room's `close` listener has run, and a
+      // direct fetch takes a shorter path than the queued close event, so an
+      // immediate read can land between the last text and the close (under
+      // load it does). The close listener below resolves the waiter, so the
+      // read sleeps only via the timeout race — no polling — and a timeout
+      // fails explicitly, so a genuine close loss still fails loudly instead
+      // of hanging the test.
+      if (url.searchParams.get("wait-close") === "1" && ROOM_CLOSES.length === 0) {
+        // The check and the registration run in one synchronous turn, so the
+        // close cannot land between them and no wakeup is missed.
+        const recorded = new Promise((resolve) => {
+          ROOM_CLOSE_WAITERS.push(resolve);
+        });
+        const timedOut = new Promise((resolve) =>
+          setTimeout(() => resolve("timed-out"), 30000));
+        const wait = recorded.then(() => "recorded");
+        if ((await Promise.race([wait, timedOut])) === "timed-out") {
+          return Response.json({ error: "loaded close never recorded" }, { status: 500 });
+        }
+      }
       return Response.json({ messages: ROOM_MESSAGES, closes: ROOM_CLOSES });
     }
     const closeAfterEcho = url.searchParams.get("close-after-echo") === "1";
@@ -50,6 +73,9 @@ export class Room extends DurableObject {
     });
     server.addEventListener("close", (e) => {
       ROOM_CLOSES.push({ code: e.code, reason: e.reason, wasClean: e.wasClean });
+      // Wake any `?wait-close=1` read: it registered before yielding, so no
+      // wakeup is missed.
+      for (const resolve of ROOM_CLOSE_WAITERS.splice(0)) resolve();
     });
     return new Response(null, { status: 101, webSocket: client });
   }
@@ -237,10 +263,18 @@ export default {
       return Response.json(result);
     }
     if (p === "/room-messages") {
+      // Forwards the query string so `?wait-close=1` reaches the Room, and
+      // propagates the Room's status: a rendezvous timeout must fail the
+      // test at the status assertion with the Room's explicit error, not at
+      // a missing-field panic.
+      const search = new URL(req.url).search;
       const res = await env.ROOM.get(env.ROOM.idFromName("r")).fetch(
-        new Request("http://x/messages"),
+        new Request("http://x/messages" + search),
       );
-      return Response.json(await res.json());
+      return new Response(await res.text(), {
+        status: res.status,
+        headers: { "content-type": "application/json" },
+      });
     }
     if (p === "/queued-close") {
       // The caller receives a text, then blocks its event loop before the
