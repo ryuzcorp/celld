@@ -744,3 +744,30 @@ fn attribution_request_tee_owned_by_running_entry() {
     assert_eq!(out["forwarded"], 1 << 20, "{out}");
     assert_eq!(out["local"], 1 << 20, "{out}");
 }
+
+#[test]
+fn attribution_request_tee_large_body_sequential_branches() {
+    let fixture = copy_fixture("attr-r2tee-large");
+    let node = TestNode::boot(fixture.path(), "attr-r2tee-large");
+
+    // 4 MiB arrives as dozens of host-stream chunks, far more than the tee
+    // pump's branch buffers once held. The waiter still reads its branches
+    // sequentially — the whole first branch through the subrequest fetch,
+    // then the second locally — so a pump that parks on the lagging branch
+    // while the drained branch starves deadlocks here instead of answering.
+    // The tee must buffer the skew, not stall on it.
+    let start = spawn_get(&node.public, "/r2-tee-start");
+    await_attr_started(&node, "r2tee");
+    let payload = vec![b'x'; 4 << 20];
+    let addr = node.public.clone();
+    let forward = std::thread::spawn(move || {
+        post_bytes(&addr, "/r2-tee-forward", &payload, Duration::from_secs(60))
+    });
+    release_attr_setup(&node, "r2tee", 1);
+    let started = join_json(start, "r2tee large start");
+    assert_eq!(started["ok"], true, "{started}");
+    let out = join_json(forward, "r2tee large forward");
+    assert_eq!(out["ok"], true, "{out}");
+    assert_eq!(out["forwarded"], 4 << 20, "{out}");
+    assert_eq!(out["local"], 4 << 20, "{out}");
+}

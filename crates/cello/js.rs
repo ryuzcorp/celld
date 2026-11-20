@@ -147,8 +147,6 @@ pub(crate) use crate::http_streams::HTTP_STREAM_DONE;
 pub(crate) use crate::http_streams::HTTP_STREAM_IDLE_TIMEOUT_MS;
 pub(crate) use crate::http_streams::HTTP_STREAM_REGISTRATION_CLOSED;
 #[cfg(all(test, cello_internal_tests))]
-pub(crate) use crate::http_streams::HTTP_TEE_BRANCH_CAPACITY;
-#[cfg(all(test, cello_internal_tests))]
 pub(crate) use crate::http_streams::NEXT_HTTP_STREAM_ID;
 pub use crate::wake_entry::forget_wake_entry;
 pub(crate) use crate::wake_entry::launch_arm_gate;
