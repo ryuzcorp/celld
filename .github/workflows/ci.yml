@@ -123,6 +123,8 @@ jobs:
     timeout-minutes: 5
     permissions:
       contents: read
+      # paths-filter lists a PR's changed files through the PR API.
+      pull-requests: read
     outputs:
       docker: ${{ steps.filter.outputs.docker }}
     steps:
