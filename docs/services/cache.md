@@ -10,10 +10,6 @@ The [Workers Cache API](https://developers.cloudflare.com/workers/runtime-apis/c
 
 Declare nothing. A response one request stores is visible to the next request on the same node.
 
-The full runnable version is in [`examples/cache`](https://github.com/ryuzcorp/cello/tree/main/examples/cache).
-
-<!-- cello-example: cache -->
-
 ```js
 export default {
   async fetch(request) {
