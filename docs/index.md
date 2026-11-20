@@ -1,8 +1,8 @@
-<!-- Modified by Ryuz Corp (Cello): CELLO_MEMORY_SCOPE; deploy --sourcemap writes the bundle's external map; operator token for the internal listener; r2 list --delimiter, the --page shape, and --cursor continuation; Workers Cache API page; deployment cache scope; deploy --sourcemap collects the no_bundle sibling map; staged invoke docs; deploy confines esbuild reads to the project; deploy --read-root; CELLO_SQLITE_CACHE_KB; CELLO_C_TRIM_MB; bucket-posture group commit docs: bundle switch default-on, linger, guarantees (0070); bundle switch defaults off (0075); CELLO_BACKGROUND_BUDGET_S (upstream #275); CELLO_TMP_MAX_BYTES (upstream #280); CELLO_SQL_STATEMENT_MS (upstream #274); CELLO_MAX_CELLS_PER_ISOLATE (upstream #278). -->
 ---
 title: Cello
 description: Self-hosted, distributed Durable Objects. Run your Cloudflare Workers application on your own machines.
 ---
+<!-- Modified by Ryuz Corp (Cello): CELLO_MEMORY_SCOPE; deploy --sourcemap writes the bundle's external map; operator token for the internal listener; r2 list --delimiter, the --page shape, and --cursor continuation; Workers Cache API page; deployment cache scope; deploy --sourcemap collects the no_bundle sibling map; staged invoke docs; deploy confines esbuild reads to the project; deploy --read-root; CELLO_SQLITE_CACHE_KB; CELLO_C_TRIM_MB; bucket-posture group commit docs: bundle switch default-on, linger, guarantees (0070); bundle switch defaults off (0075); CELLO_BACKGROUND_BUDGET_S (upstream #275); CELLO_TMP_MAX_BYTES (upstream #280); CELLO_SQL_STATEMENT_MS (upstream #274); CELLO_MAX_CELLS_PER_ISOLATE (upstream #278). -->
 
 Cello runs your Cloudflare Workers application on your own machines: Workers, Durable Objects, KV, Queues, D1, R2, Workflows, Cron Triggers, and static assets. You deploy the Wrangler project you already have. Cello stores the long-term state in a bucket you own: S3-compatible, Google Cloud Storage, or Azure Blob Storage.
 

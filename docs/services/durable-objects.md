@@ -1,8 +1,8 @@
-<!-- Modified by Ryuz Corp (Cello): stored-stub upgrade note. -->
 ---
 title: Durable Objects
 description: Keep per-name state in a cell, and reach it from any node by stub.
 ---
+<!-- Modified by Ryuz Corp (Cello): stored-stub upgrade note. -->
 
 A Durable Object is a single-threaded actor with its own SQLite database. Cello calls each running Durable Object a **cell**: exactly one node serves it at a time. Read the [Cloudflare Durable Objects documentation](https://developers.cloudflare.com/durable-objects/) for the standard API.
 
