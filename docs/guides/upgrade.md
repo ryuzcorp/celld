@@ -1,74 +1,35 @@
 ---
-title: Upgrading to 0.2.0
-description: Swap the binary or image on the same bucket; what Cello reads, writes, and no longer speaks.
+title: Upgrade Cello
+description: Move between releases without data loss, choosing a rolling or stop-all upgrade for your path.
 ---
 
-Cello 0.2.0 keeps your data and changes the wire. Stop every node of the
-old fleet, then start Cello 0.2.0 on the same bucket: celld-written data
-carries over, new writes use the `cello` spellings, and a mixed fleet of
-old and new nodes is unsupported.
+You upgrade by swapping the binary or image on the same bucket. Some releases roll node by node; others need every node stopped first. Check your path below before you start.
 
-## Upgrade steps
+## Pick the upgrade path
 
-1. **Stop all old nodes.** Cello 0.2.0 speaks a new peer protocol
-   (`cello-tunnel`, `x-cello-overload`, `cello-log-stream`, and a new
-   overload marker), so an old node and a new node cannot share a fleet.
-   There is no rolling upgrade from [denoland/celld](https://github.com/denoland/celld)
-   or Cello 0.1.x: stop every node first, then start 0.2.0.
-2. **Swap the binary or image.** `ghcr.io/ryuzcorp/cello:<semver>`
-   (`0.2.0`, `0.2`, `beta`, `latest`) replaces
-   `ghcr.io/ryuzcorp/celld:<version>-ryuzcorp.<n>`. Consumers pin by
-   digest as before. The bucket, its prefixes, and the node data
-   directories stay where they are.
-3. **Rename environment variables.** Every `CELLD_*` variable becomes
-   `CELLO_*`, strictly one-to-one, with no fallbacks and no aliases:
-   `CELLD_BUCKET` → `CELLO_BUCKET`, `CELLD_OPERATOR_TOKEN` →
-   `CELLO_OPERATOR_TOKEN`, `CELLD_DEV_STATE` → `CELLO_DEV_STATE`, and so
-   on. The node, `cello dev`, and every CLI refuse to start when any
-   `CELLD_*` variable is set, naming the `CELLO_*` spelling — a carried
-   over environment can never silently lose config. In particular a stale
-   `CELLD_OPERATOR_TOKEN` never leaves the internal listener open: the
-   node fails closed before serving anything.
-4. **Start Cello on the same bucket.** No export, no import, no rewrite
-   pass. Old data stays as it is until it is naturally rewritten.
+- **Stop all:** stop every node, then start the new version on the same bucket. No export, no import, no rewrite pass. Old data stays as it is until it is naturally rewritten.
+- **Rolling:** stop each node with SIGTERM, wait for its replacement to report healthy, then move to the next node. See [shut down and roll out](run-fleet.md#shut-down-and-roll-out-a-node).
 
-## What carries over
+Never run a mixed fleet except during a rolling upgrade, and never downgrade past the limit your path names.
 
-Persisted identifiers are written with the `cello` spelling and read
-with both, in one place per family, so the old spelling is obvious and
-easy to delete later:
+| Path | Mode | Downgrade limit |
+| --- | --- | --- |
+| celld / Cello 0.1.x to v0.2.0 | Stop all | No mixed fleet: 0.2.0 speaks a new peer protocol |
+| v0.2.1 to v0.3.0 | Rolling | Do not start v0.2.x after a node runs v0.3.0 unless its shutdown log contains `node-log close: sealed epoch`, or you can lose acknowledged writes. The default durability changes from `bucket` to `fleet` |
+| v0.3.0 to v0.4.0 | Stop all | A v0.3.0 node cannot read new large KV values, so a mixed fleet can make committed KV values unavailable |
+| v0.4.0 to v0.4.1 | Rolling | Paged restore starts one lease lifetime after the last v0.4.0 node stops. Do not start v0.4.0 after that: it cannot restore a paged cell |
+| v0.5.1 to v0.6.0 | Stop all with `fleet` durability | A v0.6.0 node refuses to start against a v0.5.1 follower. A `bucket` durability fleet can roll |
+| v0.6.0 to v0.6.1 | Rolling | Until every node runs v0.6.1, do not set `CELLO_LTX_RETENTION_SECS`, do not deploy a Python Worker, and do not raise `CELLO_MAX_ASSET_FILE_BYTES` above 25 MiB. A rollback to v0.6.0 can roll after you unset `CELLO_LTX_RETENTION_SECS` on every node |
+| v0.6.1 to v0.6.2 | Rolling | Until every node runs v0.6.2, a handler failure on the owner of a forwarded Durable Object fetch can reach the caller as a 500 response. A rollback to v0.6.1 can also roll |
+| v0.6.2 to v0.6.3 | Rolling | Upgrade each node promptly: v0.6.3 no longer trusts the emSign ECC Root CA - G3 certificate or eight compromised eMudhra intermediate CA certificates for outbound TLS. Until every node runs v0.6.3, a v0.6.2 node can still acquire a cell whose ownership record was lost and start it with an empty database. A rollback to v0.6.2 can also roll |
 
-- The runtime isolate pool script: new graphs record `__cello-runtime`;
-  graphs that record `__celld-runtime` still resolve to the runtime pool.
-- Stored stub rows: rows written before the binding-isolation patches
-  still decode as plain data on first read; storing them again writes
-  the new envelope.
-- The R2 user-metadata envelope: new objects carry `cello-r2`
-  (`cello_r2` on Azure Blob Storage); objects carrying `celld-r2` read
-  the same way. Cursors work under both the `cello-r2-cursor-v1.` and
-  the `celld-r2-cursor-v1.` spellings; new cursors use the new one.
-- Telemetry batches: the retention sweep lists the date-partitioned key
-  and never reads the forensic stamp, so batches stamped `celld-schema`
-  / `celld-retention` keep their lifecycle. New batches are stamped
-  `cello-schema` / `cello-retention`. Readers of the stamp itself must
-  accept both spellings.
-- Container image references: manifests that record `celld-image:<key>`
-  resolve to the same `deploy/images/<key>.tar` as `cello-image:<key>`;
-  new manifests record the new spelling.
+## Upgrade from celld or 0.1.x to 0.2.0
 
-Upstream `denoland/celld#NNN` links in comments and docs are historical
-references and still resolve.
+1. **Stop all old nodes.** Cello 0.2.0 speaks a new peer protocol (`cello-tunnel`, `x-cello-overload`, `cello-log-stream`, and a new overload marker), so an old node and a new node cannot share a fleet.
+2. **Swap the binary or image.** `ghcr.io/ryuzcorp/cello:<semver>` (`0.2.0`, `0.2`, `beta`, `latest`) replaces `ghcr.io/ryuzcorp/celld:<version>-ryuzcorp.<n>`. Consumers pin by digest as before. The bucket, its prefixes, and the node data directories stay where they are.
+3. **Rename environment variables.** Every `CELLD_*` variable becomes `CELLO_*`, strictly one-to-one, with no fallbacks and no aliases: `CELLD_BUCKET` → `CELLO_BUCKET`, `CELLD_OPERATOR_TOKEN` → `CELLO_OPERATOR_TOKEN`, `CELLD_DEV_STATE` → `CELLO_DEV_STATE`, and so on. The node, `cello dev`, and every CLI refuse to start when any `CELLD_*` variable is set, naming the `CELLO_*` spelling. A stale `CELLD_OPERATOR_TOKEN` never leaves the internal listener open: the node fails closed before serving anything.
+4. **Start Cello on the same bucket.** Cello 0.2.0 reads data a celld node wrote (new writes use the `cello` spellings).
 
-## What does not carry over
+Persisted identifiers are written with the `cello` spelling and read with both, in one place per family: the isolate pool script (`__cello-runtime`, still resolving `__celld-runtime`), stored stub rows, the R2 user-metadata envelope (`cello-r2`, and `cello_r2` on Azure; cursors under both `cello-r2-cursor-v1.` and `celld-r2-cursor-v1.`), telemetry batch stamps (`cello-schema` / `cello-retention` beside `celld-schema` / `celld-retention`), and container image references (`cello-image:<key>` beside `celld-image:<key>`). New writes use the new spelling.
 
-- **The wire.** The subprotocol, the overload signal, the log-stream
-  upgrade value, and the overload marker all use new spellings. Mixed
-  fleets are unsupported: a 0.2.0 node never peers with an older one.
-- **In-process names.** The isolate↔host `__cello` global, the
-  `__cello*` tokens, the `__CELLO_*__` sentinels, and the test-only
-  markers are never persisted; they were renamed outright.
-- **Local state.** `cello dev` keeps its state in `.cello/dev`; the old
-  `.celld/dev` directory is not read.
-- **Health and telemetry names** moved from `celld.*` to `cello.*` in
-  0.1.0 already (`cello.version` reports the build); update dashboards
-  and liveness probes if you have not.
+What does not carry over: the wire protocol (mixed fleets are unsupported), in-process names (the `__cello` global and `__CELLO_*__` sentinels were renamed outright), the old `.celld/dev` local state directory, and `celld.*` health and telemetry names (already `cello.*` since 0.1.0 — update dashboards and liveness probes).
