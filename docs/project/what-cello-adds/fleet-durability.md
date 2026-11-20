@@ -8,7 +8,7 @@ deployment activation, request invocation against staged versions, and
 the opt-in bucket-posture group commit. Includes the ported
 coordination-core fixes (`0025`–`0035`). Each entry names its fork patch
 number. The guarantees themselves are unchanged; see
-[What Cello guarantees](../guarantees.md).
+[What Cello guarantees](../../concepts/durability.md).
 
 ## Staged activation and invocation
 
@@ -18,7 +18,7 @@ number. The guarantees themselves are unchanged; see
   (service bindings resolve from the pointer's component map, queue
   attachments publish at activate time); `cello discard` removes
   versions no pointer names. See [Invoke a staged
-  version](../staged-invoke.md).
+  version](../../guides/staged-versions.md).
 - `0048` — `cello invoke` sends one HTTP request to a staged script
   version on one node, served by that version's code with its declared
   bindings against the real data — so a migration endpoint runs before

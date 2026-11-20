@@ -48,7 +48,7 @@ checks.
 
 - Rust, Docker, CI, tools, examples: this repo, same PR as its tests.
 - Docs: `docs/` is the Blume content folder; see
-  [Maintainers](https://cello.ryuz.eu/contributing). Build with
+  [Maintainers](https://cello.ryuz.eu/project/contributing). Build with
   `npm run dev`, gate with `npm run validate`.
 - One concern per PR, one commit per patch, with tests. Delete
   throwaway scripts before requesting review.

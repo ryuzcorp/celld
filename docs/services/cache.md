@@ -89,7 +89,7 @@ across scripts.
 
 Sharing is total: in deployment scope every script of the deployment can
 read, overwrite, and purge every other script's entries, which is why the
-scope is opt-in (see [security](../security.md#cache-scope-and-co-hosted-scripts)).
+scope is opt-in (see [security](../guides/security.md#cache-scope-and-co-hosted-scripts)).
 A different deployment — a redeploy with a new version, or another fleet —
 starts with an empty scope and never sees these entries; the old scope is
 dropped once its last serving generation drains. A forced reload of the

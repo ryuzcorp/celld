@@ -54,7 +54,7 @@ Exactly one node serves a cell at a time. A node claims a cell with a
 conditional write of an ownership record to the fleet bucket. Each activation
 advances a fencing epoch that appears in the storage prefix, so a node that
 lost the cell writes only into a superseded prefix. The
-[guarantees](../guarantees.md) page gives the full mechanism. Cello forwards
+[guarantees](../concepts/durability.md) page gives the full mechanism. Cello forwards
 each stub call to the owner node.
 
 Inside the cell, one synchronous turn runs at a time. An event that awaits can
@@ -120,7 +120,7 @@ and restores the live stub.
 - The imported `waitUntil()` and `ctx.waitUntil()` can add work while previously
   registered background work remains active.
 - An RPC stub cannot cross an isolate boundary. See
-  [RPC](../cloudflare-compat.md#rpc).
+  [RPC](../reference/cloudflare-compat.md#rpc).
 - An outbound WebSocket does not continue after the object moves to another
   node.
 - `SqlStorage.Cursor.toArray()` gives a Cello-specific error near the V8 heap
@@ -141,5 +141,5 @@ and restores the live stub.
   cursor holds uncommitted writes, so Cello rejects that output with an error.
   A read cursor can remain open.
 
-The [Cloudflare compatibility](../cloudflare-compat.md#services) page
+The [Cloudflare compatibility](../reference/cloudflare-compat.md#services) page
 lists the runtime APIs and the unsupported services.

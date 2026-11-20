@@ -171,7 +171,7 @@ count against `max_instances`. A start over the cap fails, and the node logs
   then ignores it, so a value of 0 or less throws and a valid value has no
   effect.
 - `getTcpPort(port).connect()` gives a socket with the lifetime of the event
-  that opened it. See [TCP sockets](../cloudflare-compat.md#tcp-sockets).
+  that opened it. See [TCP sockets](../reference/cloudflare-compat.md#tcp-sockets).
 - A `monitor()` promise and an `exec()` process do not keep the object active
   after the handler answers.
 - On macOS, the node reaches a container through a published port, so the image
@@ -184,5 +184,5 @@ count against `max_instances`. A start over the cap fails, and the node logs
   `OperationInterruptedError`, as after a container restart on Cloudflare. The
   next call starts a fresh container.
 
-The [Cloudflare compatibility](../cloudflare-compat.md#services) page lists
+The [Cloudflare compatibility](../reference/cloudflare-compat.md#services) page lists
 the runtime APIs and the unsupported services.

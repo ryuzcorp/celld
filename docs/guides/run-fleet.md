@@ -2,7 +2,7 @@
 
 # Operations
 
-How to configure storage, deploy, develop, and run a Cello fleet. For a new machine, start at [Install](install.md).
+How to configure storage, deploy, develop, and run a Cello fleet. For a new machine, start at [Install](../install.md).
 
 ## Configure object storage
 
@@ -68,7 +68,7 @@ Storage, Tigris, and Azure Blob Storage qualify; Backblaze B2, Hetzner,
 and DigitalOcean Spaces do not. MinIO (community edition) passes the
 storage test but is not qualified for production; do not use
 RELEASE.2025-09-06T17-38-46Z, which rejects the first deploy
-(denoland/celld#162). See [what Cello guarantees](guarantees.md).
+(denoland/celld#162). See [what Cello guarantees](../concepts/durability.md).
 
 ## Deploy an application
 
@@ -100,7 +100,7 @@ cello deploy . \
 bindings, variables, cron triggers, D1 databases, KV namespaces, Queues,
 R2 buckets, Workflows, WebAssembly modules, and static assets. An unknown
 Wrangler configuration key stops the deploy. See
-[Cloudflare compatibility](cloudflare-compat.md) for the complete boundary.
+[Cloudflare compatibility](../reference/cloudflare-compat.md) for the complete boundary.
 A node verifies the SHA-256 digest of each module before it builds a
 deployment. Pass `--sourcemap PATH` to also write the Worker's source
 map to a local file for stack-trace symbolication: the esbuild bundle's
@@ -247,7 +247,7 @@ cello invoke app=VERSION --path /migrate --method POST --bucket "$CELLO_BUCKET"
 The invoke moves no pointer and changes nothing serving. Only the
 operator can invoke: the internal-listener route requires the fleet
 signature plus the operator token when one is set. See
-[Invoke a staged version](staged-invoke.md).
+[Invoke a staged version](staged-versions.md).
 
 `cello versions [SCRIPT]` lists the deployed versions from one LIST of the
 deployment manifests, marking the serving generation current from the
@@ -426,7 +426,7 @@ release, so keep operator tooling and Cello releases together.
   (new writes use the `cello` spellings) but speaks a new peer protocol,
   so a fleet must not mix versions. Rename every `CELLD_*` variable to
   `CELLO_*`; the node refuses to start otherwise. See
-  [Compatibility](compatibility.md).
+  [Compatibility](upgrade.md).
 - **v0.2.1 to v0.3.0: rolling.** The default durability changes from
   `bucket` to `fleet`. Do not start a v0.2.x binary after a node runs
   v0.3.0 unless its shutdown log contains
@@ -563,7 +563,7 @@ unset variable selects its default. A Boolean variable accepts only `0` or
 | `CELLO_ACTIVATIONS` | Concurrent cold-cell activations (default: 8 per CPU, at least 16, at most 128) |
 | `CELLO_DEPLOY_POLL_S` | The deployment pointer poll interval in seconds (default: 30) |
 | `CELLO_DEPLOY_MAX_AGE_S` | Seconds before Cello forces a resident Durable Object onto a new deployment (default: 60; 0 forces at once) |
-| `CELLO_CACHE_SCOPE` | Which cache entries a Worker sees: `script` (default) isolates each script's entries, `deployment` shares one `caches.default` and one set of `caches.open(name)` namespaces across every script of the serving deployment, like one Cloudflare zone. See [cache](services/cache.md#cache-scope) and [security](security.md#cache-scope-and-co-hosted-scripts) |
+| `CELLO_CACHE_SCOPE` | Which cache entries a Worker sees: `script` (default) isolates each script's entries, `deployment` shares one `caches.default` and one set of `caches.open(name)` namespaces across every script of the serving deployment, like one Cloudflare zone. See [cache](../services/cache.md#cache-scope) and [security](security.md#cache-scope-and-co-hosted-scripts) |
 | `CELLO_OPERATION_DEADLINE_MS` | The deadline for a non-restore operation (default: 15000) |
 | `CELLO_MAX_CELL_REQUESTS` | Concurrent fetch events for one Durable Object (default: 64) |
 | `CELLO_MAX_CELLS_PER_ISOLATE` | Cells packed into one isolate (default: 32). Lower it for heavyweight cells such as agents |
@@ -578,14 +578,14 @@ unset variable selects its default. A Boolean variable accepts only `0` or
 | `CELLO_MEMORY_SCOPE` | Which cgroup the pressure sample and limit read: `container` (default) measures the cgroupfs root, `self` the process's own cgroup v2 leaf, falling back to the root with a warning on cgroup v1 or where the leaf is unreadable. With `self` and an unset `CELLO_MAX_RSS_MB`, the threshold defaults to 80% of the leaf's `memory.max` |
 | `CELLO_C_TRIM_MB` | Freed C-heap growth, in MiB, that earns another `malloc_trim` on the sampler tick (default: 8). Lower returns glibc free pages sooner after eviction batches |
 | `CELLO_DURABILITY` | `fleet` (default): the node sends each write to one or two other nodes and answers when they hold it on disk or the bucket upload finishes. A single node has no peer, so every write waits for the bucket. `bucket`: always wait for the bucket |
-| `CELLO_BUCKET_BUNDLES` | `0` (default): in bucket posture, upload per-cell L0 objects. Set `1` to group each flush round's dirty rows into shared bundle proofs (`log/<node>/<generation>/bundle/`). Bundling additionally needs every live lease to read format 3 (see [guarantees](guarantees.md#bucket-posture-bundle-proofs)); any other value stops startup |
+| `CELLO_BUCKET_BUNDLES` | `0` (default): in bucket posture, upload per-cell L0 objects. Set `1` to group each flush round's dirty rows into shared bundle proofs (`log/<node>/<generation>/bundle/`). Bundling additionally needs every live lease to read format 3 (see [guarantees](../concepts/durability.md#bucket-posture-bundle-proofs)); any other value stops startup |
 | `CELLO_BUCKET_BUNDLE_LINGER_MS` | Hold a bundle round open this many milliseconds after the first dirty wake so concurrent writes share one PUT (default: `0`; values above `1000` clamp to `1000`). The window applies only while more than one cell is dirty: a lone dirty cell flushes at once, so the linger costs latency only when it also saves PUTs. Measured on 200 agents × 6 writes (Class A PUT/POST/LIST): `1934` with bundling off, `1120`–`1136` with bundling on (two runs), `982`–`986` with `200` |
 | `CELLO_LOG_PIPELINE` | Fleet log rounds in flight (default: 4) |
 | `CELLO_LOG_HEDGE_MS` | The wait before a second copy of a slow log append. The default is adaptive: 4 times the slowest recent append, at least 250 ms. `0` disables the copy |
 | `CELLO_LTX_TRUNCATE_PAGES` | The WAL size, in pages, at which Cello truncates the WAL at the next checkpoint (default: 128, 512 KiB). A database larger than 4 MiB waits until the WAL is larger than the database. `0` disables it |
 | `CELLO_SQL_STATEMENT_MS` | The per-statement SQL time bound in milliseconds (unset: unbounded, the historical behavior). A timed-out statement fails with a catchable timeout error and rolls back |
 | `CELLO_SQLITE_CACHE_KB` | The SQLite page-cache budget per resident cell connection, in KiB (default: 2000, the stock ceiling). Lower bounds per-cell glibc retention on dense nodes; a working set past the cap faults pages back instead |
-| `CELLO_LTX_RETENTION_SECS` | Unset or `0` (default): Cello deletes no epoch prefix. A positive value enables [epoch GC](guarantees.md#epoch-gc): the owner deletes the prefixes below the restore base, but keeps its own epoch, the one before it, and each epoch younger than this many seconds. A pass runs at most every 5 minutes. With `CELLO_LTX_HYDRATE_MBPS=0`, a paged cell never qualifies. Epoch GC skips facet streams and needs [list-after-write consistency](guarantees.md#what-the-bucket-must-provide) |
+| `CELLO_LTX_RETENTION_SECS` | Unset or `0` (default): Cello deletes no epoch prefix. A positive value enables [epoch GC](../concepts/durability.md#epoch-gc): the owner deletes the prefixes below the restore base, but keeps its own epoch, the one before it, and each epoch younger than this many seconds. A pass runs at most every 5 minutes. With `CELLO_LTX_HYDRATE_MBPS=0`, a paged cell never qualifies. Epoch GC skips facet streams and needs [list-after-write consistency](../concepts/durability.md#what-the-bucket-must-provide) |
 | `CELLO_LTX_COMPACTION` | `1` (default) creates additive L1 objects, so a takeover reads tens of objects instead of thousands. Set `0` on every node of a mixed fleet until all nodes read v0.5.2 block objects |
 | `CELLO_LTX_COMPACTION_MIN_TXIDS` | The TXID distance that queues an L1 compaction (default: 256) |
 | `CELLO_LTX_COMPACTION_MIN_MB` | The L0 MiB that queue an L1 compaction (default: 32, at most 64) |

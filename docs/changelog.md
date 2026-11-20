@@ -38,7 +38,7 @@ data), `cello-r2` metadata and `cello-r2-cursor-*` cursors,
 `cello-schema` / `cello-retention`, and the `cello-image:` prefix. Data
 an older node wrote carries over with no migration step and no rewrite
 pass. In-process dunders and the wire identifiers were renamed outright.
-See [Compatibility](compatibility.md).
+See [Compatibility](guides/upgrade.md).
 
 
 ## v0.1.0
@@ -47,7 +47,7 @@ First Cello release. The renamed product: repo, crate, binary, and CLI
 are `cello`; `CELLD_*` is `CELLO_*`; `.celld/dev` is `.cello/dev`; the
 health path, telemetry names, and prose say Cello. Bucket objects, cell
 SQLite, stored values, and the node-to-node wire stay `celld`-spelled
-(see [Compatibility with celld](compatibility.md)). Includes everything
+(see [Compatibility with celld](guides/upgrade.md)). Includes everything
 below; no behavior change beyond the rename.
 
 Releases `v0.6.3-ryuzcorp.4` through `.13` shipped as celld, so their

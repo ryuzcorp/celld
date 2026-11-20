@@ -42,7 +42,7 @@ it must compile, so a throw in `getCode` surfaces at the first use of the
 Worker, not at `get()`.
 
 - A `modules` value can be a module object such as `{ wasm: bytes }`; the
-  [WebAssembly page](../wasm.md#dynamic-workers) shows that form. Cello refuses
+  [WebAssembly page](../reference/wasm.md#dynamic-workers) shows that form. Cello refuses
   bare bytes, as workerd does.
 - A relative import resolves from the name of the importing module, so
   `dir/a.js` can import `./b.js` when the map contains `dir/b.js`.
@@ -123,5 +123,5 @@ compiles the code again.
 - A loaded Worker entrypoint cannot transfer to another Worker. Awaitable and
   pipelined properties are also unavailable.
 
-The [Cloudflare compatibility](../cloudflare-compat.md#services) page
+The [Cloudflare compatibility](../reference/cloudflare-compat.md#services) page
 lists the runtime APIs and the unsupported services.

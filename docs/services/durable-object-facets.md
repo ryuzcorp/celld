@@ -116,5 +116,5 @@ closes it with `1011`.
   so a call must name one method.
 - The `clone()` method is unavailable.
 
-The [Cloudflare compatibility](../cloudflare-compat.md#services)
+The [Cloudflare compatibility](../reference/cloudflare-compat.md#services)
 page lists the runtime APIs and the unsupported services.
