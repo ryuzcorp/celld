@@ -7,7 +7,11 @@ A facet is a child object inside a Durable Object, with a SQLite database of its
 
 ## Run a minimal example
 
-The supervisor below loads the `App` class from an inline module and starts one facet named `"app"`. External traffic reaches the facet only through the supervisor.
+The supervisor below loads the `App` class from an inline module (abbreviated here; the full class is in the linked example) and starts one facet named `"app"`. External traffic reaches the facet only through the supervisor.
+
+The full runnable version is in [`examples/facets`](https://github.com/ryuzcorp/cello/tree/main/examples/facets).
+
+<!-- cello-example: facets -->
 
 ```jsonc
 // wrangler.jsonc

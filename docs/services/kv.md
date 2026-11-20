@@ -9,6 +9,10 @@ KV is a key-value store that a Worker reaches through a binding. Each namespace 
 
 This namespace stores one value per key: `PUT` writes the request body, `GET` reads it back, `DELETE` removes it. It runs unchanged on `cello dev` (verified with cello 0.2.1).
 
+The full runnable version is in [`examples/kv`](https://github.com/ryuzcorp/cello/tree/main/examples/kv).
+
+<!-- cello-example: kv -->
+
 ```jsonc
 // wrangler.jsonc
 {

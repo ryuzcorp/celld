@@ -29,6 +29,10 @@ curl "http://127.0.0.1:9876/?x=1"
 # Hello from cells! url=http://127.0.0.1:9876/?x=1
 ```
 
+The full runnable version is in [`examples/hello`](https://github.com/ryuzcorp/cello/tree/main/examples/hello).
+
+<!-- cello-example: hello -->
+
 ## Use the supported API
 
 - `fetch(request, env, ctx)` is the default export. It receives the inbound `Request` and returns a `Response`.
@@ -61,6 +65,10 @@ The [Cloudflare compatibility](../reference/cloudflare-compat.md#services) page 
 ## Python Workers
 
 A Worker whose `main` is a `.py` file uses the [Cloudflare Python Workers](https://developers.cloudflare.com/workers/languages/python/) API. The same project runs on Cloudflare without a change.
+
+The full runnable version is in [`examples/python`](https://github.com/ryuzcorp/cello/tree/main/examples/python).
+
+<!-- cello-example: python -->
 
 Run `uv run pywrangler sync` to vendor packages into `python_modules/`, then run `cello dev .`. The build rejects an incomplete Workers SDK (`workers-runtime-sdk`).
 
