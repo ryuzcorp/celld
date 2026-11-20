@@ -1,7 +1,27 @@
 ---
 title: Changelog
-description: What shipped in each Cello release, from v0.6.3-ryuzcorp.4 to v0.2.2.
+description: What shipped in each Cello release, from v0.6.3-ryuzcorp.4 to v0.2.3.
 ---
+## v0.2.3
+
+Streamed responses no longer die after 30 seconds. No configuration,
+data, or bucket-format changes.
+
+- **A streamed response body outlives the background budget** (#103).
+  Since v0.1.0, `CELLO_BACKGROUND_BUDGET_S` (30 s) also ended the response
+  body pump, so an SSE stream or any long download went silent about 30 s
+  after its handler answered, with the socket left open. A body now streams
+  for as long as the client stays connected and the body keeps producing.
+  `ctx.waitUntil()` work is still ended at the budget, also while its
+  entry streams.
+- **A stalled stream ends after 60 seconds without progress.** That covers
+  a body that produces nothing and a client that stops reading; the
+  producer is cancelled through its request signal. Send a keepalive (an
+  SSE comment) at least once a minute. Workerd keeps an idle body open.
+- **A client disconnect no longer waits on the body's `cancel()`.** The
+  host stream closes first, so a `cancel()` that never settles cannot pin
+  the request.
+
 ## v0.2.2
 
 Stream and WebSocket fixes, faster CI, and reorganized docs. No
