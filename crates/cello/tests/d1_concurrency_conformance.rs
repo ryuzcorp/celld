@@ -777,7 +777,7 @@ fn attribution_request_tee_skew_kills_lagging_branch() {
     let fixture = copy_fixture("attr-r2tee-skew");
     let node = TestNode::boot(fixture.path(), "attr-r2tee-skew");
 
-    // 40 MiB exceeds the host's 32 MiB per-branch skew cap. The waiter reads
+    // 40 MiB exceeds the host's 32 MiB request-shared skew cap. The waiter reads
     // only the first branch (through the subrequest fetch) and leaves the
     // second untouched, so the pump must fail the lagging branch instead of
     // buffering it without bound — while the first still flows to completion.
@@ -799,5 +799,47 @@ fn attribution_request_tee_skew_kills_lagging_branch() {
     assert!(
         error.contains("behind its sibling"),
         "lagging branch must report the skew cap: {out}"
+    );
+}
+
+#[test]
+fn attribution_request_tee_chain_shares_one_skew_budget() {
+    let fixture = copy_fixture("attr-r2tee-chain");
+    let node = TestNode::boot(fixture.path(), "attr-r2tee-chain");
+
+    // 24 MiB through a tee of a tee: each lagging branch alone stays under
+    // the 32 MiB cap, but their total passes it, so the request-shared
+    // budget must fail at least one of them — while the read branch still
+    // completes in full. Any branch that survives must be whole.
+    let start = spawn_get(&node.public, "/r2-tee-start");
+    await_attr_started(&node, "r2tee");
+    let payload = vec![b'x'; 24 << 20];
+    let addr = node.public.clone();
+    let chain = std::thread::spawn(move || {
+        post_bytes(&addr, "/r2-tee-chain", &payload, Duration::from_secs(120))
+    });
+    release_attr_setup(&node, "r2tee", 1);
+    let started = join_json(start, "r2tee chain start");
+    assert_eq!(started["ok"], true, "{started}");
+    let out = join_json(chain, "r2tee chain");
+    assert_eq!(out["ok"], true, "{out}");
+    assert_eq!(out["forwarded"], 24 << 20, "{out}");
+    let mut failed = 0;
+    for key in ["lagging1", "lagging2"] {
+        let branch = &out[key];
+        if branch["ok"] == false {
+            let error = branch["error"].as_str().unwrap_or_default();
+            assert!(
+                error.contains("behind its sibling"),
+                "{key} must report the skew cap: {out}"
+            );
+            failed += 1;
+        } else {
+            assert_eq!(branch["size"], 24 << 20, "{key} completed whole: {out}");
+        }
+    }
+    assert!(
+        failed >= 1,
+        "shared budget must fail a lagging branch: {out}"
     );
 }

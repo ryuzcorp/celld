@@ -73,11 +73,12 @@ An unsupported feature that does not cause an error is a defect.
   response.
 - A cloned body that the platform streams (a `fetch()`, RPC, Durable Object
   or R2 body) applies backpressure at the slower copy only up to 32 MiB of
-  skew: past that the lagging copy's next read rejects with `tee branch fell
-  more than 32 MiB behind its sibling; read both branches concurrently`, and
-  the other copy keeps flowing to completion. This bounds each tee's memory
-  instead of stalling the pump or buffering without limit. Workerd buffers
-  for the slower copy within the isolate's 128 MB limit instead of failing it.
+  skew, shared by all of one request's tees: past that the lagging copy's
+  next read rejects with `tee branch fell more than 32 MiB behind its
+  sibling; read both branches concurrently`, and the other copies keep
+  flowing to completion. This bounds each request's tees in total instead of
+  stalling the pump or buffering without limit. Workerd buffers for the
+  slower copy within the isolate's 128 MB limit instead of failing it.
 - A remote Durable Object call cannot retry after request-body transmission
   starts because Cello keeps no replay copy.
 - A remote Durable Object call waits for a rejected owner generation to change

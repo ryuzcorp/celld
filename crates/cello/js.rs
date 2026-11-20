@@ -142,6 +142,7 @@ pub(crate) use crate::http_streams::HttpTeePump;
 pub(crate) use crate::http_streams::HttpTransferredStream;
 pub use crate::http_streams::RequestBodyGuard;
 pub(crate) use crate::http_streams::ResponseStreamWriter;
+pub(crate) use crate::http_streams::TeeSkewBudget;
 pub(crate) use crate::http_streams::HTTP_STREAM_DONE;
 #[cfg(all(test, cello_internal_tests))]
 pub(crate) use crate::http_streams::HTTP_STREAM_IDLE_TIMEOUT_MS;
@@ -11048,9 +11049,10 @@ fn op_asset_fetch(
 
 fn tee_http_stream(
     service: &Arc<HttpStreamService>,
+    budget: Arc<TeeSkewBudget>,
     source: HttpTransferredStream,
 ) -> Result<(u64, u64), &'static str> {
-    let (ids, pump) = prepare_http_stream_tee(service, source)?;
+    let (ids, pump) = prepare_http_stream_tee(service, budget, source)?;
     asyncrt::op_handle().spawn(pump);
     Ok(ids)
 }
@@ -11096,7 +11098,9 @@ fn op_http_stream_tee(
         scope.throw_exception(exception);
         return;
     };
-    let ids = match tee_http_stream(&service, source) {
+    // Every tee of this request draws on the same skew budget, so a
+    // tee-of-a-tee chain cannot amplify memory per tee.
+    let ids = match tee_http_stream(&service, owner.tee_skew_budget(), source) {
         Ok(ids) => ids,
         Err(error) => {
             let message = v8::String::new(scope, error).unwrap();
@@ -12982,6 +12986,11 @@ pub struct IoContext {
     /// an id out before its target takes ownership, so only one request can
     /// reclaim an unread tail.
     body_streams: Mutex<HashMap<u64, HttpStreamClaim>>,
+    /// The tee skew budget shared by every tee branch this request creates.
+    /// Lazily created on the first tee, so a request that never tees pays
+    /// nothing; per-request, so one request's tees can never amplify node
+    /// memory past the cap in total.
+    tee_skew: OnceLock<Arc<TeeSkewBudget>>,
     /// Output-gate capture. While a `webSocketMessage` runs, the frames it
     /// sends are collected here instead of reaching the wire, so the shell
     /// can hold them until the message's write is durable. A stack, so a
@@ -13234,6 +13243,7 @@ impl IoContext {
             input_gates: Mutex::new(InputGateClaims::default()),
             cross_entry_gates: CrossEntryGateClaims::default(),
             body_streams: Mutex::new(HashMap::new()),
+            tee_skew: OnceLock::new(),
             ws_capture: Mutex::new(Vec::new()),
             egress: Mutex::new(Vec::new()),
             handed: Mutex::new(Some(Vec::new())),
@@ -13266,6 +13276,7 @@ impl IoContext {
             input_gates: Mutex::new(InputGateClaims::default()),
             cross_entry_gates: CrossEntryGateClaims::default(),
             body_streams: Mutex::new(HashMap::new()),
+            tee_skew: OnceLock::new(),
             ws_capture: Mutex::new(Vec::new()),
             egress: Mutex::new(Vec::new()),
             handed: Mutex::new(Some(Vec::new())),
@@ -13319,6 +13330,7 @@ impl IoContext {
             input_gates: Mutex::new(InputGateClaims::default()),
             cross_entry_gates: CrossEntryGateClaims::default(),
             body_streams: Mutex::new(HashMap::new()),
+            tee_skew: OnceLock::new(),
             ws_capture: Mutex::new(Vec::new()),
             egress: Mutex::new(Vec::new()),
             handed: Mutex::new(Some(Vec::new())),
@@ -13582,6 +13594,16 @@ impl IoContext {
         // Releasing a claim can drop an arbitrary source. Keep that work out
         // of the request-ownership lock.
         drop(replaced);
+    }
+
+    /// The tee skew budget shared by every tee branch this request creates.
+    /// Lazily created on the first tee; every tee of this request draws on
+    /// the same 32 MiB, so the request's tees can never amplify node memory
+    /// past the cap in total.
+    pub(crate) fn tee_skew_budget(&self) -> Arc<TeeSkewBudget> {
+        self.tee_skew
+            .get_or_init(|| Arc::new(TeeSkewBudget::new()))
+            .clone()
     }
 
     fn transfer_body_stream(&self, stream_id: u64) -> Option<RequestBodyGuard> {

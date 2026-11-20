@@ -500,6 +500,38 @@ export default {
       }
     }
 
+    if (url.pathname === "/r2-tee-chain") {
+      const setup = ensureAttrSetup(db, "r2tee");
+      setup.waiters += 1;
+      await setup.ready;
+      // A tee of a tee under one request: the second tee reads the first
+      // tee's drained branch. Both lagging branches buffer against the
+      // request's one shared skew budget, so once their total passes the cap
+      // at least one of them fails — while the read branch still completes.
+      const host = new URL(request.url).host;
+      const [first, lagging1] = request.body.tee();
+      const [second, lagging2] = first.tee();
+      const echoed = await fetch(`http://${host}/echo-size`, {
+        method: "POST",
+        body: second,
+      });
+      const { size } = await echoed.json();
+      const readBranch = async (branch) => {
+        try {
+          const rest = await new Response(branch).arrayBuffer();
+          return { ok: true, size: rest.byteLength };
+        } catch (error) {
+          return { ok: false, error: String(error?.message ?? error) };
+        }
+      };
+      return Response.json({
+        ok: true,
+        forwarded: size,
+        lagging1: await readBranch(lagging1),
+        lagging2: await readBranch(lagging2),
+      });
+    }
+
     return Response.json({ ok: true });
   },
 };
