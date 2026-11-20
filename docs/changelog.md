@@ -1,7 +1,36 @@
 ---
 title: Changelog
-description: What shipped in each Cello release, from v0.6.3-ryuzcorp.4 to v0.2.1.
+description: What shipped in each Cello release, from v0.6.3-ryuzcorp.4 to v0.2.2.
 ---
+## v0.2.2
+
+Stream and WebSocket fixes, faster CI, and reorganized docs. No
+configuration, data, or bucket-format changes.
+
+- **A teed body no longer deadlocks** (#93). A Worker that read one
+  `tee()` branch of a platform-streamed body (a `fetch()`, RPC, Durable
+  Object, or R2 body) to the end before the other used to hang once 16
+  chunks piled up on the unread side. The copies now buffer for each other
+  up to 32 MiB of skew, shared by all of one request's tees. Past that, the
+  lagging copy's next read rejects with `tee branch fell more than 32 MiB
+  behind its sibling; read both branches concurrently`, and the node's
+  memory stays bounded.
+- **WebSocket closes report what happened** (#90). A peer close that
+  arrives while a send is cut short reports `wasClean: false`. A backlog
+  that tripped the 16 MiB budget wins over a racing close and ends with
+  1011.
+- **Faster CI** (#91, #94). Lint and the full suite run natively on amd64
+  and arm64 under the same hostile env as before, in about 12 minutes
+  instead of about 20. Docs-only pull requests skip the Rust jobs. A
+  release tag publishes only after the `main` CI run on its commit has
+  succeeded, so the publish job no longer re-runs the tests. The flaky
+  `shutdown_during_parked_send_ends_pump` test is now deterministic.
+- **Docs** (#92, #95–#100). The site is reorganized into Guides,
+  Services, Concepts, and Reference, with a new quickstart, configuration
+  and CLI references, and one page per service. Old URLs redirect.
+- **Test harness** (#89). `CELLO_ESBUILD` reaches tests that run under
+  the hermetic env.
+
 ## v0.2.1
 
 WebSocket robustness. No configuration, data, or bucket-format changes.

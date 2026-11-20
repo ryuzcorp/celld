@@ -1,7 +1,7 @@
 # Modified by Ryuz Corp (Cello): node:crypto scrypt; C-trim threshold 8 MiB with CELLO_C_TRIM_MB knob.
 [package]
 name = "cello"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2021"
 rust-version = "1.94.1"
 license = "Apache-2.0"
