@@ -1,4 +1,4 @@
-// Modified by Ryuz Corp (Cello): node:crypto scrypt; container exec resize op; cross-isolate RPC stubs and streams; test-only fake exec ops; fake kill completion op; exec reads survive their subscribing event; per-node Workers Cache API ops; tenant egress policy; D1 export operator-ingress marker; stateless attribution tokens; reaction-aware request resources; fake close/signal completion ops; binding-forgery enforcement; trusted cell RPC; Queue DLQ forward host op; DLQ forward caller identity; WebSocket and TCP socket ownership; receiver-held stream lifetime; deployment cache scope key; share the /bundle tree per deployment generation.; cancelled requests reject pending ops so co-awaiters settle (upstream #317); answered drivers poll while waitUntil background is outstanding (upstream #300); refused handoffs reject instead of dropping resolvers (upstream #309); facet adoption drops the restored flag (upstream #292); background expiry for orphaned drives (upstream #275); unrefed AbortSignal.timeout timer (upstream #306); loader-fetch 101 webSocket join (upstream #305); nodejs process.env population (upstream #296); writable request /tmp files (upstream #280); synchronous loader abort publish (upstream #281); tenant fetch trusts the shared TLS roots (upstream #230); __traceparent op for handler-visible trace context (upstream #313); incoming fetch answers record their HTTP status for spans (upstream #285).
+// Modified by Ryuz Corp (Cello): node:crypto scrypt; container exec resize op; cross-isolate RPC stubs and streams; test-only fake exec ops; fake kill completion op; exec reads survive their subscribing event; per-node Workers Cache API ops; tenant egress policy; D1 export operator-ingress marker; stateless attribution tokens; reaction-aware request resources; fake close/signal completion ops; binding-forgery enforcement; trusted cell RPC; Queue DLQ forward host op; DLQ forward caller identity; WebSocket and TCP socket ownership; receiver-held stream lifetime; deployment cache scope key; share the /bundle tree per deployment generation.; cancelled requests reject pending ops so co-awaiters settle (upstream #317); answered drivers poll while waitUntil background is outstanding (upstream #300); refused handoffs reject instead of dropping resolvers (upstream #309); facet adoption drops the restored flag (upstream #292); background expiry for orphaned drives (upstream #275); unrefed AbortSignal.timeout timer (upstream #306); loader-fetch 101 webSocket join (upstream #305); nodejs process.env population (upstream #296); writable request /tmp files (upstream #280); synchronous loader abort publish (upstream #281); tenant fetch trusts the shared TLS roots (upstream #230); __traceparent op for handler-visible trace context (upstream #313); incoming fetch answers record their HTTP status for spans (upstream #285); response body pumps stream past the background budget (upstream #275).
 // Copyright 2026 Deno Land Inc. Apache-2.0 license.
 
 // The raw V8 adapter and its child modules remain outside the Actor execution
@@ -3696,6 +3696,12 @@ pub struct InFlight {
     /// request stays in flight until it settles, as the single-request loop
     /// keeps driving it.
     background: Option<v8::Global<v8::Promise>>,
+    /// Response body pumps this entry is still streaming (upstream #275).
+    /// Response work, not `waitUntil`: each pump keeps the entry — and the
+    /// ops its body needs — alive until it settles, and the background
+    /// budget neither charges nor seals it. `settle` retires a promise here
+    /// once it is no longer pending.
+    response_streams: Vec<v8::Global<v8::Promise>>,
     /// A successfully completed Durable Object event keeps every referenced
     /// native operation alive. Workerd does not require `waitUntil` for this
     /// I/O, so dropping these operations loses detached timers and subrequests.
@@ -4105,6 +4111,10 @@ impl InFlight {
         self.reply.is_none()
             && self.gated_reply.is_none()
             && self.background.is_none()
+            // A response body that is still streaming is the response: the
+            // entry keeps its event, ops and context until the pump settles
+            // (upstream #275).
+            && !self.has_response_stream()
             // A block that holds the gate is still this event's work:
             // retiring would close the sockets its callback may still read.
             && !self.holds_gate()
@@ -4166,6 +4176,13 @@ impl InFlight {
     /// Also clears the background clock, so a gate-holding event that lives
     /// past its budget warns at most once per budget window instead of on
     /// every poll while it keeps its native ops.
+    ///
+    /// This runs while a response body streams too (upstream #275): it ends
+    /// only the `waitUntil` claim and seals further `waitUntil`, and leaves
+    /// `response_streams` intact, so the body keeps the ops it is made of
+    /// (`keeps_native_ops_after_disconnect` sees the stream and skips the
+    /// abort pass). Timers the `waitUntil` work already started keep running
+    /// until the body settles, then end one budget window later.
     pub fn expire_background(&mut self) {
         self.background = None;
         self.background_since = None;
@@ -4232,8 +4249,18 @@ impl InFlight {
     /// event owns the block's turn and therefore owns the gate engagement.
     fn keeps_native_ops_after_disconnect(&self) -> bool {
         self.background.is_some()
+            || self.has_response_stream()
             || self.engages_gate()
             || self.context.has_cross_entry_gate_claim()
+    }
+
+    /// Whether a response body pump is still streaming (upstream #275).
+    ///
+    /// Response work, not `waitUntil` work: the driver keeps polling for
+    /// these ops wherever it keeps polling for the `waitUntil` aggregate, but
+    /// the post-response background budget leaves them alone.
+    pub(crate) fn has_response_stream(&self) -> bool {
+        !self.response_streams.is_empty()
     }
 
     /// Complete the resource-retirement edge that a claim release woke.
@@ -4358,6 +4385,9 @@ impl InFlight {
         self.context.seal_wait_until();
         self.io_context_ops.clear();
         self.unrefed_ops.clear();
+        // Nothing will drive a live pump once this entry is gone, so its
+        // promise must not stay rooted in the isolate (upstream #275).
+        self.response_streams.clear();
         // An op a foreign turn handed this event after its driver's last pass
         // never reached `ops`, so the drain below cannot reach its resolver.
         // Closing the mailbox both yields those ops and refuses every later
@@ -4476,6 +4506,11 @@ impl InFlight {
 
     fn retire_background_for_shutdown(&mut self) {
         self.background = None;
+        // Shutdown ends an open response body too (upstream #275): nothing
+        // will run its pump to completion, so it must not keep the driver —
+        // and the draining isolate — waiting for a client that is about to
+        // be cut off.
+        self.response_streams.clear();
         self.context.seal_wait_until();
         self.context.close_sockets();
     }
@@ -5056,7 +5091,9 @@ impl Worker {
 ///
 /// 1. **settle** — the handler's promise may have resolved, so marshal the
 ///    response and answer. Marshalling can start a JS-to-host body pump and
-///    register it with `waitUntil`.
+///    register it as an open response body, which holds the event until the
+///    body settles (not as `waitUntil`: the post-response budget must not
+///    seal a stream).
 /// 2. **checkpoint** — that pump's native ops exist only once the microtasks
 ///    which create them run.
 /// 3. **release the facet gate** — the second facet flush can now cover every
@@ -5317,6 +5354,7 @@ fn begin<'s>(
                 reply: Some(Answer::Fetch(reply)),
                 gated_reply: None,
                 background: None,
+                response_streams: Vec::new(),
                 completed_cell_event: false,
                 ops: std::collections::HashSet::new(),
                 io_context_ops: std::collections::HashSet::new(),
@@ -5418,6 +5456,7 @@ fn begin_entrypoint_rpc(
                 reply: Some(Answer::Rpc(reply)),
                 gated_reply: None,
                 background: None,
+                response_streams: Vec::new(),
                 completed_cell_event: false,
                 ops: std::collections::HashSet::new(),
                 io_context_ops: std::collections::HashSet::new(),
@@ -5664,6 +5703,7 @@ fn begin_queue(
                 reply: Some(Answer::Queue(reply)),
                 gated_reply: None,
                 background: None,
+                response_streams: Vec::new(),
                 completed_cell_event: false,
                 ops: std::collections::HashSet::new(),
                 io_context_ops: std::collections::HashSet::new(),
@@ -5851,6 +5891,7 @@ fn start_cell_event<'s>(
                 reply: Some(answer),
                 gated_reply: None,
                 background: None,
+                response_streams: Vec::new(),
                 completed_cell_event: false,
                 ops: std::collections::HashSet::new(),
                 io_context_ops: std::collections::HashSet::new(),
@@ -5908,6 +5949,7 @@ fn start_cell_event<'s>(
                     reply: None,
                     gated_reply,
                     background,
+                    response_streams: Vec::new(),
                     completed_cell_event: false,
                     ops: std::collections::HashSet::new(),
                     io_context_ops: std::collections::HashSet::new(),
@@ -6486,6 +6528,25 @@ fn settle(tc: &mut v8::PinScope, entry: &mut InFlight) {
             if !late.is_empty() && entry.background.is_none() {
                 entry.context.seal_wait_until();
             }
+        }
+    }
+    // Response body pumps (upstream #275): take the ones the answer started —
+    // `read_response` registers them before this call — and retire each as it
+    // settles. Nothing in this loop is `waitUntil`, so the post-response
+    // budget never reaches them.
+    for promise in entry.context.take_response_streams() {
+        entry.response_streams.push(promise);
+    }
+    let mut stream = 0;
+    while stream < entry.response_streams.len() {
+        let pending = matches!(
+            v8::Local::new(tc, &entry.response_streams[stream]).state(),
+            v8::PromiseState::Pending
+        );
+        if pending {
+            stream += 1;
+        } else {
+            entry.response_streams.swap_remove(stream);
         }
     }
 }
@@ -7729,6 +7790,7 @@ ops! { OP_NAMES, install_op_functions,
         "__http_stream_cancel" => op_http_stream_cancel,
         "__http_stream_tee" => op_http_stream_tee,
         "__response_stream_create" => op_response_stream_create,
+        "__response_stream_hold" => op_response_stream_hold,
         "__response_stream_write" => op_response_stream_write,
         "__response_stream_closed" => op_response_stream_closed,
         "__response_stream_close" => op_response_stream_close,
@@ -11141,6 +11203,28 @@ fn op_response_stream_create(
     rv.set(v8::Number::new(scope, stream_id as f64).into());
 }
 
+/// Hold a response body pump as the event's own lifetime (upstream #275).
+///
+/// `__bridgeResponseStream` calls this instead of `waitUntil`, because a
+/// streamed body is response work: it lasts as long as the client stays
+/// connected and the body produces. The promise keeps the entry alive (and
+/// its native ops) exactly as the `waitUntil` aggregate did, but the driver
+/// keeps it outside the background budget, so `expire_background` ends
+/// leftover timers and `waitUntil` work without sealing the pump.
+fn op_response_stream_hold(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue<v8::Value>,
+) {
+    let Some(promise) = args.get(0).try_cast::<v8::Promise>().ok() else {
+        return;
+    };
+    let Some(context) = event_context(scope) else {
+        return retired_event_throw(scope);
+    };
+    context.hold_response_stream(v8::Global::new(scope, promise));
+}
+
 fn op_response_stream_write(
     scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
@@ -12986,6 +13070,14 @@ pub struct IoContext {
     /// an id out before its target takes ownership, so only one request can
     /// reclaim an unread tail.
     body_streams: Mutex<HashMap<u64, HttpStreamClaim>>,
+    /// Response body pumps this event started, as the JS promises that drive
+    /// them (upstream #275). A streamed body outlives the response head: it
+    /// is plain response work, not `waitUntil`, so it keeps the event and its
+    /// native ops alive until the body ends, the client disconnects, or the
+    /// runtime stops — and the background budget neither charges nor seals
+    /// it. Taken by the owning entry in `settle`, which retires each promise
+    /// once it settles.
+    response_streams: Mutex<Vec<v8::Global<v8::Promise>>>,
     /// The tee skew budget shared by every tee branch this request creates.
     /// Lazily created on the first tee, so a request that never tees pays
     /// nothing; per-request, so one request's tees can never amplify node
@@ -13243,6 +13335,7 @@ impl IoContext {
             input_gates: Mutex::new(InputGateClaims::default()),
             cross_entry_gates: CrossEntryGateClaims::default(),
             body_streams: Mutex::new(HashMap::new()),
+            response_streams: Mutex::new(Vec::new()),
             tee_skew: OnceLock::new(),
             ws_capture: Mutex::new(Vec::new()),
             egress: Mutex::new(Vec::new()),
@@ -13276,6 +13369,7 @@ impl IoContext {
             input_gates: Mutex::new(InputGateClaims::default()),
             cross_entry_gates: CrossEntryGateClaims::default(),
             body_streams: Mutex::new(HashMap::new()),
+            response_streams: Mutex::new(Vec::new()),
             tee_skew: OnceLock::new(),
             ws_capture: Mutex::new(Vec::new()),
             egress: Mutex::new(Vec::new()),
@@ -13330,6 +13424,7 @@ impl IoContext {
             input_gates: Mutex::new(InputGateClaims::default()),
             cross_entry_gates: CrossEntryGateClaims::default(),
             body_streams: Mutex::new(HashMap::new()),
+            response_streams: Mutex::new(Vec::new()),
             tee_skew: OnceLock::new(),
             ws_capture: Mutex::new(Vec::new()),
             egress: Mutex::new(Vec::new()),
@@ -13509,6 +13604,25 @@ impl IoContext {
     fn accepts_wait_until(&self) -> bool {
         let events = self.events.lock().unwrap();
         !events.frames.is_empty() || events.wait_until_active
+    }
+
+    /// Record a response body pump as this event's own lifetime (upstream
+    /// #275).
+    ///
+    /// A streamed body is response work, not `waitUntil` work: it must keep
+    /// streaming for as long as the client stays connected and the body
+    /// produces, which is longer than the post-response budget by design. The
+    /// entry holds these promises separately from its `waitUntil` aggregate,
+    /// so `expire_background` can end leftover timers and `waitUntil` work
+    /// without sealing the pump.
+    fn hold_response_stream(&self, promise: v8::Global<v8::Promise>) {
+        self.response_streams.lock().unwrap().push(promise);
+    }
+
+    /// Take the response body pumps registered since the last take, so the
+    /// owning entry can hold them and retire each one as it settles.
+    fn take_response_streams(&self) -> Vec<v8::Global<v8::Promise>> {
+        std::mem::take(&mut *self.response_streams.lock().unwrap())
     }
 
     /// Take registrations made while the current background aggregate ran.

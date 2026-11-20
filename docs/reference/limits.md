@@ -46,6 +46,22 @@ services, APIs, and Wrangler configuration.
   reconnect.
 - A node limits the resident cells and outbound WebSockets.
 
+## Stream a response for as long as the client listens
+
+- A streaming response body is response work, not background work.
+  `CELLO_BACKGROUND_BUDGET_S` ends `ctx.waitUntil()` work after the handler
+  answers, but never a body the client is still reading. The body runs while
+  the client stays connected and the body keeps producing. While a body
+  streams, the budget ends the `waitUntil` claim; timers that work already
+  started stop one budget window after the body ends.
+- An open response still ends: when the body completes or errors, when the
+  client disconnects (which cancels the producer), after `CELLO_HANDLER_BUDGET_S`
+  if the handler has not answered, when the node shuts down, and after 60
+  seconds without progress: the body produces nothing, or the client stops
+  reading.
+- A streamed body keeps its event, isolate, and cell resident until it ends,
+  so a retiring generation waits for open streams before it frees its heaps.
+
 ## Run on Linux or Apple Silicon
 
 The installer supplies binaries for Linux x86-64, Linux ARM64, and Apple
