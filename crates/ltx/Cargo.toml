@@ -8,7 +8,7 @@
 # durability goal for every cell write.
 [package]
 name = "cello-ltx"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2021"
 license = "Apache-2.0"
 description = "In-process SQLite WAL replication to object storage (LTX format) for cello."

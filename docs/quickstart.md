@@ -12,7 +12,7 @@ curl -fsSL https://cello.ryuz.eu/install.sh | sh
 cello --version
 ```
 
-You see a version such as `cello 0.2.2`. The next step needs the self-contained esbuild binary (not a wrapper script). Download it with npm:
+You see a version such as `cello 0.2.3`. The next step needs the self-contained esbuild binary (not a wrapper script). Download it with npm:
 
 ```sh
 mkdir -p /tmp/esbuild-dl && cd /tmp/esbuild-dl
