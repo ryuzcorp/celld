@@ -47,6 +47,8 @@ jobs:
     timeout-minutes: 10
     permissions:
       contents: read
+      # Read the `ci` workflow runs for the tagged commit (the CI gate).
+      actions: read
     outputs:
       version: ${{ steps.parse.outputs.version }}
       prerelease: ${{ steps.parse.outputs.prerelease }}
@@ -97,18 +99,29 @@ jobs:
             echo "refusing tag $GITHUB_REF_NAME: $sha is not on origin/main" >&2
             exit 1
           fi
-          # The tagged commit must carry a passing `ci-ok` check from the
-          # `ci` workflow. Native CI tests and lints every main commit and
+          # The tagged commit must have a successful `ci` workflow run from
+          # its `main` push. Native CI tests and lints every main commit and
           # the image no longer re-runs the suite, so without this gate a
-          # tag could ship an untested tree.
+          # tag could ship an untested tree. The gate asks the Actions
+          # workflow-runs API for this repository's own `ci.yml`, never a
+          # check run by name: any app with `checks: write` can create a
+          # check run called `ci-ok`, but only GitHub Actions running this
+          # file produces a run here. The run's own `ci-ok` job must have
+          # passed too.
           command -v jq >/dev/null 2>&1 || { echo "refusing: jq is required" >&2; exit 1; }
-          ok=$(gh api "repos/$GITHUB_REPOSITORY/commits/$sha/check-runs?per_page=100" \
-            --jq '[.check_runs[] | select(.name == "ci-ok" and .status == "completed" and .conclusion == "success")] | length')
-          if [ "${ok:-0}" -eq 0 ]; then
-            echo "refusing tag $GITHUB_REF_NAME: no passing ci-ok check on $sha" >&2
+          run_id=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?head_sha=$sha&event=push&branch=main&status=success&per_page=100" \
+            --jq "[.workflow_runs[] | select(.head_sha == \"$sha\" and .path == \".github/workflows/ci.yml\" and .event == \"push\" and .head_branch == \"main\" and .conclusion == \"success\")] | first | .id // empty")
+          if [ -z "$run_id" ]; then
+            echo "refusing tag $GITHUB_REF_NAME: no successful ci run for the main push of $sha" >&2
             exit 1
           fi
-          echo "ci-ok passed on $sha"
+          gate=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run_id/jobs?per_page=100" \
+            --jq '[.jobs[] | select(.name == "ci-ok" and .conclusion == "success")] | length')
+          if [ "${gate:-0}" -eq 0 ]; then
+            echo "refusing tag $GITHUB_REF_NAME: ci run $run_id has no passing ci-ok job" >&2
+            exit 1
+          fi
+          echo "ci run $run_id passed on $sha (ci-ok green)"
           prerelease="false"
           if [[ $version == *-* ]]; then
             prerelease="true"
