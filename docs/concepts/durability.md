@@ -1,11 +1,26 @@
 <!-- Modified by Ryuz Corp (Cello): bucket-posture group commit docs: bundle switch opt-in (0075); fleet ops: stable node ids, witness grace, loss record, lease conflict retries, alarm deadline, wake timing (upstream #244, #273, #264, #256, #250, #249, #245, #239, #268, #308). -->
-# What Cello guarantees
+---
+title: Durability
+description: The contract Cello keeps for your writes, and what it needs from your bucket and supervisor.
+---
+
+# Durability
 
 Cello makes two promises. Exactly one node serves a cell at a time, so two
 machines never write the same database. Cello does not acknowledge a write
 until the write survives a failure, so an acknowledged write is never lost. Both
 promises require a bucket with working conditional writes and ranged reads, and
 a supervisor that restarts the process.
+
+## The contract in one minute
+
+You acknowledge a write only after a durability proof covers it. In fleet
+posture (the default, `CELLO_DURABILITY=fleet`), the proof is one or two peer
+nodes holding the write on disk; in bucket posture
+(`CELLO_DURABILITY=bucket`), the proof is an object-store round trip. One node
+alone cannot make a fleet proof, so it falls back to a bucket proof for each
+write. Two nodes are enough for fleet proofs; three or more nodes hold three
+copies of each acknowledged write.
 
 ## What the bucket must provide
 
@@ -104,10 +119,14 @@ would start it with an empty database. Each request that must read the record,
 to acquire the cell or to find its owner, fails, and the node writes
 `cello ownership record lost` to stderr. The node then refuses the cell for 10
 seconds without a bucket request, so it writes the line at most once in that
-interval. A node that still serves the cell keeps serving it and keeps writing
+interval.
++
+A node that still serves the cell keeps serving it and keeps writing
 LTX until it stops. That node cannot acknowledge a write that a bucket proof
 covers, because the record no longer names it, so the write fails and the node
-writes `cello output gate` to stderr. With `CELLO_DURABILITY=bucket`, every
+writes `cello output gate` to stderr.
++
+With `CELLO_DURABILITY=bucket`, every
 write takes a bucket proof. Cello detects the loss only from LTX under
 `cells/<cell>/ltx/`. A new cell can keep its first writes in a node bundle under
 `log/` until the tiering path drains them, so a loss before that drain starts
@@ -130,9 +149,11 @@ it. A stop that logs `node-log close: sealed epoch` has already sealed its log.
 
 Then write a released record, which names no node, at the newest epoch: the
 numerically highest `e<epoch>` prefix under `cells/<cell>/ltx/`. For a newest
-epoch of 7, the record is `{"node": "", "epoch": 7}`. After the refusal interval
 ends, the next request acquires the cell at the next epoch and restores it from
-the bucket. A released record skips the recovery of the node log of the
+the bucket.
++
+A released record skips the recovery of the node log of the
+
 previous owner. A record that is written before these logs are recovered can
 therefore lose acknowledged writes, and a node that still serves the cell
 becomes a second writer.
@@ -140,9 +161,11 @@ becomes a second writer.
 ### The epoch prefix
 
 The replicator copies each cell's SQLite data to `cells/<cell>/ltx/e<epoch>/`
-with unconditional PUTs. The epoch in the key is the fence: a node that lost
 ownership can keep writing, but only into a superseded prefix, and a restore
-selects the current lineage. The tiering path can first combine segments from
+selects the current lineage.
++
+The tiering path can first combine segments from
+
 many cells into a node bundle and drain each segment into its per-cell prefix
 later. A bundle is deleted only when the per-cell prefixes cover every segment
 in it. A failed compaction retries after 30 seconds, backing off to at most 300
@@ -153,6 +176,7 @@ closed database or falls back to its L0 chain, and keeps the local copy until
 the bucket can restore the cell. A cell whose restorable chain was born in
 this epoch, is fully per-cell covered, and fits in a short upload journal
 skips the snapshot by policy and hands off through that L0 chain directly.
+
 the bucket can restore the cell. When this residency itself uploaded into the
 epoch prefix and got a success response, that response is the proof: a
 successor finds the objects through a listing, as every restore does, which
@@ -165,6 +189,7 @@ described above, falling back to a listing on a miss or an error. A residency
 with an empty journal, such as one that resumed a local copy without
 uploading, and an eviction whose fallback finds no journaled key, list the
 prefix instead. The capture before an
+
 eviction skips the time-based checkpoint, whose sealing write would upload one
 more object just before the snapshot that covers it. After the snapshot
 publishes, a background task deletes the epoch's per-cell L0 and L1 objects
@@ -176,6 +201,7 @@ snapshot and only extends past it — so the epoch still opens with its
 snapshot and still ends at the same cut whenever a DELETE lands, including
 after a successor activates at its own new epoch and prefix. Failed or
 abandoned deletes leave garbage for epoch GC and never fail the eviction.
+
 An eviction without a snapshot deletes nothing.
 
 ### The acknowledgement rule (RPO=0)
@@ -195,11 +221,13 @@ when its position is at or below the position of the write that issued the
 read, and issues its own read at once otherwise, so sharing never delays a
 write. Positions strictly increase with every committing write, so a joiner
 committed before the issuer did and the issuer's completed proof captured it.
+
 A write at a position a verified proof already covers releases without a new
 read at all. The read is always issued after a proof that captured the writes
 it answers completed, so a takeover that orphans the prefix fails the gates it
 touches instead of acknowledging into them. A partitioned node can commit
 locally and replicate into its superseded prefix, but it does not acknowledge.
+
 The check reads the record instead of a clock, so a paused process or a skewed
 clock cannot pass it.
 
@@ -215,6 +243,7 @@ cell never waits.
 
 A fleet proof needs no such read. The owner sends each write to one or two other
 nodes, its followers (together, the ensemble), and every follower must fsync it.
+
 A takeover seals the prior node-log session before it restores, so a stale owner
 cannot complete another fleet proof.
 
