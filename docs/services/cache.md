@@ -1,8 +1,8 @@
-<!-- Modified by Ryuz Corp (Cello): Workers Cache API page; deployment cache scope. -->
 ---
 title: Cache
 description: Cache responses in memory on each node with the Workers Cache API.
 ---
+<!-- Modified by Ryuz Corp (Cello): Workers Cache API page; deployment cache scope. -->
 
 The [Workers Cache API](https://developers.cloudflare.com/workers/runtime-apis/cache/) is a per-node in-memory cache: `caches.default` plus one namespace per `caches.open(name)`. There is no binding to declare; `caches` is a global.
 

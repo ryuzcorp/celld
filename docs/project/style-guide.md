@@ -50,4 +50,5 @@ Put each page in the group that matches its type.
 
 - Every page sets `title` and `description`. The title names the page's promise.
 - Link to pages by relative path. After moving a page, fix every link that points at it and add a redirect in `blume.config.ts` when the URL changes.
+- Start every page with the frontmatter block on line 1. Put the `Modified by Ryuz Corp` marker comment on the line right after the closing `---`, never above it. A marker above the frontmatter makes the builder ignore the frontmatter and render the comment as the title. `npm run validate` checks this.
 - Keep the sidebar order in each folder's `meta.ts`: install before quickstart, guides before reference.

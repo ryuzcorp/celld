@@ -1,8 +1,8 @@
-<!-- Modified by Ryuz Corp (Cello): bucket-posture group commit docs: bundle switch opt-in (0075); fleet ops: stable node ids, witness grace, loss record, lease conflict retries, alarm deadline, wake timing (upstream #244, #273, #264, #256, #250, #249, #245, #239, #268, #308). -->
 ---
 title: Durability
 description: The contract Cello keeps for your writes, and what it needs from your bucket and supervisor.
 ---
+<!-- Modified by Ryuz Corp (Cello): bucket-posture group commit docs: bundle switch opt-in (0075); fleet ops: stable node ids, witness grace, loss record, lease conflict retries, alarm deadline, wake timing (upstream #244, #273, #264, #256, #250, #249, #245, #239, #268, #308). -->
 
 # Durability
 

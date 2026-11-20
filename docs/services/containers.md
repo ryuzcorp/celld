@@ -1,8 +1,8 @@
-<!-- Modified by Ryuz Corp (Cello): ctx.container.images; fence node-netns exception; exec kill delivery. -->
 ---
 title: Containers
 description: Run a non-JavaScript program beside your Worker in a container started by a Durable Object.
 ---
+<!-- Modified by Ryuz Corp (Cello): ctx.container.images; fence node-netns exception; exec kill delivery. -->
 
 A container runs a program that is not JavaScript beside the Worker that needs it. A Durable Object starts the container, reaches it over a TCP port, and stops it. The container disk is ephemeral, so durable state belongs in the storage of the object or in another binding. Containers are experimental in Cello, so the configuration keys, the `ctx.container` surface, the node defaults, and the security boundary can change without notice.
 
