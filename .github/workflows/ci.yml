@@ -8,9 +8,12 @@
 # per arch (build stage, then the test stage compiling all tests again),
 # plus clippy on both arches.
 #
-#   pull_request / `main` push   `lint`: clippy (once) + rustfmt
+#   pull_request / `main` push   `changes`: what the PR touches
+#                                `lint`: clippy (once) + rustfmt
 #                                `test`: full `cargo test --profile ci`
 #                                  under the hostile env, on amd64 and arm64
+#                                  (lint and test skip on docs-only PRs;
+#                                  the docs workflow validates those)
 #                                `docker`: amd64 image build, only when
 #                                  Docker inputs changed (always on `main`)
 #                                `ci-ok`: the single required check; a
@@ -36,6 +39,10 @@ concurrency:
 jobs:
   lint:
     name: Lint
+    needs: changes
+    # Docs-only PRs carry no Rust change for clippy or the suite to judge;
+    # `ci-ok` accepts the skip only when `changes` says so.
+    if: needs.changes.outputs.code == 'true' || github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     permissions:
@@ -58,6 +65,8 @@ jobs:
 
   test:
     name: Test (${{ matrix.suffix }})
+    needs: changes
+    if: needs.changes.outputs.code == 'true' || github.event_name != 'pull_request'
     strategy:
       fail-fast: false
       matrix:
@@ -116,7 +125,8 @@ jobs:
       - name: Test
         run: cargo test --profile ci --locked
 
-  # Which PRs need an image build: only ones touching Docker inputs.
+  # What a PR touches: Docker inputs (image build) and anything beyond the
+  # docs site (clippy and the suite). A docs-only PR skips the Rust jobs.
   changes:
     name: Changed inputs
     runs-on: ubuntu-latest
@@ -127,6 +137,7 @@ jobs:
       pull-requests: read
     outputs:
       docker: ${{ steps.filter.outputs.docker }}
+      code: ${{ steps.code.outputs.code }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -142,6 +153,21 @@ jobs:
               - 'Cargo.lock'
               - 'rust-toolchain*'
               - '.github/workflows/**'
+      # `every`: a file counts as code unless it matches one of the docs-only
+      # exclusions. Anything else, including any workflow, runs the suite.
+      - id: code
+        uses: dorny/paths-filter@0e4a8c6effa4802afeda77dc8d303f8176d7dfad # v3
+        with:
+          predicate-quantifier: every
+          filters: |
+            code:
+              - '**'
+              - '!docs/**'
+              - '!README.md'
+              - '!CONTRIBUTING.md'
+              - '!blume.config.ts'
+              - '!package.json'
+              - '!package-lock.json'
 
   # The image still has to build: amd64 only, and only when a Docker input
   # changed. Always on `main` pushes, so `main` never rots. Pushes nothing.
@@ -172,7 +198,9 @@ jobs:
             .
 
   # The single required check: branch protection requires `ci-ok` instead of
-  # the old per-arch job names. A skipped docker job counts as ok.
+  # the old per-arch job names. A skipped docker job counts as ok; skipped
+  # lint and test count as ok only on a pull request that `changes` found
+  # docs-only. Every `main` push runs everything.
   ci-ok:
     name: ci-ok
     if: always()
@@ -188,12 +216,26 @@ jobs:
           TEST: ${{ needs.test.result }}
           CHANGES: ${{ needs.changes.result }}
           DOCKER: ${{ needs.docker.result }}
+          CODE: ${{ needs.changes.outputs.code }}
+          EVENT: ${{ github.event_name }}
         run: |
           set -euo pipefail
           fail=0
-          [ "$LINT" = "success" ] || { echo "lint is required but was $LINT" >&2; fail=1; }
-          [ "$TEST" = "success" ] || { echo "test is required but was $TEST" >&2; fail=1; }
           [ "$CHANGES" = "success" ] || { echo "changes is required but was $CHANGES" >&2; fail=1; }
+          docs_only=0
+          if [ "$EVENT" = "pull_request" ] && [ "$CHANGES" = "success" ] && [ "$CODE" = "false" ]; then
+            docs_only=1
+          fi
+          for job in "lint:$LINT" "test:$TEST"; do
+            name=${job%%:*} result=${job#*:}
+            if [ "$result" = "success" ]; then continue; fi
+            if [ "$result" = "skipped" ] && [ "$docs_only" = 1 ]; then
+              echo "$name skipped: docs-only pull request"
+              continue
+            fi
+            echo "$name is required but was $result" >&2
+            fail=1
+          done
           case "$DOCKER" in
             success|skipped) ;;
             *) echo "docker is required but was $DOCKER" >&2; fail=1 ;;
