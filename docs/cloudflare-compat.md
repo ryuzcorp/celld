@@ -72,9 +72,12 @@ An unsupported feature that does not cause an error is a defect.
 - Cello removes `Content-Length` from a Worker response, except for a `HEAD`
   response.
 - A cloned body that the platform streams (a `fetch()`, RPC, Durable Object
-  or R2 body) applies backpressure at the slower copy: reading only one copy
-  stalls it after 16 chunks until the other copy is read, cancelled, or
-  expires. Workerd buffers for the slower copy instead.
+  or R2 body) applies backpressure at the slower copy only up to 32 MiB of
+  skew: past that the lagging copy's next read rejects with `tee branch fell
+  more than 32 MiB behind its sibling; read both branches concurrently`, and
+  the other copy keeps flowing to completion. This bounds each tee's memory
+  instead of stalling the pump or buffering without limit. Workerd buffers
+  for the slower copy within the isolate's 128 MB limit instead of failing it.
 - A remote Durable Object call cannot retry after request-body transmission
   starts because Cello keeps no replay copy.
 - A remote Durable Object call waits for a rejected owner generation to change

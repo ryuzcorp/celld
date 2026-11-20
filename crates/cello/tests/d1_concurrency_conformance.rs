@@ -771,3 +771,33 @@ fn attribution_request_tee_large_body_sequential_branches() {
     assert_eq!(out["forwarded"], 4 << 20, "{out}");
     assert_eq!(out["local"], 4 << 20, "{out}");
 }
+
+#[test]
+fn attribution_request_tee_skew_kills_lagging_branch() {
+    let fixture = copy_fixture("attr-r2tee-skew");
+    let node = TestNode::boot(fixture.path(), "attr-r2tee-skew");
+
+    // 40 MiB exceeds the host's 32 MiB per-branch skew cap. The waiter reads
+    // only the first branch (through the subrequest fetch) and leaves the
+    // second untouched, so the pump must fail the lagging branch instead of
+    // buffering it without bound — while the first still flows to completion.
+    let start = spawn_get(&node.public, "/r2-tee-start");
+    await_attr_started(&node, "r2tee");
+    let payload = vec![b'x'; 40 << 20];
+    let addr = node.public.clone();
+    let skew = std::thread::spawn(move || {
+        post_bytes(&addr, "/r2-tee-skew", &payload, Duration::from_secs(120))
+    });
+    release_attr_setup(&node, "r2tee", 1);
+    let started = join_json(start, "r2tee skew start");
+    assert_eq!(started["ok"], true, "{started}");
+    let out = join_json(skew, "r2tee skew");
+    assert_eq!(out["ok"], true, "{out}");
+    assert_eq!(out["forwarded"], 40 << 20, "{out}");
+    assert_eq!(out["skewed"], true, "{out}");
+    let error = out["error"].as_str().unwrap_or_default();
+    assert!(
+        error.contains("behind its sibling"),
+        "lagging branch must report the skew cap: {out}"
+    );
+}

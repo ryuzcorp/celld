@@ -467,6 +467,39 @@ export default {
       }
     }
 
+    if (url.pathname === "/r2-tee-skew") {
+      const setup = ensureAttrSetup(db, "r2tee");
+      setup.waiters += 1;
+      await setup.ready;
+      // Foreign checkpoint, like the forward route above — but the second
+      // branch is left unread while the first streams through. Past the
+      // host's per-branch skew cap the pump fails the lagging branch, so
+      // reading it here must reject while the forwarded size stays whole.
+      const host = new URL(request.url).host;
+      const [first, second] = request.body.tee();
+      const echoed = await fetch(`http://${host}/echo-size`, {
+        method: "POST",
+        body: first,
+      });
+      const { size } = await echoed.json();
+      try {
+        const rest = await new Response(second).arrayBuffer();
+        return Response.json({
+          ok: true,
+          forwarded: size,
+          skewed: false,
+          local: rest.byteLength,
+        });
+      } catch (error) {
+        return Response.json({
+          ok: true,
+          forwarded: size,
+          skewed: true,
+          error: String(error?.message ?? error),
+        });
+      }
+    }
+
     return Response.json({ ok: true });
   },
 };

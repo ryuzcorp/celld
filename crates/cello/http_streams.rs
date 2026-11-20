@@ -34,6 +34,15 @@ pub(crate) static NEXT_HTTP_STREAM_ID: AtomicU64 = AtomicU64::new(1);
 pub(crate) const HTTP_STREAM_DONE: &str = "__cello_http_stream_end__";
 pub(crate) const HTTP_STREAM_IDLE_TIMEOUT_MS: u64 = 60_000;
 pub(crate) const HTTP_STREAM_REGISTRATION_CLOSED: &str = "the HTTP stream service is closed";
+/// Bytes one tee branch may buffer ahead of its sibling. Past this the pump
+/// fails the lagging branch instead of buffering without bound, so a tee of
+/// an unbounded response stream cannot grow node memory without limit.
+pub(crate) const HTTP_TEE_MAX_SKEW_BYTES: u64 = 32 << 20;
+/// Rejection for a tee branch that fell past [`HTTP_TEE_MAX_SKEW_BYTES`].
+/// It names the fix (read both branches) because the failing read is the
+/// branch nobody drained, not the request that teed it.
+pub(crate) const HTTP_TEE_SKEW_MESSAGE: &str =
+    "tee branch fell more than 32 MiB behind its sibling; read both branches concurrently";
 const RESPONSE_STREAM_CONSUMER_CANCELED: &str = "response stream consumer canceled";
 const RESPONSE_STREAM_CLOSE_IN_PROGRESS: &str = "response stream close is already in progress";
 pub(crate) enum HttpStreamSource {
@@ -43,9 +52,13 @@ pub(crate) enum HttpStreamSource {
     /// branches are independent — a consumer may drain one fully before
     /// touching the other — so a bounded fan-out deadlocks once the lagging
     /// branch's buffer fills while the drained branch starves for the
-    /// pump's next item. Skewed tee data rests in memory, as for a WHATWG
-    /// tee; ingress bodies are size-capped upstream.
-    TeeBranch(tokio::sync::mpsc::UnboundedReceiver<Result<Vec<u8>, String>>),
+    /// pump's next item. `buffered` counts the bytes the pump sent but no
+    /// consumer received yet; past [`HTTP_TEE_MAX_SKEW_BYTES`] the pump
+    /// fails the branch instead of buffering without bound.
+    TeeBranch {
+        receiver: tokio::sync::mpsc::UnboundedReceiver<Result<Vec<u8>, String>>,
+        buffered: Arc<AtomicU64>,
+    },
     Stream(HttpChunkStream),
 }
 
@@ -1051,6 +1064,49 @@ impl HttpStreamService {
         drain.dispose_propagating();
     }
 
+    /// Fail a lagging tee branch: drop its queued chunks and poison it so
+    /// its next read fails with `message`, while the sibling keeps flowing.
+    /// A checked-out branch (a pull is in flight) cannot be drained, so it
+    /// is removed instead: the in-flight pull ends terminally and later
+    /// checkouts fail closed. Either way the branch stops buffering, which
+    /// is what bounds the tee's memory.
+    pub(crate) fn fail_tee_branch(&self, stream_id: u64, message: String) {
+        let mut drain = HttpStreamDrain::default();
+        {
+            let mut state = self.state.lock().unwrap();
+            let Some(entry) = state.sources.get_mut(&stream_id) else {
+                return;
+            };
+            match &mut entry.source {
+                HttpStreamSourceSlot::Available(HttpStreamSource::TeeBranch {
+                    receiver,
+                    buffered,
+                }) => {
+                    // The lock excludes a concurrent checkout, and no pull
+                    // is in flight (the slot is Available), so no receive
+                    // can interleave the drain below: resetting the counter
+                    // cannot strand a later subtraction.
+                    while receiver.try_recv().is_ok() {}
+                    buffered.store(0, Ordering::Release);
+                    entry.source = HttpStreamSourceSlot::Available(HttpStreamSource::Stream(
+                        poisoned_tee_branch(message),
+                    ));
+                }
+                HttpStreamSourceSlot::Available(_) => return,
+                HttpStreamSourceSlot::Leased { .. } => {
+                    Self::remove_locked(
+                        &mut state,
+                        stream_id,
+                        HttpStreamTerminationReason::Cancelled,
+                        &mut drain,
+                    );
+                }
+            }
+        }
+        self.sweeper_notify.notify_one();
+        drain.dispose_propagating();
+    }
+
     pub(crate) fn begin_activity(
         self: &Arc<Self>,
         stream_id: u64,
@@ -1886,8 +1942,14 @@ pub(crate) async fn next_http_stream_chunk(
             Some(Err(error)) => Err(error),
             None => Ok(None),
         },
-        HttpStreamSource::TeeBranch(receiver) => match receiver.recv().await {
-            Some(Ok(bytes)) => Ok(Some(bytes)),
+        HttpStreamSource::TeeBranch { receiver, buffered } => match receiver.recv().await {
+            Some(Ok(bytes)) => {
+                // Every subtracted byte was added before its send, in branch
+                // order, so the counter cannot underflow: only the pump adds,
+                // and this receive follows its send.
+                buffered.fetch_sub(bytes.len() as u64, Ordering::AcqRel);
+                Ok(Some(bytes))
+            }
             Some(Err(error)) => Err(error),
             None => Ok(None),
         },
@@ -2270,9 +2332,17 @@ fn http_chunk_stream(source: HttpStreamSource) -> HttpChunkStream {
         HttpStreamSource::Receiver(receiver) => {
             Box::pin(tokio_stream::wrappers::ReceiverStream::new(receiver))
         }
-        HttpStreamSource::TeeBranch(receiver) => Box::pin(
-            tokio_stream::wrappers::UnboundedReceiverStream::new(receiver),
-        ),
+        HttpStreamSource::TeeBranch { receiver, buffered } => {
+            let buffered = Arc::clone(&buffered);
+            Box::pin(
+                tokio_stream::wrappers::UnboundedReceiverStream::new(receiver).map(move |item| {
+                    if let Ok(bytes) = &item {
+                        buffered.fetch_sub(bytes.len() as u64, Ordering::AcqRel);
+                    }
+                    item
+                }),
+            )
+        }
         HttpStreamSource::Stream(stream) => stream,
     }
 }
@@ -2283,8 +2353,10 @@ fn http_chunk_stream(source: HttpStreamSource) -> HttpChunkStream {
 /// The branches are unbounded: they are independent by contract — a consumer
 /// may drain one fully before touching the other — so a bounded fan-out
 /// deadlocks once the lagging branch's buffer fills while the drained branch
-/// starves for the pump's next item. Skewed tee data rests in memory, as for
-/// a WHATWG tee; ingress bodies are size-capped upstream.
+/// starves for the pump's next item. Skewed data still cannot grow without
+/// bound: past [`HTTP_TEE_MAX_SKEW_BYTES`] buffered ahead of its sibling, a
+/// branch is failed and its queued data dropped, while the other branch
+/// keeps flowing to completion.
 pub(crate) type HttpTeePump = Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2294,8 +2366,17 @@ enum HttpTeeSendOutcome {
     SourceTerminated,
 }
 
+/// One pump-side handle to a tee branch: the sender plus the registry id and
+/// the shared buffered-bytes counter that enforces the skew cap.
+struct HttpTeeBranch {
+    sender: tokio::sync::mpsc::UnboundedSender<Result<Vec<u8>, String>>,
+    stream_id: u64,
+    buffered: Arc<AtomicU64>,
+}
+
 fn send_http_tee_item(
-    sender: &tokio::sync::mpsc::UnboundedSender<Result<Vec<u8>, String>>,
+    service: &Arc<HttpStreamService>,
+    branch: &HttpTeeBranch,
     item: Result<Vec<u8>, String>,
     termination: &HttpStreamTermination,
 ) -> HttpTeeSendOutcome {
@@ -2305,23 +2386,47 @@ fn send_http_tee_item(
     if termination.reason() != HttpStreamTerminationReason::Live {
         return HttpTeeSendOutcome::SourceTerminated;
     }
-    match sender.send(item) {
+    let bytes = match &item {
+        Ok(body) => body.len() as u64,
+        Err(_) => 0,
+    };
+    // Only the pump adds to this counter, so the check-then-add cannot race
+    // another add; a concurrent receive only lowers the count, which keeps
+    // the check conservative. Past the cap the branch is failed instead of
+    // fed: its queued data is dropped and its next read errors, while the
+    // sibling keeps flowing.
+    if branch
+        .buffered
+        .load(Ordering::Acquire)
+        .saturating_add(bytes)
+        > HTTP_TEE_MAX_SKEW_BYTES
+    {
+        service.fail_tee_branch(branch.stream_id, HTTP_TEE_SKEW_MESSAGE.to_string());
+        return HttpTeeSendOutcome::BranchClosed;
+    }
+    branch.buffered.fetch_add(bytes, Ordering::AcqRel);
+    match branch.sender.send(item) {
         Ok(()) => HttpTeeSendOutcome::Sent,
-        Err(_) => HttpTeeSendOutcome::BranchClosed,
+        Err(_) => {
+            // Never queued, so no receive will subtract it; take the add back.
+            branch.buffered.fetch_sub(bytes, Ordering::AcqRel);
+            HttpTeeSendOutcome::BranchClosed
+        }
     }
 }
 
 fn fan_out_http_tee_item(
-    tx1: &tokio::sync::mpsc::UnboundedSender<Result<Vec<u8>, String>>,
-    tx2: &tokio::sync::mpsc::UnboundedSender<Result<Vec<u8>, String>>,
+    service: &Arc<HttpStreamService>,
+    first: &HttpTeeBranch,
+    second: &HttpTeeBranch,
     item: Result<Vec<u8>, String>,
     termination: &HttpStreamTermination,
 ) -> Option<(bool, bool)> {
-    let first = send_http_tee_item(tx1, item.clone(), termination);
+    let first = send_http_tee_item(service, first, item.clone(), termination);
     if first == HttpTeeSendOutcome::SourceTerminated {
         return None;
     }
-    let second = send_http_tee_item(tx2, item, termination);
+    let second = send_http_tee_item(service, second, item, termination);
     if second == HttpTeeSendOutcome::SourceTerminated {
         return None;
     }
@@ -2331,12 +2436,15 @@ fn fan_out_http_tee_item(
     ))
 }
 
-async fn both_http_tee_receivers_closed(
-    tx1: &tokio::sync::mpsc::UnboundedSender<Result<Vec<u8>, String>>,
-    tx2: &tokio::sync::mpsc::UnboundedSender<Result<Vec<u8>, String>>,
-) {
-    tx1.closed().await;
-    tx2.closed().await;
+async fn both_http_tee_receivers_closed(first: &HttpTeeBranch, second: &HttpTeeBranch) {
+    first.sender.closed().await;
+    second.sender.closed().await;
+}
+
+/// A one-shot error stream that replaces a skew-killed tee branch, so the
+/// lagging branch's next read fails instead of yielding dropped data.
+fn poisoned_tee_branch(message: String) -> HttpChunkStream {
+    Box::pin(futures_util::stream::once(async move { Err(message) }))
 }
 
 pub(crate) fn prepare_http_stream_tee(
@@ -2345,14 +2453,33 @@ pub(crate) fn prepare_http_stream_tee(
 ) -> Result<((u64, u64), HttpTeePump), &'static str> {
     let (tx1, rx1) = tokio::sync::mpsc::unbounded_channel();
     let (tx2, rx2) = tokio::sync::mpsc::unbounded_channel();
-    let Some(id1) = service.register_source(HttpStreamSource::TeeBranch(rx1)) else {
+    let buffered1 = Arc::new(AtomicU64::new(0));
+    let buffered2 = Arc::new(AtomicU64::new(0));
+    let Some(id1) = service.register_source(HttpStreamSource::TeeBranch {
+        receiver: rx1,
+        buffered: Arc::clone(&buffered1),
+    }) else {
         return Err(HTTP_STREAM_REGISTRATION_CLOSED);
     };
-    let Some(id2) = service.register_source(HttpStreamSource::TeeBranch(rx2)) else {
+    let Some(id2) = service.register_source(HttpStreamSource::TeeBranch {
+        receiver: rx2,
+        buffered: Arc::clone(&buffered2),
+    }) else {
         service.cancel_source(id1);
         return Err(HTTP_STREAM_REGISTRATION_CLOSED);
     };
+    let first = HttpTeeBranch {
+        sender: tx1,
+        stream_id: id1,
+        buffered: buffered1,
+    };
+    let second = HttpTeeBranch {
+        sender: tx2,
+        stream_id: id2,
+        buffered: buffered2,
+    };
     let termination = source.termination_handle();
+    let service = Arc::clone(service);
     let pump = Box::pin(async move {
         loop {
             // A permanently pending source does not wake when its consumers
@@ -2360,7 +2487,7 @@ pub(crate) fn prepare_http_stream_tee(
             // their committed closure when the source is also ready.
             let event = asyncrt::select_biased! {
                 "closed tee consumers win a tie so the pump cannot read another source item";
-                _ = both_http_tee_receivers_closed(&tx1, &tx2) => None,
+                _ = both_http_tee_receivers_closed(&first, &second) => None,
                 event = futures_util::future::poll_fn(|context| source.poll_event(context)) => Some(event),
             };
             let Some(event) = event else {
@@ -2369,7 +2496,7 @@ pub(crate) fn prepare_http_stream_tee(
             match event {
                 HttpTransferredEvent::Chunk(bytes) => {
                     let Some((first, second)) =
-                        fan_out_http_tee_item(&tx1, &tx2, Ok(bytes), &termination)
+                        fan_out_http_tee_item(&service, &first, &second, Ok(bytes), &termination)
                     else {
                         break;
                     };
@@ -2378,7 +2505,9 @@ pub(crate) fn prepare_http_stream_tee(
                     }
                 }
                 HttpTransferredEvent::Error(error) => {
-                    if fan_out_http_tee_item(&tx1, &tx2, Err(error), &termination).is_some() {
+                    if fan_out_http_tee_item(&service, &first, &second, Err(error), &termination)
+                        .is_some()
+                    {
                         source.finish(HttpStreamTerminationReason::Finished);
                     }
                     break;
