@@ -13,16 +13,22 @@ const json = (o, status = 200) => Response.json(o, { status });
 // Settle a promise for a few macrotask turns and report whether it has.
 // A settled write/ready crosses at most a couple of promise hops, so three
 // timer turns are enough to tell "parked" from "resolved".
-const settled = async (promise) => {
-  let state = 'pending';
+const outcome = async (promise) => {
+  let result = { state: 'pending', value: undefined };
   promise.then(
-    () => (state = 'fulfilled'),
-    (e) => (state = 'rejected:' + String(e)),
+    (value) => { result = { state: 'fulfilled', value }; },
+    (value) => { result = { state: 'rejected', value }; },
   );
   for (let i = 0; i < 3; i++) {
     await new Promise((resolve) => setTimeout(resolve, 0));
   }
-  return state;
+  return result;
+};
+
+const settled = async (promise) => {
+  const { state, value } = await outcome(promise);
+  if (state !== 'rejected') return state;
+  return 'rejected:' + String(value);
 };
 
 // The conformance checks run inside the isolate and report failures, so the
@@ -234,6 +240,160 @@ const conformance = async () => {
     );
   }
 
+  // 9. controller.error() from a later tick errors both sides and releases
+  //    a write parked on the backpressure handshake; ready rejects with the
+  //    same error.
+  {
+    let ctrl;
+    const { readable, writable } = new TransformStream({
+      start(c) { ctrl = c; },
+    });
+    const writer = writable.getWriter();
+    const write = writer.write('parked');
+    write.catch(() => {});
+    check('error parked write', (await settled(write)) === 'pending', 'the write did not park');
+    const failure = new Error('controller error');
+    ctrl.error(failure);
+    const released = await outcome(write);
+    check(
+      'error unblocks write',
+      released.state === 'rejected' && released.value === failure,
+      `the parked write settled as ${released.state}:${String(released.value)}`,
+    );
+    check(
+      'error rejects ready',
+      (await settled(writer.ready)) === 'rejected:Error: controller error',
+      'writer.ready did not reject with the controller error',
+    );
+    check(
+      'error errors readable',
+      (await settled(readable.getReader().read())) === 'rejected:Error: controller error',
+      'the readable did not error',
+    );
+  }
+
+  // 10. controller.error() inside start() errors the writable side too: a
+  //     write that arrives afterwards must reject instead of parking on a
+  //     readable nothing will pull again.
+  {
+    const failure = new Error('start error');
+    const { readable, writable } = new TransformStream({
+      start(controller) { controller.error(failure); },
+    });
+    const writer = writable.getWriter();
+    const state = await settled(writer.write('late'));
+    check(
+      'start error write',
+      state === 'rejected:Error: start error',
+      `the write settled as ${state}`,
+    );
+    check(
+      'start error readable',
+      (await settled(readable.getReader().read())) === 'rejected:Error: start error',
+      'the readable did not error',
+    );
+  }
+
+  // 11. controller.terminate() inside start() closes the readable and errors
+  //     the writable: a later write rejects with a TypeError.
+  {
+    const { readable, writable } = new TransformStream({
+      start(controller) { controller.terminate(); },
+    });
+    const writer = writable.getWriter();
+    const state = await settled(writer.write('late'));
+    check(
+      'start terminate write',
+      state.startsWith('rejected:TypeError'),
+      `the write settled as ${state}`,
+    );
+    check(
+      'start terminate readable',
+      (await settled(readable.getReader().closed)) === 'fulfilled',
+      'the readable was not closed',
+    );
+  }
+
+  // 12. controller.terminate() from a later tick releases a parked write.
+  {
+    let ctrl;
+    const { readable, writable } = new TransformStream({
+      start(c) { ctrl = c; },
+    });
+    const writer = writable.getWriter();
+    const write = writer.write('parked');
+    write.catch(() => {});
+    await settled(write);
+    ctrl.terminate();
+    const released = await outcome(write);
+    check(
+      'terminate unblocks write',
+      released.state === 'rejected' && released.value instanceof TypeError,
+      `the parked write settled as ${released.state}:${String(released.value)}`,
+    );
+    check(
+      'terminate closes readable',
+      (await settled(readable.getReader().closed)) === 'fulfilled',
+      'the readable was not closed',
+    );
+  }
+
+  // 13. The hook that releases a parked write is internal: a tenant
+  //     shadowing the old public field must not make abort or cancel throw
+  //     before the transformer's cancel runs.
+  {
+    let cancelled = 0;
+    const { readable, writable } = new TransformStream({
+      cancel() { cancelled += 1; },
+    });
+    writable._unblockWrite = () => { throw new Error('tenant hook'); };
+    const writer = writable.getWriter();
+    const write = writer.write('parked');
+    write.catch(() => {});
+    await settled(write);
+    const reason = new Error('abort after overwrite');
+    let abortError = null;
+    try { await writer.abort(reason); } catch (e) { abortError = e; }
+    const released = await outcome(write);
+    check(
+      'overwritten hook abort settles',
+      abortError === null,
+      `abort threw ${String(abortError)}`,
+    );
+    check(
+      'overwritten hook abort',
+      released.state === 'rejected' && released.value === reason,
+      `the parked write settled as ${released.state}:${String(released.value)}`,
+    );
+    check('overwritten hook abort cancel', cancelled === 1, `transformer cancel ran ${cancelled} times`);
+
+    const second = new TransformStream({ cancel() { cancelled += 1; } });
+    second.writable._unblockWrite = () => { throw new Error('tenant hook'); };
+    const secondWriter = second.writable.getWriter();
+    const secondWrite = secondWriter.write('parked');
+    secondWrite.catch(() => {});
+    await settled(secondWrite);
+    const cancelReason = new Error('cancel after overwrite');
+    let cancelError = null;
+    try { await second.readable.cancel(cancelReason); } catch (e) { cancelError = e; }
+    const secondReleased = await outcome(secondWrite);
+    check(
+      'overwritten hook readable cancel settles',
+      cancelError === null,
+      `readable.cancel threw ${String(cancelError)}`,
+    );
+    check(
+      'overwritten hook readable cancel',
+      secondReleased.state === 'rejected' && secondReleased.value === cancelReason,
+      `the parked write settled as ${secondReleased.state}:${String(secondReleased.value)}`,
+    );
+    check(
+      'overwritten hook readable cancel ran',
+      cancelled === 2,
+      `transformer cancel ran ${cancelled} times`,
+    );
+  }
+
   return { failures };
 };
 
@@ -275,6 +435,9 @@ export class Blocked extends DurableObject {
           this.completed = i + 1;
           this.bytes = this.completed * CHUNK_BYTES;
         }
+        // End the body: the HTTP response only gains its terminal chunk when
+        // the readable closes, and the test asserts the decoded framing.
+        await writer.close();
         this.phase = 'done';
       } catch (e) {
         this.phase = 'failed: ' + String(e);

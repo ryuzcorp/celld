@@ -13,6 +13,15 @@
 // Brand-check sentinel for internal construction.
 const _wsc_brand = Symbol("WritableStreamController");
 
+// Per-stream hook a TransformStream installs on its writable side: its sink
+// write parks on the readable's backpressure promise, so entering 'erroring'
+// has to release it (the write then rejects with the stored error) or an
+// abort, a readable cancel, or a controller error could never settle. Kept
+// in a module-private WeakMap rather than an own field: a tenant that
+// shadows a public property must not be able to make abort()/cancel throw
+// before the sink's abort algorithm runs.
+const _unblockWriteHooks = new WeakMap();
+
 class WritableStreamDefaultController {
   #stream;
   #abortController;
@@ -214,11 +223,6 @@ class WritableStream {
   _backpressure = false;
   _hwm = 1;
   _started = false;
-  // TransformStream hook: its sink write parks on the readable's
-  // backpressure promise, so entering 'erroring' has to release it
-  // (the write then rejects with the stored error) or an abort, a
-  // readable cancel, or a controller error could never settle.
-  _unblockWrite = null;
 
   constructor(underlyingSink, queuingStrategy) {
     // Per spec: extract strategy fields first. Size is
@@ -375,7 +379,8 @@ class WritableStream {
   _startErroring(reason) {
     this._storedError = reason;
     this._state = 'erroring';
-    if (this._unblockWrite) this._unblockWrite();
+    const unblockWrite = _unblockWriteHooks.get(this);
+    if (unblockWrite) unblockWrite();
     if (this._writer) this._writer._rejectReady(reason);
     if (this._started && !this._inFlightWrite &&
         !this._inFlightClose)
@@ -584,8 +589,10 @@ class TransformStreamDefaultController {
       new TypeError('The transform stream was terminated.'));
   }
   error(e) {
-    this.#onError(e);
+    // Spec TransformStreamError: error the readable side first, then error
+    // the writable side and unblock a write parked on the handshake.
     this.#rsc.error(e);
+    this.#onError(e);
   }
   get desiredSize() { return this.#rsc.desiredSize; }
 }
@@ -679,13 +686,25 @@ class TransformStream {
     // transformer.flush()'s side effect can be replayed
     // on writer.close() (rsc's error state is private).
     let readableError = null;
+    // start() runs before the writable exists (the readable side is
+    // constructed first), so a controller error or terminate from inside
+    // start has nowhere to go yet. Stash it and apply it as soon as the
+    // writable is constructed: otherwise the write that later arrives parks
+    // on a handshake nothing will ever release.
+    let startWindowError = null;
+    const errorWritable = (e) => {
+      if (writable) writable._errorStream(e);
+      else startWindowError = e;
+    };
     const ctrl = new TransformStreamDefaultController(rsc, (e) => {
       if (readableError === null) readableError = e;
+      // Spec: TransformStreamErrorWritableAndUnblockWrite.
+      errorWritable(e);
     }, () => {
       // Spec: TransformStreamDefaultControllerEnqueue sets the
       // backpressure flag when the readable no longer needs data.
       setBackpressure(!(rsc.desiredSize > 0));
-    }, (e) => { writable?._errorStream(e); });
+    }, (e) => { errorWritable(e); });
     // start runs once at construction per spec. A throw -- sync or
     // async -- must error both sides rather than escape the
     // constructor, so wrap it: the executor turns a sync throw into
@@ -769,8 +788,13 @@ class TransformStream {
     }, writableStrategy);
     // An abort or a readable failure enters 'erroring'; the hook wakes a
     // write parked on the handshake so it can reject with the stored
-    // error instead of waiting for a pull that will never come.
-    writable._unblockWrite = () => setBackpressure(false);
+    // error instead of waiting for a pull that will never come. Module
+    // private so tenant code cannot shadow it.
+    _unblockWriteHooks.set(writable, () => setBackpressure(false));
+    // A controller.error()/terminate() from start() ran before the
+    // writable existed; apply it now, before any write can queue.
+    if (startWindowError !== null)
+      writable._errorStream(startWindowError);
     this.writable = writable;
   }
 }

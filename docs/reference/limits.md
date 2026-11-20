@@ -65,6 +65,9 @@ services, APIs, and Wrangler configuration.
   side, `await writer.write(...)` stays pending and `writer.ready` does not
   settle, so a response body built from one stops producing when the HTTP
   client stops reading instead of buffering in the isolate's heap. A
+  cancelled readable, an aborted or errored writable, and
+  `controller.error()` / `controller.terminate()` release a parked write
+  instead of leaving it pending forever. A
   producer that writes without awaiting either, or that writes after
   `writer.desiredSize` says 0, still queues its chunks in memory — Cello
   cannot bound a stream you keep feeding.

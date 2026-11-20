@@ -47,6 +47,10 @@ use std::time::{Duration, Instant};
 const STALLED_MAX_WRITES: u64 = 192;
 const FIXTURE_CHUNK_BYTES: u64 = 128 * 1024;
 const FIXTURE_MAX_WRITES: u64 = 512;
+/// The stall observation: a plateau is two consecutive samples this far
+/// apart, and the whole wait for one is bounded by a single failure deadline.
+const SAMPLE_INTERVAL: Duration = Duration::from_millis(200);
+const STALL_DEADLINE: Duration = Duration::from_secs(30);
 
 fn fixture_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -267,14 +271,16 @@ fn transform_stream_applies_backpressure() {
 
 /// A client that takes the response head and then stops reading must stall
 /// the producer's `write()`, not grow the isolate's heap: the completed-write
-/// count stays at the socket and host buffers. Reading the body again resumes
-/// the producer and delivers every byte.
+/// count reaches a plateau at the socket and host buffers and stays there.
+/// Reading the body again resumes the producer and delivers every byte, so
+/// the drain decodes the HTTP framing and compares the payload -- not the
+/// wire bytes -- with what the fixture wrote.
 #[test]
 fn stalled_client_bounds_the_transform_stream_producer() {
     let (_dir, node) = boot_node();
     let mut stream = TcpStream::connect(&node.public).expect("connect stalled producer");
-    // Short reads keep the deadline loop responsive; nothing is read until the
-    // drain below, which is the whole point.
+    // Short reads keep the deadline loop responsive; after the response head
+    // nothing is read until the drain below, which is the whole point.
     stream
         .set_read_timeout(Some(Duration::from_millis(200)))
         .expect("stalled read timeout");
@@ -285,52 +291,100 @@ fn stalled_client_bounds_the_transform_stream_producer() {
     stream
         .write_all(wire.as_bytes())
         .expect("write stalled request");
+
     // The response head alone says the handler answered; from here the client
     // never reads, so the only thing that bounds the producer is the
-    // TransformStream's backpressure. The first second lets the socket and
-    // host buffers fill; after that the producer must not advance at all, and
-    // it must never approach the fixture's cap.
-    std::thread::sleep(Duration::from_secs(1));
-    let filled = producer_state(&node.public).expect("state mid-stall");
-    let mut highest = filled.completed;
-    let deadline = Instant::now() + Duration::from_secs(2);
-    while Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(200));
-        let state = producer_state(&node.public).expect("state mid-stall");
-        assert!(
-            state.phase != Phase::Failed,
+    // TransformStream's backpressure. The head is also where the body framing
+    // (chunked, normally) is learned, so the drain can count payload bytes
+    // rather than HTTP bytes.
+    let (head, pending) = read_response_head(&mut stream, Duration::from_secs(30));
+    let status: u16 = head
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|code| code.parse().ok())
+        .unwrap_or_else(|| panic!("no status in response head {head:?}"));
+    assert_eq!(status, 200, "the stalled request answered {status}: {head}");
+    let framing = BodySink::framing(&head);
+
+    // Wait until the producer has completed at least one write, then sample
+    // until two consecutive samples (one interval apart) are equal: a real
+    // plateau, not a fixed warm-up a slow-but-correct implementation could
+    // fail. Every sample enforces the cap, so an implementation without
+    // backpressure still fails fast instead of running to the fixture's cap.
+    let stall_deadline = Instant::now() + STALL_DEADLINE;
+    let check_sample = |state: Producer| {
+        assert_ne!(
+            state.phase,
+            Phase::Failed,
             "the stalled producer failed instead of parking: {state:?}"
         );
-        highest = highest.max(state.completed);
-    }
-    assert!(
-        highest <= STALLED_MAX_WRITES,
-        "a client that never reads must stall the producer at the socket and host buffers, \
-         but {highest} writes of {FIXTURE_CHUNK_BYTES} bytes completed (cap {FIXTURE_MAX_WRITES}); \
-         the TransformStream buffered the body in the isolate's heap"
+        assert!(
+            state.completed <= STALLED_MAX_WRITES,
+            "a client that never reads must stall the producer at the socket and host \
+             buffers, but {} writes of {FIXTURE_CHUNK_BYTES} bytes completed (cap \
+             {STALLED_MAX_WRITES} of {FIXTURE_MAX_WRITES}); the TransformStream buffered \
+             the body in the isolate's heap",
+            state.completed
+        );
+    };
+    poll_until(
+        "producer started",
+        stall_deadline.saturating_duration_since(Instant::now()),
+        || {
+            let state = producer_state(&node.public).ok()?;
+            // Started once it has completed a write, or already failed (the
+            // sample check below reports that). A producer that finished all
+            // writes before the first sample also reports here, and the cap
+            // check then fails it immediately.
+            (state.completed > 0 || state.phase == Phase::Failed).then_some("started".to_string())
+        },
     );
+    let mut previous = producer_state(&node.public).expect("state after start");
+    check_sample(previous);
+    let plateau = loop {
+        std::thread::sleep(SAMPLE_INTERVAL);
+        let current = producer_state(&node.public).expect("state mid-stall");
+        check_sample(current);
+        let equal = current.completed == previous.completed;
+        previous = current;
+        if equal {
+            break current.completed;
+        }
+        assert!(
+            Instant::now() < stall_deadline,
+            "the stalled producer never reached a plateau within {STALL_DEADLINE:?} \
+             (last sample {} of {FIXTURE_MAX_WRITES} writes); the client is not reading",
+            previous.completed
+        );
+    };
     eprintln!(
-        "stalled producer completed {highest} of {FIXTURE_MAX_WRITES} writes before the client read"
-    );
-    assert_eq!(
-        highest, filled.completed,
-        "the producer kept completing writes with no reader: {} -> {highest}",
-        filled.completed
+        "stalled producer plateaued at {plateau} of {FIXTURE_MAX_WRITES} writes before the \
+         client read"
     );
 
-    // Reading resumes it: every byte arrives and the producer finishes. The
-    // body may stay open past the last write, so end the drain at the byte
-    // count plus a quiet window instead of at EOF.
+    // Reading resumes it: the framed body arrives and the producer finishes.
+    // Payload bytes are counted after stripping the head and the chunk
+    // framing, so a header or CRLF cannot stand in for a missing write, and
+    // a short final chunk is a framing error rather than a byte-count miss.
     let total = FIXTURE_MAX_WRITES * FIXTURE_CHUNK_BYTES;
+    let mut body = framing;
+    body.feed(&pending)
+        .unwrap_or_else(|error| panic!("the response body is malformed: {error}"));
     let mut buf = vec![0u8; 64 * 1024];
-    let mut bytes = 0u64;
     let mut quiet = 0u32;
     let drain_deadline = Instant::now() + Duration::from_secs(120);
-    loop {
+    while !body.done() {
+        assert!(
+            Instant::now() < drain_deadline,
+            "the stalled body never resumed after the client read {} payload bytes of {total}",
+            body.payload_so_far()
+        );
         match stream.read(&mut buf) {
             Ok(0) => break,
             Ok(read) => {
-                bytes += read as u64;
+                body.feed(&buf[..read])
+                    .unwrap_or_else(|error| panic!("the response body is malformed: {error}"));
                 quiet = 0;
             }
             Err(error)
@@ -340,29 +394,249 @@ fn stalled_client_bounds_the_transform_stream_producer() {
                 ) =>
             {
                 quiet += 1;
+                // Several seconds of silence after the resume means the body
+                // stopped for good; `finish` then reports the truncation.
+                if quiet >= 25 {
+                    break;
+                }
             }
             Err(error) => panic!("drain read failed: {error}"),
         }
+    }
+    let payload = body
+        .finish()
+        .unwrap_or_else(|error| panic!("the drained body is truncated: {error}"));
+    assert_eq!(
+        payload, total,
+        "the decoded body payload is {payload} bytes, not the {total} bytes the fixture wrote"
+    );
+    poll_until("producer finished", Duration::from_secs(30), || {
+        let state = producer_state(&node.public).ok()?;
+        (state.phase == Phase::Done && state.completed == FIXTURE_MAX_WRITES)
+            .then(|| format!("{state:?}"))
+    });
+}
+
+/// Read one HTTP/1.1 response head (through the blank line), returning it and
+/// any body bytes that arrived with the same read.
+fn read_response_head(stream: &mut TcpStream, deadline: Duration) -> (String, Vec<u8>) {
+    let start = Instant::now();
+    let mut raw = Vec::new();
+    loop {
+        if let Some(position) = raw.windows(4).position(|window| window == b"\r\n\r\n") {
+            let head = String::from_utf8(raw[..position].to_vec())
+                .unwrap_or_else(|error| panic!("response head is not utf8: {error}"));
+            return (head, raw[position + 4..].to_vec());
+        }
         assert!(
-            Instant::now() < drain_deadline,
-            "the stalled body never resumed after the client read {bytes} of {total} bytes"
+            raw.len() < 64 * 1024,
+            "oversize response head ({} bytes)",
+            raw.len()
         );
-        if bytes >= total && quiet >= 3 {
-            break;
+        assert!(
+            start.elapsed() < deadline,
+            "no response head within {deadline:?}"
+        );
+        let mut buf = [0u8; 4096];
+        match stream.read(&mut buf) {
+            Ok(0) => panic!(
+                "the connection closed before the response head: {:?}",
+                String::from_utf8_lossy(&raw)
+            ),
+            Ok(read) => raw.extend_from_slice(&buf[..read]),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) => {}
+            Err(error) => panic!("response head read failed: {error}"),
         }
     }
-    let finished = producer_state(&node.public).expect("state after drain");
-    assert_eq!(
-        finished.phase,
-        Phase::Done,
-        "the producer must finish once the client reads ({finished:?})"
-    );
-    assert_eq!(
-        finished.completed, FIXTURE_MAX_WRITES,
-        "every write must complete once the client reads"
-    );
-    assert!(
-        bytes >= total,
-        "the drained body is {bytes} bytes, short of the {total} bytes written"
-    );
+}
+
+fn header_value<'a>(head: &'a str, name: &str) -> Option<&'a str> {
+    head.lines().skip(1).find_map(|line| {
+        let (key, value) = line.split_once(':')?;
+        key.trim().eq_ignore_ascii_case(name).then(|| value.trim())
+    })
+}
+
+/// How the response body is framed on the wire.
+enum BodySink {
+    Chunked(ChunkedDecoder),
+    Length { expected: u64, seen: u64 },
+    UntilEof { seen: u64 },
+}
+
+impl BodySink {
+    fn framing(head: &str) -> Self {
+        let chunked = header_value(head, "transfer-encoding")
+            .is_some_and(|value| value.to_ascii_lowercase().contains("chunked"));
+        if chunked {
+            return Self::Chunked(ChunkedDecoder::default());
+        }
+        match header_value(head, "content-length").and_then(|value| value.parse().ok()) {
+            Some(expected) => Self::Length { expected, seen: 0 },
+            None => Self::UntilEof { seen: 0 },
+        }
+    }
+
+    fn feed(&mut self, input: &[u8]) -> Result<(), String> {
+        match self {
+            Self::Chunked(decoder) => decoder.feed(input),
+            Self::Length { expected, seen } => {
+                *seen += input.len() as u64;
+                if *seen > *expected {
+                    return Err(format!(
+                        "body is longer than content-length {expected} ({seen} bytes)"
+                    ));
+                }
+                Ok(())
+            }
+            Self::UntilEof { seen } => {
+                *seen += input.len() as u64;
+                Ok(())
+            }
+        }
+    }
+
+    fn done(&self) -> bool {
+        match self {
+            Self::Chunked(decoder) => decoder.done(),
+            Self::Length { expected, seen } => seen == expected,
+            Self::UntilEof { .. } => false,
+        }
+    }
+
+    fn payload_so_far(&self) -> u64 {
+        match self {
+            Self::Chunked(decoder) => decoder.payload,
+            Self::Length { seen, .. } | Self::UntilEof { seen } => *seen,
+        }
+    }
+
+    fn finish(self) -> Result<u64, String> {
+        match self {
+            Self::Chunked(decoder) => {
+                if decoder.done() {
+                    Ok(decoder.payload)
+                } else {
+                    Err(format!(
+                        "the chunked body ended in {:?} after {} payload bytes",
+                        decoder.state, decoder.payload
+                    ))
+                }
+            }
+            Self::Length { expected, seen } => {
+                if seen == expected {
+                    Ok(seen)
+                } else {
+                    Err(format!("body ended after {seen} of {expected} bytes"))
+                }
+            }
+            Self::UntilEof { seen } => Ok(seen),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum ChunkState {
+    #[default]
+    Size,
+    Data,
+    DataCrlf,
+    Terminal,
+    Done,
+}
+
+/// Strict incremental `Transfer-Encoding: chunked` decoder. Counts decoded
+/// payload bytes, validates every size line and CRLF, accepts trailers, and
+/// refuses to finish before the terminal chunk, so truncated framing cannot
+/// pass as a short-but-valid body.
+#[derive(Default)]
+struct ChunkedDecoder {
+    state: ChunkState,
+    remaining: u64,
+    crlf_seen: u8,
+    line: Vec<u8>,
+    payload: u64,
+}
+
+impl ChunkedDecoder {
+    fn done(&self) -> bool {
+        self.state == ChunkState::Done
+    }
+
+    fn feed(&mut self, mut input: &[u8]) -> Result<(), String> {
+        loop {
+            match self.state {
+                ChunkState::Done => return Ok(()),
+                ChunkState::Size | ChunkState::Terminal => {
+                    if input.is_empty() {
+                        return Ok(());
+                    }
+                    if let Some(position) = input.windows(2).position(|window| window == b"\r\n") {
+                        let terminal_line_empty = self.state == ChunkState::Terminal
+                            && self.line.is_empty()
+                            && position == 0;
+                        self.line.extend_from_slice(&input[..position]);
+                        input = &input[position + 2..];
+                        let line = String::from_utf8(std::mem::take(&mut self.line))
+                            .map_err(|_| "HTTP chunk line is not utf8".to_string())?;
+                        if self.state == ChunkState::Terminal {
+                            // A trailer line, or the empty line ending them.
+                            if terminal_line_empty {
+                                self.state = ChunkState::Done;
+                            }
+                            continue;
+                        }
+                        let hex = line.split(';').next().unwrap_or("").trim();
+                        let size = u64::from_str_radix(hex, 16)
+                            .map_err(|_| format!("invalid chunk size {line:?}"))?;
+                        if size == 0 {
+                            self.state = ChunkState::Terminal;
+                        } else {
+                            self.remaining = size;
+                            self.state = ChunkState::Data;
+                        }
+                    } else {
+                        self.line.extend_from_slice(input);
+                        if self.line.len() > 8192 {
+                            return Err("HTTP chunk line is too long".to_string());
+                        }
+                        return Ok(());
+                    }
+                }
+                ChunkState::Data => {
+                    if input.is_empty() {
+                        return Ok(());
+                    }
+                    let take = (input.len() as u64).min(self.remaining) as usize;
+                    self.payload += take as u64;
+                    self.remaining -= take as u64;
+                    input = &input[take..];
+                    if self.remaining == 0 {
+                        self.state = ChunkState::DataCrlf;
+                    }
+                }
+                ChunkState::DataCrlf => {
+                    while self.crlf_seen < 2 {
+                        let Some((&byte, rest)) = input.split_first() else {
+                            return Ok(());
+                        };
+                        let want = if self.crlf_seen == 0 { b'\r' } else { b'\n' };
+                        if byte != want {
+                            return Err(format!(
+                                "chunk data is not CRLF-terminated (byte {byte:#04x})"
+                            ));
+                        }
+                        input = rest;
+                        self.crlf_seen += 1;
+                    }
+                    self.crlf_seen = 0;
+                    self.state = ChunkState::Size;
+                }
+            }
+        }
+    }
 }
