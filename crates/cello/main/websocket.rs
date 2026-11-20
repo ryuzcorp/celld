@@ -1338,8 +1338,9 @@ type PumpReadInFlight<S> =
 /// dispatches run without any time bound, so a slow handler never trips the
 /// pipe — only frames staged past the cap end it loudly. Fragments assemble
 /// in the reader under the message cap, uncharged against the staged
-/// budget: the worst case per socket is the message cap plus one full
-/// staged budget (see `cello::ws_message`), and a message whose fragments
+/// budget: the worst case per socket is the reader's bound (about twice the
+/// message cap while a frame is copied in) plus one full staged budget (see
+/// `cello::ws_message`), and a message whose fragments
 /// pass the cap ends the socket loudly with 1009 instead of staging
 /// anything. A peer close
 /// pending behind a stuck dispatch ends the read with the pending close

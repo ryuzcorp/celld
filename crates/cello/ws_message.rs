@@ -10,17 +10,27 @@
 //! grows host memory without bound. Every socket that reads frames through
 //! this module assembles through [`CappedFragmentReader`] instead, which
 //! tracks the in-progress message and fails the read once the total passes
-//! [`WS_MAX_MESSAGE_BYTES`]. The caller ends the socket loudly with
-//! [`WS_MESSAGE_TOO_BIG_CODE`] (1009, Message Too Big) on that failure.
+//! [`WS_MAX_MESSAGE_BYTES`]. The tenant-facing pumps end the socket loudly
+//! with [`WS_MESSAGE_TOO_BIG_CODE`] (1009, Message Too Big) on that failure;
+//! the internal presence session ends and reconnects, as on any read error.
+//!
+//! Before each frame the parser's per-frame limit is narrowed to what the
+//! message has left, so an over-cap frame is refused from its header,
+//! before its payload is read. Reading one message therefore holds at most
+//! the assembly (length and capacity both within the cap) plus the one
+//! frame being copied into it, and frame plus assembly never pass the cap
+//! by more than a control frame: about 2 × 32 MiB transient during a copy,
+//! 32 MiB once it lands.
 //!
 //! Bytes held mid-assembly are deliberately *not* charged against
 //! [`crate::isolate_pipe::ISOLATE_PIPE_MAX_STAGED_BYTES`]: the assembly
 //! buffer is bounded by this cap on its own, and it is released into the
 //! staged queue — where the staged cap does count it — the moment the
-//! message completes. The worst case per socket is therefore the message cap
-//! plus one full staged budget (32 MiB + 16 MiB), never an unbounded flood.
-//! Counting the same bytes in both ledgers would need a charge transfer at
-//! completion and risk the double-release the pipe budgets exist to avoid.
+//! message completes. The worst case per socket is therefore the read bound
+//! above plus one full staged budget (about 64 MiB + 16 MiB), never an
+//! unbounded flood. Counting the same bytes in both ledgers would need a
+//! charge transfer at completion and risk the double-release the pipe
+//! budgets exist to avoid.
 
 use std::future::Future;
 
@@ -32,10 +42,15 @@ use fastwebsockets::{Frame, OpCode, Payload, WebSocketError, WebSocketRead};
 /// Deliberately Cloudflare's number: Workers fail a WebSocket message over
 /// 32 MiB (raised from 1 MiB on 2025-10-31), so a message Cello delivers
 /// intact is one Cloudflare would deliver too, and a message Cloudflare
-/// refuses never grows a Cello node past this. The per-frame
-/// `max_message_size` is set to the same value when a reader is built, so no
-/// single frame can exceed the message it belongs to.
+/// refuses never grows a Cello node past this. A single frame is held to
+/// the same bound: the parser's per-frame limit is what the message has
+/// left.
 pub const WS_MAX_MESSAGE_BYTES: usize = 32 * 1024 * 1024;
+
+/// Largest control-frame payload (RFC 6455 §5.5). Control frames interleave
+/// a fragmented message and never count toward it, so the per-frame limit
+/// never drops below this even when the message has no room left.
+const MAX_CONTROL_PAYLOAD: usize = 125;
 
 /// Close code for a message that passed the cap: 1009 (Message Too Big).
 /// Application-originated — no peer sent it — so it reports unclean, the way
@@ -53,14 +68,14 @@ pub const WS_MESSAGE_TOO_BIG_REASON: &str = "WebSocket message over its 32 MiB c
 /// mid-assembly, automatic ping/pong and close replies still go out through
 /// the callback — except the running total is checked on every fragment and
 /// the read fails with [`WebSocketError::FrameTooLarge`] once the message
-/// passes the cap. The partial assembly is dropped with the error; the
-/// caller is expected to tear the socket down (loudly, with 1009), never to
-/// keep reading on the desynchronised stream.
+/// passes the cap. The partial assembly is dropped with any error; the
+/// caller is expected to tear the socket down, never to keep reading on the
+/// desynchronised stream.
 ///
-/// The constructor pins the read half's per-frame `max_message_size` to the
-/// message cap, so a single frame can never exceed the message it belongs
-/// to: a frame at or past the cap fails the same way an over-cap assembly
-/// does.
+/// Before each frame the read half's per-frame `max_message_size` is set to
+/// what the message has left (at least a control frame's 125 bytes), so a
+/// frame that would pass the cap fails from its header without its payload
+/// ever being buffered.
 pub struct CappedFragmentReader<S> {
     inner: WebSocketRead<S>,
     opcode: Option<OpCode>,
@@ -71,9 +86,8 @@ impl<S> CappedFragmentReader<S>
 where
     S: tokio::io::AsyncRead + Unpin,
 {
-    /// Wrap a split read half, capping its per-frame size at the message cap.
-    pub fn new(mut reader: WebSocketRead<S>) -> Self {
-        reader.set_max_message_size(WS_MAX_MESSAGE_BYTES);
+    /// Wrap a split read half; the per-frame limit is set before each read.
+    pub fn new(reader: WebSocketRead<S>) -> Self {
         Self {
             inner: reader,
             opcode: None,
@@ -82,8 +96,8 @@ where
     }
 
     /// Bytes held for the message being assembled. A test hook: together
-    /// with the per-frame bound it proves the server never buffers more than
-    /// the cap plus one frame.
+    /// with the per-frame limit it proves the server never buffers more than
+    /// the cap.
     pub fn buffered_bytes(&self) -> usize {
         self.buf.len()
     }
@@ -99,18 +113,35 @@ where
         E: Into<Box<dyn std::error::Error + Send + Sync + 'static>>,
     {
         loop {
-            let frame = self.inner.read_frame(send_fn).await?;
+            // fastwebsockets 0.8.1 refuses `payload_len >= max_message_size`,
+            // so the limit is one past the largest frame this message can
+            // still take: exactly the cap fits, one byte more does not.
+            let room = WS_MAX_MESSAGE_BYTES.saturating_sub(self.buf.len());
+            self.inner
+                .set_max_message_size(room.max(MAX_CONTROL_PAYLOAD) + 1);
+            let frame = match self.inner.read_frame(send_fn).await {
+                Ok(frame) => frame,
+                Err(error) => {
+                    self.opcode = None;
+                    self.buf = Vec::new();
+                    return Err(error);
+                }
+            };
             match frame.opcode {
                 OpCode::Text | OpCode::Binary => {
                     // A new message while one is assembling: the stream is
                     // misbehaving, as with the collector before.
                     if self.opcode.is_some() {
+                        self.opcode = None;
+                        self.buf = Vec::new();
                         return Err(WebSocketError::InvalidFragment);
                     }
-                    let payload: Vec<u8> = frame.payload.into();
-                    if payload.len() > WS_MAX_MESSAGE_BYTES {
+                    // Unreachable past the per-frame limit; kept so the cap
+                    // never rests on the parser alone.
+                    if frame.payload.len() > WS_MAX_MESSAGE_BYTES {
                         return Err(WebSocketError::FrameTooLarge);
                     }
+                    let payload: Vec<u8> = frame.payload.into();
                     if frame.fin {
                         if frame.opcode == OpCode::Text && std::str::from_utf8(&payload).is_err() {
                             return Err(WebSocketError::InvalidUTF8);
@@ -130,12 +161,23 @@ where
                         return Err(WebSocketError::InvalidContinuationFrame);
                     };
                     // Check before appending: the buffer itself never holds
-                    // more than the cap, so the peak is bounded even while a
-                    // flood is in flight.
-                    if self.buf.len().saturating_add(frame.payload.len()) > WS_MAX_MESSAGE_BYTES {
+                    // more than the cap. The per-frame limit refuses most
+                    // over-cap continuations first; this catches the
+                    // control-sized slack the limit keeps.
+                    let needed = self.buf.len().saturating_add(frame.payload.len());
+                    if needed > WS_MAX_MESSAGE_BYTES {
                         self.opcode = None;
-                        self.buf.clear();
+                        self.buf = Vec::new();
                         return Err(WebSocketError::FrameTooLarge);
+                    }
+                    // Grow geometrically (amortised, so a flood of tiny
+                    // fragments stays linear) but never past the cap:
+                    // `Vec`'s own doubling could reserve up to twice it.
+                    if needed > self.buf.capacity() {
+                        let target = needed
+                            .max(self.buf.capacity().saturating_mul(2))
+                            .min(WS_MAX_MESSAGE_BYTES);
+                        self.buf.reserve_exact(target - self.buf.len());
                     }
                     self.buf.extend_from_slice(&frame.payload);
                     if frame.fin {
@@ -277,11 +319,11 @@ mod tests {
     #[tokio::test]
     async fn assembly_past_cap_fails_without_buffering_more() {
         let (mut client, mut reader) = client_pair().await;
-        // 33 × 1 MiB fragments with no FIN: the 33rd byte past the cap
-        // fails the read. Writer and reader run joined in this one task,
-        // as above; the writer's flood is finite, so after the failed
-        // read the drain consumes to EOF — the writer's end, which drops
-        // its client half — and the join always completes.
+        // 33 × 1 MiB fragments with no FIN: the 33rd is refused from its
+        // header. Writer and reader run joined in this one task, as above.
+        // The refused frame's payload is never read, so the stream is
+        // desynchronised past the error: the reader drops its half instead
+        // of draining, and the writer stops at the first failed write.
         const CHUNK: usize = 1024 * 1024;
         let write_all = async move {
             client
@@ -294,41 +336,130 @@ mod tests {
                 .await
                 .expect("first fragment writes");
             for _ in 1..=32 {
-                client
-                    .write_frame(Frame::new(
-                        false,
-                        OpCode::Continuation,
-                        None,
-                        vec![0u8; CHUNK].into(),
-                    ))
-                    .await
-                    .expect("continuation writes");
-            }
-            // Dropping the client ends the drain below: its next read sees
-            // EOF instead of parking on a half the writer already left.
-            drop(client);
-        };
-        let read_all = async {
-            let error = read_error(&mut reader).await;
-            let mut send = null_send;
-            loop {
-                match reader.read_frame(&mut send).await {
-                    Err(WebSocketError::UnexpectedEOF) => break,
-                    Err(_) => {}
-                    Ok(_) => panic!("no complete message can arrive without FIN"),
+                let continuation =
+                    Frame::new(false, OpCode::Continuation, None, vec![0u8; CHUNK].into());
+                if client.write_frame(continuation).await.is_err() {
+                    return;
                 }
             }
-            error
         };
-        let (_, error) = tokio::join!(write_all, read_all);
+        let read_all = async move {
+            let error = read_error(&mut reader).await;
+            let buffered = reader.buffered_bytes();
+            drop(reader);
+            (error, buffered)
+        };
+        let (_, (error, buffered)) = tokio::join!(write_all, read_all);
         assert!(
             matches!(error, WebSocketError::FrameTooLarge),
             "over-cap assembly reports FrameTooLarge: {error:?}"
         );
+        assert_eq!(buffered, 0, "a failed read drops the partial assembly");
+    }
+
+    /// A server-side pair with the raw client stream, for hand-written
+    /// headers that promise more payload than they send.
+    fn raw_pair() -> (
+        tokio::io::DuplexStream,
+        CappedFragmentReader<tokio::io::ReadHalf<tokio::io::DuplexStream>>,
+    ) {
+        let (client_stream, server_stream) = tokio::io::duplex(64 * 1024);
+        let (reader, _writer) =
+            fastwebsockets::WebSocket::after_handshake(server_stream, fastwebsockets::Role::Server)
+                .split(tokio::io::split);
+        (client_stream, CappedFragmentReader::new(reader))
+    }
+
+    /// An unmasked frame header (the server role accepts unmasked frames).
+    fn raw_header(fin: bool, opcode: u8, len: usize) -> Vec<u8> {
+        let mut header = vec![if fin { 0x80 } else { 0 } | opcode];
+        if len < 126 {
+            header.push(len as u8);
+        } else if let Ok(len) = u16::try_from(len) {
+            header.push(126);
+            header.extend_from_slice(&len.to_be_bytes());
+        } else {
+            header.push(127);
+            header.extend_from_slice(&(len as u64).to_be_bytes());
+        }
+        header
+    }
+
+    #[tokio::test]
+    async fn single_frame_of_exactly_cap_delivered() {
+        use tokio::io::AsyncWriteExt;
+        let (mut raw, mut reader) = raw_pair();
+        // fastwebsockets refuses `payload_len >= max_message_size`: a limit
+        // of the cap itself would refuse this frame.
+        let write_all = async move {
+            raw.write_all(&raw_header(true, 0x2, WS_MAX_MESSAGE_BYTES))
+                .await
+                .expect("header writes");
+            raw.write_all(&vec![0x5Au8; WS_MAX_MESSAGE_BYTES])
+                .await
+                .expect("payload writes");
+            raw
+        };
+        let read_all = async {
+            let mut send = null_send;
+            reader
+                .read_frame(&mut send)
+                .await
+                .expect("a single frame of exactly the cap delivers")
+        };
+        let (_raw, frame) = tokio::join!(write_all, read_all);
+        assert_eq!(frame.opcode, OpCode::Binary);
+        assert_eq!(frame.payload.len(), WS_MAX_MESSAGE_BYTES);
+    }
+
+    #[tokio::test]
+    async fn single_frame_past_cap_refused_from_header() {
+        use tokio::io::AsyncWriteExt;
+        let (mut raw, mut reader) = raw_pair();
+        raw.write_all(&raw_header(true, 0x2, WS_MAX_MESSAGE_BYTES + 1))
+            .await
+            .expect("header writes");
+        drop(raw);
+        // No payload follows: only a refusal from the header answers
+        // FrameTooLarge; reading for the payload would hit EOF instead.
+        let error = read_error(&mut reader).await;
         assert!(
-            reader.buffered_bytes() <= WS_MAX_MESSAGE_BYTES,
-            "the buffer itself never holds more than the cap"
+            matches!(error, WebSocketError::FrameTooLarge),
+            "a frame past the cap is refused from its header: {error:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn continuation_past_room_refused_from_header() {
+        use tokio::io::AsyncWriteExt;
+        // 100 bytes short of the cap, then a continuation header promising
+        // 64 KiB and no payload. With the per-frame limit at the message's
+        // room the header alone is refused; a fixed per-frame limit would
+        // wait to buffer the 64 KiB and see EOF instead — the in-flight
+        // frame would sit beside a near-full assembly.
+        const FIRST: usize = WS_MAX_MESSAGE_BYTES - 100;
+        let (mut raw, mut reader) = raw_pair();
+        let write_all = async move {
+            raw.write_all(&raw_header(false, 0x2, FIRST))
+                .await
+                .expect("header writes");
+            raw.write_all(&vec![0u8; FIRST])
+                .await
+                .expect("payload writes");
+            raw.write_all(&raw_header(false, 0x0, 64 * 1024))
+                .await
+                .expect("continuation header writes");
+        };
+        let read_all = async {
+            let error = read_error(&mut reader).await;
+            (error, reader.buffered_bytes())
+        };
+        let (_, (error, buffered)) = tokio::join!(write_all, read_all);
+        assert!(
+            matches!(error, WebSocketError::FrameTooLarge),
+            "a continuation past the message's room is refused from its header: {error:?}"
+        );
+        assert_eq!(buffered, 0, "a failed read drops the partial assembly");
     }
 
     #[tokio::test]
