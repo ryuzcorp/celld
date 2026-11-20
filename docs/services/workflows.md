@@ -85,5 +85,5 @@ resident-cell cap bound it.
 - The Workflows REST API and the `wrangler workflows` commands are
   unavailable. Drive an instance through the binding.
 
-The [Cloudflare compatibility](../cloudflare-compat.md#services) page lists
+The [Cloudflare compatibility](../reference/cloudflare-compat.md#services) page lists
 the runtime APIs and the unsupported services.

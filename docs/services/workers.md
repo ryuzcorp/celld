@@ -48,7 +48,7 @@ a Worker must keep its state in a binding, not in module scope.
   `CELLO_AI_BINDING` and `CELLO_AI_URL`, and a deployment rejects an `ai`
   declaration.
 
-The [Cloudflare compatibility](../cloudflare-compat.md#services) page lists the
+The [Cloudflare compatibility](../reference/cloudflare-compat.md#services) page lists the
 runtime APIs and the unsupported services.
 
 ## Python Workers

@@ -23,12 +23,12 @@ APIs, and Wrangler configuration.
   establishment and control requests but does not encrypt data, so the network
   must provide confidentiality.
 - The fleet bucket controls the fleet. Give its credentials access to one fleet
-  only. See [Security](security.md).
+  only. See [Security](../guides/security.md).
 
 ## Object storage credentials
 
 - The credential methods differ by provider. See
-  [Configure object storage](operations.md#configure-object-storage).
+  [Configure object storage](../guides/run-fleet.md#configure-object-storage).
 - Azure identity works only in the public Azure cloud. A managed identity from
   Azure App Service or Azure Container Apps does not work. Use a workload
   identity or a storage account key there.

@@ -109,5 +109,5 @@ applies `not_found_handling`.
 - The assets binding has one method, `fetch()`. Cello supplies no `unstable_`
   helper.
 
-The [Cloudflare compatibility](../cloudflare-compat.md#services) page
+The [Cloudflare compatibility](../reference/cloudflare-compat.md#services) page
 lists the runtime APIs and the unsupported services.

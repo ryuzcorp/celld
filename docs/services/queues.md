@@ -70,5 +70,5 @@ adds no exponential backoff to a retry. Compute the delay from
   attachment, R2 event notifications, and Queue event subscriptions are
   unavailable.
 
-The [Cloudflare compatibility](../cloudflare-compat.md#services) page lists the
+The [Cloudflare compatibility](../reference/cloudflare-compat.md#services) page lists the
 runtime APIs and the unsupported services.

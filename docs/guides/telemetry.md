@@ -18,7 +18,7 @@ lifecycle; readers of the stamp itself must accept both spellings.
 | --- | --- | --- |
 | `CELLO_OTEL` | `0` | `0` disables telemetry. `1` writes Parquet to the fleet bucket. An HTTP(S) collector base URL selects OTLP/HTTP protobuf. |
 | `CELLO_OTEL_BUCKET` | the fleet bucket | A different bucket for the Parquet files, on the same endpoint and credentials. |
-| `CELLO_OTEL_RETENTION` | `30d` | Cello deletes telemetry files older than this. `none` disables the deletion, so your own lifecycle rules can control the data. In the fleet bucket, such a rule must select only the `telemetry/` prefix, after the key prefix if the bucket value has one. [Guarantees](guarantees.md) lists the reserved prefixes that a rule must not select. |
+| `CELLO_OTEL_RETENTION` | `30d` | Cello deletes telemetry files older than this. `none` disables the deletion, so your own lifecycle rules can control the data. In the fleet bucket, such a rule must select only the `telemetry/` prefix, after the key prefix if the bucket value has one. [Guarantees](../concepts/durability.md) lists the reserved prefixes that a rule must not select. |
 | `CELLO_OTEL_FLUSH_MS` | `300000` | Cello writes a Parquet file after this many milliseconds of buffered events. |
 | `CELLO_OTEL_FLUSH_BYTES` | `5242880` | The estimated buffered bytes that trigger a flush before the interval ends. |
 | `OTEL_TRACES_SAMPLER` | `parentbased_always_on` | A standard sampler name. `traceidratio` with `OTEL_TRACES_SAMPLER_ARG` records a fraction of the traces. |

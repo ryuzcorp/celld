@@ -16,24 +16,24 @@ An unsupported feature that does not cause an error is a defect.
 
 | service | status |
 | --- | --- |
-| [Workers](services/workers.md) | **Yes** |
-| [Durable Objects](services/durable-objects.md) | **Yes** |
-| [Durable Object Facets](services/durable-object-facets.md) | **Yes** |
-| [Containers](services/containers.md) | **Experimental** |
-| [Static assets](services/static-assets.md) | **Yes** |
-| [Cron Triggers](services/cron-triggers.md) | **Yes** |
-| [Dynamic Workers](services/dynamic-workers.md) | **Yes** |
-| [KV](services/kv.md) | **Yes** |
-| [Queues](services/queues.md) | **Yes** |
-| [D1](services/d1.md) | **Yes** |
-| [Workflows](services/workflows.md) | **Yes** |
-| [R2](services/r2.md) | **Yes** |
+| [Workers](../services/workers.md) | **Yes** |
+| [Durable Objects](../services/durable-objects.md) | **Yes** |
+| [Durable Object Facets](../services/durable-object-facets.md) | **Yes** |
+| [Containers](../services/containers.md) | **Experimental** |
+| [Static assets](../services/static-assets.md) | **Yes** |
+| [Cron Triggers](../services/cron-triggers.md) | **Yes** |
+| [Dynamic Workers](../services/dynamic-workers.md) | **Yes** |
+| [KV](../services/kv.md) | **Yes** |
+| [Queues](../services/queues.md) | **Yes** |
+| [D1](../services/d1.md) | **Yes** |
+| [Workflows](../services/workflows.md) | **Yes** |
+| [R2](../services/r2.md) | **Yes** |
 | Workers AI | **No** |
 | Vectorize | **No** |
 | Hyperdrive | **No** |
 | Browser Rendering | **No** |
 | Email Workers | **No** |
-| [Python Workers](services/workers.md#python-workers) | **Partial** — `fetch` handlers on the Pyodide 0.28 runtime line |
+| [Python Workers](../services/workers.md#python-workers) | **Partial** — `fetch` handlers on the Pyodide 0.28 runtime line |
 
 ## Runtime APIs
 
@@ -321,7 +321,7 @@ execution.
 
 ### [Cache](https://developers.cloudflare.com/workers/runtime-apis/cache/)
 
-See [Cache](services/cache.md) for the full behavior, freshness rules, and
+See [Cache](../services/cache.md) for the full behavior, freshness rules, and
 limits.
 
 - The cache is per-node and in-memory: entries survive across isolates of
@@ -389,4 +389,4 @@ deployment.
 An asset-only project can omit `main`. `cello deploy` refuses an unsafe asset
 path, and `.assetsignore` requires Wrangler.
 
-See [Limitations](limitations.md) for the operational limits.
+See [Limitations](limits.md) for the operational limits.

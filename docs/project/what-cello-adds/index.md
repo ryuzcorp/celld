@@ -6,7 +6,7 @@ description: Every improvement Cello carries over upstream denoland/celld, group
 Cello is upstream denoland/celld `v0.6.3` plus 136 patches, carried
 one-commit-per-patch and released as `v0.6.3-ryuzcorp.4` through `.13`
 before the rename to Cello 0.1.0 (0.2.0 keeps the same patch stack and
-renames the frozen identifiers — see [Compatibility](../compatibility.md)).
+renames the frozen identifiers — see [Compatibility](../../guides/upgrade.md)).
 This section turns those patch entries into readable
 groups. Each entry names its fork patch number; `(upstream #NNN)` links
 are the upstream issues a patch fixes or implements.
@@ -34,4 +34,4 @@ author line kept with a `Ported-from` trailer). Patch numbers `0068`,
 
 Settings and defaults are stated on each page. The per-release
 rollup — what shipped together and what mixed versions tolerate — is
-the [Changelog](../changelog.md).
+the [Changelog](../../changelog.md).

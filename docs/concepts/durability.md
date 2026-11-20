@@ -28,7 +28,7 @@ and Azure Blob Storage. The release tests run against R2; the S3 path uses the
 same client and headers. Azure was qualified on 2026-08-18, single-node, under
 an account key, a VM managed identity, and an AKS workload identity. A managed
 identity on Azure App Service or Azure Container Apps does not work; see
-[limitations](limitations.md).
+[limitations](../reference/limits.md).
 
 Backblaze B2, Hetzner Object Storage, and DigitalOcean Spaces do not implement
 the required conditional writes, so two nodes can own one cell on them. A store

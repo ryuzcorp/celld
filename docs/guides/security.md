@@ -49,7 +49,7 @@ or JS API can change it, and an unknown value refuses the boot rather
 than silently sharing. Sharing stays bounded: a different deployment or
 fleet still sees nothing, the runtime pool and dynamically loaded
 workers keep their own entries, and each scope carries its own size cap
-and recency (see [cache](services/cache.md#cache-scope)).
+and recency (see [cache](../services/cache.md#cache-scope)).
 
 ## Separate the listeners
 
@@ -148,7 +148,7 @@ live traffic and are retired after the request; cells resolve from the
 live generation, so bindings reach the real data. It runs to completion
 server-side even if the caller disconnects, so stopping the wait cannot
 leave a half-applied migration, and it answers only after `waitUntil`
-settles. See [Invoke a staged version](staged-invoke.md).
+settles. See [Invoke a staged version](staged-versions.md).
 
 `/peer/probe` returns a signed diagnostic response. Do not call the other
 reserved peer paths directly.
@@ -290,5 +290,5 @@ disclosure.
 Each cell is a SQLite database with one writer. An ownership epoch fences each
 cell, so a node that loses its lease cannot modify the current state. This
 fencing protects storage consistency. It does not isolate hostile
-applications. See [what Cello guarantees](guarantees.md) and
-[limitations](limitations.md).
+applications. See [what Cello guarantees](../concepts/durability.md) and
+[limitations](../reference/limits.md).

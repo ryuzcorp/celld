@@ -78,5 +78,5 @@ Cello logs a warning when it loads such a target.
   next occurrence unless the handler calls `noRetry()`.
 - A service-binding target cannot run its own Cron Triggers.
 
-The [Cloudflare compatibility](../cloudflare-compat.md#services) page
+The [Cloudflare compatibility](../reference/cloudflare-compat.md#services) page
 lists the runtime APIs and the unsupported services.

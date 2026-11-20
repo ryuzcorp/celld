@@ -59,5 +59,5 @@ A write of a value above 1 MiB without a fleet bucket fails with
 - A value above 1 MiB requires a fleet bucket.
 - A namespace has one writer. Use more namespaces to increase write capacity.
 
-The [Cloudflare compatibility](../cloudflare-compat.md#services) page lists the
+The [Cloudflare compatibility](../reference/cloudflare-compat.md#services) page lists the
 runtime APIs and the unsupported services.
