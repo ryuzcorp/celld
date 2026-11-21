@@ -17,17 +17,24 @@
 //! a Worker-constructed streaming body tee it the same way, so the unread
 //! copy has the same problem.
 //!
-//! The fix charges each chunk to the branches before it is enqueued and
-//! fails the most-lagging branch once the two hold more than the host tee's
-//! 32 MiB between them (`HTTP_TEE_MAX_SKEW_BYTES`). The drained branch
-//! keeps flowing to the end, the source is not cancelled, and the failing
-//! read rejects with the host tee's error and message.
+//! The fix fails a branch only for actual lag: a branch whose queued bytes
+//! exceed a live sibling's by more than the host tee's 32 MiB
+//! (`HTTP_TEE_MAX_SKEW_BYTES`). The drained branch keeps flowing to the
+//! end, the source is not cancelled while a branch is live, and the failing
+//! read rejects with the host tee's error and message. A single chunk
+//! larger than the budget is not lag, so it still reaches both copies; the
+//! accounting probe is total (no chunk code runs), so an unusual chunk
+//! cannot strand a branch; and every chunk costs at least the 64-byte floor,
+//! so empty chunks are not free.
 //!
 //! The fixture asserts all of that inside the isolate -- byte chunks, string
-//! chunks, byte-stream (BYOB) branches, and `Response.clone()` -- and the
-//! test only checks that it reported no failures. The byte paths produce
-//! more than the budget on purpose (36 MiB for one branch, 80 MiB for
-//! lockstep), so the bound has to be real rather than incidental.
+//! chunks, byte-stream (BYOB) branches, `Response.clone()`, an oversize
+//! chunk read in lockstep and with one branch unread, a fake `ArrayBuffer`
+//! and a Proxy chunk, a forced enqueue throw, and a source of only empty
+//! chunks -- and the test only checks that it reported no failures. The byte
+//! paths produce more than the budget on purpose (36 MiB for one branch,
+//! 80 MiB for lockstep, 40 MiB in one chunk), so the bound has to be real
+//! rather than incidental.
 
 mod common;
 

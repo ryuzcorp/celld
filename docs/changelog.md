@@ -40,14 +40,18 @@ No configuration, data, or bucket-format changes.
   `Request.clone()` of a streaming body it constructed -- to the end while
   the other branch went unread buffered the whole body in the isolate's
   heap, and `near_heap_limit` grows the heap rather than failing, so one
-  tenant could run the shared process out of memory. Each chunk is now
-  charged to both branches before it is enqueued; past 32 MiB of skew --
-  the host tee's budget for platform bodies -- the lagging branch's next
-  read rejects with `tee branch fell more than 32 MiB behind its sibling;
-  read both branches concurrently`, and the branch being read keeps flowing
-  to the end with the source uncancelled. Strings count 2 bytes per UTF-16
-  code unit and any other chunk a fixed 64 bytes, so an unread branch
-  cannot buffer bytes, text, or objects without limit either.
+  tenant could run the shared process out of memory. The tee now charges
+  each chunk to both branches; when one branch holds more than 32 MiB over a
+  live sibling -- the host tee's budget for platform bodies -- that branch's
+  next read rejects with `tee branch fell more than 32 MiB behind its
+  sibling; read both branches concurrently`, and the branch being read keeps
+  flowing to the end with the source uncancelled. Only actual lag fails a
+  branch, so a single chunk larger than the budget still reaches both
+  copies. Views count their visible length and any other value a fixed 64
+  bytes, which makes the budget a guard against accidental buffering rather
+  than an isolate memory limit: a payload hidden in an object chunk is not
+  counted, and the budget is per `tee()`, so a chain of N clones can hold
+  N × 32 MiB.
 
 ## v0.2.3
 

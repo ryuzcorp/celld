@@ -2894,7 +2894,13 @@ mod decoded_stream_tests {
 
 /// The JS tee in `js/streams.js` cannot import these constants, so it
 /// repeats them. This pins the copy to the host tee's values: changing one
-/// side alone fails here instead of shipping two budgets.
+/// side alone fails here instead of shipping two budgets. Only the budget
+/// and the message are shared; the trigger differs by design. The host
+/// charges a request-total (`used`) and fails the most-lagging branch, so a
+/// single send over the budget fails every copy. The JS tee compares one
+/// branch with its sibling and fails a branch only for actual lag, so a
+/// single oversize chunk still reaches both copies. See
+/// `docs/reference/limits.md`.
 #[cfg(test)]
 mod js_tee_budget_pin {
     #[test]
