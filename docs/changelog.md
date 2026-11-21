@@ -78,6 +78,12 @@ No configuration, data, or bucket-format changes.
   races -- instead of ending the body as if it were complete, so a Worker
   never receives a truncated body without an error. The other copies keep
   flowing.
+- **A failed `fetch()` reports its root cause** (#111). The error message used
+  to be reqwest's wrapper (`error sending request for url (…)`); it now
+  names the cause, such as `tcp connect error: Connection refused`,
+  `operation timed out`, or the tee skew message when a streamed request body
+  was a tee copy the budget ended. Code that matched the old wrapper text
+  should match the cause instead.
 
 ## v0.2.3
 
