@@ -80,10 +80,12 @@ use. An unsupported feature that stays silent is a defect.
   Object, or R2 body) buffers for the slower copy up to 32 MiB of skew,
   shared by all of one request's tees. Past that a copy is failed: a copy
   nobody has read from goes first -- the one holding the most, if it gives
-  back enough of the overrun on its own -- so a copy that is itself teed
-  keeps the path its inner tee is draining, as does a subrequest streaming a
-  copy, and only when no unread copy gives back enough does the copy holding
-  the most fail. The failed copy's next
+  back enough of the overrun on its own -- and only when no unread copy
+  gives back enough does the copy holding the most fail. A copy that is
+  itself teed, or that a subrequest is streaming, is spared once it has
+  read a byte; before its first byte it is indistinguishable from an
+  unread copy, so a fetch streaming a copy can fail with the skew error
+  too. The failed copy's next
   read rejects with `tee branch fell more than 32 MiB behind its sibling;
   read both branches concurrently`, a read already in flight rejects with
   the same error rather than ending the body as if it were complete, and

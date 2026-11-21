@@ -833,7 +833,13 @@ fn attribution_request_tee_chain_shares_one_skew_budget() {
     let forwarded = &out["forwarded"];
     if forwarded["ok"] == false {
         // The copy the subrequest streamed is the one the budget ended; its
-        // body error surfaces through the outbound fetch.
+        // body error surfaces through the outbound fetch, and it must be the
+        // skew cap rather than any other fetch failure.
+        let error = forwarded["error"].as_str().unwrap_or_default();
+        assert!(
+            error.contains("behind its sibling"),
+            "forwarded copy must report the skew cap: {out}"
+        );
         skewed += 1;
     } else {
         assert_eq!(forwarded["size"], 24 << 20, "{out}");

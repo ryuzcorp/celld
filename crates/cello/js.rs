@@ -1070,7 +1070,13 @@ fn fetch_request_error(error: &reqwest::Error) -> String {
             return refused.to_string();
         }
         let Some(next) = source.source() else {
-            return format!("fetch: {error}");
+            // Report the root cause, not reqwest's generic wrapper. A
+            // request body stream failure (a teed copy's skew error, for
+            // instance) surfaces only as the source of "error sending request
+            // for url (...)"; a Worker streaming a copy must see the reason
+            // the copy failed, not an error that reads like a connection
+            // failure.
+            return format!("fetch: {source}");
         };
         source = next;
     }
