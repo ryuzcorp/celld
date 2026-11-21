@@ -111,8 +111,12 @@ async function checkSse() {
   const opened = Date.now();
   const stopped = (error) => {
     const alive = ((Date.now() - opened) / 1000).toFixed(1);
+    const lastAt = last ? ((last - opened) / 1000).toFixed(1) : '0.0';
     const span = first ? ((last - first) / 1000).toFixed(1) : '0.0';
-    return `the SSE stream stopped ${alive} s after the head (span ${span} s over ${frames} frames): ${error.message}`;
+    return (
+      `the SSE stream died ${alive} s after the head (last frame at ${lastAt} s, ` +
+      `span ${span} s over ${frames} frames): ${error.message}`
+    );
   };
   const decoder = new TextDecoder();
   let buffer = '';
