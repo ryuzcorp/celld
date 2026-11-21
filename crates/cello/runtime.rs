@@ -3017,10 +3017,14 @@ pub fn init_v8() {
 /// [`init_v8_before_threads!`] at file scope.
 #[doc(hidden)]
 pub fn init_v8_before_main() {
-    INIT_TID.store(
-        std::process::id() as i64,
-        std::sync::atomic::Ordering::SeqCst,
-    );
+    // The OS thread id, not the process id: only the initial thread's tid
+    // equals the pid, so the guard test below can tell it from a test thread.
+    #[cfg(target_os = "linux")]
+    // SAFETY: gettid has no preconditions and cannot fail.
+    let tid = i64::from(unsafe { libc::gettid() });
+    #[cfg(not(target_os = "linux"))]
+    let tid = i64::from(std::process::id());
+    INIT_TID.store(tid, std::sync::atomic::Ordering::SeqCst);
     init_v8();
 }
 
