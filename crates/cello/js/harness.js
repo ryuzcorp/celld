@@ -2543,11 +2543,12 @@ class ContainerPort {
     try {
       return await fetch(forwarded);
     } catch (error) {
-      // A refused or reset connection is the port not listening yet, which
-      // the `@cloudflare/containers` start loop recognizes by this phrase
-      // and retries; any other failure keeps its own message.
+      // A refused, reset or timed-out connection is the port not listening
+      // yet, which the `@cloudflare/containers` start loop recognizes by this
+      // phrase and retries; any other failure keeps its own message. The
+      // fetch error carries its root cause, not reqwest's wrapper text.
       const message = error?.message ?? String(error);
-      if (/error sending request|connection|connect/i.test(message)) {
+      if (/error sending request|connection|connect|timed out/i.test(message)) {
         throw new Error(
           `The container is not listening on port ${this._port}: ${message}`,
         );

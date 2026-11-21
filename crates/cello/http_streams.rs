@@ -36,9 +36,9 @@ pub(crate) const HTTP_STREAM_REGISTRATION_CLOSED: &str = "the HTTP stream servic
 const RESPONSE_STREAM_CONSUMER_CANCELED: &str = "response stream consumer canceled";
 const RESPONSE_STREAM_CLOSE_IN_PROGRESS: &str = "response stream close is already in progress";
 /// Bytes all of one request's tee branches may buffer ahead of their
-/// siblings, in total. Past this the pump fails the lagging branch instead
-/// of buffering without bound, so one request's tees can never amplify node
-/// memory past the cap in total.
+/// siblings, in total. Past this the pump fails a copy nobody has read from
+/// first (else the one buffering the most) instead of buffering without
+/// bound, so one request's tees can never amplify node memory past the cap.
 pub(crate) const HTTP_TEE_MAX_SKEW_BYTES: u64 = 32 << 20;
 /// Rejection for a tee branch that fell past [`HTTP_TEE_MAX_SKEW_BYTES`].
 /// It names the fix (read both branches) because the failing read is the
@@ -2727,11 +2727,12 @@ async fn send_http_tee_item(
     // is draining for another copy's skew stalls a live path. The cap is
     // rechecked after the pick, since a concurrent receive may have made
     // room. Each iteration either sends, ends this branch, or fails one live
-    // branch (which unregisters it from the budget), and a victim that a
-    // concurrent removal already made unkillable ends this branch instead, so
-    // the loop always makes progress. The yield lets a killed in-flight pull
-    // settle and return its bytes before the re-check.
+    // branch (which unregisters it from the budget). A victim another pump
+    // of the same request killed first is filtered from the next pick, so a
+    // re-pick makes progress without failing this branch. The yield lets a
+    // killed in-flight pull settle and return its bytes before the re-check.
     let mut kills = 0usize;
+    let mut misses = 0usize;
     // Defensive: one kill removes one branch, so the bound is the request's
     // branch count. If a future kill path forgets that, ending this branch
     // with an error still beats spinning forever.
@@ -2785,17 +2786,22 @@ async fn send_http_tee_item(
                 }
                 match victim {
                     Some(victim) if victim != branch.stream_id => {
-                        kills += 1;
-                        if service.fail_tee_branch(victim) && kills <= MAX_SKEW_KILLS {
-                            tokio::task::yield_now().await;
+                        if service.fail_tee_branch(victim) {
+                            kills += 1;
                         } else {
-                            // The victim was already gone from the registry
-                            // (its lease owns a budget entry the picker could
-                            // not see), or the kill bound was reached: this
-                            // branch must end with the skew error, never spin.
+                            // Another pump of this request killed the same
+                            // victim first: its lease returns the bytes as it
+                            // settles, and the picker no longer sees the id.
+                            // Re-pick instead of failing this live branch.
+                            misses += 1;
+                        }
+                        if kills > MAX_SKEW_KILLS || misses > MAX_SKEW_KILLS {
+                            // Bounded, so this loop can never spin: past it
+                            // the branch ends with the skew error.
                             service.fail_tee_branch(branch.stream_id);
                             return HttpTeeSendOutcome::BranchClosed;
                         }
+                        tokio::task::yield_now().await;
                     }
                     _ => {
                         service.fail_tee_branch(branch.stream_id);
@@ -3144,9 +3150,10 @@ mod decoded_stream_tests {
 /// repeats them. This pins the copy to the host tee's values: changing one
 /// side alone fails here instead of shipping two budgets. Only the budget
 /// and the message are shared; the trigger differs by design. The host
-/// charges a request-total (`used`) and fails the most-lagging branch, so a
-/// single send over the budget fails every copy. The JS tee compares one
-/// branch with its sibling and fails a branch only for actual lag, so an
+/// charges a request-total (`used`) and fails an unread copy first, else
+/// the most-lagging one, so a single send over the budget fails every
+/// copy. The JS tee compares one branch with its sibling and fails a branch
+/// only for actual lag, so an
 /// oversize chunk fails no branch for its size: with both branches reading,
 /// both copies get it, while a branch that has not read it yet is behind and
 /// fails (`checkOversizeSequential`). See `docs/reference/limits.md`.
