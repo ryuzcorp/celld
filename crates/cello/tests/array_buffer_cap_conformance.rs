@@ -252,18 +252,9 @@ fn array_buffer_growth_is_refused_at_the_budget() {
     copy_dir(&fixture_dir(), &project);
     let node = TestNode::boot(&project);
 
-    // The legitimate payloads first, on the same Durable Object the growth
-    // request will use: they must fit under the budget.
-    let (status, headers, body) = get(&node, "/legit").expect("legit answers");
-    assert_eq!(status, 200, "{body}");
-    assert_eq!(
-        header(&headers, "x-refused"),
-        Some(""),
-        "the legitimate payloads were refused: {headers:?}"
-    );
-    assert_eq!(header(&headers, "x-grown"), Some("167772160"));
-
-    // 512 MiB asked for, with a 320 MiB budget and a 64 MiB heap limit.
+    // 512 MiB asked for, with a 320 MiB budget and a 64 MiB heap limit, on an
+    // isolate that has charged nothing yet: the refusal point is the budget,
+    // not what a previous request happened to leave charged.
     let before = node.rss_mib();
     let (status, headers, body) = get(&node, "/grow?target=536870912").expect("grow answers");
     assert_eq!(status, 200, "{body}");
@@ -307,8 +298,8 @@ fn array_buffer_growth_is_refused_at_the_budget() {
         Some(&*format!("{}", 1024 * MIB))
     );
 
-    // The node still serves, and the payloads fit again: the refused isolate's
-    // memory came back (recovered, or replaced by a fresh isolate).
+    // The node still serves, and the legitimate payloads fit: the refused
+    // request's memory came back to the budget (the isolate recovered).
     let (grown, _) = await_clear(&node, "/legit", Duration::from_secs(30));
     assert_eq!(grown, 160 * MIB);
     assert!(

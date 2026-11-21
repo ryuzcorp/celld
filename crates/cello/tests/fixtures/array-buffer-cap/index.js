@@ -1,11 +1,11 @@
 // The guest side of the ArrayBuffer budget gate.
 //
 // The node boots with `CELLO_V8_HEAP_LIMIT_MB=64` and
-// `CELLO_V8_EXTERNAL_LIMIT_MB=192`, so a loop of `new Uint8Array(8 MiB)` must
-// stop at 192 MiB -- three times the heap limit, below the 256 MiB the default
-// four-heap multiple would allow -- with a `RangeError`, instead of growing the
-// process. Every route runs in one Durable Object so a later request sees the
-// memory an earlier one left behind.
+// `CELLO_V8_EXTERNAL_LIMIT_MB=320`, so a loop of `new Uint8Array(8 MiB)` must
+// stop at 320 MiB -- five times the heap limit, above the 256 MiB the default
+// four-heap multiple would allow, which is what proves the knob is read -- with
+// a `RangeError`, instead of growing the process. Every route runs in one
+// Durable Object so a later request sees the memory an earlier one left behind.
 //
 // The outcome travels in headers, not a body: a response body is itself a
 // charged backing store, and an isolate at its ceiling cannot allocate one.

@@ -30,13 +30,18 @@
 //!   way once a cap exists. [`host_store`] hands V8 a store built from the
 //!   host's own `Vec`, charged to the same budget and refused in Rust with a
 //!   `RangeError` instead.
-//! - Resizable `ArrayBuffer`s and `WebAssembly.Memory` do **not** reach the
-//!   embedder allocator: V8 backs them with the platform page allocator
-//!   (`BackingStore::TryAllocateAndPartiallyCommitMemory`). Their bytes are
-//!   counted in `HeapStatistics::external_memory`, but no hook can refuse
-//!   them; `recover_heap` retires an isolate that still holds more than its
-//!   whole budget after a collection, and what a single turn can reach is
-//!   documented in `docs/reference/limits.md`.
+//! - Resizable `ArrayBuffer`s, growable `SharedArrayBuffer`s and
+//!   `WebAssembly.Memory` do **not** reach the embedder allocator: V8 backs
+//!   them with the platform page allocator
+//!   (`BackingStore::TryAllocateAndPartiallyCommitMemory`). No allocator hook
+//!   can refuse them, so the guest-facing wrappers in
+//!   `crates/cello/js/array_buffer_guard.js` reserve their bytes through
+//!   [`reserve_for_guest`] before the pages are committed, on the constructor
+//!   and on every `resize`/`grow`, and release them through the
+//!   `FinalizationRegistry` the runtime pumps at each turn's settle. A
+//!   module-declared wasm memory is the remaining path the wrappers cannot
+//!   see; `--wasm-max-mem-pages` bounds each one and `docs/reference/limits.md`
+//!   states the residual.
 //!
 //! The invariants this module keeps:
 //!
@@ -44,8 +49,11 @@
 //!   with the allocator V8 holds for that isolate, and every store is freed
 //!   by the deleter that charged it;
 //! - an allocation past the cap fails closed: the reservation is refused
-//!   before memory is taken, and the refusal sets the isolate's condemned
-//!   flag;
+//!   before memory is taken, and a refusal that reaches JavaScript (the
+//!   wrappers', or the turn-boundary reading of retained use) sets the
+//!   isolate's condemned flag. A null return from the allocator does not: V8
+//!   may collect and retry it, and a retry that succeeds never fails the
+//!   guest;
 //! - the process never aborts: every host-created store is charged in Rust
 //!   before it exists, and the only null return V8 can see is from a JS
 //!   allocation, which V8 handles by throwing.
@@ -90,7 +98,9 @@ pub(super) fn external_limit_bytes(heap_limit: usize) -> usize {
 /// from a collection on another thread, and an allocator callback may not
 /// block or call back into V8.
 pub(super) struct BackingStoreBudget {
-    cap: usize,
+    /// The ceiling, in bytes. Atomic only so a test can lower it for one
+    /// isolate without a second constructor; production never writes it.
+    cap: AtomicUsize,
     used: AtomicUsize,
     /// Latched by the refusal of an allocation past `cap`. It is the
     /// external-memory half of the isolate's condemnation: `recover_heap`
@@ -102,14 +112,21 @@ pub(super) struct BackingStoreBudget {
 impl BackingStoreBudget {
     pub(super) fn new(cap: usize) -> Arc<Self> {
         Arc::new(Self {
-            cap,
+            cap: AtomicUsize::new(cap),
             used: AtomicUsize::new(0),
             exceeded: AtomicBool::new(false),
         })
     }
 
     pub(super) fn cap(&self) -> usize {
-        self.cap
+        self.cap.load(Ordering::Relaxed)
+    }
+
+    /// Lower (or raise) the ceiling. Test-only: a guest test that filled four
+    /// heap limits of buffers would hold 500 MiB per test in parallel.
+    #[cfg(test)]
+    pub(super) fn set_cap(&self, cap: usize) {
+        self.cap.store(cap, Ordering::Relaxed);
     }
 
     pub(super) fn used(&self) -> usize {
@@ -124,28 +141,42 @@ impl BackingStoreBudget {
         self.exceeded.store(false, Ordering::Relaxed);
     }
 
+    /// Latch the condemnation without a refusal. `recover_heap` uses it for
+    /// an isolate whose retained use is still over the recovery share after a
+    /// collection: a refusal V8's own retry absorbed is not evidence, but the
+    /// bytes the isolate still holds are.
+    pub(super) fn latch_exceeded(&self) {
+        self.exceeded.store(true, Ordering::Relaxed);
+    }
+
     /// Whether the bytes this allocator handed out are at or above `share` of
     /// the cap. `recover_heap` measures this the way it measures the heap.
     pub(super) fn used_share(&self) -> f64 {
-        if self.cap == 0 {
+        let cap = self.cap();
+        if cap == 0 {
             return 1.0;
         }
-        self.used() as f64 / self.cap as f64
+        self.used() as f64 / cap as f64
     }
 
-    /// Reserve `len` bytes, or refuse and latch the condemnation.
+    /// Reserve `len` bytes, or refuse.
     ///
     /// A compare-exchange loop, not a fetch-add followed by a check: two
-    /// concurrent allocations must not both see room for the last bytes.
+    /// concurrent allocations must not both see room for the last bytes. A
+    /// refusal is *not* latched here: V8 answers a null from the ArrayBuffer
+    /// allocator by collecting and retrying the same allocation
+    /// (`heap-allocator.cc: RetryCustomAllocate`), and when the retry succeeds
+    /// the guest never sees an error. Latching that attempt would condemn an
+    /// isolate for a refusal nobody saw. [`Self::reserve_for_guest`] latches,
+    /// because a wrapper refusal does reach the guest as a thrown error, and
+    /// `recover_heap` latches on retained use after a collection.
     fn try_reserve(&self, len: usize) -> bool {
         let mut used = self.used.load(Ordering::Relaxed);
         loop {
             let Some(next) = used.checked_add(len) else {
-                self.exceeded.store(true, Ordering::Relaxed);
                 return false;
             };
-            if next > self.cap {
-                self.exceeded.store(true, Ordering::Relaxed);
+            if next > self.cap() {
                 return false;
             }
             match self
@@ -158,7 +189,20 @@ impl BackingStoreBudget {
         }
     }
 
-    fn release(&self, len: usize) {
+    /// Reserve bytes for a guest-facing wrapper (`array_buffer_guard.js`),
+    /// latching the condemnation when the reservation is refused.
+    ///
+    /// The refusal becomes a `RangeError` at the guest's call site, so the
+    /// isolate genuinely failed to allocate: same signal as the heap guard's.
+    pub(super) fn reserve_for_guest(&self, len: usize) -> bool {
+        if self.try_reserve(len) {
+            return true;
+        }
+        self.exceeded.store(true, Ordering::Relaxed);
+        false
+    }
+
+    pub(super) fn release(&self, len: usize) {
         let _ = self
             .used
             .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |used| {
@@ -337,9 +381,19 @@ mod tests {
         assert!(budget.try_reserve(768));
         assert_eq!(budget.used(), 768);
         assert!(!budget.exceeded());
+        // The allocator path refuses without latching: V8 may retry it.
         assert!(!budget.try_reserve(512));
         assert_eq!(budget.used(), 768, "a refused reservation charged nothing");
+        assert!(
+            !budget.exceeded(),
+            "an allocator refusal is not evidence until V8's retry fails"
+        );
+        // A wrapper refusal does reach the guest, so it latches.
+        assert!(!budget.reserve_for_guest(512));
         assert!(budget.exceeded(), "the refusal condemns the isolate");
+        budget.clear_exceeded();
+        budget.latch_exceeded();
+        assert!(budget.exceeded(), "retained use latches the same flag");
         // The room that was there is still there.
         assert!(budget.try_reserve(256));
         assert_eq!(budget.used(), 1024);
@@ -408,20 +462,25 @@ mod tests {
         let budget = BackingStoreBudget::new(4096);
         assert!(!allocate(&budget, 4096, false).is_null());
         assert!(allocate(&budget, 1, false).is_null(), "the cap is exact");
-        assert!(budget.exceeded());
+        assert!(
+            !budget.exceeded(),
+            "the allocator does not latch a refusal V8 can retry"
+        );
         assert_eq!(budget.used(), 4096);
     }
 }
-
-/// The budget as a guest sees it: `new ArrayBuffer`/typed arrays are refused
-/// with `RangeError` past the ceiling, the isolate is condemned the way the
-/// heap guard condemns it, freeing buffers lifts the condemnation, and the
-/// process stops growing.
+/// The budget as a guest sees it: buffers past the ceiling are refused with a
+/// `RangeError` at the call site, the isolate is condemned the way the heap
+/// guard condemns it, freeing buffers lifts the condemnation, and the process
+/// stops growing. Resizable `ArrayBuffer`s, growable `SharedArrayBuffer`s and
+/// `WebAssembly.Memory` are charged by the prelude wrappers in
+/// `array_buffer_guard.js`, and the wrappers cannot be reached around.
 ///
-/// The ceiling is whatever the isolate has by default (four heap limits, so
-/// 512 MiB at the 128 MiB default), deliberately: a test that lowered it
-/// through a hook would fail to compile once the wiring is reverted, and the
-/// point of these tests is to fail against the old unbounded allocator.
+/// Each test that fills the budget lowers it to 64 MiB through
+/// `set_external_limit_for_test` after loading the worker: `cargo test` runs
+/// these in parallel, and four heap limits per test would hold half a gigabyte
+/// each. The default ceiling is pinned once, by
+/// `growth_past_the_budget_is_refused_and_bounded`.
 #[cfg(test)]
 mod guest_tests {
     use crate::js::{Compat, RequestBody, Worker, WorkerConfig, WorkerConfigOptions};
@@ -429,12 +488,17 @@ mod guest_tests {
     use std::time::Instant;
 
     const MIB: usize = 1024 * 1024;
+    /// What these tests run with, except where they pin the default.
+    const TEST_CAP: usize = 64 * MIB;
 
     const SCRIPT: &str = r#"
 const held = [];
 globalThis.__held = held;
 function n(url, name, fallback) {
   return Number(url.searchParams.get(name) ?? fallback);
+}
+function report(error) {
+  return { ok: false, name: error.name, message: error.message };
 }
 export default {
   async fetch(request) {
@@ -465,7 +529,7 @@ export default {
           held.push(view);
           return Response.json({ ok: true, bytes: view.byteLength });
         } catch (error) {
-          return Response.json({ ok: false, name: error.name, message: error.message });
+          return Response.json(report(error));
         }
       }
       // Allocate and drop in a loop: nothing is retained, so the budget sees
@@ -510,7 +574,7 @@ export default {
           held.push(source, copy);
           return Response.json({ ok: true, bytes: copy.byteLength });
         } catch (error) {
-          return Response.json({ ok: false, name: error.name, message: error.message });
+          return Response.json(report(error));
         }
       }
       // `transfer` allocates the target buffer.
@@ -522,37 +586,166 @@ export default {
           held.push(moved);
           return Response.json({ ok: true, bytes: moved.byteLength });
         } catch (error) {
-          return Response.json({ ok: false, name: error.name });
+          return Response.json(report(error));
         }
+      }
+      // Construct a resizable `ArrayBuffer` and resize it in the same turn.
+      // The buffer is retained on success so the next request sees the charge.
+      case "/rab": {
+        const bytes = n(url, "bytes", 8);
+        const max = n(url, "max", 0) * 1024 * 1024;
+        const resize = n(url, "resize", 0) * 1024 * 1024;
+        try {
+          const buffer = new ArrayBuffer(bytes, { maxByteLength: max });
+          buffer.resize(resize);
+          held.push(buffer);
+          return Response.json({ ok: true, bytes: buffer.byteLength });
+        } catch (error) {
+          return Response.json(report(error));
+        }
+      }
+      // A resizable buffer constructed and then transferred in one turn: the
+      // transfer keeps resizability, so its target must be charged too.
+      case "/rab-transfer": {
+        const max = n(url, "max", 0) * 1024 * 1024;
+        const to = n(url, "to", 0) * 1024 * 1024;
+        try {
+          const source = new ArrayBuffer(8, { maxByteLength: max });
+          const moved = source.transfer(to);
+          held.push(moved);
+          return Response.json({
+            ok: true,
+            bytes: moved.byteLength,
+            resizable: moved.resizable === true,
+          });
+        } catch (error) {
+          return Response.json(report(error));
+        }
+      }
+      // A growable `SharedArrayBuffer`, grown in the same turn. `Atomics` must
+      // keep working on its views after the guard replaced the constructor.
+      case "/gsab": {
+        const max = n(url, "max", 0) * 1024 * 1024;
+        const grow = n(url, "grow", 0) * 1024 * 1024;
+        try {
+          const shared = new SharedArrayBuffer(8, { maxByteLength: max });
+          shared.grow(grow);
+          held.push(shared);
+          const words = new Int32Array(shared);
+          Atomics.store(words, 0, 7);
+          Atomics.add(words, 0, 1);
+          return Response.json({
+            ok: true,
+            bytes: shared.byteLength,
+            growable: shared.growable === true,
+            atomics: Atomics.load(words, 0),
+          });
+        } catch (error) {
+          return Response.json(report(error));
+        }
+      }
+      // `WebAssembly.Memory`: `initial` and `grow` are both in 64 KiB pages.
+      case "/wasm": {
+        const initial = n(url, "initial", 0);
+        const maximum = n(url, "maximum", -1);
+        const grow = n(url, "grow", 0);
+        try {
+          const descriptor = { initial };
+          if (maximum >= 0) descriptor.maximum = maximum;
+          const memory = new WebAssembly.Memory(descriptor);
+          if (grow > 0) memory.grow(grow);
+          held.push(memory);
+          return Response.json({
+            ok: true,
+            bytes: memory.buffer.byteLength,
+          });
+        } catch (error) {
+          return Response.json(report(error));
+        }
+      }
+      // Every way a guest could try to reach around the wrapper. Each one is
+      // reported, not thrown, so the test sees which path leaked.
+      case "/bypass": {
+        const attempts = {};
+        function attempt(name, fn) {
+          try {
+            const value = fn();
+            attempts[name] = value === undefined ? "ok" : String(value);
+          } catch (error) {
+            attempts[name] = `${error.name}`;
+          }
+        }
+        attempt("prototype-constructor", () => {
+          const buffer = Reflect.construct(
+            ArrayBuffer.prototype.constructor,
+            [8, { maxByteLength: 1 << 30 }],
+          );
+          return buffer.maxByteLength;
+        });
+        attempt("shared-prototype-constructor", () => {
+          const buffer = Reflect.construct(
+            SharedArrayBuffer.prototype.constructor,
+            [8, { maxByteLength: 1 << 30 }],
+          );
+          return buffer.maxByteLength;
+        });
+        attempt("subclass-new-target", () => {
+          class Mine extends ArrayBuffer {}
+          const buffer = Reflect.construct(
+            ArrayBuffer.prototype.constructor,
+            [8, { maxByteLength: 1 << 30 }],
+            Mine,
+          );
+          return buffer.maxByteLength;
+        });
+        // The original constructor is not the prototype of the prototype's
+        // constructor: a subclass wrapper would have leaked it there.
+        attempt("prototype-chain", () =>
+          Object.getPrototypeOf(ArrayBuffer.prototype).constructor === Object
+            ? "clean"
+            : "leaked");
+        attempt("global-constructor", () =>
+          ArrayBuffer === ArrayBuffer.prototype.constructor ? "same" : "replaced");
+        attempt("shared-global-constructor", () =>
+          SharedArrayBuffer === SharedArrayBuffer.prototype.constructor
+            ? "same"
+            : "replaced");
+        attempt("wasm-memory-constructor", () =>
+          WebAssembly.Memory === WebAssembly.Memory.prototype.constructor
+            ? "same"
+            : "replaced");
+        attempt("grow-own-property", () => {
+          const descriptor = Object.getOwnPropertyDescriptor(
+            SharedArrayBuffer.prototype,
+            "grow",
+          );
+          return descriptor.value === SharedArrayBuffer.prototype.grow
+            ? "wrapped"
+            : "native";
+        });
+        attempt("resize-own-property", () => {
+          const descriptor = Object.getOwnPropertyDescriptor(
+            ArrayBuffer.prototype,
+            "resize",
+          );
+          return descriptor.value === ArrayBuffer.prototype.resize
+            ? "wrapped"
+            : "native";
+        });
+        // 16 MiB fits beside the 40 MiB the test holds; the clone needs a
+        // second 16 MiB, which crosses the ceiling after the copy exists.
+        attempt("structured-clone", () => {
+          const source = new ArrayBuffer(8, { maxByteLength: 16 * 1024 * 1024 });
+          source.resize(16 * 1024 * 1024);
+          const copy = structuredClone(source);
+          return copy.byteLength;
+        });
+        return Response.json(attempts);
       }
       case "/free": {
         const freed = held.length;
         held.length = 0;
         return Response.json({ freed });
-      }
-      // A resizable `ArrayBuffer` is backed by V8's page allocator, not the
-      // isolate allocator: this route proves the difference and the backstop.
-      case "/resizable": {
-        const max = n(url, "max", 0) * 1024 * 1024;
-        const to = n(url, "to", 0) * 1024 * 1024;
-        try {
-          const buffer = new ArrayBuffer(8, { maxByteLength: max });
-          buffer.resize(to);
-          held.push(buffer);
-          return Response.json({ ok: true, bytes: buffer.byteLength });
-        } catch (error) {
-          return Response.json({ ok: false, name: error.name });
-        }
-      }
-      case "/wasm": {
-        const pages = n(url, "pages", 0);
-        try {
-          const memory = new WebAssembly.Memory({ initial: pages, maximum: pages });
-          held.push(memory);
-          return Response.json({ ok: true, bytes: memory.buffer.byteLength });
-        } catch (error) {
-          return Response.json({ ok: false, name: error.name });
-        }
       }
     }
     return new Response("not found", { status: 404 });
@@ -588,6 +781,21 @@ export default {
         Worker::load_config(Arc::new(config)).expect("load worker")
     }
 
+    /// Load a worker whose backing-store ceiling is [`TEST_CAP`]. Answers the
+    /// worker and the bytes it already charges (the script itself and the
+    /// bootstrap's stores), which every expectation is relative to.
+    fn load_with_test_cap() -> (Worker, usize) {
+        let worker = load();
+        worker.set_external_limit_for_test(TEST_CAP);
+        let (used, cap) = budget(&worker);
+        assert_eq!(cap, TEST_CAP);
+        assert!(
+            used < MIB,
+            "loading the worker charged {used} bytes of buffers"
+        );
+        (worker, used)
+    }
+
     /// One request whose handler settles on promises alone, so its first turn
     /// is the whole request. Answers the JSON body.
     fn fetch(worker: &mut Worker, path: &str) -> serde_json::Value {
@@ -617,16 +825,17 @@ export default {
         serde_json::from_slice(&response.body).expect("json body")
     }
 
-    /// Bytes the allocator currently charges, and the ceiling it enforces.
+    /// Bytes the budget currently charges, and the ceiling it enforces.
     fn budget(worker: &Worker) -> (usize, usize) {
         worker
             .backing_store_budget_for_test()
             .expect("every loaded isolate has a budget")
     }
 
-    /// A full collection, then the foreground tasks it posted, until none is
-    /// runnable. The deleter that releases a backing store's bytes runs inside
-    /// the collection, so this is what makes "freed" observable.
+    /// A full collection and the foreground tasks it posted — including V8's
+    /// `FinalizationRegistry` cleanup, which is where a dropped resizable
+    /// buffer, growable `SharedArrayBuffer` or wasm memory gives its bytes
+    /// back. Runs until no task is left runnable.
     fn collect(worker: &mut Worker) {
         worker.settle_heap();
         let inner = worker.inner.as_ref().expect("live worker");
@@ -640,17 +849,15 @@ export default {
         panic!("foreground tasks kept coming after 1024 runs");
     }
 
-    /// The step-1 failure, now bounded: after 496 MiB of retained views a
-    /// further 32 MiB `new Uint8Array` is refused with a `RangeError`, the
-    /// isolate is condemned the way the heap guard condemns it, the allocator
-    /// stops charging at the ceiling, and a second isolate pays nothing for the
-    /// first one's fill.
+    /// The step-1 failure, now bounded: after most of the budget is retained,
+    /// a further allocation is refused with a `RangeError`, the allocator
+    /// stops charging at the ceiling, the isolate is condemned, and a second
+    /// isolate pays nothing for the first one's fill.
     ///
-    /// The fixture stops 16 MiB under the ceiling on purpose: a response body
+    /// The fixture stops a step under the ceiling on purpose: a response body
     /// is itself a charged host store, and an isolate at the exact ceiling
     /// cannot encode its own answer. That is the guest-visible contract (free
-    /// buffers before allocating more), and the conformance fixture reports
-    /// through a header for the same reason.
+    /// buffers before allocating more).
     #[test]
     fn growth_past_the_budget_is_refused_and_bounded() {
         on_engine_thread(|| {
@@ -688,10 +895,13 @@ export default {
                 "V8 external memory stays near the ceiling: {} bytes",
                 heap.external
             );
+            // The retained bytes condemned the isolate at the turn boundary;
+            // the refusal itself does not latch (V8 may retry an allocator
+            // refusal). Both guards answer through the same accessor.
             assert_eq!(
-                worker.heap_condemned_for_test(),
+                worker.condemned_for_test(),
                 Some(true),
-                "the refusal condemns the isolate, as the heap guard does"
+                "retained use condemns the isolate, as the heap guard does"
             );
 
             // The condemnation is the refused isolate's. A second isolate
@@ -702,7 +912,7 @@ export default {
                 report["ok"], true,
                 "another isolate was charged for the first one's fill: {report}"
             );
-            assert_eq!(other.heap_condemned_for_test(), Some(false));
+            assert_eq!(other.condemned_for_test(), Some(false));
             let (used_other, _) = budget(&other);
             assert!(used_other >= 64 * MIB);
         });
@@ -714,24 +924,23 @@ export default {
     #[test]
     fn churn_past_the_budget_is_never_refused() {
         on_engine_thread(|| {
-            let mut worker = load();
-            let (_, cap) = budget(&worker);
-            // 24 requests x 8 chunks x 8 MiB = 1.5 GiB, three ceilings over.
+            let (mut worker, base) = load_with_test_cap();
+            // 24 requests x 4 chunks x 4 MiB = 384 MiB, six ceilings over.
             for round in 0..24 {
-                let report = fetch(&mut worker, "/churn?step=8388608&count=8");
+                let report = fetch(&mut worker, "/churn?step=4194304&count=4");
                 assert!(
                     report["refused"].is_null(),
                     "churn round {round} was refused: {report}"
                 );
-                assert_eq!(report["allocated"], 64 * MIB);
+                assert_eq!(report["allocated"], 16 * MIB);
                 collect(&mut worker);
                 let (used, _) = budget(&worker);
                 assert!(
-                    used < cap / 2,
-                    "collected churn left {used} of {cap} charged after round {round}"
+                    used < base + TEST_CAP / 2,
+                    "collected churn left {used} charged after round {round}"
                 );
                 assert_eq!(
-                    worker.heap_condemned_for_test(),
+                    worker.condemned_for_test(),
                     Some(false),
                     "churn condemned the isolate after round {round}"
                 );
@@ -744,69 +953,71 @@ export default {
     #[test]
     fn legitimate_payloads_fit_under_the_budget() {
         on_engine_thread(|| {
+            // The default ceiling: the payload set is what the four-heap
+            // multiple is sized for.
             let mut worker = load();
+            let (base, _) = budget(&worker);
             let report = fetch(&mut worker, "/legit");
             assert_eq!(report["bytes"], 160 * MIB, "{report}");
-            assert_eq!(worker.heap_condemned_for_test(), Some(false));
+            assert_eq!(worker.condemned_for_test(), Some(false));
             let (used, cap) = budget(&worker);
             // The payloads plus the response body's own store, which is
-            // charged like any other.
+            // charged like any other. 160 MiB of 512 is well under the share
+            // that would condemn the isolate.
             assert!(
-                (160 * MIB..=160 * MIB + MIB).contains(&used),
+                used >= base + 160 * MIB && used <= base + 160 * MIB + MIB,
                 "charged {used} bytes for 160 MiB of payloads"
             );
             assert!(used < cap);
 
             // And the isolate still takes more afterwards: the ceiling is not
             // a per-request budget.
-            let report = fetch(&mut worker, "/churn?step=8388608&count=8");
+            let report = fetch(&mut worker, "/churn?step=4194304&count=2");
             assert!(report["refused"].is_null(), "{report}");
-            assert_eq!(worker.heap_condemned_for_test(), Some(false));
+            assert_eq!(worker.condemned_for_test(), Some(false));
         });
     }
 
     /// `structuredClone` and `transfer` allocate through the same budget as
     /// `new ArrayBuffer`.
     ///
-    /// Each probe gets its own isolate: a collection releases every store the
-    /// guest dropped, but V8 retains one backing store per `structuredClone`
-    /// past the first collection (measured: 48 MiB charged after a clone,
-    /// 24 MiB after a collection), which would confuse the recovery stage
-    /// below. The recovery stage uses only views the test allocated itself,
-    /// whose release is deterministic.
+    /// Each probe gets its own isolate. The clone probe depends only on the
+    /// bytes the guard charged, not on V8 retaining a store past a collection:
+    /// a fresh isolate grows to half the ceiling, then a clone that needs two
+    /// copies of 24 MiB is refused before it can cross it.
     #[test]
     fn clone_and_transfer_use_the_same_budget() {
         on_engine_thread(|| {
             {
-                let mut worker = load();
-                let report = fetch(&mut worker, "/grow?step=8388608&target=503316480");
-                assert_eq!(report["grown"], 480 * MIB, "{report}");
-                assert_eq!(worker.heap_condemned_for_test(), Some(false));
-                // 32 MiB of headroom; a 24 MiB clone needs 48.
+                let (mut worker, base) = load_with_test_cap();
+                let report = fetch(&mut worker, "/grow?step=4194304&target=33554432");
+                assert_eq!(report["grown"], 32 * MIB, "{report}");
+                assert_eq!(worker.condemned_for_test(), Some(false));
+                // 32 MiB charged, 32 MiB free: a 24 MiB clone needs 48.
                 let report = fetch(&mut worker, "/clone?mib=24");
                 assert_eq!(report["ok"], false, "the clone was not refused: {report}");
+                // A clone of a plain buffer is allocated by V8's deserializer
+                // through the isolate allocator, so the allocator's refusal
+                // surfaces as V8's deserialize error, not as the guard's own
+                // `RangeError`. That difference is documented.
                 assert!(
                     report["message"]
                         .as_str()
                         .is_some_and(|message| message.contains("deserialize")),
-                    "the clone failed at V8's deserializer: {report}"
-                );
-                assert_eq!(
-                    worker.heap_condemned_for_test(),
-                    Some(true),
-                    "the refused clone condemns the isolate"
+                    "the clone failed in V8's deserializer: {report}"
                 );
                 let (used, cap) = budget(&worker);
                 assert!(
                     used <= cap,
                     "the clone charged past the ceiling: {used}/{cap}"
                 );
+                assert!(used >= base + 32 * MIB, "the fill is still charged: {used}");
             }
 
             {
-                let mut worker = load();
-                let report = fetch(&mut worker, "/grow?step=8388608&target=503316480");
-                assert_eq!(report["grown"], 480 * MIB, "{report}");
+                let (mut worker, _) = load_with_test_cap();
+                let report = fetch(&mut worker, "/grow?step=4194304&target=33554432");
+                assert_eq!(report["grown"], 32 * MIB, "{report}");
                 // The transfer target is an allocation too: 8 MiB in, 64 MiB
                 // out crosses the ceiling.
                 let report = fetch(&mut worker, "/transfer?from=8&to=64");
@@ -824,98 +1035,238 @@ export default {
         });
     }
 
+    /// A resizable `ArrayBuffer` is refused by the wrapper in the same turn it
+    /// would commit the pages, not at the next turn boundary — and the refusal
+    /// latches the budget's own condemnation while the isolate holds well
+    /// under the recovery share, which only the wrapper's latch can do.
+    #[test]
+    fn resizable_buffer_past_the_budget_is_refused_in_the_turn() {
+        on_engine_thread(|| {
+            let (mut worker, base) = load_with_test_cap();
+            // 32 MiB of the 64 MiB ceiling, retained through the next turns.
+            let report = fetch(&mut worker, "/rab?bytes=8&max=32&resize=32");
+            assert_eq!(report["ok"], true, "{report}");
+            assert_eq!(report["bytes"], 32 * MIB, "{report}");
+            let (used, _) = budget(&worker);
+            assert!(
+                (base + 32 * MIB..=base + 32 * MIB + 65536).contains(&used),
+                "32 MiB charged plus the answer's store: {used}"
+            );
+            assert_eq!(
+                worker.external_exceeded_for_test(),
+                Some(false),
+                "half the ceiling does not condemn"
+            );
+
+            // The next turn begins at 50% of the ceiling, so nothing but the
+            // wrapper's refusal can latch the flag: 32 + 32 > 64.
+            let report = fetch(&mut worker, "/rab?bytes=8&max=32&resize=32");
+            assert_eq!(
+                report["ok"], false,
+                "the resize was not refused in its turn: {report}"
+            );
+            assert_eq!(report["name"], "RangeError", "{report}");
+            assert!(
+                report["message"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("budget")),
+                "the refusal names the budget: {report}"
+            );
+            assert_eq!(
+                worker.external_exceeded_for_test(),
+                Some(true),
+                "the wrapper's refusal latches the budget condemnation"
+            );
+            assert_eq!(worker.condemned_for_test(), Some(true));
+            let (used, cap) = budget(&worker);
+            assert!(
+                used <= cap,
+                "the refused resize charged nothing: {used} of {cap}"
+            );
+
+            // The constructor itself is refused past the ceiling, in the same
+            // turn: 48 MiB cannot fit beside the 32 MiB already held.
+            let report = fetch(&mut worker, "/rab?bytes=8&max=48&resize=48");
+            assert_eq!(
+                report["ok"], false,
+                "the construct was not refused: {report}"
+            );
+            assert_eq!(report["name"], "RangeError", "{report}");
+
+            // `transfer` keeps resizability, so its replacement is charged
+            // too: the source's max is 32 MiB and half is already retained.
+            let report = fetch(&mut worker, "/rab-transfer?max=32&to=32");
+            assert_eq!(
+                report["ok"], false,
+                "the resizable transfer was not refused: {report}"
+            );
+            assert_eq!(report["name"], "RangeError", "{report}");
+        });
+    }
+
+    /// A growable `SharedArrayBuffer` is charged on `grow` and refused past
+    /// the ceiling, and `Atomics` keeps working on its views.
+    #[test]
+    fn growable_shared_buffer_past_the_budget_is_refused() {
+        on_engine_thread(|| {
+            let (mut worker, base) = load_with_test_cap();
+            // 24 MiB of the ceiling held as an ordinary allocation.
+            let report = fetch(&mut worker, "/grow?step=4194304&target=25165824");
+            assert_eq!(report["grown"], 24 * MIB, "{report}");
+
+            // 8 MiB growable to 48 MiB: 24 + 8 fits; 24 + 48 does not.
+            let report = fetch(&mut worker, "/gsab?max=48&grow=48");
+            assert_eq!(
+                report["ok"], false,
+                "the grow was not refused in its turn: {report}"
+            );
+            assert_eq!(report["name"], "RangeError", "{report}");
+            assert!(
+                report["message"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("budget")),
+                "the refusal names the budget: {report}"
+            );
+
+            // Within the ceiling the same grow happens and `Atomics` works.
+            let report = fetch(&mut worker, "/gsab?max=16&grow=16");
+            assert_eq!(report["ok"], true, "{report}");
+            assert_eq!(report["bytes"], 16 * MIB, "{report}");
+            assert_eq!(report["growable"], true, "{report}");
+            assert_eq!(report["atomics"], 8, "Atomics works on a wrapped SAB");
+            // Collect first: the refused request's buffer is garbage, and its
+            // bytes are still charged until the finalizer runs.
+            collect(&mut worker);
+            let (used, cap) = budget(&worker);
+            assert_eq!(
+                used,
+                base + 40 * MIB,
+                "24 MiB + 16 MiB charged, got {used} of {cap}"
+            );
+
+            // A growable SAB is a page-allocator store, not an allocator one:
+            // the charge is the wrapper's, and it returns when collected.
+            fetch(&mut worker, "/free");
+            collect(&mut worker);
+            let (used, _) = budget(&worker);
+            assert_eq!(used, base, "the dropped stores released their bytes");
+        });
+    }
+
+    /// `WebAssembly.Memory` is charged on construction and on `grow`, and
+    /// refused past the ceiling in the same turn.
+    #[test]
+    fn wasm_memory_past_the_budget_is_refused() {
+        on_engine_thread(|| {
+            let (mut worker, base) = load_with_test_cap();
+            // 8 MiB of the 64 MiB ceiling, held.
+            let report = fetch(&mut worker, "/grow?step=4194304&target=8388608");
+            assert_eq!(report["grown"], 8 * MIB, "{report}");
+
+            // 1 MiB initial, grown by 56 MiB: 8 + 1 + 56 crosses only at the
+            // grow.
+            let report = fetch(&mut worker, "/wasm?initial=16&maximum=1024&grow=896");
+            assert_eq!(
+                report["ok"], false,
+                "the wasm grow was not refused in its turn: {report}"
+            );
+            assert_eq!(report["name"], "RangeError", "{report}");
+
+            // The constructor is charged too: 60 MiB cannot fit beside 8.
+            let report = fetch(&mut worker, "/wasm?initial=960");
+            assert_eq!(
+                report["ok"], false,
+                "the wasm construct was not refused: {report}"
+            );
+            assert_eq!(report["name"], "RangeError", "{report}");
+
+            // Within the ceiling it commits and grows, and the charge follows
+            // the pages.
+            let report = fetch(&mut worker, "/wasm?initial=16&maximum=256&grow=16");
+            assert_eq!(report["ok"], true, "{report}");
+            assert_eq!(report["bytes"], 32 * 65536, "{report}");
+            // Collect first: the refused requests' memories are garbage, and
+            // their bytes are still charged until the finalizer runs.
+            collect(&mut worker);
+            let (used, _) = budget(&worker);
+            assert_eq!(
+                used,
+                base + 8 * MIB + 32 * 65536,
+                "8 MiB held plus 2 MiB of wasm pages: {used}"
+            );
+
+            fetch(&mut worker, "/free");
+            collect(&mut worker);
+            let (used, _) = budget(&worker);
+            assert_eq!(used, base, "the dropped memory released its bytes");
+        });
+    }
+
+    /// Every reachable route around the wrapper is closed: the original
+    /// constructor is not nameable, the prototype's methods are the wrappers,
+    /// and a `structuredClone` that would clone a resizable buffer is charged.
+    #[test]
+    fn wrapper_bypass_attempts_fail() {
+        on_engine_thread(|| {
+            let (mut worker, base) = load_with_test_cap();
+            // 40 MiB of a 64 MiB ceiling, so the clone below would cross it.
+            let report = fetch(&mut worker, "/rab?bytes=8&max=48&resize=40");
+            assert_eq!(report["ok"], true, "{report}");
+
+            let report = fetch(&mut worker, "/bypass");
+            assert_eq!(report["prototype-constructor"], "RangeError", "{report}");
+            assert_eq!(
+                report["shared-prototype-constructor"], "RangeError",
+                "{report}"
+            );
+            assert_eq!(report["subclass-new-target"], "RangeError", "{report}");
+            assert_eq!(report["prototype-chain"], "clean", "{report}");
+            assert_eq!(report["global-constructor"], "same", "{report}");
+            assert_eq!(report["shared-global-constructor"], "same", "{report}");
+            assert_eq!(report["wasm-memory-constructor"], "same", "{report}");
+            assert_eq!(report["grow-own-property"], "wrapped", "{report}");
+            assert_eq!(report["resize-own-property"], "wrapped", "{report}");
+            assert_eq!(
+                report["structured-clone"], "RangeError",
+                "structuredClone made a resizable copy the guard could not prevent: {report}"
+            );
+            let (used, cap) = budget(&worker);
+            assert!(used <= cap, "{used} of {cap}");
+            assert!(used >= base + 40 * MIB, "the fill is still charged");
+        });
+    }
+
     /// Freeing what is charged lifts the condemnation: the collector returns
     /// the bytes to the budget, so an isolate that lets go serves again and is
     /// never condemned for memory it no longer holds.
     #[test]
     fn freed_buffers_lift_the_condemnation() {
         on_engine_thread(|| {
-            let mut worker = load();
-            let (_, cap) = budget(&worker);
-            let report = fetch(&mut worker, "/grow?step=8388608&target=503316480");
-            assert_eq!(report["grown"], 480 * MIB, "{report}");
+            let (mut worker, base) = load_with_test_cap();
+            let report = fetch(&mut worker, "/grow?step=4194304&target=58720256");
+            assert_eq!(report["grown"], 56 * MIB, "{report}");
 
-            // One allocation past the ceiling condemns the isolate.
-            let report = fetch(&mut worker, "/alloc?mib=64");
+            // One allocation past the ceiling, in a turn that begins over the
+            // recovery share: the isolate is condemned.
+            let report = fetch(&mut worker, "/alloc?mib=16");
             assert_eq!(report["ok"], false, "{report}");
             assert_eq!(report["name"], "RangeError", "{report}");
-            assert_eq!(worker.heap_condemned_for_test(), Some(true));
+            assert_eq!(worker.condemned_for_test(), Some(true));
 
             fetch(&mut worker, "/free");
             collect(&mut worker);
             let (used, _) = budget(&worker);
-            assert_eq!(used, 0, "the freed stores are released");
+            assert_eq!(used, base, "the freed stores are released");
             let report = fetch(&mut worker, "/alloc?mib=8");
             assert_eq!(report["ok"], true, "{report}");
             assert_eq!(
-                worker.heap_condemned_for_test(),
+                worker.condemned_for_test(),
                 Some(false),
                 "a drained isolate serves again"
             );
-            let (used, _) = budget(&worker);
+            assert_eq!(worker.external_exceeded_for_test(), Some(false));
+            let (used, cap) = budget(&worker);
             assert!(used < cap);
-        });
-    }
-
-    /// The two paths V8 keeps outside the allocator. A resized `ArrayBuffer` is
-    /// charged to no allocator but is counted as external memory, so the next
-    /// turn sees it, condemns the isolate and (in a pool) retires it —
-    /// `retire_if_over_budget`. Wasm memory is counted nowhere, the documented
-    /// remaining gap.
-    #[test]
-    fn resizable_and_wasm_memory_bypass_the_allocator_but_are_seen() {
-        on_engine_thread(|| {
-            let mut worker = load();
-            let (_, cap) = budget(&worker);
-            // A resizable buffer commits its `resize` through the page
-            // allocator. Untouched, so this costs address space and the
-            // external-memory reading, not resident pages.
-            let report = fetch(&mut worker, "/resizable?max=640&to=600");
-            assert_eq!(report["ok"], true, "{report}");
-            assert_eq!(report["bytes"], 600 * MIB);
-            let (used, _) = budget(&worker);
-            assert!(
-                used < MIB,
-                "a resizable buffer charges no allocator, only the answer's \
-                 small store: {used}"
-            );
-            let heap = worker.heap_bytes().expect("live isolate");
-            assert!(
-                heap.external as usize >= 600 * MIB,
-                "V8 counts the resized buffer as external memory: {}",
-                heap.external
-            );
-            assert!(
-                heap.external as usize > cap,
-                "the resized buffer is past the ceiling, so the isolate retires"
-            );
-
-            // The next turn sees it and condemns the isolate. A standalone
-            // worker has no pool to retire it to; in a pool the same check
-            // retires it, which the conformance suite covers.
-            fetch(&mut worker, "/churn?step=8388608&count=1");
-            assert_eq!(
-                worker.heap_condemned_for_test(),
-                Some(true),
-                "a store past the ceiling condemns the isolate at the next turn"
-            );
-
-            // Wasm memory goes further: the page allocator, and V8 does not
-            // even count it in `external_memory` (measured: +212 bytes for a
-            // 64 MiB memory). Nothing in this isolate can see it, which is
-            // why it is documented as the remaining gap.
-            let mut other = load();
-            let before = other.heap_bytes().expect("live isolate").external;
-            let report = fetch(&mut other, "/wasm?pages=1024");
-            assert_eq!(report["ok"], true, "{report}");
-            assert_eq!(report["bytes"], 64 * MIB, "{report}");
-            let after = other.heap_bytes().expect("live isolate").external;
-            assert!(
-                after < before + 4 * MIB as u64,
-                "wasm memory is invisible to external accounting: {before} -> {after}"
-            );
-            let (used, _) = budget(&other);
-            assert!(used < MIB, "wasm memory charges no allocator: {used}");
         });
     }
 }

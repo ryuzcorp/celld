@@ -96,28 +96,62 @@ services, APIs, and Wrangler configuration.
 
 - An isolate holds at most `CELLO_V8_EXTERNAL_LIMIT_MB` of `ArrayBuffer`
   memory: four times its V8 heap limit by default, 512 MiB with the
-  default 128 MiB heap. Past it, `new ArrayBuffer`, typed arrays,
-  `structuredClone`, `ArrayBuffer.prototype.transfer`, and every buffer the
-  host hands to JavaScript throw `RangeError: Array buffer allocation
-  failed`. The isolate is then condemned the way a heap-limit hit condemns
-  it: it takes on no new hibernatable socket, and it is retired at its next
-  turn so the cell restarts on a fresh isolate. An isolate that lets go of
-  its buffers is not condemned: a collection returns them to the budget, so
-  allocating and dropping far more than the budget in total never fails.
+  default 128 MiB heap. The budget covers every backing store the isolate
+  can reach — plain `ArrayBuffer`s and typed arrays, resizable
+  `ArrayBuffer`s (`maxByteLength`, `resize`, `transfer`), growable
+  `SharedArrayBuffer`s (`maxByteLength`, `grow`), `WebAssembly.Memory`
+  (`initial`, `grow`), every `structuredClone` of a buffer, and the buffers
+  the host hands to JavaScript (response bodies, WebSocket messages, RPC
+  arguments, `/tmp` reads, D1 blobs).
+- Past the cap the allocation is refused in the same turn, before the pages
+  are committed, and the failure reaches the guest as a `RangeError`. Plain
+  buffers are refused by V8's allocator, so the message is V8's
+  `Array buffer allocation failed`. The guard the resizable, growable and
+  wasm paths go through (`array_buffer_guard.js`) and the host's own buffers
+  throw `Array buffer allocation failed: the isolate's ArrayBuffer memory
+  budget is exhausted (..., see CELLO_V8_EXTERNAL_LIMIT_MB); free buffers
+  before allocating more`. A `structuredClone` of a resizable buffer is
+  cloned before the guard can charge it, so that clone is refused after it
+  exists; a clone of a plain buffer that the allocator refuses fails inside
+  V8's deserializer with `Unable to deserialize cloned data`.
+- One buffer may not reserve more than the whole budget: `maxByteLength`
+  (and a wasm memory's address-space reservation) above
+  `CELLO_V8_EXTERNAL_LIMIT_MB` is refused, even when its current length
+  would fit.
+- A refusal condemns the isolate the way a heap-limit hit does: it takes on
+  no new hibernatable socket and no new SQL result set materializes, and it
+  serves again once a collection finds both the heap and the budget under 75
+  percent of their limits. A turn that begins with retained buffers over 75
+  percent of the budget is condemned too, after a rate-limited collection —
+  so an isolate that merely asked for too much once, and was refused without
+  keeping it, is not condemned. The isolate is not retired for memory it
+  holds: the cell keeps serving on it at reduced admission, exactly as it
+  does after a heap-limit hit.
+- Bytes come back when the collector frees the object. For plain buffers that
+  is the next collection. For the resizable/growable/wasm paths the guard
+  returns them through V8's `FinalizationRegistry`, which the runtime drives
+  at each turn's settle, so a dropped buffer is released by the end of the
+  turn that dropped it. Within a single turn the bytes still count: a loop
+  that creates and drops more than the budget of resizable or wasm buffers
+  without yielding can be refused even though it retains nothing. Plain
+  `ArrayBuffer` churn has no such bound — V8 collects and retries it — so
+  allocate-and-drop loops over typed arrays are never refused, however much
+  they allocate in total.
 - The limit covers the whole isolate, not one request. A `tee()` chain, a
   clone, a WebSocket message and a `.arrayBuffer()` call share it, so a
   handler that holds several 32 MiB payloads at once can reach it while
   every payload on its own is well under it. An isolate at the limit cannot
   allocate at all, including the buffer a response body is built from; free
-  what you no longer need, or let the request fail and the isolate retire.
-- Two allocation paths are outside the budget. `ArrayBuffer.prototype.resize`
-  on a resizable `ArrayBuffer` and `WebAssembly.Memory` are backed by the
-  platform page allocator, not by the isolate's. A resized buffer is still
-  counted as external memory, so an isolate that grows one past its whole
-  budget is retired at the next turn. Wasm memory is counted nowhere, so it
-  is bounded only by V8's own Wasm memory limit and by the node's
-  `CELLO_MAX_RSS_MB` pressure shedding. Do not rely on the budget to stop a
-  Worker that allocates large Wasm memories.
+  what you no longer need before you allocate more.
+- One path is only partly covered: a `WebAssembly.Memory` a *module*
+  declares (not one passed in from JavaScript) never reaches the guard.
+  `--wasm-max-mem-pages` caps each such memory at the isolate's whole budget
+  (and every `grow`, including one performed by wasm code, at the same
+  number), but an isolate that instantiates many modules, each with its own
+  memory, is bounded only by the node's `CELLO_MAX_RSS_MB` pressure
+  shedding. Do not rely on the budget to stop a Worker that instantiates
+  many multi-hundred-megabyte Wasm memories; a memory held by JavaScript is
+  charged normally.
 - The budget is per isolate, not per node: `CELLO_MAX_CELLS_PER_ISOLATE`
   cells share one, and a node runs as many isolates as its pools allow. Size
   it against `CELLO_MAX_RSS_MB` and the isolate count, not against the

@@ -95,18 +95,27 @@ changes; `CELLO_V8_EXTERNAL_LIMIT_MB` is new and optional.
   limit and was never refused (measured: RSS +643 MiB, isolate not
   condemned). Every isolate now has an allocator of its own that charges
   each backing store to a per-isolate budget and returns null past it, which
-  V8 turns into a catchable `RangeError: Array buffer allocation failed`;
-  the refusal condemns the isolate, which retires it so the cell restarts on
-  a fresh one. The budget is `CELLO_V8_EXTERNAL_LIMIT_MB`, four heap limits
-  by default (512 MiB), above the 64 MiB `/tmp` read, 32 MiB WebSocket
-  message, 32 MiB tee skew and clone that one request legitimately holds. A
-  collection returns freed buffers to the budget, so churn past the limit is
-  never refused. Buffers the host hands to JavaScript -- response bodies,
-  WebSocket messages, RPC arguments, `/tmp` reads, D1 blobs -- are charged
-  to the same budget and refused the same way. Two paths stay outside it
-  and are documented in [Limitations](reference/limits.md): a resized
-  resizable `ArrayBuffer` is retired at the next turn, and
-  `WebAssembly.Memory` is bounded only by V8 and the node's memory pressure.
+  V8 turns into a catchable `RangeError: Array buffer allocation failed`.
+  The budget is `CELLO_V8_EXTERNAL_LIMIT_MB`, four heap limits by default
+  (512 MiB), above the 64 MiB `/tmp` read, 32 MiB WebSocket message, 32 MiB
+  tee skew and clone that one request legitimately holds. The three
+  page-allocator paths that bypass the allocator -- a resizable
+  `ArrayBuffer`, a growable `SharedArrayBuffer`, and `WebAssembly.Memory` --
+  are charged by a prelude guard on construction and on every
+  `resize`/`grow`, before the pages are committed, so they are refused in
+  the same turn rather than seen at the next one; the guard is not reachable
+  around (`ArrayBuffer.prototype.constructor`, `Reflect.construct`,
+  `structuredClone`, `transfer`). A refusal condemns the isolate the way a
+  heap-limit hit does: it takes on no new retained state and serves again
+  once it is back under 75 percent of both limits. A collection returns
+  freed buffers to the budget, so churn past the limit is never refused.
+  Buffers the host hands to JavaScript -- response bodies, WebSocket
+  messages, RPC arguments, `/tmp` reads, D1 blobs -- are charged to the same
+  budget and refused the same way. What remains is documented in
+  [Limitations](reference/limits.md): a `WebAssembly.Memory` that a module
+  declares is bounded per memory (`--wasm-max-mem-pages`, the whole budget)
+  but not charged, so many such memories in one isolate are bounded only by
+  the node's memory pressure shedding.
 
 ## v0.2.3
 
