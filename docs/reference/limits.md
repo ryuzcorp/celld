@@ -71,19 +71,22 @@ services, APIs, and Wrangler configuration.
   producer that writes without awaiting either, or that writes after
   `writer.desiredSize` says 0, still queues its chunks in memory — Cello
   cannot bound a stream you keep feeding.
-- A `tee()` bounds the skew between its branches: while one branch keeps
-  reading, the other may hold at most 32 MiB more than it — the budget the
-  host tee of a platform body uses. Past that the branch that is behind
-  fails its next read with `tee branch fell more than 32 MiB behind its
-  sibling; read both branches concurrently`, and the branch being read
-  keeps flowing to the end. Only actual lag fails a branch, so a single
-  chunk larger than the budget still reaches both copies. Views count their
-  visible length, not the buffer they keep alive, and any other value a
-  fixed 64 bytes, so this is a guard against accidental buffering rather
-  than an isolate memory limit: a payload hidden in an object chunk, or a
-  small view over a large buffer, is not counted. The budget is per
-  `tee()`, so a chain of N clones can hold N × 32 MiB. Read both branches,
-  or cancel the one you do not need.
+- A `tee()` bounds the skew between its branches: the difference between
+  what the two branches hold is measured just after a chunk is queued, and
+  past 32 MiB — the budget the host tee of a platform body uses — the
+  branch that is behind fails its next read with `tee branch fell more than
+  32 MiB behind its sibling; read both branches concurrently`, while the
+  branch being read keeps flowing to the end. The chunk size alone fails no
+  branch, but a branch that has not read an oversize chunk yet holds all of
+  it and fails for lag, so with chunks larger than the budget both branches
+  must be read concurrently. A chunk is charged its size — a string 2 bytes
+  per UTF-16 code unit, a buffer its length, a view its visible length and
+  not the buffer behind it — and every chunk at least 64 bytes. That makes
+  the budget a guard against accidental buffering rather than an isolate
+  memory limit: a payload hidden in an object chunk, or a small view over a
+  large buffer, is not counted. The budget is per `tee()`, so a chain of N
+  clones can hold N × 32 MiB. Read both branches, or cancel the one you do
+  not need.
 - An isolate holds at most 128 live `CompressionStream`s and
   `DecompressionStream`s together. Constructing one more throws a
   `RangeError`. A stream stops counting once it finishes, is cancelled or
