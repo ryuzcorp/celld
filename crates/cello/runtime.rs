@@ -3054,6 +3054,7 @@ macro_rules! init_v8_before_threads {
 
 #[cfg(test)]
 mod test_v8_preinit {
+    #[cfg(target_os = "linux")]
     use std::sync::atomic::Ordering;
 
     crate::init_v8_before_threads!();
@@ -3062,6 +3063,11 @@ mod test_v8_preinit {
     /// made, so pin the convention: if the constructor is dropped, `INIT_TID`
     /// stays zero (or records a test thread) and this fails before any test
     /// that depends on V8 can run.
+    ///
+    /// Linux only: that is where V8 uses protection keys, and where the
+    /// constructor is emitted into `.init_array`; elsewhere V8 may initialise
+    /// on any thread and the guard would fail for no reason.
+    #[cfg(target_os = "linux")]
     #[test]
     fn v8_initialises_on_the_process_thread() {
         assert_eq!(
