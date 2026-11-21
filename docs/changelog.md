@@ -4,8 +4,8 @@ description: What shipped in each Cello release, from v0.6.3-ryuzcorp.4 to v0.2.
 ---
 ## Unreleased
 
-A `TransformStream` now applies backpressure. No configuration, data, or
-bucket-format changes.
+A `TransformStream` now applies backpressure, and compression streams no
+longer leak native memory. No configuration, data, or bucket-format changes.
 
 - **`TransformStream` applies backpressure** (#105). Its writable side used to
   resolve `write()` as soon as the transform returned, whether or not
@@ -24,6 +24,16 @@ bucket-format changes.
   of parking. A producer that writes without awaiting either,
   or that writes past `writer.desiredSize` 0, still queues in memory;
   `writer.ready` is the signal to honor.
+- **Compression streams release their native state** (#106). Every
+  `CompressionStream` and `DecompressionStream` held its zlib state in one
+  process-wide table that only a finished, cancelled, or aborted stream left.
+  An abandoned stream, a stream whose input was not bytes, or a torn-down
+  isolate kept its entry forever, so one tenant constructing streams in a loop
+  could leak native memory for every tenant on the node. The table is now
+  per isolate and goes with it. A stream left unreachable mid-flight is
+  released when it is garbage-collected, and a transform error releases it
+  too. An isolate holds at most 128 live compression streams; the next
+  constructor call throws a `RangeError`.
 
 ## v0.2.3
 

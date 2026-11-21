@@ -71,6 +71,10 @@ services, APIs, and Wrangler configuration.
   producer that writes without awaiting either, or that writes after
   `writer.desiredSize` says 0, still queues its chunks in memory — Cello
   cannot bound a stream you keep feeding.
+- An isolate holds at most 128 live `CompressionStream`s and
+  `DecompressionStream`s together. Constructing one more throws a
+  `RangeError`. A stream stops counting once it finishes, is cancelled or
+  aborted, errors, or is garbage-collected after it becomes unreachable.
 
 ## Run on Linux or Apple Silicon
 
