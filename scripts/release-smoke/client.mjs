@@ -63,10 +63,17 @@ const pattern = (bytes) => {
   return buf;
 };
 
-async function runCheck(id, title, fn) {
+// `limitMs` is the check's whole-run ceiling: every network wait inside a
+// check has its own deadline, and this one guarantees a hung image still
+// reaches the summary instead of stalling the gate.
+async function runCheck(id, title, fn, limitMs) {
   const started = Date.now();
   try {
-    const note = await fn();
+    const note = await withDeadline(
+      Promise.resolve().then(fn),
+      limitMs,
+      `check ${id} did not finish`,
+    );
     const result = { id, title, ok: true, note, elapsed: clock(started) };
     results.push(result);
     return result;
@@ -215,6 +222,12 @@ async function checkIdleBody() {
 function connectWebSocket(path) {
   return new Promise((resolve, reject) => {
     const socket = connect({ host: HOST, port: Number(PORT) });
+    // The caller's deadline is a backstop; this one closes the socket, so a
+    // hung edge leaves no descriptor behind.
+    const opened = setTimeout(() => {
+      socket.destroy();
+      reject(new Error('the WebSocket did not open within 30 s'));
+    }, 30000);
     const key = randomBytes(16).toString('base64');
     const expectedAccept = createHash('sha1')
       .update(key + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11')
@@ -362,6 +375,7 @@ function connectWebSocket(path) {
         if (accept !== expectedAccept) {
           throw new Error('the upgrade accept header does not match the key');
         }
+        clearTimeout(opened);
         resolve({
           send: sendFrame,
           sendDeclared: writeFrame,
@@ -370,6 +384,7 @@ function connectWebSocket(path) {
         });
       })
       .catch((error) => {
+        clearTimeout(opened);
         socket.destroy();
         reject(error);
       });
@@ -500,10 +515,14 @@ async function checkBackpressure() {
   const socket = connect({ host: HOST, port: Number(PORT) });
   let state = { completed: 0, phase: 'idle' };
   try {
-    await new Promise((resolve, reject) => {
-      socket.once('error', reject);
-      socket.once('connect', resolve);
-    });
+    await withDeadline(
+      new Promise((resolve, reject) => {
+        socket.once('error', reject);
+        socket.once('connect', resolve);
+      }),
+      30000,
+      'the tight route did not accept a connection',
+    );
     socket.setNoDelay(true);
     socket.write(
       `GET /cell/tight HTTP/1.1\r\nHost: ${HOST}:${PORT}\r\n` +
@@ -512,23 +531,27 @@ async function checkBackpressure() {
     // Take the response head and then stop reading: from here the only
     // bound on the producer is TransformStream backpressure.
     let seen = Buffer.alloc(0);
-    await new Promise((resolve, reject) => {
-      const onData = (chunk) => {
-        seen = Buffer.concat([seen, chunk]);
-        if (seen.includes('\r\n\r\n')) {
-          socket.off('data', onData);
-          socket.pause();
-          resolve();
-        }
-        if (seen.length > 1024 * 1024) {
-          socket.off('data', onData);
-          reject(new Error('no response head on the tight route'));
-        }
-      };
-      socket.on('data', onData);
-      socket.once('error', reject);
-      socket.once('end', () => reject(new Error('the tight route ended before a head')));
-    });
+    await withDeadline(
+      new Promise((resolve, reject) => {
+        const onData = (chunk) => {
+          seen = Buffer.concat([seen, chunk]);
+          if (seen.includes('\r\n\r\n')) {
+            socket.off('data', onData);
+            socket.pause();
+            resolve();
+          }
+          if (seen.length > 1024 * 1024) {
+            socket.off('data', onData);
+            reject(new Error('no response head on the tight route'));
+          }
+        };
+        socket.on('data', onData);
+        socket.once('error', reject);
+        socket.once('end', () => reject(new Error('the tight route ended before a head')));
+      }),
+      30000,
+      'the tight route sent no response head',
+    );
     const head = seen.toString('latin1').split('\r\n\r\n')[0];
     const status = Number(head.split(' ')[1]);
     if (status !== 200) throw new Error(`the tight route answered ${status}`);
@@ -575,16 +598,28 @@ console.log(
 // the idle-body deadline is independent of it. Their lines print in check
 // order once both finish.
 for (const result of await Promise.all([
-  runCheck(1, `SSE TransformStream stays alive for ${SSE_SECONDS} s`, checkSse),
-  runCheck(2, 'idle response body ends at ~60 s', checkIdleBody),
+  runCheck(
+    1,
+    `SSE TransformStream stays alive for ${SSE_SECONDS} s`,
+    checkSse,
+    (SSE_SECONDS + 90) * 1000,
+  ),
+  runCheck(2, 'idle response body ends at ~60 s', checkIdleBody, 150000),
 ])) {
   report(result);
 }
-report(await runCheck(3, '20 MiB WebSocket message round-trips', checkWsRoundtrip));
-report(await runCheck(4, '32 MiB WebSocket cap: 32 MiB passes, +1 closes 1009', checkWsCap));
-report(await runCheck(5, '8 MiB tee(): A then B, both intact', checkTee));
+report(await runCheck(3, '20 MiB WebSocket message round-trips', checkWsRoundtrip, 240000));
 report(
-  await runCheck(6, 'stalled reader plateaus the TransformStream producer', checkBackpressure),
+  await runCheck(4, '32 MiB WebSocket cap: 32 MiB passes, +1 closes 1009', checkWsCap, 420000),
+);
+report(await runCheck(5, '8 MiB tee(): A then B, both intact', checkTee, 180000));
+report(
+  await runCheck(
+    6,
+    'stalled reader plateaus the TransformStream producer',
+    checkBackpressure,
+    120000,
+  ),
 );
 
 const ordered = results.sort((a, b) => a.id - b.id);
