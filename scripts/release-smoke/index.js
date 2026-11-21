@@ -35,7 +35,8 @@ const json = (body, status = 200) => Response.json(body, { status });
 const hex = (bytes) =>
   Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
 
-const sha256 = async (bytes) => hex(new Uint8Array(await crypto.subtle.digest('SHA-256', bytes)));
+const sha256 = async (bytes) =>
+  hex(new Uint8Array(await crypto.subtle.digest('SHA-256', bytes)));
 
 // An SSE body out of a `TransformStream`: every write is only completed once
 // the response pump reads it, which is what keeps a slow client from
