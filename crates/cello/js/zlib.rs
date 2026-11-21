@@ -406,8 +406,10 @@ export default {
 "#;
 
     /// Runs `test` on a thread created after V8 initialised: the PKRU
-    /// access an isolate needs is inherited at thread creation, and the
-    /// test harness made this test's thread before anything initialised.
+    /// access an isolate needs is inherited at thread creation. The test-only
+    /// constructor in `runtime` has already initialised V8 on the process's
+    /// initial thread (see `init_v8`), so no libtest thread can be the one
+    /// that wins the one-time grant; this call only states the dependency.
     fn on_engine_thread(test: impl FnOnce() + Send + 'static) {
         crate::runtime::init_v8();
         crate::asyncrt::shared_test_runtime();

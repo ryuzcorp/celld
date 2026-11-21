@@ -16,9 +16,16 @@ use cello::js::{Compat, RequestBody, Worker, WorkerConfig, WorkerConfigOptions};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
-/// Init V8 and the asyncrt host handle once per test binary, on a leaked
-/// current-thread runtime. The handle asserts exactly-once, so the tests
-/// share it; both drive turns on their own threads and never poll an op.
+// V8's protection-key grant must land on the process's initial thread, before
+// libtest creates a test thread; see `cello::init_v8_before_threads`.
+cello::init_v8_before_threads!();
+
+/// Install the asyncrt host handle once per test binary, on a leaked
+/// current-thread runtime. V8 is already initialised by the process constructor
+/// (see `cello::init_v8_before_threads`); the `init_v8` call stays as an
+/// idempotent statement of the dependency. The handle asserts exactly-once, so
+/// the tests share it; both drive turns on their own threads and never poll an
+/// op.
 fn ensure_engine() {
     static INIT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
     INIT.get_or_init(|| {

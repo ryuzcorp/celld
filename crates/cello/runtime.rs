@@ -3006,6 +3006,72 @@ pub fn init_v8() {
     js::Engine::init();
 }
 
+/// Initialise V8 from a test binary's process constructor, before `main`.
+///
+/// libtest creates one thread per test from its main thread, so an `init_v8`
+/// call left to the first test that needs V8 grants the `PKRU` access to that
+/// test's thread and its descendants only (see [`init_v8`]): every thread
+/// libtest created before it traps with `SEGV_PKUERR` on its first access to a
+/// protected V8 page. `main.rs` makes the grant on the process's initial
+/// thread for the server; a test binary does the same by invoking
+/// [`init_v8_before_threads!`] at file scope.
+#[doc(hidden)]
+pub fn init_v8_before_main() {
+    INIT_TID.store(
+        std::process::id() as i64,
+        std::sync::atomic::Ordering::SeqCst,
+    );
+    init_v8();
+}
+
+/// The OS thread [`init_v8_before_main`] ran on; zero until it runs.
+#[doc(hidden)]
+pub static INIT_TID: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+/// Emit the ELF constructor that initialises V8 before `main`.
+///
+/// Invoke it once at file scope in a test binary whose tests enter V8, so the
+/// one-time `PKRU` grant lands on the process's initial thread, before libtest
+/// creates the thread of any test. The lib test binary invokes it from its own
+/// test module; the in-process integration test binaries invoke it at the top
+/// of their file.
+///
+/// `.init_array` is the ELF constructor table, which the loader runs before
+/// `main`; `#[used]` keeps the entry in the object file.
+#[macro_export]
+macro_rules! init_v8_before_threads {
+    () => {
+        const _: () = {
+            extern "C" fn init_v8_before_threads() {
+                $crate::runtime::init_v8_before_main();
+            }
+            #[used]
+            #[cfg_attr(target_os = "linux", link_section = ".init_array")]
+            static INIT_V8: extern "C" fn() = init_v8_before_threads;
+        };
+    };
+}
+
+#[cfg(test)]
+mod test_v8_preinit {
+    use std::sync::atomic::Ordering;
+
+    crate::init_v8_before_threads!();
+
+    /// A test that merely uses V8 cannot see where the one-time grant was
+    /// made, so pin the convention: if the constructor is dropped, `INIT_TID`
+    /// stays zero (or records a test thread) and this fails before any test
+    /// that depends on V8 can run.
+    #[test]
+    fn v8_initialises_on_the_process_thread() {
+        assert_eq!(
+            super::INIT_TID.load(Ordering::SeqCst),
+            i64::from(std::process::id()),
+            "V8 must initialise from the process constructor, before libtest threads exist"
+        );
+    }
+}
+
 impl StatelessRuntime {
     #[doc(hidden)]
     pub fn start(
@@ -4080,8 +4146,10 @@ export default { fetch() { return new Response('ok'); } };
     fn ensure_v8() {
         static V8: std::sync::Once = std::sync::Once::new();
         V8.call_once(|| {
-            // Before any thread this test spawns: PKRU access is
-            // inherited at thread creation (see `init_v8`).
+            // The test-only constructor in `runtime` has already initialised
+            // V8 on the process's initial thread, before libtest's threads
+            // existed; PKRU access is inherited at thread creation (see
+            // `init_v8`), so this is a no-op that states the dependency.
             init_engine();
         });
     }
