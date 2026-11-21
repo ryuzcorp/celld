@@ -1268,28 +1268,36 @@ impl HttpStreamService {
     }
 
     /// Fail a lagging tee branch: poison it so its next read fails with
-    /// `message`, while the sibling keeps flowing. The replaced state drops
-    /// here and returns its outstanding bytes to the owner budget; queued
-    /// chunks drop with it. A checked-out branch (a pull is in flight) is
-    /// removed with [`HttpStreamTerminationReason::Skewed`] instead, so that
-    /// pull fails with the same message rather than ending as if the body had
-    /// finished: a clone of a clone would otherwise hand its own consumers a
-    /// silently truncated body. Its state drops on settle, which is what
-    /// returns its bytes to the budget.
-    pub(crate) fn fail_tee_branch(&self, stream_id: u64, message: String) {
+    /// [`HTTP_TEE_SKEW_MESSAGE`], while the sibling keeps flowing. The
+    /// replaced state drops here and returns its outstanding bytes to the
+    /// owner budget; queued chunks drop with it. A checked-out branch (a pull
+    /// is in flight) is removed with [`HttpStreamTerminationReason::Skewed`]
+    /// instead, so that pull fails with the same message rather than ending
+    /// as if the body had finished: a clone of a clone would otherwise hand
+    /// its own consumers a silently truncated body. Its state drops on
+    /// settle, which is what returns its bytes to the budget.
+    ///
+    /// Returns whether a branch was actually failed. An id whose registry
+    /// entry is already gone cannot be: the budget entry can outlive it,
+    /// because failing a leased branch removes the registry entry while the
+    /// consumer's lease still owns the state, and only its Drop unregisters
+    /// it from the budget. The kill loop must make progress instead of
+    /// re-picking such an id forever.
+    pub(crate) fn fail_tee_branch(&self, stream_id: u64) -> bool {
         let mut drain = HttpStreamDrain::default();
-        {
+        let acted = {
             let mut state = self.state.lock().unwrap();
             let Some(entry) = state.sources.get_mut(&stream_id) else {
-                return;
+                return false;
             };
             match &mut entry.source {
                 HttpStreamSourceSlot::Available(HttpStreamSource::TeeBranch(_)) => {
                     entry.source = HttpStreamSourceSlot::Available(HttpStreamSource::Stream(
-                        poisoned_tee_branch(message),
+                        poisoned_tee_branch(HTTP_TEE_SKEW_MESSAGE.to_string()),
                     ));
+                    true
                 }
-                HttpStreamSourceSlot::Available(_) => return,
+                HttpStreamSourceSlot::Available(_) => false,
                 HttpStreamSourceSlot::Leased { .. } => {
                     Self::remove_locked(
                         &mut state,
@@ -1297,11 +1305,13 @@ impl HttpStreamService {
                         HttpStreamTerminationReason::Skewed,
                         &mut drain,
                     );
+                    true
                 }
             }
-        }
+        };
         self.sweeper_notify.notify_one();
         drain.dispose_propagating();
+        acted
     }
 
     /// The live tee branch a send past the request's skew cap fails: `bytes`
@@ -1317,16 +1327,20 @@ impl HttpStreamService {
         let state = self.state.lock().unwrap();
         let candidates = counters
             .into_iter()
-            .map(|(stream_id, buffered, drained)| {
-                let leased = state
-                    .sources
-                    .get(&stream_id)
-                    .is_some_and(|entry| matches!(entry.source, HttpStreamSourceSlot::Leased { .. }));
-                TeeVeeCandidate {
+            .filter_map(|(stream_id, buffered, drained)| {
+                // A budget entry can outlive its registry entry: failing a
+                // leased branch, or expiring one, removes the entry while the
+                // consumer's lease still owns the state, and only that Drop
+                // unregisters it from the budget. Such an id cannot be killed
+                // here, so it is not a candidate; if none is left the caller
+                // ends the sending branch instead of spinning on it.
+                let entry = state.sources.get(&stream_id)?;
+                let leased = matches!(entry.source, HttpStreamSourceSlot::Leased { .. });
+                Some(TeeVeeCandidate {
                     stream_id,
                     buffered,
                     undrained: copy_is_undrained(drained, leased),
-                }
+                })
             })
             .collect();
         choose_tee_victim(candidates, excess)
@@ -2648,9 +2662,15 @@ struct TeeVeeCandidate {
 /// consumer is draining keeps flowing. That is what a tee of a tee needs --
 /// the inner tee's source and a copy it feeds hold overlapping bytes, and
 /// failing a copy a consumer is still taking bytes from used to truncate the
-/// whole chain. A drained copy is failed only when no undrained one frees
-/// enough (it holds almost nothing, or there is none), because dropping its
-/// bytes is still better than buffering past the cap without bound.
+/// whole chain. A copy counts as drained once its consumer has taken a byte
+/// (and an inner tee's source is never a candidate while it holds the
+/// transfer lease), so a copy that is itself teed, or that a subrequest is
+/// streaming, is spared from its first read; before that byte it is
+/// indistinguishable from an unread copy, so a fetch streaming a copy can
+/// fail with the skew error rather than a truncated body. A drained copy is
+/// failed only when no undrained one frees enough (it holds almost nothing,
+/// or there is none), because dropping its bytes is still better than
+/// buffering past the cap without bound.
 ///
 /// The stream id breaks a remaining tie, so the choice never depends on map
 /// iteration order.
@@ -2706,9 +2726,16 @@ async fn send_http_tee_item(
     // preferring a copy nobody has drained, because ending a copy a consumer
     // is draining for another copy's skew stalls a live path. The cap is
     // rechecked after the pick, since a concurrent receive may have made
-    // room. Each iteration kills a live branch or sends, so the loop
-    // terminates; the yield lets a killed in-flight pull settle and return its
-    // bytes before the re-check.
+    // room. Each iteration either sends, ends this branch, or fails one live
+    // branch (which unregisters it from the budget), and a victim that a
+    // concurrent removal already made unkillable ends this branch instead, so
+    // the loop always makes progress. The yield lets a killed in-flight pull
+    // settle and return its bytes before the re-check.
+    let mut kills = 0usize;
+    // Defensive: one kill removes one branch, so the bound is the request's
+    // branch count. If a future kill path forgets that, ending this branch
+    // with an error still beats spinning forever.
+    const MAX_SKEW_KILLS: usize = 4096;
     loop {
         enum Outcome {
             Sent,
@@ -2758,12 +2785,20 @@ async fn send_http_tee_item(
                 }
                 match victim {
                     Some(victim) if victim != branch.stream_id => {
-                        service.fail_tee_branch(victim, HTTP_TEE_SKEW_MESSAGE.to_string());
-                        tokio::task::yield_now().await;
+                        kills += 1;
+                        if service.fail_tee_branch(victim) && kills <= MAX_SKEW_KILLS {
+                            tokio::task::yield_now().await;
+                        } else {
+                            // The victim was already gone from the registry
+                            // (its lease owns a budget entry the picker could
+                            // not see), or the kill bound was reached: this
+                            // branch must end with the skew error, never spin.
+                            service.fail_tee_branch(branch.stream_id);
+                            return HttpTeeSendOutcome::BranchClosed;
+                        }
                     }
                     _ => {
-                        service
-                            .fail_tee_branch(branch.stream_id, HTTP_TEE_SKEW_MESSAGE.to_string());
+                        service.fail_tee_branch(branch.stream_id);
                         return HttpTeeSendOutcome::BranchClosed;
                     }
                 }
@@ -2772,24 +2807,53 @@ async fn send_http_tee_item(
     }
 }
 
+/// Queue the source termination's error on both branches, as the pump does
+/// when the source reports the termination as an event. A clean end queues
+/// nothing: the branches' senders dropping ends them normally.
+fn publish_tee_termination(
+    first: &HttpTeeBranch,
+    second: &HttpTeeBranch,
+    source_id: u64,
+    reason: HttpStreamTerminationReason,
+) {
+    if let Err(error) = HttpStreamService::termination_result(source_id, reason) {
+        for branch in [first, second] {
+            // The branch's own queued bytes stay ahead of the error; an error
+            // item is charged no bytes, so the budget is untouched.
+            let _ = branch.sender.send(Err(error.clone()));
+        }
+    }
+}
+
+/// Send one source item to both branches. `Err` carries the source's
+/// termination when it committed between the pump producing the item and the
+/// send: the item is dropped, and the termination's error is published to
+/// both branches here, exactly as the pump's `Terminated` event does. Without
+/// that, both branches would end as if the body had finished and a consumer
+/// would see a silently truncated body.
 async fn fan_out_http_tee_item(
     service: &Arc<HttpStreamService>,
+    source_id: u64,
     first: &HttpTeeBranch,
     second: &HttpTeeBranch,
     item: Result<Vec<u8>, String>,
     termination: &HttpStreamTermination,
-) -> Option<(bool, bool)> {
-    let first = send_http_tee_item(service, first, item.clone(), termination).await;
-    if first == HttpTeeSendOutcome::SourceTerminated {
-        return None;
+) -> Result<(bool, bool), HttpStreamTerminationReason> {
+    let first_outcome = send_http_tee_item(service, first, item.clone(), termination).await;
+    if first_outcome == HttpTeeSendOutcome::SourceTerminated {
+        let reason = termination.reason();
+        publish_tee_termination(first, second, source_id, reason);
+        return Err(reason);
     }
-    let second = send_http_tee_item(service, second, item, termination).await;
-    if second == HttpTeeSendOutcome::SourceTerminated {
-        return None;
+    let second_outcome = send_http_tee_item(service, second, item, termination).await;
+    if second_outcome == HttpTeeSendOutcome::SourceTerminated {
+        let reason = termination.reason();
+        publish_tee_termination(first, second, source_id, reason);
+        return Err(reason);
     }
-    Some((
-        first == HttpTeeSendOutcome::Sent,
-        second == HttpTeeSendOutcome::Sent,
+    Ok((
+        first_outcome == HttpTeeSendOutcome::Sent,
+        second_outcome == HttpTeeSendOutcome::Sent,
     ))
 }
 
@@ -2893,20 +2957,35 @@ pub(crate) fn prepare_http_stream_tee(
             };
             match event {
                 HttpTransferredEvent::Chunk(bytes) => {
-                    let Some((first, second)) =
-                        fan_out_http_tee_item(&service, &first, &second, Ok(bytes), &termination)
-                            .await
-                    else {
-                        break;
-                    };
-                    if !first && !second {
-                        break;
+                    match fan_out_http_tee_item(
+                        &service,
+                        source_id,
+                        &first,
+                        &second,
+                        Ok(bytes),
+                        &termination,
+                    )
+                    .await
+                    {
+                        // A source termination that committed between
+                        // producing this item and sending it was published to
+                        // both branches by `fan_out_http_tee_item`.
+                        Err(_) => break,
+                        Ok((false, false)) => break,
+                        Ok(_) => {}
                     }
                 }
                 HttpTransferredEvent::Error(error) => {
-                    if fan_out_http_tee_item(&service, &first, &second, Err(error), &termination)
-                        .await
-                        .is_some()
+                    if fan_out_http_tee_item(
+                        &service,
+                        source_id,
+                        &first,
+                        &second,
+                        Err(error),
+                        &termination,
+                    )
+                    .await
+                    .is_ok()
                     {
                         source.finish(HttpStreamTerminationReason::Finished);
                     }
@@ -2923,14 +3002,7 @@ pub(crate) fn prepare_http_stream_tee(
                     // so no consumer mistakes dropped bytes for the end of
                     // the body. `Finished` and `Cancelled` are a clean end
                     // (the source was closed deliberately), so they stay one.
-                    if let Err(error) = HttpStreamService::termination_result(source_id, reason) {
-                        for branch in [&first, &second] {
-                            // The branch's own queued bytes stay ahead of the
-                            // error; an error item is charged no bytes, so
-                            // the budget is untouched.
-                            let _ = branch.sender.send(Err(error.clone()));
-                        }
-                    }
+                    publish_tee_termination(&first, &second, source_id, reason);
                     break;
                 }
             }
@@ -3103,16 +3175,21 @@ mod js_tee_budget_pin {
 /// copy a consumer is draining, and it must choose the same branch every run.
 /// A tee of a tee makes that the common case: the inner tee's source and its
 /// copies hold overlapping bytes, so the request total passes the cap while
-/// the inner pump is still catching up. Failing the source -- or the
-/// subrequest body, whose pull-mode slot is idle between chunks -- aborts the
-/// chain's live read path, which the `attr-r2tee-chain` conformance test saw
-/// as an empty `forwarded` body under load.
+/// the inner pump is still catching up. Failing a copy a consumer is already
+/// reading aborts the chain's live path, which the `attr-r2tee-chain`
+/// conformance test saw as an empty `forwarded` body under load. A copy a
+/// subrequest is streaming only counts as read after its first byte; before
+/// that the fetch may itself be the victim, which must surface the skew error
+/// and never a truncated body.
 #[cfg(test)]
 mod tee_skew_victim_tests {
     use super::{
-        choose_tee_victim, copy_is_undrained, HttpStreamService, HttpStreamTerminationReason,
-        TeeVeeCandidate, HTTP_TEE_SKEW_MESSAGE,
+        choose_tee_victim, copy_is_undrained, fan_out_http_tee_item, HttpStreamService,
+        HttpStreamSource, HttpStreamTermination, HttpStreamTerminationReason, HttpTeeBranch,
+        TeeBranchCounters, TeeSkewBudget, TeeVeeCandidate, HTTP_TEE_SKEW_MESSAGE,
     };
+    use std::sync::atomic::{AtomicBool, AtomicU64};
+    use std::sync::Arc;
 
     /// `undrained` means the branch's consumer has taken no byte yet.
     fn candidate(stream_id: u64, buffered: u64, undrained: bool) -> TeeVeeCandidate {
@@ -3158,14 +3235,10 @@ mod tee_skew_victim_tests {
 
     #[test]
     fn equal_undrained_holdings_are_broken_by_stream_id() {
-        let forward = choose_tee_victim(
-            vec![candidate(3, 4096, true), candidate(5, 4096, true)],
-            1,
-        );
-        let reverse = choose_tee_victim(
-            vec![candidate(5, 4096, true), candidate(3, 4096, true)],
-            1,
-        );
+        let forward =
+            choose_tee_victim(vec![candidate(3, 4096, true), candidate(5, 4096, true)], 1);
+        let reverse =
+            choose_tee_victim(vec![candidate(5, 4096, true), candidate(3, 4096, true)], 1);
         assert_eq!(forward, Some(3));
         assert_eq!(reverse, forward, "the victim must not depend on map order");
     }
@@ -3216,5 +3289,88 @@ mod tee_skew_victim_tests {
             HttpStreamService::termination_result(7, HttpStreamTerminationReason::Skewed),
             Err(HTTP_TEE_SKEW_MESSAGE.to_string()),
         );
+    }
+
+    #[test]
+    fn a_budget_entry_without_a_registry_entry_is_not_a_victim() {
+        // Killing a leased branch removes its registry entry while the
+        // consumer's lease still owns the state, so the budget can hold an id
+        // `fail_tee_branch` cannot act on. Picking it would spin the kill
+        // loop without freeing a byte; it must be skipped in favour of the
+        // live branch.
+        let service = Arc::new(HttpStreamService::default());
+        let budget = TeeSkewBudget::new();
+        {
+            let mut inner = budget.inner.lock().unwrap();
+            inner.used = (33 << 20) as u64;
+            inner.branches.insert(
+                1,
+                TeeBranchCounters {
+                    buffered: Arc::new(AtomicU64::new(40 << 20)),
+                    drained: Arc::new(AtomicBool::new(false)),
+                },
+            );
+            inner.branches.insert(
+                2,
+                TeeBranchCounters {
+                    buffered: Arc::new(AtomicU64::new(1)),
+                    drained: Arc::new(AtomicBool::new(false)),
+                },
+            );
+        }
+        // Only id 2 is in the registry; id 1 is a leaked budget entry.
+        service.state.lock().unwrap().sources.insert(
+            2,
+            super::HttpStreamEntry::new(
+                0,
+                u64::MAX,
+                HttpStreamSource::Stream(Box::pin(futures_util::stream::empty())),
+                false,
+            ),
+        );
+        assert_eq!(service.pick_tee_victim(&budget, 1 << 20), Some(2));
+    }
+
+    #[tokio::test]
+    async fn a_source_termination_before_a_send_errors_both_branches() {
+        // The pump produced this chunk, then the source's termination
+        // committed in the gap before the send -- exactly what a concurrent
+        // skew kill or idle sweep does. Both branches must get the error
+        // after their queued bytes, not a clean end that looks like a
+        // complete body.
+        let service = Arc::new(HttpStreamService::default());
+        let budget = Arc::new(TeeSkewBudget::new());
+        let (tx1, mut rx1) = tokio::sync::mpsc::unbounded_channel();
+        let (tx2, mut rx2) = tokio::sync::mpsc::unbounded_channel();
+        let first = HttpTeeBranch {
+            sender: tx1,
+            stream_id: 1,
+            buffered: Arc::new(AtomicU64::new(0)),
+            budget: Arc::clone(&budget),
+        };
+        let second = HttpTeeBranch {
+            sender: tx2,
+            stream_id: 2,
+            buffered: Arc::new(AtomicU64::new(0)),
+            budget,
+        };
+        let termination = Arc::new(HttpStreamTermination::new());
+        let item = Ok(vec![b'x'; 16]);
+        termination.commit(HttpStreamTerminationReason::Skewed);
+        let outcome =
+            fan_out_http_tee_item(&service, 99, &first, &second, item, &termination).await;
+        assert_eq!(outcome, Err(HttpStreamTerminationReason::Skewed));
+        assert_eq!(
+            rx1.recv().await,
+            Some(Err(HTTP_TEE_SKEW_MESSAGE.to_string())),
+        );
+        assert_eq!(
+            rx2.recv().await,
+            Some(Err(HTTP_TEE_SKEW_MESSAGE.to_string())),
+        );
+        // The sender is still alive, so nothing but the error was queued:
+        // no clean end follows for a consumer to mistake for a whole body.
+        assert!(rx1.try_recv().is_err());
+        assert!(rx2.try_recv().is_err());
     }
 }

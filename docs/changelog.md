@@ -68,9 +68,16 @@ No configuration, data, or bucket-format changes.
   no error at all, while the other copies carried on. The budget now ends a
   copy nobody has read from -- the one holding the most, when it gives back
   enough on its own -- and fails a copy a consumer is draining only when no
-  unread copy does. A copy failed while a read is already in flight rejects
-  that read with `tee branch fell more than 32 MiB behind its sibling; read
-  both branches concurrently` instead of ending the body.
+  unread copy does. A copy is spared once its consumer has taken a byte, and
+  a copy an inner tee is draining is spared from the moment it is teed;
+  before its first byte a copy a subrequest is streaming is
+  indistinguishable from an unread copy, so a fetch streaming one can itself
+  be the victim. Either way the failed copy rejects with `tee branch fell
+  more than 32 MiB behind its sibling; read both branches concurrently` --
+  including a read already in flight, and a send that a source termination
+  races -- instead of ending the body as if it were complete, so a Worker
+  never receives a truncated body without an error. The other copies keep
+  flowing.
 
 ## v0.2.3
 
