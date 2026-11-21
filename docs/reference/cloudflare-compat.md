@@ -188,6 +188,9 @@ The `tail` and `email` handlers are unavailable.
   `controller.error()`, and `controller.terminate()` release a parked write.
   `IdentityTransformStream` and
   `FixedLengthStream` resolve a write only once its bytes have been read.
+- `CompressionStream` and `DecompressionStream` are capped at 128 live
+  streams per isolate; Workerd has no such cap. The 129th constructor call
+  throws a `RangeError`. Finish, cancel, or abort streams you no longer use.
 - Byte streams cross isolate boundaries on the same node as part of
   Durable Object RPC, in both directions: a `ReadableStream` your cell
   returns reads chunk by chunk, and a `WritableStream` it returns accepts
