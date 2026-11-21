@@ -29,12 +29,13 @@ Each check prints one `PASS`/`FAIL` line with its elapsed time and detail, then 
 
 ## Requirements and knobs
 
-The host needs Docker (reached through the `docker` group with `/usr/bin/sg`), `curl`, and Node.js 24 or newer. The client in `scripts/release-smoke/client.mjs` uses only Node built-ins; it needs no npm packages. The image itself needs nothing extra: the fixture sets `no_bundle`, so the image's missing esbuild is never invoked.
+The host needs Docker, `curl`, and Node.js 24 or newer. By default the gate runs `docker` directly; set `SMOKE_DOCKER_GROUP=docker` (or another group) to run each invocation through `sg GROUP -c`, for a shell that lacks the group. The client in `scripts/release-smoke/client.mjs` uses only Node built-ins; it needs no npm packages. The image itself needs nothing extra: the fixture sets `no_bundle`, so the image's missing esbuild is never invoked.
 
 | Variable | Effect |
 | --- | --- |
 | `SMOKE_SSE_SECONDS` | SSE span the gate requires; default `300` |
 | `SMOKE_QUICK=1` | Shorten the SSE span to 90 s for local iteration |
+| `SMOKE_DOCKER_GROUP` | Run docker through `sg GROUP -c`; unset runs `docker` directly |
 
 The gate runs the default span, not `SMOKE_QUICK`, when it clears an image for a consumer pin. Checks 1 and 2 run together, so a full run takes about six minutes.
 

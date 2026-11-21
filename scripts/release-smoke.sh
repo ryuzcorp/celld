@@ -14,6 +14,9 @@
 #                         cello-releasesmoke:local
 #   SMOKE_QUICK=1         shorten the SSE span to 90 s (local iteration)
 #   SMOKE_SSE_SECONDS=N   set the SSE span explicitly (default 300)
+#   SMOKE_DOCKER_GROUP    run docker through `sg GROUP -c` (for a host where
+#                         your shell lacks the group); unset runs docker
+#                         directly
 #
 # Requirements: Docker, curl, and Node.js 24 or newer on the host (the
 # client uses only built-in modules). The container is removed on every
@@ -25,7 +28,7 @@ FIXTURE="$SCRIPT_DIR/release-smoke"
 CONTAINER_PORT=9876
 
 usage() {
-  sed -n '9,20p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  sed -n '9,25p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 die() {
@@ -33,9 +36,15 @@ die() {
   exit 2
 }
 
-# Every docker invocation goes through the docker group explicitly.
+# Plain `docker` unless SMOKE_DOCKER_GROUP names a group this shell lacks:
+# then `sg` grants the group for the invocation, so a workstation rule stays
+# out of the script's defaults.
 dock() {
-  /usr/bin/sg docker -c "$(printf '%q ' docker "$@")"
+  if [ -n "${SMOKE_DOCKER_GROUP:-}" ]; then
+    sg "$SMOKE_DOCKER_GROUP" -c "$(printf '%q ' docker "$@")"
+  else
+    docker "$@"
+  fi
 }
 
 if [ "$#" -ne 1 ]; then
@@ -51,7 +60,11 @@ if [ "$node_major" -lt 24 ]; then
   die "Node.js 24 or newer is required on the host (found $(node --version))"
 fi
 command -v curl >/dev/null 2>&1 || die 'curl is required on the host'
-[ -x /usr/bin/sg ] || die '/usr/bin/sg is required to reach the docker group'
+command -v docker >/dev/null 2>&1 || die 'docker is required on the host'
+if [ -n "${SMOKE_DOCKER_GROUP:-}" ]; then
+  command -v sg >/dev/null 2>&1 ||
+    die 'sg is required when SMOKE_DOCKER_GROUP is set'
+fi
 
 NAME="cello-releasesmoke-$(date +%s)-$$"
 
