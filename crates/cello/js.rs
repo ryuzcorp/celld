@@ -1745,10 +1745,20 @@ fn resolve_res(tc: &mut v8::PinScope, id: u64, res: Result<asyncrt::OpOut, Strin
             let s = v8::String::new(tc, &v).unwrap();
             r.resolve(tc, s.into());
         }
-        Ok(asyncrt::OpOut::Bytes(b)) => {
-            let v = bytes_value(tc, b);
-            r.resolve(tc, v);
-        }
+        Ok(asyncrt::OpOut::Bytes(b)) => match bytes_value(tc, b) {
+            Ok(v) => {
+                r.resolve(tc, v);
+            }
+            Err(refusal) => {
+                // The bytes cannot be presented, so the promise must not
+                // resolve with a value the guest would have to guess at: the
+                // reader gets the `RangeError` V8 would have raised for a
+                // refused allocation. Scheduling it and then rejecting is the
+                // one V8 operation left; nothing runs after it.
+                let exception = host_store_error(tc, &refusal);
+                r.reject(tc, exception);
+            }
+        },
         Err(e) => {
             let s = v8::String::new(tc, &e).unwrap();
             let ex = v8::Exception::error(tc, s);
@@ -1773,51 +1783,60 @@ fn backing_store_budget(
 /// A store for bytes the host already owns, charged to this isolate's
 /// budget.
 ///
-/// Answers `None` after throwing a `RangeError` in the same shape as the one
-/// V8 raises for a refused allocation (and the one the
-/// `array_buffer_guard.js` wrappers throw), naming the budget: the bytes would
-/// take the isolate past its ceiling, so the answer is refused rather than the
-/// process growing. The caller must return; the pending exception is what the
-/// JS call sees.
+/// Answers [`array_buffer_budget::HostStoreRefusal`] when the bytes would take
+/// the isolate past its ceiling, and **schedules no exception**: V8 forbids
+/// running JavaScript operations once an exception is pending, and a caller
+/// may have to abandon a half-built row, batch or argument list. Each caller
+/// either throws at an op boundary, rejects a promise, or propagates the error
+/// before touching V8 again.
 fn host_backing_store<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     bytes: Vec<u8>,
-) -> Option<v8::SharedRef<v8::BackingStore>> {
+) -> Result<v8::SharedRef<v8::BackingStore>, array_buffer_budget::HostStoreRefusal> {
     let Some(budget) = backing_store_budget(scope) else {
         // No isolate budget to charge: keep today's path rather than fail an
         // answer V8 expects. `load_config` cannot produce this.
-        return Some(v8::ArrayBuffer::new_backing_store_from_vec(bytes).make_shared());
+        return Ok(v8::ArrayBuffer::new_backing_store_from_vec(bytes).make_shared());
     };
-    match array_buffer_budget::host_store(&budget, bytes) {
-        Some(store) => Some(store.make_shared()),
-        None => {
-            let message = v8::String::new(
-                scope,
-                &format!(
-                    "Array buffer allocation failed: the isolate's ArrayBuffer \
-                     memory budget is exhausted ({} MiB, see \
-                     CELLO_V8_EXTERNAL_LIMIT_MB); free buffers before \
-                     allocating more",
-                    budget.cap() / (1024 * 1024)
-                ),
-            )
-            .unwrap();
-            let exception = v8::Exception::range_error(scope, message);
-            scope.throw_exception(exception);
-            None
-        }
-    }
+    array_buffer_budget::host_store(&budget, bytes).map(|store| store.make_shared())
+}
+
+/// The `RangeError` a refusal becomes at a JavaScript boundary: the same
+/// shape as the one V8 raises for a refused allocation, and the one the
+/// `array_buffer_guard.js` wrappers throw, naming the budget.
+fn host_store_error<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    refusal: &array_buffer_budget::HostStoreRefusal,
+) -> v8::Local<'s, v8::Value> {
+    let message = v8::String::new(scope, &refusal.to_string()).unwrap();
+    v8::Exception::range_error(scope, message)
+}
+
+/// Schedule the refusal's `RangeError`; the caller must return without
+/// running further JavaScript.
+fn throw_host_store_refusal(
+    scope: &mut v8::PinScope,
+    refusal: &array_buffer_budget::HostStoreRefusal,
+) {
+    let exception = host_store_error(scope, refusal);
+    scope.throw_exception(exception);
 }
 
 /// Move `bytes` into a `Uint8Array` without copying, charged to the
 /// isolate's backing-store budget.
-fn bytes_value<'s>(scope: &mut v8::PinScope<'s, '_>, bytes: Vec<u8>) -> v8::Local<'s, v8::Value> {
+///
+/// A refusal is a value, not a pending exception; see [`host_backing_store`].
+/// Callers that can propagate an error (`Result`) should let it, callers at a
+/// synchronous op boundary use [`bytes_value_or_throw`], and promise paths
+/// reject with [`host_store_error`].
+fn bytes_value<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    bytes: Vec<u8>,
+) -> Result<v8::Local<'s, v8::Value>, array_buffer_budget::HostStoreRefusal> {
     #[cfg(cello_internal_tests)]
     let input = bytes.as_ptr() as usize;
     let len = bytes.len();
-    let Some(store) = host_backing_store(scope, bytes) else {
-        return v8::undefined(scope).into();
-    };
+    let store = host_backing_store(scope, bytes)?;
     let buffer = v8::ArrayBuffer::with_backing_store(scope, &store);
     #[cfg(cello_internal_tests)]
     record_bytes_value_allocation_for_test(
@@ -1827,7 +1846,23 @@ fn bytes_value<'s>(scope: &mut v8::PinScope<'s, '_>, bytes: Vec<u8>) -> v8::Loca
             .data()
             .map(|data| data.as_ptr() as usize),
     );
-    v8::Uint8Array::new(scope, buffer, 0, len).unwrap().into()
+    Ok(v8::Uint8Array::new(scope, buffer, 0, len).unwrap().into())
+}
+
+/// [`bytes_value`] for a synchronous op callback: throws the refusal's
+/// `RangeError` and answers `None`, so the caller returns with nothing else
+/// passed to (or set on) the guest.
+fn bytes_value_or_throw<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    bytes: Vec<u8>,
+) -> Option<v8::Local<'s, v8::Value>> {
+    match bytes_value(scope, bytes) {
+        Ok(value) => Some(value),
+        Err(refusal) => {
+            throw_host_store_refusal(scope, &refusal);
+            None
+        }
+    }
 }
 
 #[cfg(cello_internal_tests)]
@@ -5622,7 +5657,10 @@ fn begin_entrypoint_rpc(
         let entrypoint = v8::String::new(tc, entrypoint).unwrap();
         let (path, args) = match operation {
             crate::WorkerRpcOperation::Get { path } => (path, v8::null(tc).into()),
-            crate::WorkerRpcOperation::Call { path, args } => (path, bytes_value(tc, args)),
+            // A refused argument store stops the dispatch here: the reply
+            // carries the refusal to the caller, and no incomplete argument
+            // list reaches JavaScript.
+            crate::WorkerRpcOperation::Call { path, args } => (path, bytes_value(tc, args)?),
         };
         let path = path
             .iter()
@@ -5632,7 +5670,7 @@ fn begin_entrypoint_rpc(
         // The caller's props, structured-clone bytes like `args`. `local` stays
         // false: the call crossed an isolate boundary.
         let local = v8::Boolean::new(tc, false);
-        let props = bytes_value(tc, props);
+        let props = bytes_value(tc, props)?;
         let recv = v8::undefined(tc).into();
         begin_event_context(tc)?;
         let ret = f
@@ -5839,7 +5877,7 @@ fn queue_batch_value<'s>(
         set_queue_property(scope, object, "id", id.into())?;
         let timestamp = v8::Number::new(scope, message.timestamp_ms as f64);
         set_queue_property(scope, object, "timestamp", timestamp.into())?;
-        let body = bytes_value(scope, message.body);
+        let body = bytes_value(scope, message.body)?;
         set_queue_property(scope, object, "body", body)?;
         let content_type = v8::String::new(scope, message.content_type.as_str()).unwrap();
         set_queue_property(scope, object, "contentType", content_type.into())?;
@@ -5940,12 +5978,17 @@ fn begin_queue(
     }
 }
 
-/// for the JSON flavor, a `Uint8Array` for structured clone.
-fn rpc_data_value<'s>(scope: &mut v8::PinScope<'s, '_>, data: RpcData) -> v8::Local<'s, v8::Value> {
-    match data {
+/// for the JSON flavor, a `Uint8Array` for structured clone. A store the
+/// budget refuses is an error, so the dispatch never builds an argument list
+/// with a missing value in it.
+fn rpc_data_value<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    data: RpcData,
+) -> Result<v8::Local<'s, v8::Value>, array_buffer_budget::HostStoreRefusal> {
+    Ok(match data {
         RpcData::Json(json) => v8::String::new(scope, &json).unwrap().into(),
-        RpcData::V8(bytes) => bytes_value(scope, bytes.into()),
-    }
+        RpcData::V8(bytes) => bytes_value(scope, bytes.into())?,
+    })
 }
 
 /// The inverse: `__dispatchRpc` answers in the flavor it was asked in.
@@ -6234,7 +6277,9 @@ fn begin_cell(tc: &mut v8::PinScope, job: CellJob, event_time: i64) -> Begun {
                     // of the routing seam collecting it first.
                     let (body_value, stream_id) = match body {
                         RequestBody::Bytes(bytes) => {
-                            (bytes_value(tc, bytes.into()), v8::null(tc).into())
+                            // Refused bytes fail the event before the handler
+                            // is handed a request with no body in it.
+                            (bytes_value(tc, bytes.into())?, v8::null(tc).into())
                         }
                         RequestBody::Stream(id) => (
                             v8::undefined(tc).into(),
@@ -6287,7 +6332,7 @@ fn begin_cell(tc: &mut v8::PinScope, job: CellJob, event_time: i64) -> Begun {
                     let arguments = [
                         v8::String::new(tc, &scope).unwrap().into(),
                         v8::String::new(tc, &method).unwrap().into(),
-                        rpc_data_value(tc, args),
+                        rpc_data_value(tc, args)?,
                         v8::Boolean::new(tc, trusted).into(),
                     ];
                     let recv = v8::undefined(tc).into();
@@ -6350,7 +6395,7 @@ fn begin_cell(tc: &mut v8::PinScope, job: CellJob, event_time: i64) -> Begun {
                         stub_id.into(),
                         v8::Array::new_with_elements(tc, &path).into(),
                         match args {
-                            Some(args) => rpc_data_value(tc, args),
+                            Some(args) => rpc_data_value(tc, args)?,
                             None => v8::null(tc).into(),
                         },
                     ];
@@ -6408,7 +6453,7 @@ fn begin_cell(tc: &mut v8::PinScope, job: CellJob, event_time: i64) -> Begun {
                         WsIn::Text(text) => {
                             ("__wsMessage", v8::String::new(tc, &text).unwrap().into())
                         }
-                        WsIn::Binary(bytes) => ("__wsBinary", bytes_value(tc, bytes)),
+                        WsIn::Binary(bytes) => ("__wsBinary", bytes_value(tc, bytes)?),
                     };
                     let f = internal_function(tc, name)?;
                     let arguments = [
@@ -6805,7 +6850,7 @@ fn start_fetch<'s>(
         FetchTarget::Entrypoint(entrypoint) => {
             let dispatch = internal_function(tc, "__dispatchEntrypointFetch")?;
             let name = v8::String::new(tc, &entrypoint.name).unwrap();
-            let props = bytes_value(tc, entrypoint.props);
+            let props = bytes_value(tc, entrypoint.props)?;
             // Settlement and synchronous-throw cleanup both close this host
             // frame. The dispatcher supplies its own handler context, but
             // omitting the outer frame would leave those paths unbalanced.
@@ -10159,7 +10204,10 @@ fn op_rpc_signal_poll(
     let signals = rpc_signals().lock().unwrap();
     match signals.get(&signal) {
         Some(RpcSignalState::Aborted(reason)) => {
-            rv.set(bytes_value(scope, reason.clone()));
+            let Some(reason) = bytes_value_or_throw(scope, reason.clone()) else {
+                return;
+            };
+            rv.set(reason);
         }
         Some(RpcSignalState::Live(_)) => {}
         None => rv.set(v8::null(scope).into()),
@@ -10536,7 +10584,11 @@ fn op_stub_call(
 /// or malformed id, a release from an isolate holding nothing, or a hold
 /// dropped while other holders remain. Release is idempotent.
 fn resolve_empty_release(scope: &mut v8::PinScope, mut rv: v8::ReturnValue<v8::Value>) {
-    let empty = bytes_value(scope, Vec::new());
+    // An empty store is never charged, so this cannot be refused; the
+    // fallible form is the one the type system offers.
+    let Some(empty) = bytes_value_or_throw(scope, Vec::new()) else {
+        return;
+    };
     let done = resolved_promise(scope, empty).expect("a release can resolve an empty answer");
     rv.set(done.into());
 }
@@ -12065,8 +12117,11 @@ fn webcrypto_return_bytes(
     // `v8::ArrayBuffer::New` aborts the process when the allocator refuses
     // (`FatalProcessOutOfMemory: v8::ArrayBuffer::New`), while a host store
     // past the budget is refused here with a `RangeError` the guest catches.
-    let Some(store) = host_backing_store(scope, bytes.to_vec()) else {
-        return;
+    let store = match host_backing_store(scope, bytes.to_vec()) {
+        Ok(store) => store,
+        // The op answers nothing: an empty view would read as a valid
+        // zero-length answer to bytes that were never delivered.
+        Err(refusal) => return throw_host_store_refusal(scope, &refusal),
     };
     let buffer = v8::ArrayBuffer::with_backing_store(scope, &store);
     let view = v8::Uint8Array::new(scope, buffer, 0, bytes.len()).unwrap();
@@ -12253,7 +12308,7 @@ fn op_array_buffer_reserve(
     let admitted = match scope.get_slot::<Arc<HeapLimitState>>() {
         Some(state) if requested.is_finite() && requested > 0.0 => state
             .external
-            .reserve_for_guest(requested.min(usize::MAX as f64) as usize),
+            .reserve_latching(requested.min(usize::MAX as f64) as usize),
         Some(_) if requested.is_finite() => true,
         Some(_) => false,
         None => true,
@@ -12827,7 +12882,10 @@ fn op_atob(
             // for a typed view, so a 25 MiB value does not become 25 million
             // JavaScript numbers before the cell can store it.
             if args.get(1).boolean_value(scope) {
-                rv.set(bytes_value(scope, bytes));
+                let Some(value) = bytes_value_or_throw(scope, bytes) else {
+                    return;
+                };
+                rv.set(value);
                 return;
             }
             // atob returns a binary string (latin1)
@@ -14443,8 +14501,12 @@ fn op_vfs_read_file(
             .unwrap()
             .read_file(&path);
         if let Some(bytes) = bytes {
-            let Some(store) = host_backing_store(scope, bytes) else {
-                return;
+            let store = match host_backing_store(scope, bytes) {
+                Ok(store) => store,
+                // A read whose bytes do not fit throws and answers nothing:
+                // returning `null` would be indistinguishable from ENOENT,
+                // and an empty buffer would hand the guest wrong bytes.
+                Err(refusal) => return throw_host_store_refusal(scope, &refusal),
             };
             let buffer = v8::ArrayBuffer::with_backing_store(scope, &store);
             rv.set(buffer.into());
@@ -14460,8 +14522,9 @@ fn op_vfs_read_file(
     };
     // One copy into the V8 heap. The projected `Bytes` stays shared, so a
     // second read of the same module does not re-copy the config's source.
-    let Some(store) = host_backing_store(scope, bytes.to_vec()) else {
-        return;
+    let store = match host_backing_store(scope, bytes.to_vec()) {
+        Ok(store) => store,
+        Err(refusal) => return throw_host_store_refusal(scope, &refusal),
     };
     let buffer = v8::ArrayBuffer::with_backing_store(scope, &store);
     rv.set(buffer.into());
@@ -15150,7 +15213,7 @@ fn make_incoming_request<'s>(
     let stream_id = body.stream_id();
     let (body, stream_id) = match stream_id {
         None => (
-            bytes_value(tc, body.into_held_bytes().unwrap()),
+            bytes_value(tc, body.into_held_bytes().unwrap())?,
             v8::undefined(tc).into(),
         ),
         Some(id) => (
@@ -15201,7 +15264,7 @@ fn make_request<'s>(
     let u = v8::String::new(tc, url).unwrap();
     let m = v8::String::new(tc, method).unwrap();
     let bytes = body.into_held_bytes().unwrap_or_default();
-    let b = bytes_value(tc, bytes);
+    let b = bytes_value(tc, bytes)?;
     let h = v8::String::new(tc, &serde_json::to_string(headers)?).unwrap();
     let recv = v8::undefined(tc).into();
     f.call(tc, recv, &[u.into(), m.into(), b, h.into()])

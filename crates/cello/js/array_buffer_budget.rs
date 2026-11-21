@@ -50,10 +50,12 @@
 //!   by the deleter that charged it;
 //! - an allocation past the cap fails closed: the reservation is refused
 //!   before memory is taken, and a refusal that reaches JavaScript (the
-//!   wrappers', or the turn-boundary reading of retained use) sets the
-//!   isolate's condemned flag. A null return from the allocator does not: V8
-//!   may collect and retry it, and a retry that succeeds never fails the
-//!   guest;
+//!   wrappers', a host store's, or the turn-boundary reading of retained use)
+//!   sets the isolate's condemned flag. A null return from the allocator does
+//!   not: V8 may collect and retry it, and a retry that succeeds never fails
+//!   the guest. The one allocator refusal that cannot be retried — a request
+//!   larger than the whole cap — latches, because no collection can make room
+//!   for it;
 //! - the process never aborts: every host-created store is charged in Rust
 //!   before it exists, and the only null return V8 can see is from a JS
 //!   allocation, which V8 handles by throwing.
@@ -167,9 +169,9 @@ impl BackingStoreBudget {
     /// allocator by collecting and retrying the same allocation
     /// (`heap-allocator.cc: RetryCustomAllocate`), and when the retry succeeds
     /// the guest never sees an error. Latching that attempt would condemn an
-    /// isolate for a refusal nobody saw. [`Self::reserve_for_guest`] latches,
-    /// because a wrapper refusal does reach the guest as a thrown error, and
-    /// `recover_heap` latches on retained use after a collection.
+    /// isolate for a refusal nobody saw. [`Self::reserve_latching`] latches,
+    /// because its refusals do reach the guest, and `recover_heap` latches on
+    /// retained use after a collection.
     fn try_reserve(&self, len: usize) -> bool {
         let mut used = self.used.load(Ordering::Relaxed);
         loop {
@@ -189,12 +191,15 @@ impl BackingStoreBudget {
         }
     }
 
-    /// Reserve bytes for a guest-facing wrapper (`array_buffer_guard.js`),
-    /// latching the condemnation when the reservation is refused.
+    /// Reserve bytes for a refusal the guest is about to see — a guest-facing
+    /// wrapper (`array_buffer_guard.js`) or a host store — latching the
+    /// condemnation when the reservation is refused.
     ///
-    /// The refusal becomes a `RangeError` at the guest's call site, so the
-    /// isolate genuinely failed to allocate: same signal as the heap guard's.
-    pub(super) fn reserve_for_guest(&self, len: usize) -> bool {
+    /// Either way the refusal becomes a `RangeError` at the guest's call site,
+    /// so the isolate genuinely failed to allocate: same signal as the heap
+    /// guard's. The allocator keeps [`Self::try_reserve`] instead, because V8
+    /// may retry a null return after a collection.
+    pub(super) fn reserve_latching(&self, len: usize) -> bool {
         if self.try_reserve(len) {
             return true;
         }
@@ -210,6 +215,34 @@ impl BackingStoreBudget {
             });
     }
 }
+
+/// A host-owned store this isolate's budget refused.
+///
+/// Deliberately a value, not a scheduled V8 exception: V8 forbids running
+/// JavaScript operations once an exception is pending, and a conversion may
+/// have to abandon a half-built row, batch or argument list. The caller
+/// decides how the guest learns about it — a rejected promise, a throw at the
+/// op boundary, or an error on an internal reply channel — and stops touching
+/// V8 until it has.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct HostStoreRefusal {
+    /// The ceiling the bytes would have crossed, for the guest-facing message.
+    pub(super) cap: usize,
+}
+
+impl std::fmt::Display for HostStoreRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "Array buffer allocation failed: the isolate's ArrayBuffer memory \
+             budget is exhausted ({} MiB, see CELLO_V8_EXTERNAL_LIMIT_MB); free \
+             buffers before allocating more",
+            self.cap / (1024 * 1024)
+        )
+    }
+}
+
+impl std::error::Error for HostStoreRefusal {}
 
 /// Backing-store alignment. V8 asks for at least 8-byte alignment (a
 /// `Float64Array` view over the store); the system allocator provides more.
@@ -232,6 +265,14 @@ fn allocate(budget: &BackingStoreBudget, len: usize, zeroed: bool) -> *mut c_voi
         return empty_pointer();
     }
     if !budget.try_reserve(len) {
+        // A request for more than the whole cap can never be satisfied — no
+        // collection returns bytes the cap never had — so this refusal is
+        // V8's last and the guest sees the `RangeError`. Latch it. A smaller
+        // refusal stays unlatched: V8 collects and retries that one, and a
+        // retry that succeeds never fails the guest.
+        if len > budget.cap() {
+            budget.latch_exceeded();
+        }
         return std::ptr::null_mut();
     }
     let Some(layout) = layout(len) else {
@@ -334,21 +375,24 @@ unsafe extern "C" fn release_host_store(
 
 /// A backing store for bytes the host already owns, charged to `budget`.
 ///
-/// Answers `None` when the bytes would take the isolate past its cap; the
-/// caller throws the `RangeError` the guest would have seen from V8.
+/// Answers [`HostStoreRefusal`] when the bytes would take the isolate past
+/// its cap; the caller throws or rejects with the `RangeError` the guest
+/// would have seen from V8. The refusal is latched, because the guest does
+/// see it: unlike a null from the allocator, there is no V8 retry that could
+/// absorb it.
 ///
 /// An empty `Vec` takes V8's own path: nothing is charged, and V8's
 /// zero-length store needs no deleter bookkeeping.
 pub(super) fn host_store(
     budget: &Arc<BackingStoreBudget>,
     mut bytes: Vec<u8>,
-) -> Option<v8::UniqueRef<v8::BackingStore>> {
+) -> Result<v8::UniqueRef<v8::BackingStore>, HostStoreRefusal> {
     if bytes.is_empty() {
-        return Some(v8::ArrayBuffer::new_backing_store_from_vec(bytes));
+        return Ok(v8::ArrayBuffer::new_backing_store_from_vec(bytes));
     }
     let len = bytes.len();
-    if !budget.try_reserve(len) {
-        return None;
+    if !budget.reserve_latching(len) {
+        return Err(HostStoreRefusal { cap: budget.cap() });
     }
     let pointer = bytes.as_mut_ptr();
     let charge = Box::new(HostCharge {
@@ -359,7 +403,7 @@ pub(super) fn host_store(
     // SAFETY: the pointer is `charge.bytes`'s buffer, which the `Box` keeps
     // alive until V8 calls the deleter, and `release_host_store` takes back
     // exactly the `HostCharge` pointer handed over here.
-    Some(unsafe {
+    Ok(unsafe {
         v8::ArrayBuffer::new_backing_store_from_ptr(
             pointer.cast(),
             len,
@@ -389,7 +433,7 @@ mod tests {
             "an allocator refusal is not evidence until V8's retry fails"
         );
         // A wrapper refusal does reach the guest, so it latches.
-        assert!(!budget.reserve_for_guest(512));
+        assert!(!budget.reserve_latching(512));
         assert!(budget.exceeded(), "the refusal condemns the isolate");
         budget.clear_exceeded();
         budget.latch_exceeded();
@@ -467,6 +511,15 @@ mod tests {
             "the allocator does not latch a refusal V8 can retry"
         );
         assert_eq!(budget.used(), 4096);
+
+        // More than the whole cap can never be satisfied: V8's retry after a
+        // collection cannot find room the cap never had, so the refusal is
+        // final and latches.
+        assert!(allocate(&budget, 8192, false).is_null());
+        assert!(
+            budget.exceeded(),
+            "a request larger than the cap records its final refusal"
+        );
     }
 }
 /// The budget as a guest sees it: buffers past the ceiling are refused with a
@@ -762,8 +815,12 @@ export default {
     }
 
     fn load() -> Worker {
+        load_script(SCRIPT)
+    }
+
+    fn load_script(src: &str) -> Worker {
         let config = WorkerConfig::new(WorkerConfigOptions {
-            src: SCRIPT.to_string(),
+            src: src.to_string(),
             script_name: "array-buffer-budget".to_string(),
             do_classes: Vec::new(),
             bindings: Vec::new(),
@@ -895,9 +952,10 @@ export default {
                 "V8 external memory stays near the ceiling: {} bytes",
                 heap.external
             );
-            // The retained bytes condemned the isolate at the turn boundary;
-            // the refusal itself does not latch (V8 may retry an allocator
-            // refusal). Both guards answer through the same accessor.
+            // The retained bytes condemned the isolate at the turn boundary.
+            // This refusal itself did not latch: 32 MiB fits under the whole
+            // cap, so V8's collect-and-retry could have succeeded. Both guards
+            // answer through the same accessor.
             assert_eq!(
                 worker.condemned_for_test(),
                 Some(true),
@@ -1267,6 +1325,306 @@ export default {
             assert_eq!(worker.external_exceeded_for_test(), Some(false));
             let (used, cap) = budget(&worker);
             assert!(used < cap);
+        });
+    }
+
+    /// A body stream whose one chunk is bigger than the whole cap. The read
+    /// promise is what a stream chunk reaches the guest through, so a refused
+    /// chunk must reject it — never resolve it with a value the guest has to
+    /// recognise as missing.
+    const STREAM_SCRIPT: &str = r#"
+export default {
+  async fetch(request) {
+    const reader = request.body.getReader();
+    try {
+      const { value } = await reader.read();
+      return Response.json({ ok: true, bytes: value ? value.byteLength : -1 });
+    } catch (error) {
+      return Response.json({
+        ok: false,
+        name: error && error.name,
+        message: String(error && error.message),
+      });
+    }
+  },
+};
+"#;
+
+    /// A refused stream chunk rejects the read promise with the budget's
+    /// `RangeError`, and the request answers instead of dying: the host store
+    /// that carries a chunk is charged like any other, and the reader is the
+    /// thing it must report to.
+    #[test]
+    fn refused_stream_chunk_rejects_the_read_promise() {
+        on_engine_thread(|| {
+            // The test delivers the chunk itself, so the stream's own bytes
+            // never need to exist twice.
+            let stream: crate::js::HttpChunkStream =
+                Box::pin(futures_util::stream::iter(vec![Ok::<Vec<u8>, String>(
+                    vec![7; 8 << 20],
+                )]));
+            let stream_id = crate::js::register_body_stream(stream).expect("register body stream");
+            let mut worker = load_script(STREAM_SCRIPT);
+            worker.set_external_limit_for_test(TEST_CAP);
+            let (base, cap) = budget(&worker);
+            assert_eq!(cap, TEST_CAP);
+
+            let (reply, mut receive) = tokio::sync::oneshot::channel();
+            let job = crate::WorkerJob::Fetch {
+                queued_at: Instant::now(),
+                entrypoint: None,
+                invocation_limits: None,
+                url: "http://test/read".to_string(),
+                method: "GET".to_string(),
+                body: RequestBody::Stream(stream_id),
+                headers: Vec::new(),
+                // A held body crosses as its bytes; a streamed body crosses
+                // as its id, and only an incoming request (one with an id)
+                // carries a stream at all.
+                request_id: Some(crate::js::next_request_id()),
+                tail_report: None,
+                reply,
+            };
+            let (entry, started) = worker.turn_begin(job, None);
+            let mut entry = entry.expect("request starts");
+            assert_eq!(started.len(), 1, "the handler awaits its first chunk");
+            let op = started[0].0;
+            drop(started);
+
+            // The chunk body is larger than the whole ceiling, so no
+            // collection can make room for it: this is the final refusal.
+            let started = worker.turn_deliver(
+                &mut entry,
+                op,
+                Ok(crate::asyncrt::OpOut::Bytes(vec![7; 3 * TEST_CAP])),
+            );
+            drop(started);
+            if !entry.finished() {
+                drop(worker.turn_poll(&mut entry));
+            }
+            let response = receive
+                .try_recv()
+                .expect("the handler answered the refused read")
+                .unwrap_or_else(|error| panic!("the request failed instead: {error:#}"));
+            let report: serde_json::Value =
+                serde_json::from_slice(&response.body).expect("json body");
+            assert_eq!(
+                report["ok"], false,
+                "the refused chunk resolved the read promise: {report}"
+            );
+            assert_eq!(
+                report["name"], "RangeError",
+                "the reader sees the budget's RangeError: {report}"
+            );
+            assert!(
+                report["message"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("budget")),
+                "the rejection names the budget: {report}"
+            );
+            let (used, cap) = budget(&worker);
+            assert!(
+                used < base + MIB,
+                "the refused chunk left {used} bytes charged, base {base}"
+            );
+            assert!(used < cap);
+            entry.abandon();
+        });
+    }
+
+    /// A scratch cell database in the worker's own storage, as the D1 tests
+    /// build one: `open_with_compat` needs the isolate's cells installed, and
+    /// holding the worker's lock is what installs them.
+    fn open_cell(worker: &mut Worker, scope: &str, dir: &tempfile::TempDir) {
+        let path = dir.path().join(format!("{scope}.sqlite3"));
+        let inner = worker.inner.as_mut().expect("live worker");
+        let (_locker, _cells) = inner.lock();
+        crate::storage::open_with_compat(scope, path.to_str().expect("utf-8 path"), false)
+            .expect("open cell");
+    }
+
+    /// One statement on the cell, with the cursor it starts closed again.
+    fn run_sql(worker: &mut Worker, scope: &str, sql: &str) {
+        let inner = worker.inner.as_mut().expect("live worker");
+        let (_locker, _cells) = inner.lock();
+        let (cursor, _columns, _row, _written, _reused) =
+            crate::storage::sql_cursor_start_values(scope, sql, &[])
+                .unwrap_or_else(|error| panic!("{sql}: {error}"));
+        crate::storage::sql_cursor_close(cursor);
+    }
+
+    /// A cell scope whose cap is [`SMALL_CAP`] and one table with BLOBs big
+    /// enough to be unpayable. A cell connection clamps
+    /// `SQLITE_LIMIT_LENGTH` to 2.2 MB, so one blob is a MiB and a two-blob
+    /// row stays inside a legal row: one fits beside nothing at
+    /// [`SMALL_CAP`], two cannot both fit.
+    const SMALL_CAP: usize = MIB + MIB / 2;
+    const BLOB: usize = MIB;
+
+    fn cell_with_blobs(name: &str) -> (Worker, tempfile::TempDir, String) {
+        let mut worker = load();
+        worker.set_external_limit_for_test(SMALL_CAP);
+        let dir = tempfile::tempdir().expect("temp dir");
+        let scope = format!("array-buffer-blob-{name}");
+        open_cell(&mut worker, &scope, &dir);
+        run_sql(
+            &mut worker,
+            &scope,
+            "CREATE TABLE b(id INTEGER PRIMARY KEY, one BLOB, two BLOB)",
+        );
+        run_sql(
+            &mut worker,
+            &scope,
+            &format!("INSERT INTO b VALUES (1, zeroblob({BLOB}), zeroblob({BLOB}))"),
+        );
+        (worker, dir, scope)
+    }
+
+    /// A row carrying two BLOBs that cannot both be presented throws one
+    /// `RangeError`, presents nothing, and closes the native cursor. Without
+    /// the close every refusal would retain a SQLite statement until the cell
+    /// closes — row 1 because the exception prevented the `SqlCursor` (and its
+    /// finalizer) from existing, a later row because `_advanceNative` →
+    /// `_finishNative` only unregisters the finalizer.
+    ///
+    /// The converter is driven through [`cursor_row`], which is exactly what
+    /// both cursor ops call; it is the function that closes and throws.
+    #[test]
+    fn refused_blob_row_closes_the_cursor_and_throws_once() {
+        on_engine_thread(|| {
+            let (mut worker, _dir, scope) = cell_with_blobs("close");
+            let inner = worker.inner.as_mut().expect("live worker");
+            let (mut locker, _cells) = inner.lock();
+            v8::scope!(let hs, &mut *locker);
+            let realm = inner.realm(hs);
+            let context = realm.context;
+            let cs = &mut v8::ContextScope::new(hs, context);
+            let tc = std::pin::pin!(v8::TryCatch::new(cs));
+            let tc = &mut tc.init();
+
+            // Row 1 is the two-BLOB row: the first column fits, the second
+            // cannot, which is the D1 shape the finding describes.
+            let (cursor, _columns, row, _written, _reused) =
+                crate::storage::sql_cursor_start_values(&scope, "SELECT one, two FROM b", &[])
+                    .expect("cursor starts");
+            assert!(
+                crate::storage::sql_cursor_scope(cursor).is_some(),
+                "the native cursor exists before the conversion"
+            );
+            let row = row.expect("the first row is stepped");
+            let refused = super::super::storage_ops::cursor_row(tc, cursor, row);
+            assert!(
+                refused.is_none(),
+                "a row with an unpayable BLOB column is not presented"
+            );
+            let exception = tc.exception().expect("the refusal was thrown");
+            let text = exception
+                .to_string(tc)
+                .expect("exception text")
+                .to_rust_string_lossy(tc);
+            assert!(
+                text.starts_with("RangeError:") && text.contains("budget"),
+                "the guest sees the budget's RangeError, got {text:?}"
+            );
+            assert!(
+                crate::storage::sql_cursor_scope(cursor).is_none(),
+                "the native cursor is closed, so its statement is not retained"
+            );
+
+            // The connection is not wedged: a later query starts and finishes
+            // on the same cell.
+            let (after, _columns, _row, _written, _reused) =
+                crate::storage::sql_cursor_start_values(&scope, "SELECT count(*) FROM b", &[])
+                    .expect("a later query still runs");
+            crate::storage::sql_cursor_close(after);
+        });
+    }
+
+    /// A refused host store latches the isolate's condemnation even when the
+    /// retained use is nowhere near the recovery share: the guest sees the
+    /// `RangeError`, so the isolate failed to allocate and must be replaced
+    /// like one that hit the heap limit.
+    #[test]
+    fn refused_host_store_latches_condemnation() {
+        on_engine_thread(|| {
+            // A single BLOB larger than the whole cap, on an isolate holding
+            // nothing else: only the host store's own refusal can latch.
+            let (mut worker, _dir, scope) = cell_with_blobs("latch");
+            worker.set_external_limit_for_test(BLOB / 2);
+            let (before, cap) = budget(&worker);
+            assert_eq!(cap, BLOB / 2);
+            assert_eq!(
+                worker.external_exceeded_for_test(),
+                Some(false),
+                "an idle isolate is not condemned"
+            );
+            {
+                let inner = worker.inner.as_mut().expect("live worker");
+                let (mut locker, _cells) = inner.lock();
+                v8::scope!(let hs, &mut *locker);
+                let realm = inner.realm(hs);
+                let context = realm.context;
+                let cs = &mut v8::ContextScope::new(hs, context);
+                let tc = std::pin::pin!(v8::TryCatch::new(cs));
+                let tc = &mut tc.init();
+                let (cursor, _columns, row, _written, _reused) =
+                    crate::storage::sql_cursor_start_values(&scope, "SELECT one FROM b", &[])
+                        .expect("cursor starts");
+                let row = row.expect("the first row is stepped");
+                let refused = super::super::storage_ops::cursor_row(tc, cursor, row);
+                assert!(refused.is_none(), "the BLOB does not fit in the cap");
+                assert!(tc.has_caught(), "the refusal was thrown");
+            }
+            assert_eq!(
+                worker.external_exceeded_for_test(),
+                Some(true),
+                "the host store's refusal condemns the isolate"
+            );
+            assert_eq!(worker.condemned_for_test(), Some(true));
+            let (used, _) = budget(&worker);
+            assert_eq!(used, before, "a refused store charges nothing");
+        });
+    }
+
+    /// The one allocator refusal V8 cannot retry — a fixed buffer larger than
+    /// the whole cap — condemns the isolate even though it holds nothing: no
+    /// collection can free room the cap never had.
+    #[test]
+    fn oversize_fixed_buffer_condemns_the_isolate() {
+        on_engine_thread(|| {
+            let (mut worker, base) = load_with_test_cap();
+            assert_eq!(
+                worker.external_exceeded_for_test(),
+                Some(false),
+                "an empty isolate is not condemned"
+            );
+            // 96 MiB against a 64 MiB ceiling: V8 collects and retries, and
+            // both attempts must fail.
+            let report = fetch(&mut worker, "/alloc?mib=96");
+            assert_eq!(
+                report["ok"], false,
+                "the allocation was not refused: {report}"
+            );
+            assert_eq!(
+                report["name"], "RangeError",
+                "the refusal is V8's RangeError: {report}"
+            );
+            assert_eq!(
+                worker.external_exceeded_for_test(),
+                Some(true),
+                "an unpayable allocation records its final refusal"
+            );
+            assert_eq!(worker.condemned_for_test(), Some(true));
+            let (used, cap) = budget(&worker);
+            assert!(
+                used < base + MIB,
+                "the refusal charged {used} bytes (base {base}): only the \
+                 answer's own store should be charged"
+            );
+            assert!(cap > base);
+            // The latch is this isolate's: a second one starts clean.
+            let (other, _) = load_with_test_cap();
+            assert_eq!(other.external_exceeded_for_test(), Some(false));
         });
     }
 }

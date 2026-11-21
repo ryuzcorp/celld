@@ -20,8 +20,9 @@
 //! steps, so it has to be refused at 320 MiB — five heap limits, and *above*
 //! the 256 MiB the default four-heap multiple would allow, which is what pins
 //! the knob — with the `RangeError` V8 raises when its allocator returns null.
-//! RSS is measured around that one request, so "bounded" is a property of the
-//! real process rather than of the accounting alone. A second request then
+//! RSS is measured around that one request (on Linux, where `/proc` reports
+//! it), so "bounded" is a property of the real process rather than of the
+//! accounting alone. A second request then
 //! allocates the legitimate per-request payloads (64 MiB body or `/tmp` read,
 //! 32 MiB WebSocket message, 32 MiB tee budget and a clone) on the same
 //! Durable Object, which only fits once the first request's buffers have been
@@ -150,7 +151,10 @@ impl TestNode {
     /// Resident set size of the node process, in MiB.
     ///
     /// The node is non-dumpable, but its own `/proc/<pid>/status` is readable
-    /// by the same user that spawned it.
+    /// by the same user that spawned it. `/proc` is Linux-only, so the RSS
+    /// bound is asserted there only; the refusal, growth, churn and health
+    /// assertions hold on every platform.
+    #[cfg(target_os = "linux")]
     fn rss_mib(&self) -> u64 {
         let status = std::fs::read_to_string(format!("/proc/{}/status", self.child.id()))
             .expect("node status");
@@ -255,9 +259,11 @@ fn array_buffer_growth_is_refused_at_the_budget() {
     // 512 MiB asked for, with a 320 MiB budget and a 64 MiB heap limit, on an
     // isolate that has charged nothing yet: the refusal point is the budget,
     // not what a previous request happened to leave charged.
+    #[cfg(target_os = "linux")]
     let before = node.rss_mib();
     let (status, headers, body) = get(&node, "/grow?target=536870912").expect("grow answers");
     assert_eq!(status, 200, "{body}");
+    #[cfg(target_os = "linux")]
     let after = node.rss_mib();
 
     let refused = header(&headers, "x-refused").unwrap_or("");
@@ -279,6 +285,8 @@ fn array_buffer_growth_is_refused_at_the_budget() {
     );
     // The charge is at most 320 MiB; the process may hold allocator and V8
     // overhead above it, but a run that kept growing would be 512 MiB higher.
+    // `/proc` is where the RSS comes from, so this bound is Linux-only.
+    #[cfg(target_os = "linux")]
     assert!(
         after.saturating_sub(before) <= 416,
         "RSS grew by {} MiB for a 320 MiB budget ({before} -> {after})",

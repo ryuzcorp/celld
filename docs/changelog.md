@@ -107,11 +107,18 @@ changes; `CELLO_V8_EXTERNAL_LIMIT_MB` is new and optional.
   around (`ArrayBuffer.prototype.constructor`, `Reflect.construct`,
   `structuredClone`, `transfer`). A refusal condemns the isolate the way a
   heap-limit hit does: it takes on no new retained state and serves again
-  once it is back under 75 percent of both limits. A collection returns
+  once it is back under 75 percent of both limits. Three refusals are
+  evidence: a refused host store, the guard's, and an allocation larger than
+  the whole budget (which no collection can make room for). A smaller plain
+  allocation that V8 collects and retries successfully never fails the
+  guest, so it does not condemn. A collection returns
   freed buffers to the budget, so churn past the limit is never refused.
   Buffers the host hands to JavaScript -- response bodies, WebSocket
   messages, RPC arguments, `/tmp` reads, D1 blobs -- are charged to the same
-  budget and refused the same way. What remains is documented in
+  budget and refused the same way: a refused stream chunk rejects the read
+  promise with the budget's `RangeError`, and a SQL row whose BLOB does not
+  fit throws one `RangeError` and closes its native cursor, so the refused
+  statement is not retained. What remains is documented in
   [Limitations](reference/limits.md): a `WebAssembly.Memory` that a module
   declares is bounded per memory (`--wasm-max-mem-pages`, the whole budget)
   but not charged, so many such memories in one isolate are bounded only by

@@ -121,12 +121,22 @@ services, APIs, and Wrangler configuration.
 - A refusal condemns the isolate the way a heap-limit hit does: it takes on
   no new hibernatable socket and no new SQL result set materializes, and it
   serves again once a collection finds both the heap and the budget under 75
-  percent of their limits. A turn that begins with retained buffers over 75
-  percent of the budget is condemned too, after a rate-limited collection —
-  so an isolate that merely asked for too much once, and was refused without
-  keeping it, is not condemned. The isolate is not retired for memory it
+  percent of their limits. Three refusals count as evidence: a refused host
+  store (a response body, a WebSocket message, a `/tmp` read, a D1 blob), a
+  guest-facing wrapper's refusal, and a plain allocation larger than the
+  whole budget, which no collection can make room for. A smaller plain
+  allocation that V8 collects and retries successfully never reaches the
+  guest, so it does not count. A turn that begins with retained buffers over
+  75 percent of the budget is condemned too, after a rate-limited collection
+  — so an isolate that merely asked for more than was free once, and dropped
+  it, is not condemned. The isolate is not retired for memory it
   holds: the cell keeps serving on it at reduced admission, exactly as it
   does after a heap-limit hit.
+- A refused buffer is never presented as a partial value. A stream chunk that
+  does not fit rejects the `read()` promise with the budget's `RangeError`; a
+  host buffer for a synchronous host call throws at that call; a row whose
+  BLOB does not fit throws one `RangeError` and its SQL cursor is closed, so
+  the refused statement is not retained on the cell's connection.
 - Bytes come back when the collector frees the object. For plain buffers that
   is the next collection. For the resizable/growable/wasm paths the guard
   returns them through V8's `FinalizationRegistry`, which the runtime drives

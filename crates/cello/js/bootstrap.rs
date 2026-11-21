@@ -673,7 +673,7 @@ pub(super) fn populate_loader_process_env(
         return Ok(());
     }
     let installer = internal_function(scope, "__installLoaderProcessEnv")?;
-    let bytes = super::bytes_value(scope, env.bytes.clone());
+    let bytes = super::bytes_value(scope, env.bytes.clone())?;
     let reserved = v8::String::new(scope, crate::deploy::NODE_IDENTITY_ENV).unwrap();
     let tc = std::pin::pin!(v8::TryCatch::new(scope));
     let tc = &mut tc.init();
@@ -813,10 +813,10 @@ pub(super) fn build_env(scope: &mut v8::PinScope, config: &WorkerConfig) -> Resu
                 None => v8::null(scope).into(),
             };
             routes.set_index(scope, offset + 1, entrypoint);
-            let props = super::bytes_value(scope, route.props.clone());
+            let props = super::bytes_value(scope, route.props.clone())?;
             routes.set_index(scope, offset + 2, props);
         }
-        let bytes = super::bytes_value(scope, env.bytes.clone());
+        let bytes = super::bytes_value(scope, env.bytes.clone())?;
         let tc = std::pin::pin!(v8::TryCatch::new(scope));
         let tc = &mut tc.init();
         let receiver = v8::undefined(tc).into();
