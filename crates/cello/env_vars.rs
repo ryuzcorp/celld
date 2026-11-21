@@ -347,6 +347,12 @@ pub fn validate() -> anyhow::Result<()> {
         }
     }
 
+    if let Some(megabytes) = positive::<usize>("CELLO_V8_EXTERNAL_LIMIT_MB")? {
+        if megabytes.checked_mul(1024 * 1024).is_none() {
+            bail!("CELLO_V8_EXTERNAL_LIMIT_MB is too large: {megabytes}");
+        }
+    }
+
     if let Some(value) = value("CELLO_LOG_TRANSPORT")? {
         if !matches!(value.as_str(), "http" | "stream") {
             bail!("CELLO_LOG_TRANSPORT must be http or stream, not {value:?}");

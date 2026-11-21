@@ -760,7 +760,9 @@ fn sql_value_to_v8<'s>(
             if bytes.is_empty() {
                 return v8::ArrayBuffer::new(scope, 0).into();
             }
-            let store = v8::ArrayBuffer::new_backing_store_from_vec(bytes).make_shared();
+            let Some(store) = super::host_backing_store(scope, bytes) else {
+                return v8::undefined(scope).into();
+            };
             v8::ArrayBuffer::with_backing_store(scope, &store).into()
         }
     }

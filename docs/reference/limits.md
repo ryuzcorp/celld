@@ -92,6 +92,37 @@ services, APIs, and Wrangler configuration.
   `RangeError`. A stream stops counting once it finishes, is cancelled or
   aborted, errors, or is garbage-collected after it becomes unreachable.
 
+## Cap memory per isolate
+
+- An isolate holds at most `CELLO_V8_EXTERNAL_LIMIT_MB` of `ArrayBuffer`
+  memory: four times its V8 heap limit by default, 512 MiB with the
+  default 128 MiB heap. Past it, `new ArrayBuffer`, typed arrays,
+  `structuredClone`, `ArrayBuffer.prototype.transfer`, and every buffer the
+  host hands to JavaScript throw `RangeError: Array buffer allocation
+  failed`. The isolate is then condemned the way a heap-limit hit condemns
+  it: it takes on no new hibernatable socket, and it is retired at its next
+  turn so the cell restarts on a fresh isolate. An isolate that lets go of
+  its buffers is not condemned: a collection returns them to the budget, so
+  allocating and dropping far more than the budget in total never fails.
+- The limit covers the whole isolate, not one request. A `tee()` chain, a
+  clone, a WebSocket message and a `.arrayBuffer()` call share it, so a
+  handler that holds several 32 MiB payloads at once can reach it while
+  every payload on its own is well under it. An isolate at the limit cannot
+  allocate at all, including the buffer a response body is built from; free
+  what you no longer need, or let the request fail and the isolate retire.
+- Two allocation paths are outside the budget. `ArrayBuffer.prototype.resize`
+  on a resizable `ArrayBuffer` and `WebAssembly.Memory` are backed by the
+  platform page allocator, not by the isolate's. A resized buffer is still
+  counted as external memory, so an isolate that grows one past its whole
+  budget is retired at the next turn. Wasm memory is counted nowhere, so it
+  is bounded only by V8's own Wasm memory limit and by the node's
+  `CELLO_MAX_RSS_MB` pressure shedding. Do not rely on the budget to stop a
+  Worker that allocates large Wasm memories.
+- The budget is per isolate, not per node: `CELLO_MAX_CELLS_PER_ISOLATE`
+  cells share one, and a node runs as many isolates as its pools allow. Size
+  it against `CELLO_MAX_RSS_MB` and the isolate count, not against the
+  fleet's memory.
+
 ## Run on Linux or Apple Silicon
 
 The installer supplies binaries for Linux x86-64, Linux ARM64, and Apple

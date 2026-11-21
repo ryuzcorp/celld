@@ -406,6 +406,8 @@ TUNING:
   CELLO_ALARM_RESIDENT_MS         Near-alarm residency window
   CELLO_WAKER_TICK_MS             Orphan-alarm scan interval
   CELLO_V8_HEAP_LIMIT_MB          Per-isolate V8 heap limit
+  CELLO_V8_EXTERNAL_LIMIT_MB      Per-isolate ArrayBuffer memory limit
+                                  (default: 4 x the heap limit)
   CELLO_MAX_CELLS_PER_ISOLATE     Cells per isolate (default: 32; lower it
                                   for heavyweight cells such as agents)
   CELLO_SQL_STATEMENT_MS          Per-statement SQL time bound (unset means

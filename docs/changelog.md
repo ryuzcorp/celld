@@ -5,8 +5,9 @@ description: What shipped in each Cello release, from v0.6.3-ryuzcorp.4 to v0.2.
 ## Unreleased
 
 A `TransformStream` now applies backpressure, a `tee()` bounds the skew
-between its branches, and compression streams no longer leak native memory.
-No configuration, data, or bucket-format changes.
+between its branches, compression streams no longer leak native memory, and
+an isolate's `ArrayBuffer` memory is capped. No data or bucket-format
+changes; `CELLO_V8_EXTERNAL_LIMIT_MB` is new and optional.
 
 - **`TransformStream` applies backpressure** (#105). Its writable side used to
   resolve `write()` as soon as the transform returned, whether or not
@@ -84,6 +85,28 @@ No configuration, data, or bucket-format changes.
   `operation timed out`, or the tee skew message when a streamed request body
   was a tee copy the budget ended. Code that matched the old wrapper text
   should match the cause instead.
+
+- **An isolate's `ArrayBuffer` memory is capped** (#110). V8's default
+  ArrayBuffer allocator is `malloc`, so `new ArrayBuffer(n)` in a Worker was
+  an unbounded allocation inside the shared process: `near_heap_limit`
+  extends the V8 heap limit and never fails the allocation, and backing
+  stores are external memory rather than heap. One tenant looping
+  `new Uint8Array(8 << 20)` grew the node by 640 MiB with a 128 MiB heap
+  limit and was never refused (measured: RSS +643 MiB, isolate not
+  condemned). Every isolate now has an allocator of its own that charges
+  each backing store to a per-isolate budget and returns null past it, which
+  V8 turns into a catchable `RangeError: Array buffer allocation failed`;
+  the refusal condemns the isolate, which retires it so the cell restarts on
+  a fresh one. The budget is `CELLO_V8_EXTERNAL_LIMIT_MB`, four heap limits
+  by default (512 MiB), above the 64 MiB `/tmp` read, 32 MiB WebSocket
+  message, 32 MiB tee skew and clone that one request legitimately holds. A
+  collection returns freed buffers to the budget, so churn past the limit is
+  never refused. Buffers the host hands to JavaScript -- response bodies,
+  WebSocket messages, RPC arguments, `/tmp` reads, D1 blobs -- are charged
+  to the same budget and refused the same way. Two paths stay outside it
+  and are documented in [Limitations](reference/limits.md): a resized
+  resizable `ArrayBuffer` is retired at the next turn, and
+  `WebAssembly.Memory` is bounded only by V8 and the node's memory pressure.
 
 ## v0.2.3
 

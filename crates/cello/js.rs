@@ -1757,12 +1757,64 @@ fn resolve_res(tc: &mut v8::PinScope, id: u64, res: Result<asyncrt::OpOut, Strin
     }
 }
 
-/// Move `bytes` into a `Uint8Array` without copying.
+/// The backing-store budget of the isolate this scope belongs to.
+///
+/// Every isolate `load_config` builds has one, installed in
+/// [`HeapLimitState`]; `None` means this scope is not on a Worker isolate and
+/// there is nothing to charge.
+fn backing_store_budget(
+    scope: &mut v8::PinScope,
+) -> Option<Arc<array_buffer_budget::BackingStoreBudget>> {
+    scope
+        .get_slot::<Arc<HeapLimitState>>()
+        .map(|state| state.external.clone())
+}
+
+/// A store for bytes the host already owns, charged to this isolate's
+/// budget.
+///
+/// Answers `None` after throwing the `RangeError` the guest would have seen
+/// from `new ArrayBuffer(n)`: the bytes would take the isolate past its
+/// ceiling, so the answer is refused rather than the process growing. The
+/// caller must return; the pending exception is what the JS call sees.
+fn host_backing_store<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    bytes: Vec<u8>,
+) -> Option<v8::SharedRef<v8::BackingStore>> {
+    let Some(budget) = backing_store_budget(scope) else {
+        // No isolate budget to charge: keep today's path rather than fail an
+        // answer V8 expects. `load_config` cannot produce this.
+        return Some(v8::ArrayBuffer::new_backing_store_from_vec(bytes).make_shared());
+    };
+    match array_buffer_budget::host_store(&budget, bytes) {
+        Some(store) => Some(store.make_shared()),
+        None => {
+            let message = v8::String::new(
+                scope,
+                &format!(
+                    "the isolate's ArrayBuffer memory budget is exhausted ({} MiB); \
+                     free buffers before allocating more (see \
+                     CELLO_V8_EXTERNAL_LIMIT_MB)",
+                    budget.cap() / (1024 * 1024)
+                ),
+            )
+            .unwrap();
+            let exception = v8::Exception::range_error(scope, message);
+            scope.throw_exception(exception);
+            None
+        }
+    }
+}
+
+/// Move `bytes` into a `Uint8Array` without copying, charged to the
+/// isolate's backing-store budget.
 fn bytes_value<'s>(scope: &mut v8::PinScope<'s, '_>, bytes: Vec<u8>) -> v8::Local<'s, v8::Value> {
     #[cfg(cello_internal_tests)]
     let input = bytes.as_ptr() as usize;
     let len = bytes.len();
-    let store = v8::ArrayBuffer::new_backing_store_from_vec(bytes).make_shared();
+    let Some(store) = host_backing_store(scope, bytes) else {
+        return v8::undefined(scope).into();
+    };
     let buffer = v8::ArrayBuffer::with_backing_store(scope, &store);
     #[cfg(cello_internal_tests)]
     record_bytes_value_allocation_for_test(
@@ -2640,7 +2692,7 @@ impl WorkerIsolate {
         (self.isolate.lock(), self.cells.install())
     }
 
-    /// Lift condemnation from an isolate whose heap has drained.
+    /// Lift condemnation from an isolate whose memory has drained.
     ///
     /// `near_heap_limit` latches a flag that nothing used to clear, so a cell
     /// that reached its limit once stayed condemned until the process
@@ -2648,11 +2700,26 @@ impl WorkerIsolate {
     /// one, because a handler must not see the isolate recover halfway
     /// through.
     ///
-    /// A heap still over the line buys one `low_memory_notification` and a
-    /// second reading. V8 stops collecting once it is past the limit, so a
-    /// drained isolate holds the dead heap until something allocates again —
-    /// without the forced collection the reading that decides recovery is a
-    /// reading of garbage. `HEAP_GC_NUDGE_INTERVAL` bounds the cost.
+    /// Two guards condemn an isolate: the V8 heap limit (`near_heap_limit`)
+    /// and its backing-store budget (an allocator refusal). Both are measured
+    /// here, and both must be under [`HEAP_RECOVERY_SHARE`] before the isolate
+    /// serves again.
+    ///
+    /// A guard still over the line buys one `low_memory_notification` and a
+    /// second reading. V8 stops collecting once the heap is past the limit,
+    /// and backing stores a guest dropped are only releasable once the
+    /// collector finds them — without the forced collection the reading that
+    /// decides recovery is a reading of garbage. `HEAP_GC_NUDGE_INTERVAL`
+    /// bounds the cost.
+    ///
+    /// Recovery is not the only way out. V8 allocates resizable
+    /// `ArrayBuffer`s and `WebAssembly.Memory` through the platform page
+    /// allocator rather than the isolate's (see `array_buffer_budget`), so
+    /// those bytes cannot be refused at the allocation site; they are only
+    /// counted in `external_memory`. An isolate still holding more than its
+    /// whole budget after a collection therefore cannot serve this cell's
+    /// traffic again, and is retired so the pool grows a fresh one — the same
+    /// outcome a heap OOM has, without the process growing.
     ///
     /// Removing the callback with the original limit puts back the limit
     /// `near_heap_limit` raised; re-adding it re-arms the guard.
@@ -2660,26 +2727,41 @@ impl WorkerIsolate {
         let Some(state) = locker.get_slot::<Arc<HeapLimitState>>().cloned() else {
             return;
         };
-        if !state.excessively_exceeded.load(Ordering::Relaxed) {
+        // The truth about external memory first, every turn: stores V8 made
+        // outside the allocator (a resized `ArrayBuffer`, wasm memory) never
+        // latch a flag at an allocation site, so this is the only place they
+        // are seen. An isolate still over its whole budget after a
+        // collection is condemned and retired; one that dropped back under
+        // it recovers below.
+        if state.external_memory_over_budget(locker) {
+            state.excessively_exceeded.store(true, Ordering::Relaxed);
+            state.retire_if_over_budget(locker);
             return;
         }
-        if heap_share(locker, state.limit) >= HEAP_RECOVERY_SHARE {
+        if !state.condemned() {
+            return;
+        }
+        if state.over_recovery_share(locker) {
             if !state.due_for_gc_nudge() {
                 return;
             }
             locker.low_memory_notification();
-            if heap_share(locker, state.limit) >= HEAP_RECOVERY_SHARE {
+            if state.over_recovery_share(locker) {
+                state.retire_if_over_budget(locker);
                 return;
             }
         }
         state.excessively_exceeded.store(false, Ordering::Relaxed);
+        state.external.clear_exceeded();
         let data = Arc::as_ptr(&state) as *mut HeapLimitState as *mut std::ffi::c_void;
         locker.remove_near_heap_limit_callback(near_heap_limit, state.limit);
         locker.add_near_heap_limit_callback(near_heap_limit, data);
         tracing::info!(
             event = "isolate_heap_recovered",
             limit_bytes = state.limit,
-            "isolate heap fell back under its limit, so it serves again"
+            external_bytes = state.external.used(),
+            external_limit_bytes = state.external.cap(),
+            "isolate memory fell back under its limits, so it serves again"
         );
     }
 
@@ -2742,8 +2824,22 @@ const HEAP_RECOVERY_SHARE: f64 = 0.75;
 /// condemned isolate on collecting than on serving.
 const HEAP_GC_NUDGE_INTERVAL: Duration = Duration::from_secs(1);
 
+/// Share of the backing-store budget that V8 may hold in external memory the
+/// allocator never saw before the isolate is retired.
+///
+/// The allocator never exceeds its cap, so `external_memory - used` is a store
+/// V8 made outside the allocator: a resized `ArrayBuffer` or wasm memory. A
+/// quarter of the budget is already past anything a legitimate request holds
+/// there (an embedder here creates no external strings), and it leaves room
+/// for the rounding between the length V8 asks for and the length it counts.
+const UNACCOUNTED_EXTERNAL_SHARE: f64 = 0.25;
+
 struct HeapLimitState {
     excessively_exceeded: AtomicBool,
+    /// Backing-store memory this isolate's ArrayBuffer allocator handed out,
+    /// and the ceiling it enforces. The allocator latches `exceeded` when it
+    /// refuses; the heap-limit callback latches `excessively_exceeded`.
+    external: Arc<array_buffer_budget::BackingStoreBudget>,
     /// The limit V8 gave this isolate, before any emergency extension.
     /// Recovery measures against this one because `near_heap_limit` raises
     /// the current one.
@@ -2756,6 +2852,62 @@ struct HeapLimitState {
 }
 
 impl HeapLimitState {
+    /// Whether either memory guard has condemned this isolate.
+    fn condemned(&self) -> bool {
+        self.excessively_exceeded.load(Ordering::Relaxed) || self.external.exceeded()
+    }
+
+    /// Whether either guard still reads over its recovery share: the heap
+    /// past [`HEAP_RECOVERY_SHARE`] of its limit, or the backing stores past
+    /// that share of their budget.
+    fn over_recovery_share(&self, isolate: &mut v8::Isolate) -> bool {
+        heap_share(isolate, self.limit) >= HEAP_RECOVERY_SHARE
+            || self.external.used_share() >= HEAP_RECOVERY_SHARE
+    }
+
+    /// Whether V8 holds more than [`UNACCOUNTED_EXTERNAL_SHARE`] of the budget
+    /// in external memory the allocator never saw.
+    ///
+    /// The allocator cannot exceed the cap, so `external_memory - used` is a
+    /// backing store V8 allocated outside it — a resized `ArrayBuffer` or wasm
+    /// memory — which no allocation hook can refuse.
+    fn external_memory_over_budget(&self, isolate: &mut v8::Isolate) -> bool {
+        let unaccounted = isolate
+            .get_heap_statistics()
+            .external_memory()
+            .saturating_sub(self.external.used());
+        unaccounted as f64 > self.external.cap() as f64 * UNACCOUNTED_EXTERNAL_SHARE
+    }
+
+    /// Replace the isolate that is provably over its whole budget.
+    ///
+    /// The current turn still runs on it: a condemnation asks the pool to
+    /// free this isolate once it drains, exactly as a guest's
+    /// `__isolate_condemn` does. A standalone slot has no pool to replace it
+    /// and keeps serving, as it does for every other condemnation.
+    fn retire_if_over_budget(&self, isolate: &mut v8::Isolate) {
+        if !self.external_memory_over_budget(isolate) {
+            return;
+        }
+        let Some(slot) = crate::pool::current_slot() else {
+            return;
+        };
+        let reason = format!(
+            "the isolate holds {} bytes of external memory past its {} byte budget \
+             (see CELLO_V8_EXTERNAL_LIMIT_MB)",
+            isolate.get_heap_statistics().external_memory(),
+            self.external.cap()
+        );
+        if slot.condemn(&reason) {
+            tracing::warn!(
+                event = "isolate_external_budget_exceeded",
+                external_bytes = isolate.get_heap_statistics().external_memory(),
+                external_limit_bytes = self.external.cap(),
+                "isolate held more external memory than its budget, so it is retired"
+            );
+        }
+    }
+
     /// Whether a condemned isolate can pay for another forced collection.
     ///
     /// Rate-limited rather than once for each condemnation: the load can
@@ -4618,7 +4770,13 @@ fn install_trace<'s>(
 ) -> Option<v8::Local<'s, v8::Value>> {
     let context = trace?;
     let previous = scope.get_continuation_preserved_embedder_data();
-    let buffer = v8::ArrayBuffer::new(scope, 25);
+    // A host-owned store, not `v8::ArrayBuffer::new`: that call aborts the
+    // process when the isolate's allocator refuses, and a 25-byte trace
+    // rider is host bookkeeping rather than guest data, so it is not charged
+    // to the guest's budget. One such buffer exists per in-flight traced
+    // turn and becomes garbage with the turn.
+    let store = v8::ArrayBuffer::new_backing_store_from_vec(vec![0_u8; 25]).make_shared();
+    let buffer = v8::ArrayBuffer::with_backing_store(scope, &store);
     let data = buffer.get_backing_store().data()?;
     let bytes = data.as_ptr() as *mut u8;
     // SAFETY: a freshly created 25-byte buffer, written before any JS
@@ -4826,6 +4984,28 @@ impl Worker {
             physical: statistics.total_physical_size() as u64,
             external: statistics.external_memory() as u64,
         })
+    }
+
+    /// Whether the heap-limit guard has condemned this isolate, for a test
+    /// that has to see the state machine rather than its side effects.
+    #[cfg(test)]
+    pub(crate) fn heap_condemned_for_test(&self) -> Option<bool> {
+        let inner = self.inner.as_ref()?;
+        let (locker, _cells) = inner.lock();
+        locker
+            .get_slot::<Arc<HeapLimitState>>()
+            .map(|state| state.excessively_exceeded.load(Ordering::Relaxed))
+    }
+
+    /// The backing-store budget as `(charged bytes, ceiling)`, for a test that
+    /// measures the allocator rather than the guest.
+    #[cfg(test)]
+    pub(crate) fn backing_store_budget_for_test(&self) -> Option<(usize, usize)> {
+        let inner = self.inner.as_ref()?;
+        let (locker, _cells) = inner.lock();
+        locker
+            .get_slot::<Arc<HeapLimitState>>()
+            .map(|state| (state.external.used(), state.external.cap()))
     }
 
     /// Run a request's first turn.
@@ -6689,13 +6869,23 @@ impl Worker {
         let do_classes = config.do_classes.as_slice();
         let node = config.node.as_str();
         let compat = config.compat;
-        let params = v8::CreateParams::default().heap_limits(0, v8_heap_limit_bytes());
+        let heap_limit = v8_heap_limit_bytes();
+        // Before the isolate exists, because V8 takes the allocator with its
+        // creation: every `new ArrayBuffer(n)` in the guest draws on this
+        // budget from the first line of the module.
+        let backing_stores = array_buffer_budget::BackingStoreBudget::new(
+            array_buffer_budget::external_limit_bytes(heap_limit),
+        );
+        let params = v8::CreateParams::default()
+            .heap_limits(0, heap_limit)
+            .array_buffer_allocator(array_buffer_budget::allocator(&backing_stores).make_shared());
         let mut isolate = v8::Isolate::new(params);
         // Dynamic `import()` of builtin specifiers; per-import()-call only.
         isolate.set_host_import_module_dynamically_callback(host_import_module_dynamically);
         let original_heap_limit = isolate.get_heap_statistics().heap_size_limit();
         let heap_limit_state = Arc::new(HeapLimitState {
             excessively_exceeded: AtomicBool::new(false),
+            external: backing_stores,
             limit: original_heap_limit,
             last_gc_nudge: Mutex::new(None),
             #[cfg(cello_internal_tests)]
@@ -11847,18 +12037,20 @@ fn webcrypto_return_bytes(
     mut rv: v8::ReturnValue<v8::Value>,
     bytes: &[u8],
 ) {
-    let buffer = v8::ArrayBuffer::new(scope, bytes.len());
-    if !bytes.is_empty() {
-        let store = buffer.get_backing_store();
-        let destination = unsafe {
-            std::slice::from_raw_parts_mut(store.data().unwrap().as_ptr() as *mut u8, bytes.len())
-        };
-        destination.copy_from_slice(bytes);
-    }
+    // One copy either way: the bytes move into a `Vec` the store owns
+    // instead of into a store V8 allocated. That matters beyond tidiness:
+    // `v8::ArrayBuffer::New` aborts the process when the allocator refuses
+    // (`FatalProcessOutOfMemory: v8::ArrayBuffer::New`), while a host store
+    // past the budget is refused here with a `RangeError` the guest catches.
+    let Some(store) = host_backing_store(scope, bytes.to_vec()) else {
+        return;
+    };
+    let buffer = v8::ArrayBuffer::with_backing_store(scope, &store);
     let view = v8::Uint8Array::new(scope, buffer, 0, bytes.len()).unwrap();
     rv.set(view.into());
 }
 
+mod array_buffer_budget;
 mod binding_policy;
 mod container;
 mod crypto;
@@ -12014,9 +12206,11 @@ fn op_heap_limit_excessively_exceeded(
     _args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
+    // Either guard: the heap limit or the backing-store budget. Both mean
+    // "this isolate may not take on more retained state".
     let exceeded = scope
         .get_slot::<Arc<HeapLimitState>>()
-        .is_some_and(|state| state.excessively_exceeded.load(Ordering::Relaxed));
+        .is_some_and(|state| state.condemned());
     rv.set(v8::Boolean::new(scope, exceeded).into());
 }
 /// Whether this isolate is too close to its heap limit to retain more state.
@@ -12028,12 +12222,7 @@ fn op_heap_over_admission_share(
     let state = scope.get_slot::<Arc<HeapLimitState>>().cloned();
     let over = match state {
         // A condemned isolate admits nothing, whatever the heap now reads.
-        Some(state)
-            if state.excessively_exceeded.load(Ordering::Relaxed)
-                || admission_refusal_forced(&state) =>
-        {
-            true
-        }
+        Some(state) if state.condemned() || admission_refusal_forced(&state) => true,
         Some(state) => heap_share(scope, state.limit) >= HEAP_ADMISSION_SHARE,
         None => false,
     };
@@ -14173,7 +14362,9 @@ fn op_vfs_read_file(
             .unwrap()
             .read_file(&path);
         if let Some(bytes) = bytes {
-            let store = v8::ArrayBuffer::new_backing_store_from_vec(bytes).make_shared();
+            let Some(store) = host_backing_store(scope, bytes) else {
+                return;
+            };
             let buffer = v8::ArrayBuffer::with_backing_store(scope, &store);
             rv.set(buffer.into());
             return;
@@ -14188,7 +14379,9 @@ fn op_vfs_read_file(
     };
     // One copy into the V8 heap. The projected `Bytes` stays shared, so a
     // second read of the same module does not re-copy the config's source.
-    let store = v8::ArrayBuffer::new_backing_store_from_vec(bytes.to_vec()).make_shared();
+    let Some(store) = host_backing_store(scope, bytes.to_vec()) else {
+        return;
+    };
     let buffer = v8::ArrayBuffer::with_backing_store(scope, &store);
     rv.set(buffer.into());
 }

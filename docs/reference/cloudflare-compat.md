@@ -2,7 +2,7 @@
 title: Cloudflare compatibility
 description: Which Cloudflare services and runtime APIs Cello supports, and how each difference behaves.
 ---
-<!-- Modified by Ryuz Corp (Cello): node:crypto scrypt; cloned streaming bodies; cross-isolate RPC stubs and streams; per-node Workers Cache API; receiver-held RPC streams; AbortSignal.timeout is unreferenced (upstream #306); loader 101 webSocket target (upstream #305); loader sibling cloudflare:workers imports (upstream #304); AES-KW and symmetric JWK (upstream #295); EC raw point format (upstream #271); writable request /tmp, node:url file helpers, and the CELLO_TMP_MAX_BYTES /tmp cap (upstream #280); workerd close codes (upstream #279); fetch gzip/deflate decoding (upstream #238); Symbol.dispose on RPC results (upstream #260); post-response DO dial (upstream #254); synchronous caller cancel (upstream #281). -->
+<!-- Modified by Ryuz Corp (Cello): per-isolate ArrayBuffer memory cap; node:crypto scrypt; cloned streaming bodies; cross-isolate RPC stubs and streams; per-node Workers Cache API; receiver-held RPC streams; AbortSignal.timeout is unreferenced (upstream #306); loader 101 webSocket target (upstream #305); loader sibling cloudflare:workers imports (upstream #304); AES-KW and symmetric JWK (upstream #295); EC raw point format (upstream #271); writable request /tmp, node:url file helpers, and the CELLO_TMP_MAX_BYTES /tmp cap (upstream #280); workerd close codes (upstream #279); fetch gzip/deflate decoding (upstream #238); Symbol.dispose on RPC results (upstream #260); post-response DO dial (upstream #254); synchronous caller cancel (upstream #281). -->
 
 This page lists only the differences from the linked Cloudflare APIs. An
 entry without a note matches Cloudflare.
@@ -93,6 +93,24 @@ use. An unsupported feature that stays silent is a defect.
   the whole send, so a single chunk larger than 32 MiB fails every copy that
   has not read it. Workerd buffers for the slower copy within the isolate's
   128 MB limit instead of failing it.
+- An isolate's `ArrayBuffer` memory is capped (`CELLO_V8_EXTERNAL_LIMIT_MB`,
+  four V8 heap limits by default) instead of Workerd's single 128 MB
+  per-isolate memory limit covering the heap and every buffer together. Past
+  the cap, `new ArrayBuffer`, typed arrays, `structuredClone`, `transfer`, a
+  resizable `ArrayBuffer` (`maxByteLength`, `resize`), a growable
+  `SharedArrayBuffer` and `WebAssembly.Memory` throw
+  `RangeError: Array buffer allocation failed`, and the isolate is condemned:
+  it takes on no new hibernatable socket and retires at the next turn, like a
+  heap-limit hit. Buffers the host hands to JavaScript -- response bodies,
+  WebSocket messages, RPC arguments, `/tmp` reads, D1 blobs -- are charged to
+  the same budget and refused the same way. Cello's defaults are more generous
+  than Workerd's (128 MiB heap plus 512 MiB of buffers); lower
+  `CELLO_V8_HEAP_LIMIT_MB` and `CELLO_V8_EXTERNAL_LIMIT_MB` together to
+  approximate Workerd. One gap remains: a `WebAssembly.Memory` that a module
+  declares (rather than one passed in from JavaScript) is capped per memory
+  (`--wasm-max-mem-pages`, the whole budget) but not charged. Workerd keeps
+  both inside the same 128 MB limit. Below 128 MB an isolate behaves the same
+  as on Cloudflare.
 - A `tee()` of a Worker-constructed `ReadableStream` bounds the skew the
   same way, counted per tee. The difference between what the two branches
   hold is measured just after a chunk is queued; past 32 MiB the branch
