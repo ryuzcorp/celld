@@ -49,8 +49,9 @@ const _TEE_SKEW_MESSAGE =
 //
 // The budget is a guard against accidental buffering by honest code, not
 // an isolate memory limit: this charge can be smaller than what a chunk
-// actually retains (a 1-byte view over a 64 MiB buffer costs 1 byte, and a
-// payload hidden in an object costs the floor).
+// actually retains (a 1 MiB view over a 64 MiB buffer costs 1 MiB -- and a
+// 1-byte view the 64-byte floor -- and a payload hidden in an object costs
+// the floor).
 const _TEE_OBJECT_BYTES = 64;
 
 // The probe must never run chunk code: a chunk may be a Proxy, or an
@@ -620,13 +621,16 @@ class ReadableStream {
     }
 
     // Fail a branch only for actual lag: it holds more queued bytes than a
-    // live sibling and that skew is past the budget. The leading branch is
-    // never failed and one chunk can fail at most one branch, so a single
-    // chunk larger than the budget still reaches both copies instead of
-    // killing them -- the host tee's total-based check would fail both
-    // (see docs/reference/limits.md). Returns whether a branch is still
-    // live; with one branch left there is no sibling to be behind, so it
-    // keeps everything and the source is not cancelled.
+    // live sibling and that difference, measured just after the chunk is
+    // queued, is past the budget. The leading branch is never failed and
+    // one chunk can fail at most one branch. The chunk size alone fails no
+    // branch, but a branch that has not read an oversize chunk yet holds
+    // all of it and fails for lag, so with chunks larger than the budget
+    // both branches must be read concurrently -- the host tee's total-based
+    // check would fail both regardless (see docs/reference/limits.md).
+    // Returns whether a branch is still live; with one branch left there is
+    // no sibling to be behind, so it keeps everything and the source is not
+    // cancelled.
     function failLagging() {
       for (;;) {
         if (!live1() && !live2()) {
@@ -660,9 +664,23 @@ class ReadableStream {
           try {
             if (done) {
               if (closed) return;
-              if (live1()) controllers[0].close();
-              if (live2()) controllers[1].close();
+              // The source has ended: the tee is finished whatever a
+              // branch does next, and its `cancel` must not run.
               closed = true;
+              // A close can throw for a branch only. A byte branch whose
+              // BYOB read left a partial element on an odd-length tail
+              // throws from close() (per spec); the sibling must still
+              // close, and only the throwing branch is errored.
+              try {
+                if (live1()) controllers[0].close();
+              } catch (e) {
+                if (live1()) controllers[0].error(e);
+              }
+              try {
+                if (live2()) controllers[1].close();
+              } catch (e) {
+                if (live2()) controllers[1].error(e);
+              }
               return;
             }
             chunkCharge = _teeChunkBytes(value);

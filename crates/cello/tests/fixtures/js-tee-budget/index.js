@@ -331,7 +331,109 @@ const checkOversizeUnread = async (check) => {
   );
 };
 
-/// (h) The accounting probe must be total and trap-free: a fake
+/// (h) The natural shape: read one branch, then the other. The chunk size
+/// alone fails no branch, but the branch that has not read it yet holds all
+/// of it and fails for lag, so a chunk larger than the budget needs both
+/// branches read concurrently. The first copy is complete and the source is
+/// not cancelled.
+const checkOversizeSequential = async (check) => {
+  const chunk = new Uint8Array(OVERSIZE_BYTES);
+  const { stream, state } = singleChunkSource(chunk);
+  const [first, second] = stream.tee();
+  const a = first.getReader();
+  const b = second.getReader();
+  const readA = await settle(a.read());
+  check(
+    'oversize sequential: the first branch receives the whole chunk',
+    readA.error === null && readA.value !== null &&
+    readA.value.done === false &&
+    readA.value.value.byteLength === OVERSIZE_BYTES,
+    `read ${readA.error !== null ? readA.error :
+      readA.value.value && readA.value.value.byteLength} bytes`,
+  );
+  const endA = await settle(a.read());
+  check(
+    'oversize sequential: the first branch ends',
+    endA.error === null && endA.value !== null && endA.value.done === true,
+    `settled with ${endA.error !== null ? endA.error : 'a chunk'}`,
+  );
+  const readB = await settle(b.read());
+  check(
+    'oversize sequential: the branch that had not read yet fails for lag',
+    readB.error !== null && readB.error.message === MESSAGE,
+    `rejected with ${readB.error}`,
+  );
+  check(
+    'oversize sequential: the source is not cancelled',
+    state.canceled === false,
+    'the source cancel ran while the first branch was still live',
+  );
+};
+
+/// (i) A byte branch's `close()` can throw: a BYOB read left a partial
+/// element on an odd-length tail. Close each branch on its own, so only the
+/// throwing branch errors, the sibling closes normally, and the source --
+/// already finished -- is not cancelled. The BYOB read sits on the first
+/// branch: a close that throws there must not stop the second from closing.
+const checkOddTailClose = async (check) => {
+  const state = { produced: 0, canceled: false };
+  const stream = new ReadableStream({
+    type: 'bytes',
+    pull(controller) {
+      if (state.produced >= 1) {
+        controller.close();
+        return;
+      }
+      state.produced += 1;
+      controller.enqueue(new Uint8Array([7]));
+    },
+    cancel() {
+      state.canceled = true;
+    },
+  });
+  const [first, second] = stream.tee();
+  const byob = first.getReader({ mode: 'byob' });
+  const element = settle(byob.read(new Uint16Array(1)));
+  const reader = second.getReader();
+  let received = 0;
+  let siblingError = null;
+  for (;;) {
+    const read = await settle(reader.read());
+    if (read.error !== null) {
+      siblingError = read.error;
+      break;
+    }
+    if (read.value.done) break;
+    received += read.value.value.byteLength;
+  }
+  check(
+    'odd tail: the sibling branch reads the bytes and closes normally',
+    siblingError === null && received === 1,
+    siblingError !== null ? `rejected with ${siblingError}` :
+      `read ${received} bytes`,
+  );
+  const end = await settle(reader.read());
+  check(
+    'odd tail: the sibling stays closed, not errored',
+    end.error === null && end.value !== null && end.value.done === true,
+    `settled with ${end.error !== null ? end.error :
+      end.value && end.value.done ? 'done' : 'a chunk'}`,
+  );
+  const partial = await element;
+  check(
+    'odd tail: the BYOB branch errors on the partial element',
+    partial.error !== null &&
+    partial.error.message === 'Insufficient bytes to fill elements',
+    `settled with ${partial.error !== null ? partial.error : 'a chunk'}`,
+  );
+  check(
+    'odd tail: the source is not cancelled after it ended',
+    state.canceled === false,
+    'the source cancel ran after the source had closed',
+  );
+};
+
+/// (j) The accounting probe must be total and trap-free: a fake
 /// ArrayBuffer (whose native byteLength getter throws) and a Proxy whose
 /// traps would throw are ordinary chunks charged the floor, so both
 /// branches get them and neither is stranded.
@@ -411,7 +513,7 @@ const checkHostileChunks = async (check) => {
   );
 };
 
-/// (i) No throw may strand a branch: if an enqueue throws after the first
+/// (k) No throw may strand a branch: if an enqueue throws after the first
 /// branch already has the chunk, the sibling still settles and the source
 /// reader is released (its cancel runs).
 const checkEnqueueThrow = async (check) => {
@@ -451,7 +553,7 @@ const checkEnqueueThrow = async (check) => {
   );
 };
 
-/// (j) Zero-length chunks are not free: each still costs the per-chunk
+/// (l) Zero-length chunks are not free: each still costs the per-chunk
 /// floor, so an unread branch fed only empty strings reaches the budget.
 const checkEmptyChunks = async (check) => {
   // 33554432 / 64 = 524288 chunks fill the budget exactly; the next one
@@ -516,6 +618,8 @@ export default {
     await checkByteStreamBranches(check);
     await checkOversizeLockstep(check);
     await checkOversizeUnread(check);
+    await checkOversizeSequential(check);
+    await checkOddTailClose(check);
     await checkEnqueueThrow(check);
     await checkEmptyChunks(check);
     // Last: on a tee whose probe runs chunk code this check strands the

@@ -86,15 +86,19 @@ use. An unsupported feature that stays silent is a defect.
   buffers for the slower copy within the isolate's 128 MB limit instead of
   failing it.
 - A `tee()` of a Worker-constructed `ReadableStream` bounds the skew the
-  same way, counted per tee: while one branch keeps reading, the other may
-  hold at most 32 MiB more than it, and past that the branch that is behind
-  fails its next read with the same error while the branch being read keeps
-  flowing. Only actual lag fails a branch, so a single chunk larger than
-  the budget reaches both copies. Views count their visible length, not the
-  buffer behind them, and any other value a fixed 64 bytes; the budget is a
-  guard against accidental buffering, not an isolate memory limit, so a
-  payload hidden in an object chunk is not counted and a chain of N clones
-  can hold N × 32 MiB. Workerd does not bound these branches at all.
+  same way, counted per tee. The difference between what the two branches
+  hold is measured just after a chunk is queued; past 32 MiB the branch
+  that is behind fails its next read with the same error, while the branch
+  being read keeps flowing. The chunk size alone fails no branch, but a
+  branch that has not read an oversize chunk yet holds all of it and fails
+  for lag, so with chunks larger than the budget both branches must be read
+  concurrently. A chunk is charged its size -- 2 bytes per UTF-16 code unit
+  for a string, the length of a buffer, the visible length of a view and
+  not the buffer behind it -- and every chunk at least 64 bytes. That makes
+  the budget a guard against accidental buffering rather than an isolate
+  memory limit, so a payload hidden in an object chunk is not counted and a
+  chain of N clones can hold N × 32 MiB. Workerd does not bound these
+  branches at all.
 - A streamed response body that produces no bytes for 60 seconds ends,
   even while the client stays connected. Workerd keeps an idle body open.
   Send a keepalive (an SSE comment line such as `: ping`) at least once a

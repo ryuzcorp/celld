@@ -41,17 +41,20 @@ No configuration, data, or bucket-format changes.
   the other branch went unread buffered the whole body in the isolate's
   heap, and `near_heap_limit` grows the heap rather than failing, so one
   tenant could run the shared process out of memory. The tee now charges
-  each chunk to both branches; when one branch holds more than 32 MiB over a
-  live sibling -- the host tee's budget for platform bodies -- that branch's
-  next read rejects with `tee branch fell more than 32 MiB behind its
-  sibling; read both branches concurrently`, and the branch being read keeps
-  flowing to the end with the source uncancelled. Only actual lag fails a
-  branch, so a single chunk larger than the budget still reaches both
-  copies. Views count their visible length and any other value a fixed 64
-  bytes, which makes the budget a guard against accidental buffering rather
-  than an isolate memory limit: a payload hidden in an object chunk is not
-  counted, and the budget is per `tee()`, so a chain of N clones can hold
-  N × 32 MiB.
+  each chunk to both branches; the difference between what they hold is
+  measured just after a chunk is queued, and past 32 MiB -- the host tee's
+  budget for platform bodies -- the branch that is behind fails its next
+  read with `tee branch fell more than 32 MiB behind its sibling; read both
+  branches concurrently`, while the branch being read keeps flowing to the
+  end with the source uncancelled. The chunk size alone fails no branch,
+  but a branch that has not read an oversize chunk yet holds all of it and
+  fails for lag, so with chunks larger than the budget both branches must
+  be read concurrently. A chunk is charged its size (2 bytes per UTF-16
+  code unit for a string, its length for a buffer, its visible length for a
+  view) and at least 64 bytes. That makes the budget a guard against
+  accidental buffering rather than an isolate memory limit: a payload
+  hidden in an object chunk is not counted, and the budget is per `tee()`,
+  so a chain of N clones can hold N × 32 MiB.
 
 ## v0.2.3
 
