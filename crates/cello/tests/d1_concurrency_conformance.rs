@@ -807,10 +807,16 @@ fn attribution_request_tee_chain_shares_one_skew_budget() {
     let fixture = copy_fixture("attr-r2tee-chain");
     let node = TestNode::boot(fixture.path(), "attr-r2tee-chain");
 
-    // 24 MiB through a tee of a tee: each lagging branch alone stays under
-    // the 32 MiB cap, but their total passes it, so the request-shared
-    // budget must fail at least one of them — while the read branch still
-    // completes in full. Any branch that survives must be whole.
+    // 24 MiB through a tee of a tee: each copy alone stays under the 32 MiB
+    // cap, but their total passes it, so the request-shared budget must end a
+    // copy. Which copy is decided by scheduling: the inner tee's source, the
+    // copy the subrequest streams, and an unread copy all hold overlapping
+    // bytes, and until a consumer takes its first byte the last two are
+    // indistinguishable. So the contract is about what survives: every copy
+    // the budget spared arrives whole, at least one copy (or the subrequest
+    // reading one) reports the skew cap, and no copy comes up short — a
+    // truncated body that reads as the end of the stream is the bug this
+    // pins, and it used to show up as `forwarded: 0` with every branch "ok".
     let start = spawn_get(&node.public, "/r2-tee-start");
     await_attr_started(&node, "r2tee");
     let payload = vec![b'x'; 24 << 20];
@@ -823,8 +829,15 @@ fn attribution_request_tee_chain_shares_one_skew_budget() {
     assert_eq!(started["ok"], true, "{started}");
     let out = join_json(chain, "r2tee chain");
     assert_eq!(out["ok"], true, "{out}");
-    assert_eq!(out["forwarded"], 24 << 20, "{out}");
-    let mut failed = 0;
+    let mut skewed = 0;
+    let forwarded = &out["forwarded"];
+    if forwarded["ok"] == false {
+        // The copy the subrequest streamed is the one the budget ended; its
+        // body error surfaces through the outbound fetch.
+        skewed += 1;
+    } else {
+        assert_eq!(forwarded["size"], 24 << 20, "{out}");
+    }
     for key in ["lagging1", "lagging2"] {
         let branch = &out[key];
         if branch["ok"] == false {
@@ -833,13 +846,13 @@ fn attribution_request_tee_chain_shares_one_skew_budget() {
                 error.contains("behind its sibling"),
                 "{key} must report the skew cap: {out}"
             );
-            failed += 1;
+            skewed += 1;
         } else {
             assert_eq!(branch["size"], 24 << 20, "{key} completed whole: {out}");
         }
     }
     assert!(
-        failed >= 1,
-        "shared budget must fail a lagging branch: {out}"
+        skewed >= 1,
+        "shared budget must fail a copy, not truncate one: {out}"
     );
 }

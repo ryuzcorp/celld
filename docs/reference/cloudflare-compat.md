@@ -78,13 +78,19 @@ use. An unsupported feature that stays silent is a defect.
   `HEAD` response.
 - A cloned body that the platform streams (a `fetch()`, RPC, Durable
   Object, or R2 body) buffers for the slower copy up to 32 MiB of skew,
-  shared by all of one request's tees. Past that, the lagging copy's next
+  shared by all of one request's tees. Past that a copy is failed: a copy
+  nobody has read from goes first -- the one holding the most, if it gives
+  back enough of the overrun on its own -- so a copy that is itself teed
+  keeps the path its inner tee is draining, as does a subrequest streaming a
+  copy, and only when no unread copy gives back enough does the copy holding
+  the most fail. The failed copy's next
   read rejects with `tee branch fell more than 32 MiB behind its sibling;
-  read both branches concurrently`, and the other copies keep flowing to
-  completion. That budget is charged with the whole send, so a single
-  chunk larger than 32 MiB fails every copy that has not read it. Workerd
-  buffers for the slower copy within the isolate's 128 MB limit instead of
-  failing it.
+  read both branches concurrently`, a read already in flight rejects with
+  the same error rather than ending the body as if it were complete, and
+  the other copies keep flowing to completion. That budget is charged with
+  the whole send, so a single chunk larger than 32 MiB fails every copy that
+  has not read it. Workerd buffers for the slower copy within the isolate's
+  128 MB limit instead of failing it.
 - A `tee()` of a Worker-constructed `ReadableStream` bounds the skew the
   same way, counted per tee. The difference between what the two branches
   hold is measured just after a chunk is queued; past 32 MiB the branch

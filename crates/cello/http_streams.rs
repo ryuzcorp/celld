@@ -13,7 +13,6 @@ use anyhow::Result;
 use futures_util::StreamExt as _;
 use std::collections::HashMap;
 use std::pin::Pin;
-#[cfg(all(test, cello_internal_tests))]
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::AtomicU8;
@@ -48,7 +47,11 @@ pub(crate) const HTTP_TEE_SKEW_MESSAGE: &str =
     "tee branch fell more than 32 MiB behind its sibling; read both branches concurrently";
 /// The skew budget shared by every tee branch one request creates. All of a
 /// request's tees draw on the same [`HTTP_TEE_MAX_SKEW_BYTES`]: the send that
-/// would push the total past the cap fails the most-lagging branch instead.
+/// would push the total past the cap fails a branch instead, so a chain of
+/// tees cannot amplify node memory past the cap in total. The branch failed
+/// is a copy nobody has drained, one that gives back enough on its own; only
+/// when no undrained copy does is the branch holding the most failed. A chain
+/// of tees therefore keeps the copies its inner tees are still draining.
 /// `inner` makes each pump's check-add-send atomic against other pumps and
 /// against revocations, so the total never exceeds the cap and no byte is
 /// lost or double-counted. It is never held across an await or another lock.
@@ -59,8 +62,19 @@ pub(crate) struct TeeSkewBudget {
 struct TeeBudgetInner {
     /// Total sent-but-unreceived bytes across all of the request's tee branches.
     used: u64,
-    /// Live branches by stream id, for failing the most-lagging one.
-    branches: HashMap<u64, Arc<AtomicU64>>,
+    /// Live branches by stream id, for failing the copy nobody drained.
+    branches: HashMap<u64, TeeBranchCounters>,
+}
+
+/// One live tee branch as the budget sees it.
+struct TeeBranchCounters {
+    /// The branch's sent-but-unreceived bytes.
+    buffered: Arc<AtomicU64>,
+    /// Whether the branch's consumer has taken at least one byte. A copy the
+    /// budget fails first is one nobody has drained; a copy that is being
+    /// drained must not be failed *even between two pulls*, and a pull-mode
+    /// consumer's registry slot is idle between them.
+    drained: Arc<AtomicBool>,
 }
 
 impl TeeSkewBudget {
@@ -72,6 +86,28 @@ impl TeeSkewBudget {
             }),
         }
     }
+
+    /// One snapshot of every live branch and of the bytes the request has to
+    /// give back to fit a send of `bytes` under the cap again.
+    fn snapshot(&self, bytes: u64) -> (Vec<(u64, u64, bool)>, u64) {
+        let inner = self.inner.lock().unwrap();
+        let excess = inner
+            .used
+            .saturating_add(bytes)
+            .saturating_sub(HTTP_TEE_MAX_SKEW_BYTES);
+        let counters = inner
+            .branches
+            .iter()
+            .map(|(stream_id, counters)| {
+                (
+                    *stream_id,
+                    counters.buffered.load(Ordering::Acquire),
+                    counters.drained.load(Ordering::Acquire),
+                )
+            })
+            .collect();
+        (counters, excess)
+    }
 }
 /// Receive-side state for one tee branch. `buffered` counts this branch's
 /// sent-but-unreceived bytes; `budget` is the request-shared skew budget
@@ -82,6 +118,7 @@ pub(crate) struct TeeBranchState {
     receiver: tokio::sync::mpsc::UnboundedReceiver<Result<Vec<u8>, String>>,
     stream_id: u64,
     buffered: Arc<AtomicU64>,
+    drained: Arc<AtomicBool>,
     budget: Arc<TeeSkewBudget>,
 }
 
@@ -92,6 +129,7 @@ impl TeeBranchState {
     fn received(&self, item: &Result<Vec<u8>, String>) {
         if let Ok(bytes) = item {
             let bytes = bytes.len() as u64;
+            self.drained.store(true, Ordering::Release);
             self.buffered.fetch_sub(bytes, Ordering::AcqRel);
             // Lock-free would also be safe (only decreases), but sharing the
             // lock with the pump keeps the total exactly accounted.
@@ -164,6 +202,11 @@ pub(crate) enum HttpStreamTerminationReason {
     Finished = 1,
     Cancelled = 2,
     Expired = 3,
+    /// A tee branch the request's skew budget failed. It ends the branch's
+    /// in-flight read with [`HTTP_TEE_SKEW_MESSAGE`] instead of a clean end,
+    /// so a consumer that was mid-read cannot mistake dropped bytes for the
+    /// end of the body.
+    Skewed = 4,
 }
 
 impl HttpStreamTerminationReason {
@@ -173,6 +216,7 @@ impl HttpStreamTerminationReason {
             1 => Self::Finished,
             2 => Self::Cancelled,
             3 => Self::Expired,
+            4 => Self::Skewed,
             _ => unreachable!("invalid HTTP stream termination reason {value}"),
         }
     }
@@ -647,6 +691,7 @@ impl HttpStreamService {
             HttpStreamTerminationReason::Finished | HttpStreamTerminationReason::Cancelled => {
                 Ok(None)
             }
+            HttpStreamTerminationReason::Skewed => Err(HTTP_TEE_SKEW_MESSAGE.to_string()),
             HttpStreamTerminationReason::Expired => Err(Self::expired_error(stream_id)),
             HttpStreamTerminationReason::Live => Err(Self::unknown_error(stream_id)),
         }
@@ -1226,9 +1271,11 @@ impl HttpStreamService {
     /// `message`, while the sibling keeps flowing. The replaced state drops
     /// here and returns its outstanding bytes to the owner budget; queued
     /// chunks drop with it. A checked-out branch (a pull is in flight) is
-    /// removed instead: the in-flight pull ends terminally, its state drops
-    /// on settle, and later checkouts fail closed. Either way the branch
-    /// stops buffering, which is what bounds the tee's memory.
+    /// removed with [`HttpStreamTerminationReason::Skewed`] instead, so that
+    /// pull fails with the same message rather than ending as if the body had
+    /// finished: a clone of a clone would otherwise hand its own consumers a
+    /// silently truncated body. Its state drops on settle, which is what
+    /// returns its bytes to the budget.
     pub(crate) fn fail_tee_branch(&self, stream_id: u64, message: String) {
         let mut drain = HttpStreamDrain::default();
         {
@@ -1247,7 +1294,7 @@ impl HttpStreamService {
                     Self::remove_locked(
                         &mut state,
                         stream_id,
-                        HttpStreamTerminationReason::Cancelled,
+                        HttpStreamTerminationReason::Skewed,
                         &mut drain,
                     );
                 }
@@ -1255,6 +1302,34 @@ impl HttpStreamService {
         }
         self.sweeper_notify.notify_one();
         drain.dispose_propagating();
+    }
+
+    /// The live tee branch a send past the request's skew cap fails: `bytes`
+    /// is the item the send could not fit.
+    ///
+    /// The byte counters and drain flags live in the request's
+    /// [`TeeSkewBudget`] and the pull state lives in this registry, so they
+    /// are read one after the other into a snapshot: the budget's lock is
+    /// never held across another lock (see [`TeeSkewBudget`]), and this
+    /// registry's is only held for the classification.
+    fn pick_tee_victim(&self, budget: &TeeSkewBudget, bytes: u64) -> Option<u64> {
+        let (counters, excess) = budget.snapshot(bytes);
+        let state = self.state.lock().unwrap();
+        let candidates = counters
+            .into_iter()
+            .map(|(stream_id, buffered, drained)| {
+                let leased = state
+                    .sources
+                    .get(&stream_id)
+                    .is_some_and(|entry| matches!(entry.source, HttpStreamSourceSlot::Leased { .. }));
+                TeeVeeCandidate {
+                    stream_id,
+                    buffered,
+                    undrained: copy_is_undrained(drained, leased),
+                }
+            })
+            .collect();
+        choose_tee_victim(candidates, excess)
     }
 
     pub(crate) fn begin_activity(
@@ -1849,6 +1924,10 @@ fn transferred_termination_poll(
 impl HttpTransferredStream {
     fn termination_handle(&self) -> Arc<HttpStreamTermination> {
         self.lease.inner.as_ref().unwrap().termination.clone()
+    }
+
+    fn stream_id(&self) -> u64 {
+        self.lease.stream_id()
     }
 
     /// Poll the transferred source without committing a natural terminal
@@ -2515,7 +2594,10 @@ fn http_chunk_stream(source: HttpStreamSource) -> HttpChunkStream {
 /// bound: every branch created under one request draws on the same `budget`
 /// (see [`TeeSkewBudget`]), and the send that would push the request's total
 /// past [`HTTP_TEE_MAX_SKEW_BYTES`] fails its branch while the others keep
-/// flowing to completion.
+/// flowing to completion. A failed branch reports
+/// [`HTTP_TEE_SKEW_MESSAGE`] to whoever reads it next, including a pull that
+/// was already in flight, so a consumer never mistakes dropped bytes for the
+/// end of the body.
 pub(crate) type HttpTeePump = Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2535,15 +2617,62 @@ struct HttpTeeBranch {
     budget: Arc<TeeSkewBudget>,
 }
 
-/// The most-lagging live branch of an owner: the one holding the most
-/// unreceived bytes. Failing it frees the most budget and never punishes a
-/// drained branch for another's skew.
-fn most_lagging_branch(inner: &TeeBudgetInner) -> Option<u64> {
-    inner
-        .branches
+/// Whether a copy counts as undrained, so the budget may fail it for a
+/// sibling's skew. Nobody has taken a byte from it (`drained`), and no pull is
+/// in flight on it (`leased`). The two are separate because a consumer's
+/// registry slot says "pull in flight" only for the length of one pull: a
+/// subrequest body takes a chunk per pull and is idle in between, while an
+/// inner tee's source holds a transfer lease for its whole life -- even while
+/// its pump has been descheduled and taken nothing.
+fn copy_is_undrained(drained: bool, leased: bool) -> bool {
+    !drained && !leased
+}
+
+/// One candidate for the request's next skew victim: what one branch holds
+/// and whether anybody has drained it.
+struct TeeVeeCandidate {
+    stream_id: u64,
+    /// Bytes this branch holds sent-but-unreceived.
+    buffered: u64,
+    /// Whether its consumer has taken no byte at all yet, so failing it fails
+    /// a read nobody made rather than one that is making progress.
+    undrained: bool,
+}
+
+/// The branch a send past the request's skew cap fails, given the bytes the
+/// request has to give back (`excess`) to fit under the cap again.
+///
+/// A copy nobody has drained is failed first, and the one holding the most is
+/// chosen among those that free enough on their own: its next read rejects
+/// with [`HTTP_TEE_SKEW_MESSAGE`] exactly as promised, and every copy a
+/// consumer is draining keeps flowing. That is what a tee of a tee needs --
+/// the inner tee's source and a copy it feeds hold overlapping bytes, and
+/// failing a copy a consumer is still taking bytes from used to truncate the
+/// whole chain. A drained copy is failed only when no undrained one frees
+/// enough (it holds almost nothing, or there is none), because dropping its
+/// bytes is still better than buffering past the cap without bound.
+///
+/// The stream id breaks a remaining tie, so the choice never depends on map
+/// iteration order.
+fn choose_tee_victim(candidates: Vec<TeeVeeCandidate>, excess: u64) -> Option<u64> {
+    let undrained = candidates
         .iter()
-        .max_by_key(|(_, buffered)| buffered.load(Ordering::Acquire))
-        .map(|(stream_id, _)| *stream_id)
+        .filter(|candidate| candidate.undrained && candidate.buffered >= excess)
+        .max_by_key(|candidate| (candidate.buffered, u64::MAX - candidate.stream_id))
+        .map(|candidate| candidate.stream_id);
+    if undrained.is_some() {
+        return undrained;
+    }
+    candidates
+        .into_iter()
+        .max_by_key(|candidate| {
+            (
+                candidate.buffered,
+                candidate.undrained,
+                u64::MAX - candidate.stream_id,
+            )
+        })
+        .map(|candidate| candidate.stream_id)
 }
 
 async fn send_http_tee_item(
@@ -2573,17 +2702,18 @@ async fn send_http_tee_item(
     // released before any kill and is never held across an await or another
     // lock.
     //
-    // Past the cap the most-lagging branch of the owner is failed — which may
-    // be this one — because killing a drained branch for another's skew would
-    // stall the only flowing copy. Each iteration kills a live branch or
-    // sends, so the loop terminates; the yield lets a killed in-flight pull
-    // settle and return its bytes before the re-check.
+    // Past the cap a branch of the owner is failed — which may be this one —
+    // preferring a copy nobody has drained, because ending a copy a consumer
+    // is draining for another copy's skew stalls a live path. The cap is
+    // rechecked after the pick, since a concurrent receive may have made
+    // room. Each iteration kills a live branch or sends, so the loop
+    // terminates; the yield lets a killed in-flight pull settle and return its
+    // bytes before the re-check.
     loop {
         enum Outcome {
             Sent,
             Closed,
-            Kill(u64),
-            KillSelf,
+            Over,
         }
         // One critical section per attempt: the check, the adds and the send
         // are atomic, so a revocation can never interleave the add with a
@@ -2591,10 +2721,7 @@ async fn send_http_tee_item(
         let outcome = {
             let mut inner = branch.budget.inner.lock().unwrap();
             if inner.used.saturating_add(bytes) > HTTP_TEE_MAX_SKEW_BYTES {
-                match most_lagging_branch(&inner) {
-                    Some(victim) if victim != branch.stream_id => Outcome::Kill(victim),
-                    _ => Outcome::KillSelf,
-                }
+                Outcome::Over
             } else {
                 inner.used += bytes;
                 branch.buffered.fetch_add(bytes, Ordering::AcqRel);
@@ -2617,13 +2744,29 @@ async fn send_http_tee_item(
         match outcome {
             Outcome::Sent => return HttpTeeSendOutcome::Sent,
             Outcome::Closed => return HttpTeeSendOutcome::BranchClosed,
-            Outcome::Kill(victim) => {
-                service.fail_tee_branch(victim, HTTP_TEE_SKEW_MESSAGE.to_string());
-                tokio::task::yield_now().await;
-            }
-            Outcome::KillSelf => {
-                service.fail_tee_branch(branch.stream_id, HTTP_TEE_SKEW_MESSAGE.to_string());
-                return HttpTeeSendOutcome::BranchClosed;
+            Outcome::Over => {
+                let victim = service.pick_tee_victim(&branch.budget, bytes);
+                // The picker's snapshot is taken outside the critical
+                // section, so a receive may have made room in between: only
+                // fail a branch while the request is still over the cap.
+                let still_over = {
+                    let inner = branch.budget.inner.lock().unwrap();
+                    inner.used.saturating_add(bytes) > HTTP_TEE_MAX_SKEW_BYTES
+                };
+                if !still_over {
+                    continue;
+                }
+                match victim {
+                    Some(victim) if victim != branch.stream_id => {
+                        service.fail_tee_branch(victim, HTTP_TEE_SKEW_MESSAGE.to_string());
+                        tokio::task::yield_now().await;
+                    }
+                    _ => {
+                        service
+                            .fail_tee_branch(branch.stream_id, HTTP_TEE_SKEW_MESSAGE.to_string());
+                        return HttpTeeSendOutcome::BranchClosed;
+                    }
+                }
             }
         }
     }
@@ -2670,10 +2813,13 @@ pub(crate) fn prepare_http_stream_tee(
     let (tx2, rx2) = tokio::sync::mpsc::unbounded_channel();
     let buffered1 = Arc::new(AtomicU64::new(0));
     let buffered2 = Arc::new(AtomicU64::new(0));
+    let drained1 = Arc::new(AtomicBool::new(false));
+    let drained2 = Arc::new(AtomicBool::new(false));
     let Some(id1) = service.register_source(HttpStreamSource::TeeBranch(TeeBranchState {
         receiver: rx1,
         stream_id: u64::MAX,
         buffered: Arc::clone(&buffered1),
+        drained: Arc::clone(&drained1),
         budget: Arc::clone(&budget),
     })) else {
         return Err(HTTP_STREAM_REGISTRATION_CLOSED);
@@ -2682,6 +2828,7 @@ pub(crate) fn prepare_http_stream_tee(
         receiver: rx2,
         stream_id: u64::MAX,
         buffered: Arc::clone(&buffered2),
+        drained: Arc::clone(&drained2),
         budget: Arc::clone(&budget),
     })) else {
         service.cancel_source(id1);
@@ -2693,8 +2840,20 @@ pub(crate) fn prepare_http_stream_tee(
     // can have touched these entries; a failure here cancels the tee.
     {
         let mut inner = budget.inner.lock().unwrap();
-        inner.branches.insert(id1, Arc::clone(&buffered1));
-        inner.branches.insert(id2, Arc::clone(&buffered2));
+        inner.branches.insert(
+            id1,
+            TeeBranchCounters {
+                buffered: Arc::clone(&buffered1),
+                drained: drained1,
+            },
+        );
+        inner.branches.insert(
+            id2,
+            TeeBranchCounters {
+                buffered: Arc::clone(&buffered2),
+                drained: drained2,
+            },
+        );
     }
     if !service.assign_tee_branch_id(id1) || !service.assign_tee_branch_id(id2) {
         service.cancel_source(id1);
@@ -2717,6 +2876,7 @@ pub(crate) fn prepare_http_stream_tee(
         budget,
     };
     let termination = source.termination_handle();
+    let source_id = source.stream_id();
     let service = Arc::clone(service);
     let pump = Box::pin(async move {
         loop {
@@ -2756,7 +2916,23 @@ pub(crate) fn prepare_http_stream_tee(
                     source.finish(HttpStreamTerminationReason::Finished);
                     break;
                 }
-                HttpTransferredEvent::Terminated(_) => break,
+                HttpTransferredEvent::Terminated(reason) => {
+                    // A source that ends without a natural end must not look
+                    // finished to the branches: each live one fails with the
+                    // termination's error after the bytes it already holds,
+                    // so no consumer mistakes dropped bytes for the end of
+                    // the body. `Finished` and `Cancelled` are a clean end
+                    // (the source was closed deliberately), so they stay one.
+                    if let Err(error) = HttpStreamService::termination_result(source_id, reason) {
+                        for branch in [&first, &second] {
+                            // The branch's own queued bytes stay ahead of the
+                            // error; an error item is charged no bytes, so
+                            // the budget is untouched.
+                            let _ = branch.sender.send(Err(error.clone()));
+                        }
+                    }
+                    break;
+                }
             }
         }
     });
@@ -2919,6 +3095,126 @@ mod js_tee_budget_pin {
             js.contains(super::HTTP_TEE_SKEW_MESSAGE),
             "js/streams.js must reject with the host tee's message: {}",
             super::HTTP_TEE_SKEW_MESSAGE,
+        );
+    }
+}
+
+/// One request's skew budget must end a read nobody made rather than abort a
+/// copy a consumer is draining, and it must choose the same branch every run.
+/// A tee of a tee makes that the common case: the inner tee's source and its
+/// copies hold overlapping bytes, so the request total passes the cap while
+/// the inner pump is still catching up. Failing the source -- or the
+/// subrequest body, whose pull-mode slot is idle between chunks -- aborts the
+/// chain's live read path, which the `attr-r2tee-chain` conformance test saw
+/// as an empty `forwarded` body under load.
+#[cfg(test)]
+mod tee_skew_victim_tests {
+    use super::{
+        choose_tee_victim, copy_is_undrained, HttpStreamService, HttpStreamTerminationReason,
+        TeeVeeCandidate, HTTP_TEE_SKEW_MESSAGE,
+    };
+
+    /// `undrained` means the branch's consumer has taken no byte yet.
+    fn candidate(stream_id: u64, buffered: u64, undrained: bool) -> TeeVeeCandidate {
+        TeeVeeCandidate {
+            stream_id,
+            buffered,
+            undrained,
+        }
+    }
+
+    #[test]
+    fn the_copy_nobody_drained_is_failed_first() {
+        // The standings the conformance test reached: the inner tee's source
+        // (2) is mid-pull with 16 MiB, the subrequest's body (4) has taken
+        // bytes already, and the copy nobody has read (5) holds 8 MiB.
+        let victim = choose_tee_victim(
+            vec![
+                candidate(2, 16 << 20, false),
+                candidate(4, 8 << 20, false),
+                candidate(5, 8 << 20, true),
+            ],
+            40 << 10,
+        );
+        assert_eq!(victim, Some(5));
+    }
+
+    #[test]
+    fn equal_holdings_fail_the_branch_nobody_reads() {
+        // The inner tee's source (2, mid-pull) and the unread copy (3) hold
+        // exactly the same bytes until the inner pump runs.
+        for order in [[2, 3], [3, 2]] {
+            let candidates: Vec<TeeVeeCandidate> = order
+                .into_iter()
+                .map(|stream_id| candidate(stream_id, 16 << 20, stream_id == 3))
+                .collect();
+            assert_eq!(
+                choose_tee_victim(candidates, 1),
+                Some(3),
+                "order {order:?} must still fail the unread copy",
+            );
+        }
+    }
+
+    #[test]
+    fn equal_undrained_holdings_are_broken_by_stream_id() {
+        let forward = choose_tee_victim(
+            vec![candidate(3, 4096, true), candidate(5, 4096, true)],
+            1,
+        );
+        let reverse = choose_tee_victim(
+            vec![candidate(5, 4096, true), candidate(3, 4096, true)],
+            1,
+        );
+        assert_eq!(forward, Some(3));
+        assert_eq!(reverse, forward, "the victim must not depend on map order");
+    }
+
+    #[test]
+    fn a_drained_copy_loses_when_no_undrained_copy_frees_enough() {
+        // Only one undrained copy and it holds almost nothing: failing it
+        // would not return the request under its cap, so the most lagging
+        // branch goes instead -- and its in-flight read reports the skew
+        // error rather than a clean end.
+        let victim = choose_tee_victim(
+            vec![candidate(2, 40 << 20, false), candidate(3, 1, true)],
+            8 << 20,
+        );
+        assert_eq!(victim, Some(2));
+    }
+
+    #[test]
+    fn an_undrained_copy_that_frees_enough_is_preferred_over_a_bigger_one() {
+        // 33 MiB counted, 1 MiB over: the undrained copy frees the need on
+        // its own, so the 2 MiB it holds is preferred over the 20 MiB the
+        // inner tee is draining.
+        let victim = choose_tee_victim(
+            vec![candidate(2, 20 << 20, false), candidate(3, 2 << 20, true)],
+            1 << 20,
+        );
+        assert_eq!(victim, Some(3));
+    }
+
+    #[test]
+    fn a_pull_in_flight_rules_out_an_otherwise_undrained_copy() {
+        // An inner tee's source holds a transfer lease from the moment it is
+        // teed, even if its pump has been descheduled and received nothing
+        // yet: it is undrained, but failing it aborts a live read path.
+        assert!(copy_is_undrained(false, false));
+        assert!(!copy_is_undrained(false, true));
+        // A subrequest body pulls a chunk at a time and its registry slot is
+        // idle in between; taking a byte is what rules it out then.
+        assert!(!copy_is_undrained(true, false));
+        assert!(!copy_is_undrained(true, true));
+    }
+
+    #[test]
+    fn a_failed_mid_read_branch_reports_the_skew_not_a_clean_end() {
+        // A branch removed from under a live pull must not look like the end
+        // of the body: the pull reports the same error a later read does.
+        assert_eq!(
+            HttpStreamService::termination_result(7, HttpStreamTerminationReason::Skewed),
+            Err(HTTP_TEE_SKEW_MESSAGE.to_string()),
         );
     }
 }

@@ -505,17 +505,17 @@ export default {
       setup.waiters += 1;
       await setup.ready;
       // A tee of a tee under one request: the second tee reads the first
-      // tee's drained branch. Both lagging branches buffer against the
-      // request's one shared skew budget, so once their total passes the cap
-      // at least one of them fails — while the read branch still completes.
+      // tee's drained branch. Every copy buffers against the request's one
+      // shared skew budget, so once the total passes the cap the budget ends
+      // a copy. Which one is decided by scheduling: until a copy's consumer
+      // takes its first byte, an unread copy, the inner tee's source, and the
+      // copy this subrequest streams are indistinguishable, and any of them
+      // may hold the most bytes. So the read reports its outcome instead of
+      // assuming one: a copy the budget ends under this subrequest fails the
+      // fetch with the skew error, and a copy it spares arrives whole.
       const host = new URL(request.url).host;
       const [first, lagging1] = request.body.tee();
       const [second, lagging2] = first.tee();
-      const echoed = await fetch(`http://${host}/echo-size`, {
-        method: "POST",
-        body: second,
-      });
-      const { size } = await echoed.json();
       const readBranch = async (branch) => {
         try {
           const rest = await new Response(branch).arrayBuffer();
@@ -524,9 +524,20 @@ export default {
           return { ok: false, error: String(error?.message ?? error) };
         }
       };
+      let forwarded;
+      try {
+        const echoed = await fetch(`http://${host}/echo-size`, {
+          method: "POST",
+          body: second,
+        });
+        const { size } = await echoed.json();
+        forwarded = { ok: true, size };
+      } catch (error) {
+        forwarded = { ok: false, error: String(error?.message ?? error) };
+      }
       return Response.json({
         ok: true,
-        forwarded: size,
+        forwarded,
         lagging1: await readBranch(lagging1),
         lagging2: await readBranch(lagging2),
       });

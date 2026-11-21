@@ -55,6 +55,22 @@ No configuration, data, or bucket-format changes.
   accidental buffering rather than an isolate memory limit: a payload
   hidden in an object chunk is not counted, and the budget is per `tee()`,
   so a chain of N clones can hold N × 32 MiB.
+- **A tee of a tee keeps its read path under the shared budget** (#111). The
+  32 MiB budget one request's tees share picked its victim by buffered bytes
+  alone, and the `HashMap` iteration order broke ties. In a chain that tie is
+  the common case -- the inner `tee()`'s source and an unread copy hold
+  exactly the same bytes until the inner pump runs -- and once the chain
+  charges the same bytes at two stages the inner tee's source is often the
+  largest holder outright, so the budget kept failing the copy its own tee
+  was draining. The inner tee then treated that as its source ending and
+  closed both of its copies: a Worker's `await copy.arrayBuffer()` (or a
+  subrequest streaming a copy) got an empty or truncated body under load and
+  no error at all, while the other copies carried on. The budget now ends a
+  copy nobody has read from -- the one holding the most, when it gives back
+  enough on its own -- and fails a copy a consumer is draining only when no
+  unread copy does. A copy failed while a read is already in flight rejects
+  that read with `tee branch fell more than 32 MiB behind its sibling; read
+  both branches concurrently` instead of ending the body.
 
 ## v0.2.3
 
