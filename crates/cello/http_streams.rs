@@ -2891,3 +2891,27 @@ mod decoded_stream_tests {
         );
     }
 }
+
+/// The JS tee in `js/streams.js` cannot import these constants, so it
+/// repeats them. This pins the copy to the host tee's values: changing one
+/// side alone fails here instead of shipping two budgets.
+#[cfg(test)]
+mod js_tee_budget_pin {
+    #[test]
+    fn js_tee_repeats_the_host_budget_and_message() {
+        let js = include_str!("js/streams.js");
+        assert!(
+            js.contains(&format!(
+                "_TEE_MAX_SKEW_BYTES = {};",
+                super::HTTP_TEE_MAX_SKEW_BYTES
+            )),
+            "js/streams.js must declare _TEE_MAX_SKEW_BYTES = {}",
+            super::HTTP_TEE_MAX_SKEW_BYTES,
+        );
+        assert!(
+            js.contains(super::HTTP_TEE_SKEW_MESSAGE),
+            "js/streams.js must reject with the host tee's message: {}",
+            super::HTTP_TEE_SKEW_MESSAGE,
+        );
+    }
+}

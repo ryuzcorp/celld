@@ -4,8 +4,9 @@ description: What shipped in each Cello release, from v0.6.3-ryuzcorp.4 to v0.2.
 ---
 ## Unreleased
 
-A `TransformStream` now applies backpressure, and compression streams no
-longer leak native memory. No configuration, data, or bucket-format changes.
+A `TransformStream` now applies backpressure, a `tee()` bounds the skew
+between its branches, and compression streams no longer leak native memory.
+No configuration, data, or bucket-format changes.
 
 - **`TransformStream` applies backpressure** (#105). Its writable side used to
   resolve `write()` as soon as the transform returned, whether or not
@@ -34,6 +35,19 @@ longer leak native memory. No configuration, data, or bucket-format changes.
   released when it is garbage-collected, and a transform error releases it
   too. An isolate holds at most 128 live compression streams; the next
   constructor call throws a `RangeError`.
+- **A `tee()` bounds the skew between its branches** (#107). A Worker that
+  read one branch of `response.body.tee()` -- or of a `Response.clone()` or
+  `Request.clone()` of a streaming body it constructed -- to the end while
+  the other branch went unread buffered the whole body in the isolate's
+  heap, and `near_heap_limit` grows the heap rather than failing, so one
+  tenant could run the shared process out of memory. Each chunk is now
+  charged to both branches before it is enqueued; past 32 MiB of skew --
+  the host tee's budget for platform bodies -- the lagging branch's next
+  read rejects with `tee branch fell more than 32 MiB behind its sibling;
+  read both branches concurrently`, and the branch being read keeps flowing
+  to the end with the source uncancelled. Strings count 2 bytes per UTF-16
+  code unit and any other chunk a fixed 64 bytes, so an unread branch
+  cannot buffer bytes, text, or objects without limit either.
 
 ## v0.2.3
 

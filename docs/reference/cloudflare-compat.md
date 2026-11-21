@@ -83,6 +83,13 @@ use. An unsupported feature that stays silent is a defect.
   read both branches concurrently`, and the other copies keep flowing to
   completion. Workerd buffers for the slower copy within the isolate's
   128 MB limit instead of failing it.
+- A `tee()` of a Worker-constructed `ReadableStream` has the same bound,
+  counted per tee: the two branches may hold 32 MiB of skew between them,
+  and past it the lagging branch's next read rejects with the same error
+  while the branch being read keeps flowing. Strings count 2 bytes per
+  UTF-16 code unit and any other chunk a fixed 64 bytes, so an unread
+  branch cannot buffer bytes, text, or objects without limit. Workerd does
+  not bound these branches at all.
 - A streamed response body that produces no bytes for 60 seconds ends,
   even while the client stays connected. Workerd keeps an idle body open.
   Send a keepalive (an SSE comment line such as `: ping`) at least once a

@@ -23,6 +23,41 @@ const _rsc_brand = Symbol("ReadableStreamController");
 const RELEASED =
   "This ReadableStream reader has been released.";
 
+// The skew budget one tee applies: bytes its branches may hold queued and
+// unconsumed between them before the lagging one fails. It is the host
+// tee's budget and message (HTTP_TEE_MAX_SKEW_BYTES and
+// HTTP_TEE_SKEW_MESSAGE in http_streams.rs), so a body exposes one bound
+// however it was teed; a unit test there pins the pair to this file, since
+// a prelude script cannot import a Rust constant.
+const _TEE_MAX_SKEW_BYTES = 33554432;
+const _TEE_SKEW_MESSAGE =
+  "tee branch fell more than 32 MiB behind its sibling; read both branches concurrently";
+
+// What one queued chunk costs the budget. The bound only holds if no chunk
+// type is free, so every value is charged:
+//  * ArrayBuffer, SharedArrayBuffer and any view: `byteLength`, the bytes
+//    the branch is holding;
+//  * string: 2 bytes per UTF-16 code unit, which is what V8 stores;
+//  * anything else (an object, an array, a number, ...): a fixed floor
+//    standing in for V8's object header plus the queue slots. Its contents
+//    are deliberately not sized: a tee must not run a chunk's getters or
+//    proxy traps, and a producer that wants to buffer a payload inside
+//    objects needs no tee to do it. The floor still caps a queue of small
+//    objects and primitives, which would otherwise be free.
+const _TEE_OBJECT_BYTES = 64;
+
+function _teeChunkBytes(chunk) {
+  if (typeof chunk === 'string') return chunk.length * 2;
+  if (chunk === null || typeof chunk !== 'object')
+    return _TEE_OBJECT_BYTES;
+  if (chunk instanceof ArrayBuffer) return chunk.byteLength;
+  if (ArrayBuffer.isView(chunk)) return chunk.byteLength;
+  if (typeof SharedArrayBuffer !== 'undefined' &&
+      chunk instanceof SharedArrayBuffer)
+    return chunk.byteLength;
+  return _TEE_OBJECT_BYTES;
+}
+
 class ReadableStreamDefaultController {
   #stream;
   #closeRequested = false;
@@ -461,25 +496,44 @@ class ReadableStream {
     const reader = this.getReader();
     let closed = false;
     let canceled1 = false, canceled2 = false;
+    // A branch the skew budget failed. It is not cancelled: its reads
+    // reject with the budget error, the other branch keeps flowing, and
+    // the source is not cancelled while that one is live.
+    let failed1 = false, failed2 = false;
     let reason1, reason2;
     let reading = false;
+    const live1 = () => !canceled1 && !failed1;
+    const live2 = () => !canceled2 && !failed2;
 
-    // Workerd deviation from spec tee: a branch's cancel
-    // settles immediately rather than waiting for the
-    // other branch; the source is cancelled (with the
-    // composite reason) once both have cancelled.
+    // Both branches are gone (cancelled or failed), so nothing can read
+    // this tee again: cancel the source with the composite reason instead
+    // of holding its reader forever. Workerd's cancel settles a branch
+    // immediately rather than waiting for the other, and the source is
+    // cancelled only once both are gone -- the same here.
+    function release() {
+      if (closed || live1() || live2()) return;
+      closed = true;
+      return reader.cancel([reason1, reason2]);
+    }
+
     const makeBranch = (first) => {
       const src = {
         pull: pullAlgorithm,
         cancel: (reason) => {
           if (first) { canceled1 = true; reason1 = reason; }
           else { canceled2 = true; reason2 = reason; }
-          if (canceled1 && canceled2)
-            return reader.cancel([reason1, reason2]);
+          return release();
         },
       };
-      if (isBytes) src.type = 'bytes';
-      return new ReadableStream(src);
+      if (isBytes) {
+        src.type = 'bytes';
+        return new ReadableStream(src);
+      }
+      // Size a default branch's chunks in the budget's own bytes, so its
+      // `_queueTotalSize` -- which the reader maintains on every dequeue
+      // -- is exactly what the branch holds unconsumed. A bytes strategy
+      // may not carry size(), and a byte branch already counts bytes.
+      return new ReadableStream(src, { size: _teeChunkBytes });
     };
     const branch1 = makeBranch(true);
     const branch2 = makeBranch(false);
@@ -487,6 +541,41 @@ class ReadableStream {
       branch1._controller,
       branch2._controller,
     ];
+    // Bytes a branch holds queued and unconsumed: a byte branch keeps the
+    // total on its controller, a default branch on the stream.
+    const held = (branch) => branch._byteCtl !== undefined
+      ? branch._byteCtl._queueTotalSize
+      : branch._queueTotalSize;
+
+    // Charge a chunk to the branches before it is enqueued, the way the
+    // host tee charges a send (send_http_tee_item in http_streams.rs).
+    // Past the budget the most-lagging live branch is failed -- the one
+    // nobody reads -- so the drained branch keeps flowing to the end and
+    // the source is not cancelled. Failing a branch clears its queue, so
+    // the loop re-checks; a single chunk larger than the whole budget
+    // fails a branch outright, as it does in the host tee. Returns whether
+    // any branch remains live to take the chunk.
+    function charge(bytes) {
+      for (;;) {
+        if (!live1() && !live2()) {
+          const released = release();
+          if (released !== undefined) released.catch(() => {});
+          return false;
+        }
+        if (held(branch1) + held(branch2) + bytes <=
+            _TEE_MAX_SKEW_BYTES)
+          return true;
+        const failFirst = live1() &&
+          (!live2() || held(branch1) >= held(branch2));
+        if (failFirst) { failed1 = true; reason1 = _TEE_SKEW_MESSAGE; }
+        else { failed2 = true; reason2 = _TEE_SKEW_MESSAGE; }
+        // The read that fails is the branch nobody drained, not the code
+        // that teed, so the message names the fix. Same `Error` and text
+        // as the host tee's rejection.
+        (failFirst ? controllers[0] : controllers[1])
+          .error(new Error(_TEE_SKEW_MESSAGE));
+      }
+    }
 
     function pullAlgorithm() {
       if (reading || closed) return Promise.resolve();
@@ -497,17 +586,20 @@ class ReadableStream {
           if (done) {
             if (closed) return;
             closed = true;
-            if (!canceled1) controllers[0].close();
-            if (!canceled2) controllers[1].close();
+            if (live1()) controllers[0].close();
+            if (live2()) controllers[1].close();
             return;
           }
+          // Size the chunk once, before an enqueue transfers its buffer,
+          // and charge it to whichever branches end up taking it.
+          if (!charge(_teeChunkBytes(value))) return;
           // Byte enqueue transfers the chunk's buffer,
           // so when both branches are live the first
           // gets a copy.
-          if (!canceled1)
-            controllers[0].enqueue(isBytes && !canceled2
+          if (live1())
+            controllers[0].enqueue(isBytes && live2()
               ? new Uint8Array(value) : value);
-          if (!canceled2)
+          if (live2())
             controllers[1].enqueue(cloneForBranch2
               ? structuredClone(value) : value);
         },
@@ -515,10 +607,8 @@ class ReadableStream {
           reading = false;
           if (!closed) {
             closed = true;
-            if (!canceled1)
-              controllers[0].error(e);
-            if (!canceled2)
-              controllers[1].error(e);
+            if (live1()) controllers[0].error(e);
+            if (live2()) controllers[1].error(e);
           }
         }
       );
@@ -528,8 +618,8 @@ class ReadableStream {
     reader.closed.catch(e => {
       if (!closed) {
         closed = true;
-        if (!canceled1) controllers[0].error(e);
-        if (!canceled2) controllers[1].error(e);
+        if (live1()) controllers[0].error(e);
+        if (live2()) controllers[1].error(e);
       }
     });
 
