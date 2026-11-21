@@ -71,14 +71,19 @@ services, APIs, and Wrangler configuration.
   producer that writes without awaiting either, or that writes after
   `writer.desiredSize` says 0, still queues its chunks in memory — Cello
   cannot bound a stream you keep feeding.
-- A `tee()` bounds the skew between its branches: the bytes one branch has
-  queued while the other has already read them are charged against 32 MiB,
-  the budget the host tee of a platform body uses. Past it the branch
-  nobody read fails its next read with `tee branch fell more than 32 MiB
-  behind its sibling; read both branches concurrently`, and the branch
-  being read keeps flowing to the end. Strings count 2 bytes per UTF-16
-  code unit and any other chunk a fixed 64 bytes, so no chunk type buffers
-  without limit. Read both branches, or cancel the one you do not need.
+- A `tee()` bounds the skew between its branches: while one branch keeps
+  reading, the other may hold at most 32 MiB more than it — the budget the
+  host tee of a platform body uses. Past that the branch that is behind
+  fails its next read with `tee branch fell more than 32 MiB behind its
+  sibling; read both branches concurrently`, and the branch being read
+  keeps flowing to the end. Only actual lag fails a branch, so a single
+  chunk larger than the budget still reaches both copies. Views count their
+  visible length, not the buffer they keep alive, and any other value a
+  fixed 64 bytes, so this is a guard against accidental buffering rather
+  than an isolate memory limit: a payload hidden in an object chunk, or a
+  small view over a large buffer, is not counted. The budget is per
+  `tee()`, so a chain of N clones can hold N × 32 MiB. Read both branches,
+  or cancel the one you do not need.
 - An isolate holds at most 128 live `CompressionStream`s and
   `DecompressionStream`s together. Constructing one more throws a
   `RangeError`. A stream stops counting once it finishes, is cancelled or

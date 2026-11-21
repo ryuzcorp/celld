@@ -20,6 +20,15 @@ const MESSAGE =
 const CHUNK_BYTES = 1024 * 1024;
 const BYTE_CHUNKS = 36;
 
+// The per-chunk floor `_teeChunkBytes` applies to every chunk, so empty
+// chunks cannot be free.
+const FLOOR = 64;
+
+// A single chunk larger than the whole budget. Both copies must still get
+// it when neither branch lags; only a branch that is actually behind may
+// fail.
+const OVERSIZE_BYTES = 40 * 1024 * 1024;
+
 const json = (body, status = 200) => Response.json(body, { status });
 
 const settle = async (promise) => {
@@ -52,6 +61,26 @@ const byteSource = (count, chunkBytes = CHUNK_BYTES, type = null) => {
   };
   if (type !== null) source.type = type;
   return { stream: new ReadableStream(source), state };
+};
+
+/// A source of one `chunk`, then end, that records whether anything
+/// cancelled it.
+const singleChunkSource = (chunk) => {
+  const state = { sent: false, canceled: false };
+  const stream = new ReadableStream({
+    pull(controller) {
+      if (state.sent) {
+        controller.close();
+        return;
+      }
+      state.sent = true;
+      controller.enqueue(chunk);
+    },
+    cancel() {
+      state.canceled = true;
+    },
+  });
+  return { stream, state };
 };
 
 /// Read a branch to its end, reporting the bytes it yielded.
@@ -231,6 +260,245 @@ const checkByteStreamBranches = async (check) => {
   );
 };
 
+/// (f) A single chunk larger than the budget is not lag: both branches
+/// read it in lockstep and neither is failed, so neither copy is lost and
+/// the source is never cancelled.
+const checkOversizeLockstep = async (check) => {
+  const chunk = new Uint8Array(OVERSIZE_BYTES);
+  const { stream, state } = singleChunkSource(chunk);
+  const [first, second] = stream.tee();
+  const a = first.getReader();
+  const b = second.getReader();
+  const both = await settle(Promise.all([a.read(), b.read()]));
+  check(
+    'oversize lockstep: both branches receive the chunk',
+    both.error === null && both.value !== null &&
+    both.value[0].done === false && both.value[1].done === false &&
+    both.value[0].value.byteLength === OVERSIZE_BYTES &&
+    both.value[1].value.byteLength === OVERSIZE_BYTES,
+    both.error !== null ? `rejected with ${both.error}` :
+      `first ${both.value[0].done ? 'done' : 'chunk'}, ` +
+      `second ${both.value[1].done ? 'done' : 'chunk'}`,
+  );
+  const ends = await settle(Promise.all([a.read(), b.read()]));
+  check(
+    'oversize lockstep: neither branch failed',
+    ends.error === null && ends.value !== null &&
+    ends.value[0].done === true && ends.value[1].done === true,
+    ends.error !== null ? `rejected with ${ends.error}` :
+      `first ${ends.value[0].done}, second ${ends.value[1].done}`,
+  );
+  check(
+    'oversize lockstep: the source is not cancelled',
+    state.canceled === false,
+    'the source cancel ran although no branch lagged',
+  );
+};
+
+/// (g) The same chunk with one branch unread: the read branch still
+/// receives all of it, and only the unread branch fails, once it holds
+/// more than the budget the read branch has already taken.
+const checkOversizeUnread = async (check) => {
+  const chunk = new Uint8Array(OVERSIZE_BYTES);
+  const { stream, state } = singleChunkSource(chunk);
+  const [first, second] = stream.tee();
+  const reader = first.getReader();
+  const read = await settle(reader.read());
+  check(
+    'oversize unread: the read branch receives the whole chunk',
+    read.error === null && read.value !== null &&
+    read.value.done === false &&
+    read.value.value.byteLength === OVERSIZE_BYTES,
+    `read ${read.error !== null ? read.error :
+      read.value.value && read.value.value.byteLength} bytes`,
+  );
+  const end = await settle(reader.read());
+  check(
+    'oversize unread: the read branch ends',
+    end.error === null && end.value !== null && end.value.done === true,
+    `settled with ${end.error !== null ? end.error : 'a chunk'}`,
+  );
+  const unread = await settle(second.getReader().read());
+  check(
+    'oversize unread: only the unread branch fails',
+    unread.error !== null && unread.error.message === MESSAGE,
+    `rejected with ${unread.error}`,
+  );
+  check(
+    'oversize unread: the source is not cancelled',
+    state.canceled === false,
+    'the source cancel ran while the read branch was still live',
+  );
+};
+
+/// (h) The accounting probe must be total and trap-free: a fake
+/// ArrayBuffer (whose native byteLength getter throws) and a Proxy whose
+/// traps would throw are ordinary chunks charged the floor, so both
+/// branches get them and neither is stranded.
+const checkHostileChunks = async (check) => {
+  const state = { sent: 0, traps: 0, canceled: false };
+  const fake = Object.create(ArrayBuffer.prototype);
+  Object.defineProperty(fake, 'byteLength', {
+    get() {
+      state.traps += 1;
+      throw new TypeError('the tee read a fake ArrayBuffer');
+    },
+  });
+  const proxy = new Proxy({ payload: 'hidden' }, {
+    get(target, key, receiver) {
+      state.traps += 1;
+      return Reflect.get(target, key, receiver);
+    },
+    getPrototypeOf() {
+      state.traps += 1;
+      return ArrayBuffer.prototype;
+    },
+    has() {
+      state.traps += 1;
+      return false;
+    },
+    ownKeys() {
+      state.traps += 1;
+      return [];
+    },
+  });
+  const stream = new ReadableStream({
+    pull(controller) {
+      if (state.sent >= 2) {
+        controller.close();
+        return;
+      }
+      controller.enqueue(state.sent === 0 ? fake : proxy);
+      state.sent += 1;
+    },
+    cancel() {
+      state.canceled = true;
+    },
+  });
+  const readAll = async (reader) => {
+    const values = [];
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) return values;
+      values.push(value);
+    }
+  };
+  const [first, second] = stream.tee();
+  const settled = await settle(Promise.all([
+    readAll(first.getReader()), readAll(second.getReader())]));
+  check(
+    'hostile chunks: both branches settle',
+    settled.error === null,
+    `read rejected with ${settled.error}`,
+  );
+  const [left, right] = settled.value || [[], []];
+  check(
+    'hostile chunks: both branches receive both chunks',
+    left.length === 2 && right.length === 2 &&
+    left[0] === fake && left[1] === proxy &&
+    right[0] === fake && right[1] === proxy,
+    `first ${left.length}, second ${right.length} chunks`,
+  );
+  check(
+    'hostile chunks: the probe ran no chunk code',
+    state.traps === 0,
+    `ran ${state.traps} chunk getters/traps`,
+  );
+  check(
+    'hostile chunks: the source is not cancelled',
+    state.canceled === false,
+    'the source cancel ran for a chunk that is merely unusual',
+  );
+};
+
+/// (i) No throw may strand a branch: if an enqueue throws after the first
+/// branch already has the chunk, the sibling still settles and the source
+/// reader is released (its cancel runs).
+const checkEnqueueThrow = async (check) => {
+  const { stream, state } = byteSource(1);
+  const [first, second] = stream.tee();
+  const reader1 = first.getReader();
+  const reader2 = second.getReader();
+  // Close branch 2's controller underneath the tee: its next enqueue
+  // throws, after branch 1 already got the chunk.
+  second._controller.close();
+  const left = await settle(reader1.read());
+  const right = await settle(reader2.read());
+  check(
+    'enqueue throw: both branches settle',
+    left.error === null && left.value !== null &&
+    left.value.done === false && right.error !== null,
+    `first ${left.error !== null ? left.error : 'a chunk'}, ` +
+    `second ${right.error !== null ? right.error : 'a chunk'}`,
+  );
+  check(
+    'enqueue throw: the sibling gets the same error',
+    right.error !== null &&
+    right.error.message === 'Cannot enqueue a closed/errored stream',
+    `rejected with ${right.error}`,
+  );
+  const after = await settle(reader1.read());
+  check(
+    'enqueue throw: the teed stream is closed, not left readable',
+    after.error !== null && after.error === right.error,
+    `read settled with ${after.error !== null ? after.error :
+      (after.value && after.value.done) ? 'done' : 'a chunk'}`,
+  );
+  check(
+    'enqueue throw: the source cancel ran',
+    state.canceled === true,
+    'the source reader was left holding the body',
+  );
+};
+
+/// (j) Zero-length chunks are not free: each still costs the per-chunk
+/// floor, so an unread branch fed only empty strings reaches the budget.
+const checkEmptyChunks = async (check) => {
+  // 33554432 / 64 = 524288 chunks fill the budget exactly; the next one
+  // puts the unread branch past it.
+  const count = BUDGET / FLOOR + 1;
+  const state = { produced: 0, canceled: false };
+  const stream = new ReadableStream({
+    pull(controller) {
+      if (state.produced >= count) {
+        controller.close();
+        return;
+      }
+      state.produced += 1;
+      controller.enqueue('');
+    },
+    cancel() {
+      state.canceled = true;
+    },
+  });
+  const [first, second] = stream.tee();
+  const reader = first.getReader();
+  let received = 0;
+  let nonEmpty = 0;
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    received += 1;
+    if (value !== '') nonEmpty += 1;
+  }
+  check(
+    'empty chunks: the drained branch completes',
+    received === count && nonEmpty === 0,
+    `read ${received} of ${count} chunks (${nonEmpty} non-empty)`,
+  );
+  const { error } = await settle(second.getReader().read());
+  check(
+    'empty chunks: the unread branch fails at the floor',
+    error !== null && error.message === MESSAGE,
+    `rejected with ${error}`,
+  );
+  check(
+    'empty chunks: the source is not cancelled',
+    state.canceled === false,
+    'the source cancel ran while the drained branch was still reading',
+  );
+};
+
 export default {
   async fetch(request) {
     const { pathname } = new URL(request.url);
@@ -246,6 +514,13 @@ export default {
     await checkStringChunks(check);
     await checkClonedResponse(check);
     await checkByteStreamBranches(check);
+    await checkOversizeLockstep(check);
+    await checkOversizeUnread(check);
+    await checkEnqueueThrow(check);
+    await checkEmptyChunks(check);
+    // Last: on a tee whose probe runs chunk code this check strands the
+    // sibling branch, so it is the one that can hang the whole route.
+    await checkHostileChunks(check);
     return json({ failures });
   },
 };

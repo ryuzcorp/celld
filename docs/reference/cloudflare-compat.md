@@ -81,15 +81,20 @@ use. An unsupported feature that stays silent is a defect.
   shared by all of one request's tees. Past that, the lagging copy's next
   read rejects with `tee branch fell more than 32 MiB behind its sibling;
   read both branches concurrently`, and the other copies keep flowing to
-  completion. Workerd buffers for the slower copy within the isolate's
-  128 MB limit instead of failing it.
-- A `tee()` of a Worker-constructed `ReadableStream` has the same bound,
-  counted per tee: the two branches may hold 32 MiB of skew between them,
-  and past it the lagging branch's next read rejects with the same error
-  while the branch being read keeps flowing. Strings count 2 bytes per
-  UTF-16 code unit and any other chunk a fixed 64 bytes, so an unread
-  branch cannot buffer bytes, text, or objects without limit. Workerd does
-  not bound these branches at all.
+  completion. That budget is charged with the whole send, so a single
+  chunk larger than 32 MiB fails every copy that has not read it. Workerd
+  buffers for the slower copy within the isolate's 128 MB limit instead of
+  failing it.
+- A `tee()` of a Worker-constructed `ReadableStream` bounds the skew the
+  same way, counted per tee: while one branch keeps reading, the other may
+  hold at most 32 MiB more than it, and past that the branch that is behind
+  fails its next read with the same error while the branch being read keeps
+  flowing. Only actual lag fails a branch, so a single chunk larger than
+  the budget reaches both copies. Views count their visible length, not the
+  buffer behind them, and any other value a fixed 64 bytes; the budget is a
+  guard against accidental buffering, not an isolate memory limit, so a
+  payload hidden in an object chunk is not counted and a chain of N clones
+  can hold N × 32 MiB. Workerd does not bound these branches at all.
 - A streamed response body that produces no bytes for 60 seconds ends,
   even while the client stays connected. Workerd keeps an idle body open.
   Send a keepalive (an SSE comment line such as `: ping`) at least once a

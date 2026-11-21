@@ -33,29 +33,85 @@ const _TEE_MAX_SKEW_BYTES = 33554432;
 const _TEE_SKEW_MESSAGE =
   "tee branch fell more than 32 MiB behind its sibling; read both branches concurrently";
 
-// What one queued chunk costs the budget. The bound only holds if no chunk
-// type is free, so every value is charged:
-//  * ArrayBuffer, SharedArrayBuffer and any view: `byteLength`, the bytes
-//    the branch is holding;
+// What one queued chunk costs the budget. Every chunk is charged, and no
+// chunk type is free:
+//  * a view (typed array or DataView): its visible `byteLength` -- the
+//    window it presents, not the backing buffer it keeps alive;
+//  * ArrayBuffer / SharedArrayBuffer: its `byteLength`;
 //  * string: 2 bytes per UTF-16 code unit, which is what V8 stores;
 //  * anything else (an object, an array, a number, ...): a fixed floor
 //    standing in for V8's object header plus the queue slots. Its contents
 //    are deliberately not sized: a tee must not run a chunk's getters or
 //    proxy traps, and a producer that wants to buffer a payload inside
 //    objects needs no tee to do it. The floor still caps a queue of small
-//    objects and primitives, which would otherwise be free.
+//    objects and primitives, and it applies to every chunk type, so empty
+//    strings and zero-length buffers are not free.
+//
+// The budget is a guard against accidental buffering by honest code, not
+// an isolate memory limit: this charge can be smaller than what a chunk
+// actually retains (a 1-byte view over a 64 MiB buffer costs 1 byte, and a
+// payload hidden in an object costs the floor).
 const _TEE_OBJECT_BYTES = 64;
 
+// The probe must never run chunk code: a chunk may be a Proxy, or an
+// object whose prototype is ArrayBuffer.prototype, and a native getter on
+// the wrong receiver throws. Capture the intrinsics once, at prelude
+// evaluation before any user code runs, and call them with the captured
+// Reflect.apply inside try/catch, so the measurement is total and no trap
+// or Get runs on the chunk.
+const _teeApply = Reflect.apply;
+const _teeIsView = ArrayBuffer.isView;
+const _teeArrayBufferByteLength = Object.getOwnPropertyDescriptor(
+  ArrayBuffer.prototype, 'byteLength').get;
+const _teeTypedArrayByteLength = Object.getOwnPropertyDescriptor(
+  Object.getPrototypeOf(Uint8Array.prototype), 'byteLength').get;
+const _teeDataViewByteLength = Object.getOwnPropertyDescriptor(
+  DataView.prototype, 'byteLength').get;
+const _teeSharedArrayBufferByteLength =
+  typeof SharedArrayBuffer === 'undefined' ? undefined :
+    Object.getOwnPropertyDescriptor(
+      SharedArrayBuffer.prototype, 'byteLength').get;
+
+// The length a captured getter reports for `value`, or undefined when the
+// getter rejects the receiver (a fake ArrayBuffer, a Proxy, a revoked
+// Proxy) or reports something that is not a non-negative finite number.
+function _teeMeasuredBytes(getter, value) {
+  if (getter === undefined) return undefined;
+  try {
+    const n = _teeApply(getter, value, []);
+    if (typeof n === 'number' && Number.isFinite(n) && n >= 0)
+      return n;
+  } catch (e) {
+    // Not an instance of that builtin: fall through to the floor.
+  }
+  return undefined;
+}
+
 function _teeChunkBytes(chunk) {
-  if (typeof chunk === 'string') return chunk.length * 2;
-  if (chunk === null || typeof chunk !== 'object')
-    return _TEE_OBJECT_BYTES;
-  if (chunk instanceof ArrayBuffer) return chunk.byteLength;
-  if (ArrayBuffer.isView(chunk)) return chunk.byteLength;
-  if (typeof SharedArrayBuffer !== 'undefined' &&
-      chunk instanceof SharedArrayBuffer)
-    return chunk.byteLength;
-  return _TEE_OBJECT_BYTES;
+  let bytes = _TEE_OBJECT_BYTES;
+  if (typeof chunk === 'string') {
+    bytes = chunk.length * 2;
+  } else if (chunk !== null && typeof chunk === 'object') {
+    let measured;
+    try {
+      if (_teeApply(_teeIsView, undefined, [chunk])) {
+        // A typed array or DataView. A Proxy of one is not a view, so it
+        // never reaches these getters.
+        measured = _teeMeasuredBytes(_teeTypedArrayByteLength, chunk);
+        if (measured === undefined)
+          measured = _teeMeasuredBytes(_teeDataViewByteLength, chunk);
+      } else {
+        measured = _teeMeasuredBytes(_teeArrayBufferByteLength, chunk);
+        if (measured === undefined)
+          measured = _teeMeasuredBytes(
+            _teeSharedArrayBufferByteLength, chunk);
+      }
+    } catch (e) {
+      measured = undefined;
+    }
+    if (measured !== undefined) bytes = measured;
+  }
+  return bytes < _TEE_OBJECT_BYTES ? _TEE_OBJECT_BYTES : bytes;
 }
 
 class ReadableStreamDefaultController {
@@ -488,7 +544,7 @@ class ReadableStream {
     return this._cancel(reason);
   }
 
-  tee(cloneForBranch2 = false) {
+  tee() {
     // Branches of a byte stream are byte streams, so
     // they support BYOB reads; the source is still read
     // through a default reader (coalesced chunks).
@@ -502,6 +558,12 @@ class ReadableStream {
     let failed1 = false, failed2 = false;
     let reason1, reason2;
     let reading = false;
+    // The charge of the chunk the in-flight pull is enqueuing, computed
+    // once per chunk before either enqueue (which may transfer a buffer).
+    // A default branch's size strategy reads it back, so the budget and
+    // the branch's `_queueTotalSize` agree and a chunk is never measured
+    // twice.
+    let chunkCharge = _TEE_OBJECT_BYTES;
     const live1 = () => !canceled1 && !failed1;
     const live2 = () => !canceled2 && !failed2;
 
@@ -533,7 +595,7 @@ class ReadableStream {
       // `_queueTotalSize` -- which the reader maintains on every dequeue
       // -- is exactly what the branch holds unconsumed. A bytes strategy
       // may not carry size(), and a byte branch already counts bytes.
-      return new ReadableStream(src, { size: _teeChunkBytes });
+      return new ReadableStream(src, { size: () => chunkCharge });
     };
     const branch1 = makeBranch(true);
     const branch2 = makeBranch(false);
@@ -547,33 +609,45 @@ class ReadableStream {
       ? branch._byteCtl._queueTotalSize
       : branch._queueTotalSize;
 
-    // Charge a chunk to the branches before it is enqueued, the way the
-    // host tee charges a send (send_http_tee_item in http_streams.rs).
-    // Past the budget the most-lagging live branch is failed -- the one
-    // nobody reads -- so the drained branch keeps flowing to the end and
-    // the source is not cancelled. Failing a branch clears its queue, so
-    // the loop re-checks; a single chunk larger than the whole budget
-    // fails a branch outright, as it does in the host tee. Returns whether
-    // any branch remains live to take the chunk.
-    function charge(bytes) {
+    function failBranch(first) {
+      if (first) { failed1 = true; reason1 = _TEE_SKEW_MESSAGE; }
+      else { failed2 = true; reason2 = _TEE_SKEW_MESSAGE; }
+      // The read that fails is the branch nobody drained, not the code
+      // that teed, so the message names the fix. Same `Error` and text as
+      // the host tee's rejection.
+      (first ? controllers[0] : controllers[1])
+        .error(new Error(_TEE_SKEW_MESSAGE));
+    }
+
+    // Fail a branch only for actual lag: it holds more queued bytes than a
+    // live sibling and that skew is past the budget. The leading branch is
+    // never failed and one chunk can fail at most one branch, so a single
+    // chunk larger than the budget still reaches both copies instead of
+    // killing them -- the host tee's total-based check would fail both
+    // (see docs/reference/limits.md). Returns whether a branch is still
+    // live; with one branch left there is no sibling to be behind, so it
+    // keeps everything and the source is not cancelled.
+    function failLagging() {
       for (;;) {
         if (!live1() && !live2()) {
           const released = release();
           if (released !== undefined) released.catch(() => {});
           return false;
         }
-        if (held(branch1) + held(branch2) + bytes <=
-            _TEE_MAX_SKEW_BYTES)
-          return true;
-        const failFirst = live1() &&
-          (!live2() || held(branch1) >= held(branch2));
-        if (failFirst) { failed1 = true; reason1 = _TEE_SKEW_MESSAGE; }
-        else { failed2 = true; reason2 = _TEE_SKEW_MESSAGE; }
-        // The read that fails is the branch nobody drained, not the code
-        // that teed, so the message names the fix. Same `Error` and text
-        // as the host tee's rejection.
-        (failFirst ? controllers[0] : controllers[1])
-          .error(new Error(_TEE_SKEW_MESSAGE));
+        if (!live1() || !live2()) return true;
+        const firstHeld = held(branch1);
+        const secondHeld = held(branch2);
+        if (firstHeld > secondHeld &&
+            firstHeld - secondHeld > _TEE_MAX_SKEW_BYTES) {
+          failBranch(true);
+          continue;
+        }
+        if (secondHeld > firstHeld &&
+            secondHeld - firstHeld > _TEE_MAX_SKEW_BYTES) {
+          failBranch(false);
+          continue;
+        }
+        return true;
       }
     }
 
@@ -583,25 +657,41 @@ class ReadableStream {
       return reader.read().then(
         ({ value, done }) => {
           reading = false;
-          if (done) {
+          try {
+            if (done) {
+              if (closed) return;
+              if (live1()) controllers[0].close();
+              if (live2()) controllers[1].close();
+              closed = true;
+              return;
+            }
+            chunkCharge = _teeChunkBytes(value);
+            // Byte enqueue transfers the chunk's buffer,
+            // so when both branches are live the first
+            // gets a copy.
+            if (live1())
+              controllers[0].enqueue(isBytes && live2()
+                ? new Uint8Array(value) : value);
+            if (live2()) controllers[1].enqueue(value);
+            // Measure the lag after both enqueues: a branch whose reader
+            // was already waiting has drained the chunk synchronously, so
+            // the difference between the two totals is what the branches
+            // really hold, and an unread branch fails once it is past the
+            // budget even when the chunk that got it there is oversize.
+            failLagging();
+          } catch (e) {
+            // No chunk and no stream state may strand a branch: whatever
+            // threw (a byte enqueue rejecting a chunk, a controller
+            // closed underneath the tee, a failing strategy), both
+            // branches get the error, the tee is done, and the source
+            // reader is released.
             if (closed) return;
             closed = true;
-            if (live1()) controllers[0].close();
-            if (live2()) controllers[1].close();
-            return;
+            if (live1()) controllers[0].error(e);
+            if (live2()) controllers[1].error(e);
+            const released = reader.cancel([e, e]);
+            if (released !== undefined) released.catch(() => {});
           }
-          // Size the chunk once, before an enqueue transfers its buffer,
-          // and charge it to whichever branches end up taking it.
-          if (!charge(_teeChunkBytes(value))) return;
-          // Byte enqueue transfers the chunk's buffer,
-          // so when both branches are live the first
-          // gets a copy.
-          if (live1())
-            controllers[0].enqueue(isBytes && live2()
-              ? new Uint8Array(value) : value);
-          if (live2())
-            controllers[1].enqueue(cloneForBranch2
-              ? structuredClone(value) : value);
         },
         (e) => {
           reading = false;
