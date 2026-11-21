@@ -35,6 +35,7 @@ struct BootstrapSource {
     source: &'static v8::OneByteConst,
 }
 
+static_source!(ARRAY_BUFFER_GUARD_SOURCE, "array_buffer_guard.js");
 static_source!(TEXT_ENCODING_SOURCE, "text_encoding.js");
 static_source!(URL_SEARCH_PARAMS_SOURCE, "url_search_params.js");
 static_source!(URL_SOURCE, "url.js");
@@ -51,6 +52,13 @@ static_source!(HTML_REWRITER_SOURCE, "html_rewriter.js");
 static_source!(CRYPTO_SOURCE, "crypto.js");
 
 static PRELUDE: &[BootstrapSource] = &[
+    // First: every later prelude and all tenant code must see the guarded
+    // `ArrayBuffer`, `SharedArrayBuffer`, `WebAssembly.Memory` and
+    // `structuredClone` (see the file's header).
+    BootstrapSource {
+        name: "array_buffer_guard.js",
+        source: &ARRAY_BUFFER_GUARD_SOURCE,
+    },
     BootstrapSource {
         name: "text_encoding.js",
         source: &TEXT_ENCODING_SOURCE,
@@ -306,11 +314,27 @@ pub(super) fn install_harness<'s>(
     for source in POST_HARNESS {
         run_bootstrap_static_script(scope, source, arguments)?;
     }
+    // `harness.js` installs `structuredClone` (V8 152 has no such builtin),
+    // so the ArrayBuffer guard from the prelude could not wrap it before the
+    // harness ran. Charge clones of resizable buffers now that it exists.
+    graft_array_buffer_clone(scope)?;
     // Resolving the event hooks belongs to installing the harness, not to the
     // first event: the harness is what defines them, and a caller that
     // installed the harness without them would silently fall back to nothing
     // at all. `harness.js` has just run, so all four globals exist here.
     install_event_hooks(scope)
+}
+
+/// Wrap the harness's `structuredClone` in the ArrayBuffer guard's accounting.
+///
+/// The guard in `install_prelude` could not do it: `structuredClone` is not a
+/// V8 builtin and `harness.js`, which installs it, runs after the prelude.
+fn graft_array_buffer_clone(scope: &mut v8::PinScope) -> Result<()> {
+    let graft = internal_function(scope, "arrayBufferGuardGraftClone")?;
+    graft
+        .call(scope, v8::undefined(scope).into(), &[])
+        .ok_or_else(|| anyhow!("the ArrayBuffer guard did not graft structuredClone"))?;
+    Ok(())
 }
 
 /// Resolve the per-event harness hooks once and hold them for the isolate.
@@ -649,7 +673,7 @@ pub(super) fn populate_loader_process_env(
         return Ok(());
     }
     let installer = internal_function(scope, "__installLoaderProcessEnv")?;
-    let bytes = super::bytes_value(scope, env.bytes.clone());
+    let bytes = super::bytes_value(scope, env.bytes.clone())?;
     let reserved = v8::String::new(scope, crate::deploy::NODE_IDENTITY_ENV).unwrap();
     let tc = std::pin::pin!(v8::TryCatch::new(scope));
     let tc = &mut tc.init();
@@ -789,10 +813,10 @@ pub(super) fn build_env(scope: &mut v8::PinScope, config: &WorkerConfig) -> Resu
                 None => v8::null(scope).into(),
             };
             routes.set_index(scope, offset + 1, entrypoint);
-            let props = super::bytes_value(scope, route.props.clone());
+            let props = super::bytes_value(scope, route.props.clone())?;
             routes.set_index(scope, offset + 2, props);
         }
-        let bytes = super::bytes_value(scope, env.bytes.clone());
+        let bytes = super::bytes_value(scope, env.bytes.clone())?;
         let tc = std::pin::pin!(v8::TryCatch::new(scope));
         let tc = &mut tc.init();
         let receiver = v8::undefined(tc).into();

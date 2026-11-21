@@ -5,6 +5,12 @@
 // plus a page-count cap through the OS, so the execution boundary's
 // injected clock/filesystem/async rules do not apply to it.
 #![allow(clippy::disallowed_methods)]
+// The node's process tree is walked through `/proc/<pid>/task/*/children` and
+// its file-size limit is clamped with `prlimit`: both are Linux-only, so the
+// whole runner is. The cross-platform claims of this fixture are about the
+// node, not the harness — the harness cannot observe a forked isolate's
+// rlimit anywhere else.
+#![cfg(target_os = "linux")]
 
 //! A full disk must not poison a cell past recovery (upstream #291): a
 //! transactional write that fails with SQLITE_FULL destroys its

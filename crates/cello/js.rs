@@ -1745,10 +1745,20 @@ fn resolve_res(tc: &mut v8::PinScope, id: u64, res: Result<asyncrt::OpOut, Strin
             let s = v8::String::new(tc, &v).unwrap();
             r.resolve(tc, s.into());
         }
-        Ok(asyncrt::OpOut::Bytes(b)) => {
-            let v = bytes_value(tc, b);
-            r.resolve(tc, v);
-        }
+        Ok(asyncrt::OpOut::Bytes(b)) => match bytes_value(tc, b) {
+            Ok(v) => {
+                r.resolve(tc, v);
+            }
+            Err(refusal) => {
+                // The bytes cannot be presented, so the promise must not
+                // resolve with a value the guest would have to guess at: the
+                // reader gets the `RangeError` V8 would have raised for a
+                // refused allocation. Scheduling it and then rejecting is the
+                // one V8 operation left; nothing runs after it.
+                let exception = host_store_error(tc, &refusal);
+                r.reject(tc, exception);
+            }
+        },
         Err(e) => {
             let s = v8::String::new(tc, &e).unwrap();
             let ex = v8::Exception::error(tc, s);
@@ -1757,12 +1767,76 @@ fn resolve_res(tc: &mut v8::PinScope, id: u64, res: Result<asyncrt::OpOut, Strin
     }
 }
 
-/// Move `bytes` into a `Uint8Array` without copying.
-fn bytes_value<'s>(scope: &mut v8::PinScope<'s, '_>, bytes: Vec<u8>) -> v8::Local<'s, v8::Value> {
+/// The backing-store budget of the isolate this scope belongs to.
+///
+/// Every isolate `load_config` builds has one, installed in
+/// [`HeapLimitState`]; `None` means this scope is not on a Worker isolate and
+/// there is nothing to charge.
+fn backing_store_budget(
+    scope: &mut v8::PinScope,
+) -> Option<Arc<array_buffer_budget::BackingStoreBudget>> {
+    scope
+        .get_slot::<Arc<HeapLimitState>>()
+        .map(|state| state.external.clone())
+}
+
+/// A store for bytes the host already owns, charged to this isolate's
+/// budget.
+///
+/// Answers [`array_buffer_budget::HostStoreRefusal`] when the bytes would take
+/// the isolate past its ceiling, and **schedules no exception**: V8 forbids
+/// running JavaScript operations once an exception is pending, and a caller
+/// may have to abandon a half-built row, batch or argument list. Each caller
+/// either throws at an op boundary, rejects a promise, or propagates the error
+/// before touching V8 again.
+fn host_backing_store<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    bytes: Vec<u8>,
+) -> Result<v8::SharedRef<v8::BackingStore>, array_buffer_budget::HostStoreRefusal> {
+    let Some(budget) = backing_store_budget(scope) else {
+        // No isolate budget to charge: keep today's path rather than fail an
+        // answer V8 expects. `load_config` cannot produce this.
+        return Ok(v8::ArrayBuffer::new_backing_store_from_vec(bytes).make_shared());
+    };
+    array_buffer_budget::host_store(&budget, bytes).map(|store| store.make_shared())
+}
+
+/// The `RangeError` a refusal becomes at a JavaScript boundary: the same
+/// shape as the one V8 raises for a refused allocation, and the one the
+/// `array_buffer_guard.js` wrappers throw, naming the budget.
+fn host_store_error<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    refusal: &array_buffer_budget::HostStoreRefusal,
+) -> v8::Local<'s, v8::Value> {
+    let message = v8::String::new(scope, &refusal.to_string()).unwrap();
+    v8::Exception::range_error(scope, message)
+}
+
+/// Schedule the refusal's `RangeError`; the caller must return without
+/// running further JavaScript.
+fn throw_host_store_refusal(
+    scope: &mut v8::PinScope,
+    refusal: &array_buffer_budget::HostStoreRefusal,
+) {
+    let exception = host_store_error(scope, refusal);
+    scope.throw_exception(exception);
+}
+
+/// Move `bytes` into a `Uint8Array` without copying, charged to the
+/// isolate's backing-store budget.
+///
+/// A refusal is a value, not a pending exception; see [`host_backing_store`].
+/// Callers that can propagate an error (`Result`) should let it, callers at a
+/// synchronous op boundary use [`bytes_value_or_throw`], and promise paths
+/// reject with [`host_store_error`].
+fn bytes_value<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    bytes: Vec<u8>,
+) -> Result<v8::Local<'s, v8::Value>, array_buffer_budget::HostStoreRefusal> {
     #[cfg(cello_internal_tests)]
     let input = bytes.as_ptr() as usize;
     let len = bytes.len();
-    let store = v8::ArrayBuffer::new_backing_store_from_vec(bytes).make_shared();
+    let store = host_backing_store(scope, bytes)?;
     let buffer = v8::ArrayBuffer::with_backing_store(scope, &store);
     #[cfg(cello_internal_tests)]
     record_bytes_value_allocation_for_test(
@@ -1772,7 +1846,23 @@ fn bytes_value<'s>(scope: &mut v8::PinScope<'s, '_>, bytes: Vec<u8>) -> v8::Loca
             .data()
             .map(|data| data.as_ptr() as usize),
     );
-    v8::Uint8Array::new(scope, buffer, 0, len).unwrap().into()
+    Ok(v8::Uint8Array::new(scope, buffer, 0, len).unwrap().into())
+}
+
+/// [`bytes_value`] for a synchronous op callback: throws the refusal's
+/// `RangeError` and answers `None`, so the caller returns with nothing else
+/// passed to (or set on) the guest.
+fn bytes_value_or_throw<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    bytes: Vec<u8>,
+) -> Option<v8::Local<'s, v8::Value>> {
+    match bytes_value(scope, bytes) {
+        Ok(value) => Some(value),
+        Err(refusal) => {
+            throw_host_store_refusal(scope, &refusal);
+            None
+        }
+    }
 }
 
 #[cfg(cello_internal_tests)]
@@ -2136,8 +2226,39 @@ impl Engine {
         // which poisoned the global state when both ran.
         static INIT: std::sync::Once = std::sync::Once::new();
         INIT.call_once(|| {
+            // One wasm memory may not commit more than one isolate's whole
+            // backing-store budget. A module that declares its own memory
+            // never reaches the `array_buffer_guard.js` wrappers, so this flag
+            // is the only bound on it: V8 clamps a declared memory's maximum
+            // and every `grow` to this page count (`wasm-objects.cc`,
+            // `max_mem32_pages()`). What it cannot bound is the number of
+            // memories; `docs/reference/limits.md` states that residual.
+            //
+            // Read without `expect`: `Engine::init` also runs in a test
+            // process that never validated the environment, and a bad value
+            // there must not panic before the first isolate exists.
+            let heap_limit = crate::env_vars::positive::<usize>("CELLO_V8_HEAP_LIMIT_MB")
+                .ok()
+                .flatten()
+                .map_or(DEFAULT_V8_HEAP_LIMIT_BYTES, |megabytes| {
+                    megabytes.saturating_mul(1024 * 1024)
+                });
+            let external_limit = crate::env_vars::positive::<usize>("CELLO_V8_EXTERNAL_LIMIT_MB")
+                .ok()
+                .flatten()
+                .map_or_else(
+                    || heap_limit.saturating_mul(array_buffer_budget::EXTERNAL_LIMIT_HEAP_MULTIPLE),
+                    |megabytes| megabytes.saturating_mul(1024 * 1024),
+                );
+            // `kV8MaxWasmMemory32Pages` is 65536 on 64-bit V8; a larger value
+            // would only mean "unbounded".
+            let wasm_limit_pages = (external_limit / 65536).clamp(1, 65536);
+            #[cfg(not(cello_internal_tests))]
+            v8::V8::set_flags_from_string(&format!("--wasm-max-mem-pages={wasm_limit_pages}"));
             #[cfg(cello_internal_tests)]
-            v8::V8::set_flags_from_string("--expose-gc");
+            v8::V8::set_flags_from_string(&format!(
+                "--wasm-max-mem-pages={wasm_limit_pages} --expose-gc"
+            ));
             // No `v8::icu::set_common_data_78` call: the rusty_v8 152 prebuilt
             // statically links the complete ICU data (full locale tables and
             // regex property-of-strings, e.g. /\p{RGI_Emoji}/v — verified
@@ -2640,7 +2761,7 @@ impl WorkerIsolate {
         (self.isolate.lock(), self.cells.install())
     }
 
-    /// Lift condemnation from an isolate whose heap has drained.
+    /// Lift condemnation from an isolate whose memory has drained.
     ///
     /// `near_heap_limit` latches a flag that nothing used to clear, so a cell
     /// that reached its limit once stayed condemned until the process
@@ -2648,11 +2769,29 @@ impl WorkerIsolate {
     /// one, because a handler must not see the isolate recover halfway
     /// through.
     ///
-    /// A heap still over the line buys one `low_memory_notification` and a
-    /// second reading. V8 stops collecting once it is past the limit, so a
-    /// drained isolate holds the dead heap until something allocates again —
-    /// without the forced collection the reading that decides recovery is a
-    /// reading of garbage. `HEAP_GC_NUDGE_INTERVAL` bounds the cost.
+    /// Two guards condemn an isolate: the V8 heap limit (`near_heap_limit`)
+    /// and its backing-store budget (an allocator refusal). Both are measured
+    /// here, and both must be under [`HEAP_RECOVERY_SHARE`] before the isolate
+    /// serves again.
+    ///
+    /// A guard still over the line buys one `low_memory_notification` and a
+    /// second reading. V8 stops collecting once the heap is past the limit,
+    /// and backing stores a guest dropped are only releasable once the
+    /// collector finds them — without the forced collection the reading that
+    /// decides recovery is a reading of garbage. `HEAP_GC_NUDGE_INTERVAL`
+    /// bounds the cost.
+    ///
+    /// The budget side has one rule the heap side does not: a store V8 made
+    /// through the platform page allocator (`array_buffer_guard.js`: a
+    /// resizable `ArrayBuffer`, a growable `SharedArrayBuffer`, a
+    /// `WebAssembly.Memory`) is charged at the guest's call site, so a
+    /// refusal reaches JavaScript there and latches the flag. The allocator's
+    /// own null return does not latch — V8 collects and retries it, and a
+    /// retry that succeeds never fails the guest. What condemns an isolate
+    /// here is the bytes it still holds: a turn that begins with retained use
+    /// over [`HEAP_RECOVERY_SHARE`] of the budget latches the flag (after the
+    /// rate-limited collection below, so a store dropped in the previous turn
+    /// is not counted against it).
     ///
     /// Removing the callback with the original limit puts back the limit
     /// `near_heap_limit` raised; re-adding it re-arms the guard.
@@ -2660,26 +2799,43 @@ impl WorkerIsolate {
         let Some(state) = locker.get_slot::<Arc<HeapLimitState>>().cloned() else {
             return;
         };
-        if !state.excessively_exceeded.load(Ordering::Relaxed) {
+        // A budget at or over its recovery share condemns the isolate even
+        // when no allocation was refused: an allocator refusal is answered by
+        // a collection and a retry, so only the bytes still retained after a
+        // collection are evidence that the isolate is full. Collect once
+        // (rate limited) before deciding, because a store the guest dropped
+        // is only returned to the budget by the collector.
+        if !state.condemned() && state.external.used_share() >= HEAP_RECOVERY_SHARE {
+            if state.due_for_gc_nudge() {
+                locker.low_memory_notification();
+            }
+            if state.external.used_share() >= HEAP_RECOVERY_SHARE {
+                state.external.latch_exceeded();
+            }
+        }
+        if !state.condemned() {
             return;
         }
-        if heap_share(locker, state.limit) >= HEAP_RECOVERY_SHARE {
+        if state.over_recovery_share(locker) {
             if !state.due_for_gc_nudge() {
                 return;
             }
             locker.low_memory_notification();
-            if heap_share(locker, state.limit) >= HEAP_RECOVERY_SHARE {
+            if state.over_recovery_share(locker) {
                 return;
             }
         }
         state.excessively_exceeded.store(false, Ordering::Relaxed);
+        state.external.clear_exceeded();
         let data = Arc::as_ptr(&state) as *mut HeapLimitState as *mut std::ffi::c_void;
         locker.remove_near_heap_limit_callback(near_heap_limit, state.limit);
         locker.add_near_heap_limit_callback(near_heap_limit, data);
         tracing::info!(
             event = "isolate_heap_recovered",
             limit_bytes = state.limit,
-            "isolate heap fell back under its limit, so it serves again"
+            external_bytes = state.external.used(),
+            external_limit_bytes = state.external.cap(),
+            "isolate memory fell back under its limits, so it serves again"
         );
     }
 
@@ -2731,9 +2887,11 @@ const V8_HEAP_EMERGENCY_BYTES: usize = 16 * 1024 * 1024;
 /// fires once it no longer does.
 const HEAP_ADMISSION_SHARE: f64 = 0.9;
 
-/// Share of the heap limit under which a condemned isolate is condemned no
-/// more. Under `HEAP_ADMISSION_SHARE` by enough that recovery does not
-/// immediately re-admit into a heap that is about to fail again.
+/// Share of a limit under which a condemned isolate is condemned no more.
+/// On the heap it sits under `HEAP_ADMISSION_SHARE` by enough that recovery
+/// does not immediately re-admit into a heap that is about to fail again; on
+/// the backing-store budget it is also the share that condemns an isolate no
+/// allocation refusal marked, once a collection confirms the bytes are held.
 const HEAP_RECOVERY_SHARE: f64 = 0.75;
 
 /// The shortest gap between two collections forced by `recover_heap`. A full
@@ -2744,6 +2902,12 @@ const HEAP_GC_NUDGE_INTERVAL: Duration = Duration::from_secs(1);
 
 struct HeapLimitState {
     excessively_exceeded: AtomicBool,
+    /// Backing-store memory this isolate's ArrayBuffer allocator handed out
+    /// plus what the `array_buffer_guard.js` wrappers reserved, and the
+    /// ceiling both enforce. A wrapper refusal and a turn that begins over
+    /// the recovery share latch `exceeded`; the heap-limit callback latches
+    /// `excessively_exceeded`.
+    external: Arc<array_buffer_budget::BackingStoreBudget>,
     /// The limit V8 gave this isolate, before any emergency extension.
     /// Recovery measures against this one because `near_heap_limit` raises
     /// the current one.
@@ -2756,6 +2920,21 @@ struct HeapLimitState {
 }
 
 impl HeapLimitState {
+    /// Whether either memory guard has condemned this isolate: a heap-limit
+    /// hit, a refused guest-facing reservation, or retained use over the
+    /// recovery share.
+    fn condemned(&self) -> bool {
+        self.excessively_exceeded.load(Ordering::Relaxed) || self.external.exceeded()
+    }
+
+    /// Whether either guard still reads over its recovery share: the heap
+    /// past [`HEAP_RECOVERY_SHARE`] of its limit, or the backing stores past
+    /// that share of their budget.
+    fn over_recovery_share(&self, isolate: &mut v8::Isolate) -> bool {
+        heap_share(isolate, self.limit) >= HEAP_RECOVERY_SHARE
+            || self.external.used_share() >= HEAP_RECOVERY_SHARE
+    }
+
     /// Whether a condemned isolate can pay for another forced collection.
     ///
     /// Rate-limited rather than once for each condemnation: the load can
@@ -4618,7 +4797,13 @@ fn install_trace<'s>(
 ) -> Option<v8::Local<'s, v8::Value>> {
     let context = trace?;
     let previous = scope.get_continuation_preserved_embedder_data();
-    let buffer = v8::ArrayBuffer::new(scope, 25);
+    // A host-owned store, not `v8::ArrayBuffer::new`: that call aborts the
+    // process when the isolate's allocator refuses, and a 25-byte trace
+    // rider is host bookkeeping rather than guest data, so it is not charged
+    // to the guest's budget. One such buffer exists per in-flight traced
+    // turn and becomes garbage with the turn.
+    let store = v8::ArrayBuffer::new_backing_store_from_vec(vec![0_u8; 25]).make_shared();
+    let buffer = v8::ArrayBuffer::with_backing_store(scope, &store);
     let data = buffer.get_backing_store().data()?;
     let bytes = data.as_ptr() as *mut u8;
     // SAFETY: a freshly created 25-byte buffer, written before any JS
@@ -4826,6 +5011,56 @@ impl Worker {
             physical: statistics.total_physical_size() as u64,
             external: statistics.external_memory() as u64,
         })
+    }
+
+    /// Whether either memory guard has condemned this isolate, for a test
+    /// that has to see the state machine rather than its side effects. This is
+    /// what the production ops read (`condemned()`), not just the heap flag.
+    #[cfg(test)]
+    pub(crate) fn condemned_for_test(&self) -> Option<bool> {
+        let inner = self.inner.as_ref()?;
+        let (locker, _cells) = inner.lock();
+        locker
+            .get_slot::<Arc<HeapLimitState>>()
+            .map(|state| state.condemned())
+    }
+
+    /// Whether the backing-store budget latched its own condemnation. A test
+    /// that reads this proves the latch exists: with the latch removed, a
+    /// small isolate refused a reservation is below the recovery share and
+    /// nothing else would set it.
+    #[cfg(test)]
+    pub(crate) fn external_exceeded_for_test(&self) -> Option<bool> {
+        let inner = self.inner.as_ref()?;
+        let (locker, _cells) = inner.lock();
+        locker
+            .get_slot::<Arc<HeapLimitState>>()
+            .map(|state| state.external.exceeded())
+    }
+
+    /// Lower the isolate's backing-store ceiling. Only for a test: the
+    /// production ceiling comes from `CELLO_V8_EXTERNAL_LIMIT_MB`, which a
+    /// test process cannot set per isolate.
+    #[cfg(test)]
+    pub(crate) fn set_external_limit_for_test(&self, bytes: usize) {
+        let Some(inner) = self.inner.as_ref() else {
+            return;
+        };
+        let (locker, _cells) = inner.lock();
+        if let Some(state) = locker.get_slot::<Arc<HeapLimitState>>() {
+            state.external.set_cap(bytes);
+        }
+    }
+
+    /// The backing-store budget as `(charged bytes, ceiling)`, for a test that
+    /// measures the allocator rather than the guest.
+    #[cfg(test)]
+    pub(crate) fn backing_store_budget_for_test(&self) -> Option<(usize, usize)> {
+        let inner = self.inner.as_ref()?;
+        let (locker, _cells) = inner.lock();
+        locker
+            .get_slot::<Arc<HeapLimitState>>()
+            .map(|state| (state.external.used(), state.external.cap()))
     }
 
     /// Run a request's first turn.
@@ -5422,7 +5657,10 @@ fn begin_entrypoint_rpc(
         let entrypoint = v8::String::new(tc, entrypoint).unwrap();
         let (path, args) = match operation {
             crate::WorkerRpcOperation::Get { path } => (path, v8::null(tc).into()),
-            crate::WorkerRpcOperation::Call { path, args } => (path, bytes_value(tc, args)),
+            // A refused argument store stops the dispatch here: the reply
+            // carries the refusal to the caller, and no incomplete argument
+            // list reaches JavaScript.
+            crate::WorkerRpcOperation::Call { path, args } => (path, bytes_value(tc, args)?),
         };
         let path = path
             .iter()
@@ -5432,7 +5670,7 @@ fn begin_entrypoint_rpc(
         // The caller's props, structured-clone bytes like `args`. `local` stays
         // false: the call crossed an isolate boundary.
         let local = v8::Boolean::new(tc, false);
-        let props = bytes_value(tc, props);
+        let props = bytes_value(tc, props)?;
         let recv = v8::undefined(tc).into();
         begin_event_context(tc)?;
         let ret = f
@@ -5639,7 +5877,7 @@ fn queue_batch_value<'s>(
         set_queue_property(scope, object, "id", id.into())?;
         let timestamp = v8::Number::new(scope, message.timestamp_ms as f64);
         set_queue_property(scope, object, "timestamp", timestamp.into())?;
-        let body = bytes_value(scope, message.body);
+        let body = bytes_value(scope, message.body)?;
         set_queue_property(scope, object, "body", body)?;
         let content_type = v8::String::new(scope, message.content_type.as_str()).unwrap();
         set_queue_property(scope, object, "contentType", content_type.into())?;
@@ -5740,12 +5978,17 @@ fn begin_queue(
     }
 }
 
-/// for the JSON flavor, a `Uint8Array` for structured clone.
-fn rpc_data_value<'s>(scope: &mut v8::PinScope<'s, '_>, data: RpcData) -> v8::Local<'s, v8::Value> {
-    match data {
+/// for the JSON flavor, a `Uint8Array` for structured clone. A store the
+/// budget refuses is an error, so the dispatch never builds an argument list
+/// with a missing value in it.
+fn rpc_data_value<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    data: RpcData,
+) -> Result<v8::Local<'s, v8::Value>, array_buffer_budget::HostStoreRefusal> {
+    Ok(match data {
         RpcData::Json(json) => v8::String::new(scope, &json).unwrap().into(),
-        RpcData::V8(bytes) => bytes_value(scope, bytes.into()),
-    }
+        RpcData::V8(bytes) => bytes_value(scope, bytes.into())?,
+    })
 }
 
 /// The inverse: `__dispatchRpc` answers in the flavor it was asked in.
@@ -6034,7 +6277,9 @@ fn begin_cell(tc: &mut v8::PinScope, job: CellJob, event_time: i64) -> Begun {
                     // of the routing seam collecting it first.
                     let (body_value, stream_id) = match body {
                         RequestBody::Bytes(bytes) => {
-                            (bytes_value(tc, bytes.into()), v8::null(tc).into())
+                            // Refused bytes fail the event before the handler
+                            // is handed a request with no body in it.
+                            (bytes_value(tc, bytes.into())?, v8::null(tc).into())
                         }
                         RequestBody::Stream(id) => (
                             v8::undefined(tc).into(),
@@ -6087,7 +6332,7 @@ fn begin_cell(tc: &mut v8::PinScope, job: CellJob, event_time: i64) -> Begun {
                     let arguments = [
                         v8::String::new(tc, &scope).unwrap().into(),
                         v8::String::new(tc, &method).unwrap().into(),
-                        rpc_data_value(tc, args),
+                        rpc_data_value(tc, args)?,
                         v8::Boolean::new(tc, trusted).into(),
                     ];
                     let recv = v8::undefined(tc).into();
@@ -6150,7 +6395,7 @@ fn begin_cell(tc: &mut v8::PinScope, job: CellJob, event_time: i64) -> Begun {
                         stub_id.into(),
                         v8::Array::new_with_elements(tc, &path).into(),
                         match args {
-                            Some(args) => rpc_data_value(tc, args),
+                            Some(args) => rpc_data_value(tc, args)?,
                             None => v8::null(tc).into(),
                         },
                     ];
@@ -6208,7 +6453,7 @@ fn begin_cell(tc: &mut v8::PinScope, job: CellJob, event_time: i64) -> Begun {
                         WsIn::Text(text) => {
                             ("__wsMessage", v8::String::new(tc, &text).unwrap().into())
                         }
-                        WsIn::Binary(bytes) => ("__wsBinary", bytes_value(tc, bytes)),
+                        WsIn::Binary(bytes) => ("__wsBinary", bytes_value(tc, bytes)?),
                     };
                     let f = internal_function(tc, name)?;
                     let arguments = [
@@ -6605,7 +6850,7 @@ fn start_fetch<'s>(
         FetchTarget::Entrypoint(entrypoint) => {
             let dispatch = internal_function(tc, "__dispatchEntrypointFetch")?;
             let name = v8::String::new(tc, &entrypoint.name).unwrap();
-            let props = bytes_value(tc, entrypoint.props);
+            let props = bytes_value(tc, entrypoint.props)?;
             // Settlement and synchronous-throw cleanup both close this host
             // frame. The dispatcher supplies its own handler context, but
             // omitting the outer frame would leave those paths unbalanced.
@@ -6689,13 +6934,23 @@ impl Worker {
         let do_classes = config.do_classes.as_slice();
         let node = config.node.as_str();
         let compat = config.compat;
-        let params = v8::CreateParams::default().heap_limits(0, v8_heap_limit_bytes());
+        let heap_limit = v8_heap_limit_bytes();
+        // Before the isolate exists, because V8 takes the allocator with its
+        // creation: every `new ArrayBuffer(n)` in the guest draws on this
+        // budget from the first line of the module.
+        let backing_stores = array_buffer_budget::BackingStoreBudget::new(
+            array_buffer_budget::external_limit_bytes(heap_limit),
+        );
+        let params = v8::CreateParams::default()
+            .heap_limits(0, heap_limit)
+            .array_buffer_allocator(array_buffer_budget::allocator(&backing_stores).make_shared());
         let mut isolate = v8::Isolate::new(params);
         // Dynamic `import()` of builtin specifiers; per-import()-call only.
         isolate.set_host_import_module_dynamically_callback(host_import_module_dynamically);
         let original_heap_limit = isolate.get_heap_statistics().heap_size_limit();
         let heap_limit_state = Arc::new(HeapLimitState {
             excessively_exceeded: AtomicBool::new(false),
+            external: backing_stores,
             limit: original_heap_limit,
             last_gc_nudge: Mutex::new(None),
             #[cfg(cello_internal_tests)]
@@ -7608,6 +7863,9 @@ ops! { OP_NAMES, install_op_functions,
         "__heap_limit_excessively_exceeded" =>
             op_heap_limit_excessively_exceeded,
         "__heap_over_admission_share" => op_heap_over_admission_share,
+        "$$__array_buffer_reserve" => op_array_buffer_reserve,
+        "$$__array_buffer_release" => op_array_buffer_release,
+        "$$__array_buffer_cap" => op_array_buffer_cap,
         "__traceparent" => op_traceparent,
         "__ws_send" => websocket::op_ws_send,
         "__ws_send_binary" => websocket::op_ws_send_binary,
@@ -9946,7 +10204,10 @@ fn op_rpc_signal_poll(
     let signals = rpc_signals().lock().unwrap();
     match signals.get(&signal) {
         Some(RpcSignalState::Aborted(reason)) => {
-            rv.set(bytes_value(scope, reason.clone()));
+            let Some(reason) = bytes_value_or_throw(scope, reason.clone()) else {
+                return;
+            };
+            rv.set(reason);
         }
         Some(RpcSignalState::Live(_)) => {}
         None => rv.set(v8::null(scope).into()),
@@ -10323,7 +10584,11 @@ fn op_stub_call(
 /// or malformed id, a release from an isolate holding nothing, or a hold
 /// dropped while other holders remain. Release is idempotent.
 fn resolve_empty_release(scope: &mut v8::PinScope, mut rv: v8::ReturnValue<v8::Value>) {
-    let empty = bytes_value(scope, Vec::new());
+    // An empty store is never charged, so this cannot be refused; the
+    // fallible form is the one the type system offers.
+    let Some(empty) = bytes_value_or_throw(scope, Vec::new()) else {
+        return;
+    };
     let done = resolved_promise(scope, empty).expect("a release can resolve an empty answer");
     rv.set(done.into());
 }
@@ -11847,18 +12112,23 @@ fn webcrypto_return_bytes(
     mut rv: v8::ReturnValue<v8::Value>,
     bytes: &[u8],
 ) {
-    let buffer = v8::ArrayBuffer::new(scope, bytes.len());
-    if !bytes.is_empty() {
-        let store = buffer.get_backing_store();
-        let destination = unsafe {
-            std::slice::from_raw_parts_mut(store.data().unwrap().as_ptr() as *mut u8, bytes.len())
-        };
-        destination.copy_from_slice(bytes);
-    }
+    // One copy either way: the bytes move into a `Vec` the store owns
+    // instead of into a store V8 allocated. That matters beyond tidiness:
+    // `v8::ArrayBuffer::New` aborts the process when the allocator refuses
+    // (`FatalProcessOutOfMemory: v8::ArrayBuffer::New`), while a host store
+    // past the budget is refused here with a `RangeError` the guest catches.
+    let store = match host_backing_store(scope, bytes.to_vec()) {
+        Ok(store) => store,
+        // The op answers nothing: an empty view would read as a valid
+        // zero-length answer to bytes that were never delivered.
+        Err(refusal) => return throw_host_store_refusal(scope, &refusal),
+    };
+    let buffer = v8::ArrayBuffer::with_backing_store(scope, &store);
     let view = v8::Uint8Array::new(scope, buffer, 0, bytes.len()).unwrap();
     rv.set(view.into());
 }
 
+mod array_buffer_budget;
 mod binding_policy;
 mod container;
 mod crypto;
@@ -12014,11 +12284,71 @@ fn op_heap_limit_excessively_exceeded(
     _args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
+    // Either guard: the heap limit or the backing-store budget. Both mean
+    // "this isolate may not take on more retained state".
     let exceeded = scope
         .get_slot::<Arc<HeapLimitState>>()
-        .is_some_and(|state| state.excessively_exceeded.load(Ordering::Relaxed));
+        .is_some_and(|state| state.condemned());
     rv.set(v8::Boolean::new(scope, exceeded).into());
 }
+/// Reserve `bytes` of this isolate's backing-store budget for a guest-facing
+/// wrapper (`array_buffer_guard.js`): a resizable `ArrayBuffer`'s construction
+/// or `resize`, a growable `SharedArrayBuffer`'s construction or `grow`, or a
+/// `WebAssembly.Memory`'s construction or `grow`.
+///
+/// Answers `false` when the reservation would cross the cap; the wrapper turns
+/// that into a `RangeError` at the guest's call site, so the refusal latches
+/// the same condemnation a heap-limit hit does.
+fn op_array_buffer_reserve(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let requested = args.get(0).number_value(scope).unwrap_or(f64::NAN);
+    let admitted = match scope.get_slot::<Arc<HeapLimitState>>() {
+        Some(state) if requested.is_finite() && requested > 0.0 => state
+            .external
+            .reserve_latching(requested.min(usize::MAX as f64) as usize),
+        Some(_) if requested.is_finite() => true,
+        Some(_) => false,
+        None => true,
+    };
+    rv.set(v8::Boolean::new(scope, admitted).into());
+}
+
+/// Return bytes a wrapper reserved. Only the wrapper's own bookkeeping calls
+/// this; it is not a guest capability (ops are parameters of internal
+/// scripts, never globals).
+fn op_array_buffer_release(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue<v8::Value>,
+) {
+    let released = args.get(0).number_value(scope).unwrap_or(0.0);
+    if !(released.is_finite() && released > 0.0) {
+        return;
+    }
+    if let Some(state) = scope.get_slot::<Arc<HeapLimitState>>() {
+        state
+            .external
+            .release(released.min(usize::MAX as f64) as usize);
+    }
+}
+
+/// The backing-store ceiling, for the wrapper's `maxByteLength` check: one
+/// buffer may never reserve more address space than the whole budget.
+fn op_array_buffer_cap(
+    scope: &mut v8::PinScope,
+    _args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    const MAX_SAFE_INTEGER: usize = 9_007_199_254_740_991;
+    let cap = scope
+        .get_slot::<Arc<HeapLimitState>>()
+        .map_or(MAX_SAFE_INTEGER, |state| state.external.cap());
+    rv.set(v8::Number::new(scope, cap as f64).into());
+}
+
 /// Whether this isolate is too close to its heap limit to retain more state.
 fn op_heap_over_admission_share(
     scope: &mut v8::PinScope,
@@ -12028,12 +12358,7 @@ fn op_heap_over_admission_share(
     let state = scope.get_slot::<Arc<HeapLimitState>>().cloned();
     let over = match state {
         // A condemned isolate admits nothing, whatever the heap now reads.
-        Some(state)
-            if state.excessively_exceeded.load(Ordering::Relaxed)
-                || admission_refusal_forced(&state) =>
-        {
-            true
-        }
+        Some(state) if state.condemned() || admission_refusal_forced(&state) => true,
         Some(state) => heap_share(scope, state.limit) >= HEAP_ADMISSION_SHARE,
         None => false,
     };
@@ -12557,7 +12882,10 @@ fn op_atob(
             // for a typed view, so a 25 MiB value does not become 25 million
             // JavaScript numbers before the cell can store it.
             if args.get(1).boolean_value(scope) {
-                rv.set(bytes_value(scope, bytes));
+                let Some(value) = bytes_value_or_throw(scope, bytes) else {
+                    return;
+                };
+                rv.set(value);
                 return;
             }
             // atob returns a binary string (latin1)
@@ -14173,7 +14501,13 @@ fn op_vfs_read_file(
             .unwrap()
             .read_file(&path);
         if let Some(bytes) = bytes {
-            let store = v8::ArrayBuffer::new_backing_store_from_vec(bytes).make_shared();
+            let store = match host_backing_store(scope, bytes) {
+                Ok(store) => store,
+                // A read whose bytes do not fit throws and answers nothing:
+                // returning `null` would be indistinguishable from ENOENT,
+                // and an empty buffer would hand the guest wrong bytes.
+                Err(refusal) => return throw_host_store_refusal(scope, &refusal),
+            };
             let buffer = v8::ArrayBuffer::with_backing_store(scope, &store);
             rv.set(buffer.into());
             return;
@@ -14188,7 +14522,10 @@ fn op_vfs_read_file(
     };
     // One copy into the V8 heap. The projected `Bytes` stays shared, so a
     // second read of the same module does not re-copy the config's source.
-    let store = v8::ArrayBuffer::new_backing_store_from_vec(bytes.to_vec()).make_shared();
+    let store = match host_backing_store(scope, bytes.to_vec()) {
+        Ok(store) => store,
+        Err(refusal) => return throw_host_store_refusal(scope, &refusal),
+    };
     let buffer = v8::ArrayBuffer::with_backing_store(scope, &store);
     rv.set(buffer.into());
 }
@@ -14876,7 +15213,7 @@ fn make_incoming_request<'s>(
     let stream_id = body.stream_id();
     let (body, stream_id) = match stream_id {
         None => (
-            bytes_value(tc, body.into_held_bytes().unwrap()),
+            bytes_value(tc, body.into_held_bytes().unwrap())?,
             v8::undefined(tc).into(),
         ),
         Some(id) => (
@@ -14927,7 +15264,7 @@ fn make_request<'s>(
     let u = v8::String::new(tc, url).unwrap();
     let m = v8::String::new(tc, method).unwrap();
     let bytes = body.into_held_bytes().unwrap_or_default();
-    let b = bytes_value(tc, bytes);
+    let b = bytes_value(tc, bytes)?;
     let h = v8::String::new(tc, &serde_json::to_string(headers)?).unwrap();
     let recv = v8::undefined(tc).into();
     f.call(tc, recv, &[u.into(), m.into(), b, h.into()])

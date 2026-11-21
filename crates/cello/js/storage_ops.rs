@@ -640,6 +640,17 @@ pub(super) fn op_sql_cursor_start(
     }
     match result {
         Ok((cursor, columns, row, rows_written, reused_cached_query)) => {
+            // Row 1 first: a refused BLOB closes the cursor and throws, and
+            // nothing is built or registered for a cursor the guest never
+            // receives.
+            let first: v8::Local<v8::Value> = match row {
+                Some(row) => match cursor_row(scope, cursor, row) {
+                    Some(row) => row.into(),
+                    // The refusal is already scheduled; `rv` stays unset.
+                    None => return,
+                },
+                None => v8::null(scope).into(),
+            };
             let result = v8::Object::new(scope);
             let set = |scope: &mut v8::PinScope, name: &str, value: v8::Local<v8::Value>| {
                 let key = v8::String::new(scope, name).unwrap();
@@ -653,10 +664,6 @@ pub(super) fn op_sql_cursor_start(
                 names.set_index(scope, index as u32, name.into());
             }
             set(scope, "columns", names.into());
-            let first: v8::Local<v8::Value> = match row {
-                Some(row) => sql_row_to_v8(scope, row).into(),
-                None => v8::null(scope).into(),
-            };
             set(scope, "row", first);
             let written = v8::Number::new(scope, rows_written as f64).into();
             set(scope, "rowsWritten", written);
@@ -698,7 +705,13 @@ pub(super) fn op_sql_cursor_next(
         }
     }
     match storage::sql_cursor_next(cursor) {
-        Ok((Some(row), _)) => rv.set(sql_row_to_v8(scope, row).into()),
+        Ok((Some(row), _)) => {
+            // A `None` closed the cursor and scheduled the refusal; `rv` stays
+            // unset so no partial row crosses.
+            if let Some(row) = cursor_row(scope, cursor, row) {
+                rv.set(row.into());
+            }
+        }
         Ok((None, rows_written)) => rv.set(v8::Number::new(scope, rows_written as f64).into()),
         Err(error) => throw_sql_error(scope, error),
     }
@@ -717,16 +730,21 @@ fn throw_sql_error(scope: &mut v8::PinScope, error: impl std::fmt::Display) {
 }
 
 /// One SQL result row as a `v8::Array` of column values.
+///
+/// A column whose bytes the isolate's budget refuses stops the conversion at
+/// that column: no further `set_index` runs, because a refused store is not a
+/// scheduled exception and the rest of the row is simply not built. The caller
+/// gets the refusal and must not present a partial row.
 fn sql_row_to_v8<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     row: Vec<storage::SqlValue>,
-) -> v8::Local<'s, v8::Array> {
+) -> Result<v8::Local<'s, v8::Array>, super::array_buffer_budget::HostStoreRefusal> {
     let array = v8::Array::new(scope, row.len() as i32);
     for (index, value) in row.into_iter().enumerate() {
-        let value = sql_value_to_v8(scope, value);
+        let value = sql_value_to_v8(scope, value)?;
         array.set_index(scope, index as u32, value);
     }
-    array
+    Ok(array)
 }
 
 /// One SQL column value as a V8 value, matching what `JSON.parse` plus the
@@ -735,8 +753,8 @@ fn sql_row_to_v8<'s>(
 fn sql_value_to_v8<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     value: storage::SqlValue,
-) -> v8::Local<'s, v8::Value> {
-    match value {
+) -> Result<v8::Local<'s, v8::Value>, super::array_buffer_budget::HostStoreRefusal> {
+    Ok(match value {
         storage::SqlValue::Null => v8::null(scope).into(),
         // A SQLite integer is an i64 and a JS number is a double, so an
         // integer above 2^53 loses its low bits. `JSON.parse` rounded the
@@ -755,16 +773,43 @@ fn sql_value_to_v8<'s>(
         storage::SqlValue::Text(text) => v8::String::new(scope, &text).unwrap().into(),
         // An ArrayBuffer, because that is what the `_decode` closure produced
         // from `{__cello_bytes: [...]}`. The bytes move into the backing store
-        // without a copy, as `bytes_value` in `js.rs` does.
+        // without a copy, as `bytes_value` in `js.rs` does; a store the budget
+        // refuses is reported to the caller, never presented as `undefined`.
         storage::SqlValue::Blob(bytes) => {
             if bytes.is_empty() {
-                return v8::ArrayBuffer::new(scope, 0).into();
+                return Ok(v8::ArrayBuffer::new(scope, 0).into());
             }
-            let store = v8::ArrayBuffer::new_backing_store_from_vec(bytes).make_shared();
+            let store = super::host_backing_store(scope, bytes)?;
             v8::ArrayBuffer::with_backing_store(scope, &store).into()
+        }
+    })
+}
+
+/// One cursor row as a V8 array, or a thrown refusal.
+///
+/// A row carrying a BLOB the budget refuses cannot be presented at all: the
+/// conversion stops at that column and the native cursor is closed before the
+/// `RangeError` is thrown. Closing matters on both cursor paths — on row 1 the
+/// exception prevents the `SqlCursor` from ever being built, so no finalizer
+/// exists to close it, and on a later row the JS half's
+/// `_advanceNative` → `_finishNative` unregisters the finalizer without
+/// closing. Without this, every refusal would retain a SQLite statement on the
+/// connection until the cell closes.
+pub(super) fn cursor_row<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    cursor: u64,
+    row: Vec<storage::SqlValue>,
+) -> Option<v8::Local<'s, v8::Array>> {
+    match sql_row_to_v8(scope, row) {
+        Ok(row) => Some(row),
+        Err(refusal) => {
+            storage::sql_cursor_close(cursor);
+            super::throw_host_store_refusal(scope, &refusal);
+            None
         }
     }
 }
+
 pub(super) fn op_sql_cursor_close(
     scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
@@ -1312,8 +1357,13 @@ pub(super) fn op_sc_encode(
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
-    if let Some(bytes) = serialize_storage_value(scope, args.get(0)) {
-        rv.set(bytes_value(scope, bytes));
+    let Some(bytes) = serialize_storage_value(scope, args.get(0)) else {
+        return;
+    };
+    // A refused encode throws and answers nothing: the RPC caller must not
+    // receive an empty payload in place of the clone.
+    if let Some(value) = super::bytes_value_or_throw(scope, bytes) {
+        rv.set(value);
     }
 }
 
@@ -1731,7 +1781,9 @@ pub(super) fn op_do_lift_finish_rpc(
     let token = args.get(0).integer_value(scope).unwrap_or(0).max(0) as u64;
     let caps = args.get(2).boolean_value(scope);
     if let Some(bytes) = finish_lift(scope, token, args.get(1), if caps { 5 } else { 6 }) {
-        rv.set(super::bytes_value(scope, bytes));
+        if let Some(value) = super::bytes_value_or_throw(scope, bytes) {
+            rv.set(value);
+        }
     }
 }
 
@@ -1744,7 +1796,9 @@ pub(super) fn op_do_lift_finish_stored(
 ) {
     let token = args.get(0).integer_value(scope).unwrap_or(0).max(0) as u64;
     if let Some(bytes) = finish_lift(scope, token, args.get(1), STORED_STUB_TAG_V2) {
-        rv.set(super::bytes_value(scope, bytes));
+        if let Some(value) = super::bytes_value_or_throw(scope, bytes) {
+            rv.set(value);
+        }
     }
 }
 
@@ -1761,7 +1815,9 @@ pub(super) fn op_rpc_encode_bare(
         let mut out = Vec::with_capacity(bytes.len() + 1);
         out.push(if caps { 1 } else { 2 });
         out.extend_from_slice(&bytes);
-        rv.set(super::bytes_value(scope, out));
+        if let Some(value) = super::bytes_value_or_throw(scope, out) {
+            rv.set(value);
+        }
     }
 }
 
@@ -1782,7 +1838,9 @@ pub(super) fn op_bytes_tagged(
     let mut out = Vec::with_capacity(bytes.len() + 1);
     out.push(tag as u8);
     out.extend_from_slice(&bytes);
-    rv.set(super::bytes_value(scope, out));
+    if let Some(value) = super::bytes_value_or_throw(scope, out) {
+        rv.set(value);
+    }
 }
 
 /// `__rpc_decode_bytes(bytes) -> [tag, decoded]`: check the envelope tag

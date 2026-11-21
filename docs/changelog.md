@@ -5,8 +5,9 @@ description: What shipped in each Cello release, from v0.6.3-ryuzcorp.4 to v0.2.
 ## Unreleased
 
 A `TransformStream` now applies backpressure, a `tee()` bounds the skew
-between its branches, and compression streams no longer leak native memory.
-No configuration, data, or bucket-format changes.
+between its branches, compression streams no longer leak native memory, and
+an isolate's `ArrayBuffer` memory is capped. No data or bucket-format
+changes; `CELLO_V8_EXTERNAL_LIMIT_MB` is new and optional.
 
 - **`TransformStream` applies backpressure** (#105). Its writable side used to
   resolve `write()` as soon as the transform returned, whether or not
@@ -84,6 +85,44 @@ No configuration, data, or bucket-format changes.
   `operation timed out`, or the tee skew message when a streamed request body
   was a tee copy the budget ended. Code that matched the old wrapper text
   should match the cause instead.
+
+- **An isolate's `ArrayBuffer` memory is capped** (#110). V8's default
+  ArrayBuffer allocator is `malloc`, so `new ArrayBuffer(n)` in a Worker was
+  an unbounded allocation inside the shared process: `near_heap_limit`
+  extends the V8 heap limit and never fails the allocation, and backing
+  stores are external memory rather than heap. One tenant looping
+  `new Uint8Array(8 << 20)` grew the node by 640 MiB with a 128 MiB heap
+  limit and was never refused (measured: RSS +643 MiB, isolate not
+  condemned). Every isolate now has an allocator of its own that charges
+  each backing store to a per-isolate budget and returns null past it, which
+  V8 turns into a catchable `RangeError: Array buffer allocation failed`.
+  The budget is `CELLO_V8_EXTERNAL_LIMIT_MB`, four heap limits by default
+  (512 MiB), above the 64 MiB `/tmp` read, 32 MiB WebSocket message, 32 MiB
+  tee skew and clone that one request legitimately holds. The three
+  page-allocator paths that bypass the allocator -- a resizable
+  `ArrayBuffer`, a growable `SharedArrayBuffer`, and `WebAssembly.Memory` --
+  are charged by a prelude guard on construction and on every
+  `resize`/`grow`, before the pages are committed, so they are refused in
+  the same turn rather than seen at the next one; the guard is not reachable
+  around (`ArrayBuffer.prototype.constructor`, `Reflect.construct`,
+  `structuredClone`, `transfer`). A refusal condemns the isolate the way a
+  heap-limit hit does: it takes on no new retained state and serves again
+  once it is back under 75 percent of both limits. Three refusals are
+  evidence: a refused host store, the guard's, and an allocation larger than
+  the whole budget (which no collection can make room for). A smaller plain
+  allocation that V8 collects and retries successfully never fails the
+  guest, so it does not condemn. A collection returns
+  freed buffers to the budget, so churn past the limit is never refused.
+  Buffers the host hands to JavaScript -- response bodies, WebSocket
+  messages, RPC arguments, `/tmp` reads, D1 blobs -- are charged to the same
+  budget and refused the same way: a refused stream chunk rejects the read
+  promise with the budget's `RangeError`, and a SQL row whose BLOB does not
+  fit throws one `RangeError` and closes its native cursor, so the refused
+  statement is not retained. What remains is documented in
+  [Limitations](reference/limits.md): a `WebAssembly.Memory` that a module
+  declares is bounded per memory (`--wasm-max-mem-pages`, the whole budget)
+  but not charged, so many such memories in one isolate are bounded only by
+  the node's memory pressure shedding.
 
 ## v0.2.3
 

@@ -135,9 +135,15 @@ pub(super) fn op_cache_match(
     let headers = v8::String::new(scope, &serde_json::to_string(&headers).unwrap_or_default())
         .map(v8::Local::<v8::Value>::from)
         .unwrap_or_else(|| v8::null(scope).into());
-    let body = body
-        .map(|bytes| bytes_value(scope, bytes))
-        .unwrap_or_else(|| v8::null(scope).into());
+    let body = match body {
+        Some(bytes) => match bytes_value_or_throw(scope, bytes) {
+            Some(body) => body,
+            // A cached body the budget refuses throws: answering `null`
+            // would report a miss for an entry that was found.
+            None => return,
+        },
+        None => v8::null(scope).into(),
+    };
     rv.set(v8::Array::new_with_elements(scope, &[status, headers, body]).into());
 }
 
